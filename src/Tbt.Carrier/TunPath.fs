@@ -415,6 +415,7 @@ type TunPath(output: ITunOutput, counters: TunCounters, localIp: uint32, localPo
             let rtt = float (now - s.SentNs)
             srttNs <- if srttNs = 0.0 then rtt else 0.875 * srttNs + 0.125 * rtt
             let r = now - s.SentNs
+            if Trace.enabled then Trace.record Trace.Rtt (uint64 inflight) pathId (int (r / 1000L))
             if r < minRttNs || now - minRttStamp > 10_000_000_000L then
                 minRttNs <- r
                 minRttStamp <- now

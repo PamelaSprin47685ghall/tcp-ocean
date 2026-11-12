@@ -21,6 +21,10 @@ let Arrive = 3
 [<Literal>]
 let Known = 4
 
+/// path: an RTT sample of a first-copy segment (step = path inflight bytes, aux = RTT us).
+[<Literal>]
+let Rtt = 5
+
 let mutable enabled = false
 let private capacity = 1 <<< 22
 let mutable private kinds: byte[] = [||]
