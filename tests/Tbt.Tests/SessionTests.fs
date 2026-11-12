@@ -281,3 +281,29 @@ let ``a fully lost tail is found by HEARTBEAT and repaired by BOOSTER`` () =
         r <- r + 1
     Assert.Equal<byte[]>(Array.append head tail, pair.ServerPort.Stream(slot).ToArray())
     Assert.True(c.Tx.BoostersSent > 0L)
+
+[<Fact>]
+let ``short local writes go through the reserve and keep every byte in order`` () =
+    let config = { SessionConfig.defaults with WindowSteps = 512 }
+    let pair = Pair(config, 4, 0.02, 13)
+    let c = pair.Client
+    let rnd = Random 5
+    let flows = 6
+    let slots = Array.zeroCreate<int> flows
+    for i in 0 .. flows - 1 do
+        let mutable s = -1
+        Assert.True(c.TryOpenFlow(&s))
+        slots.[i] <- s
+    let data = Array.init flows (fun i -> Array.init (400_000 + i * 50_000) (fun j -> byte (j * (i + 3) + j / 977)))
+    let sent = Array.zeroCreate<int> flows
+    let mutable r = 0
+    while r < 30_000 && slots |> Array.exists (fun s -> not (pair.ServerPort.Finished.Contains s)) do
+        for i in 0 .. flows - 1 do
+            if sent.[i] < data.[i].Length || c.FlowSending slots.[i] then
+                sent.[i] <- sent.[i] + pair.Feed(c, slots.[i], ReadOnlySpan(data.[i], sent.[i], data.[i].Length - sent.[i]), true)
+        pair.ServerPort.WriteLimit <- (if rnd.Next 3 = 0 then 0 else rnd.Next(1, 3000))
+        for s in slots do pair.Server.PumpFlow s
+        pair.Round() |> ignore
+        r <- r + 1
+    for i in 0 .. flows - 1 do
+        Assert.Equal<byte[]>(data.[i], pair.ServerPort.Stream(slots.[i]).ToArray())

@@ -67,6 +67,10 @@ type SessionCarrier(session: Session, bridge: FlowBridge, probe: INotSentProbe) 
         + " tx_head=" + string tx.Head + " peer_ack=" + string tx.PeerAck + " grant_limit=" + string tx.GrantLimit
         + " queued=" + string tx.Queued + " rx_ack=" + string rx.AckStepLo + " rx_base=" + string rx.Decoder.BaseStep
         + " recovered=" + string rx.Counters.Recovered + " flows=" + string bridge.Active
+        + " opened=" + string session.Flows.Counters.Opened + " closed=" + string session.Flows.Counters.Closed
+        + " local_fail=" + string session.Flows.Counters.LocalFailures
+        + " stale=" + string session.Flows.Counters.StaleSources
+        + " flow_state=" + string session.FlowStatesSent + "/" + string session.FlowStatesRejected
 
     /// Add a path whose bootstrap is done; frames already buffered are taken at once.
     member _.AddPath(link: PathLink) =

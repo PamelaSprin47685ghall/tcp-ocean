@@ -1,9 +1,10 @@
 #!/usr/bin/env bash
 # End-to-end run on network namespaces (netns.sh) with real traffic:
-#   1. echo: FLOWS parallel connections through the tunnel, every byte checked;
-#   2. bulk: iperf3 upload and download through the tunnel.
+#   1. one session: echo checks (every byte checked), echo latency, bulk up/down, latency
+#      under bulk, back to back;
+#   2. one session: iperf3 up, down, parallel up, parallel down, up again, back to back.
 # The server runs as the NativeAOT binary, the client on the JIT runtime.
-# Reports server peak RSS (VmHWM), server CPU seconds and iperf3 goodput.
+# Reports server peak RSS (VmHWM), server CPU seconds, goodput and echo latency.
 #   run.sh [owd_ms] [rate_mbit] [loss] [paths] [seconds]
 # Needs sudo, gcc, python3, iperf3, .NET 10 SDK. Logs go to a temporary directory.
 set -euo pipefail
@@ -37,7 +38,7 @@ in_ns far python3 "$work/echo.py" serve 7000 &
 in_ns far iperf3 -s -p 5201 >/dev/null 2>&1 &
 sleep 0.5
 
-# One tunnel per test, so that each measurement starts from a fresh session.
+# One tunnel = one session; each session runs several cases back to back.
 tunnel() {
     local name=$1 target=$2
     in_ns far "$work/aot/tbtun" server --listen 10.200.2.2:8443 --target "$target" --psk-file "$work/psk" --stats-s 1 \
@@ -62,20 +63,37 @@ goodput() { python3 -c 'import json,sys; d=json.load(sys.stdin); print("%.1f" % 
 
 status=0
 echo "reference, plain TCP without tunnel: 1 flow $(in_ns near iperf3 -c 10.200.2.2 -p 5201 -t "$seconds" -J | goodput) Mbit/s, $paths flows $(in_ns near iperf3 -c 10.200.2.2 -p 5201 -t "$seconds" -P "$paths" -J | goodput) Mbit/s"
+echo "reference, plain TCP without tunnel: $(in_ns near python3 "$work/echo.py" ping 10.200.2.2 7000 100)"
+
+# Session 1: every echo/latency case back to back on one session, so that a flow left
+# stalled by an earlier case shows up as a failure of the later ones.
 if [[ ${SKIP_ECHO:-0} != 1 ]]; then
-tunnel echo 10.200.2.2:7000
-in_ns near python3 "$work/echo.py" check 127.0.0.1 1080 8 1000000 || status=1
-in_ns near python3 "$work/echo.py" check 127.0.0.1 1080 64 20000 || status=1
-report echo; stop
+tunnel mux 10.200.2.2:7000
+run_case() { "$@" || { echo "FAILED: ${*:3}"; status=1; }; }
+run_case in_ns near python3 "$work/echo.py" check 127.0.0.1 1080 8 1000000
+run_case in_ns near python3 "$work/echo.py" check 127.0.0.1 1080 64 20000
+run_case in_ns near python3 "$work/echo.py" ping 127.0.0.1 1080 200
+run_case in_ns near python3 "$work/echo.py" bulk 127.0.0.1 1080 up "$seconds"
+run_case in_ns near python3 "$work/echo.py" bulk 127.0.0.1 1080 down "$seconds"
+run_case in_ns near python3 "$work/echo.py" pingbulk 127.0.0.1 1080 200 "$seconds"
+run_case in_ns near python3 "$work/echo.py" check 127.0.0.1 1080 8 1000000
+report mux; stop
 fi
 
-tunnel up 10.200.2.2:5201
-echo "bulk upload: $(in_ns near iperf3 -c 127.0.0.1 -p 1080 -t "$seconds" -J | goodput) Mbit/s"
-report upload; stop
-
-tunnel down 10.200.2.2:5201
-echo "bulk download: $(in_ns near iperf3 -c 127.0.0.1 -p 1080 -t "$seconds" -R -J | goodput) Mbit/s"
-report download; stop
+# Session 2: iperf3 cases back to back on one session (control flow idles while data runs).
+tunnel bulk 10.200.2.2:5201
+for args in "" "-R" "-P $paths" "-R -P $paths" ""; do
+    # shellcheck disable=SC2086
+    sleep 2  # iperf3 -s takes one test at a time: let the last one finish on the far side
+    if json=$(timeout $((seconds + 30)) sudo ip netns exec tbe_near iperf3 -c 127.0.0.1 -p 1080 -t "$seconds" $args -J) \
+        && out=$(goodput <<<"$json"); then
+        echo "iperf3 ${args:-up}: $out Mbit/s"
+    else
+        echo "FAILED: iperf3 ${args:-up}: $(python3 -c 'import json,sys; print(json.load(sys.stdin).get("error","no result"))' <<<"$json" 2>/dev/null)"
+        status=1
+    fi
+done
+report bulk; stop
 
 echo "wanem: $(tr '\n' ' ' < "$work/wanem.stats")"
 echo "logs: $work"
