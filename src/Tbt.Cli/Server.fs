@@ -144,7 +144,7 @@ let run (o: Options) =
             if leave then pending.RemoveAt i
             i <- i - 1
 
-    let poller = Poller()
+    use poller = new Poller()
     let mutable lastStats = Environment.TickCount64
     while true do
         match listener with

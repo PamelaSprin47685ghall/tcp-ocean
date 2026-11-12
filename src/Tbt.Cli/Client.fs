@@ -72,7 +72,7 @@ let run (o: Options) =
         listener.Bind listenAt
         listener.Listen 128
         listener.Blocking <- false
-        let poller = Poller()
+        use poller = new Poller()
         let statsMs = int64 (o.Int("stats-s", 0)) * 1000L
         let mutable lastStats = Environment.TickCount64
         while carrier.Alive do
