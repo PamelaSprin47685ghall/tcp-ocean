@@ -14,6 +14,7 @@
     <Compile Include="TunTests.fs" />
     <Compile Include="FuzzTests.fs" />
     <Compile Include="PollerTests.fs" />
+    <Compile Include="ControlTests.fs" />
   </ItemGroup>
   <ItemGroup>
     <None Include="../vectors/*.json" CopyToOutputDirectory="PreserveNewest" LinkBase="vectors" />

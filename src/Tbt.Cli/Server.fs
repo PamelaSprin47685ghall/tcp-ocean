@@ -196,7 +196,10 @@ let run (o: Options) =
                 c.Session.Fail(ex.GetType().Name + ": " + ex.Message)
             if not c.Alive then
                 if c.Session.Faulted then failed <- failed + 1L
-                let why = if c.Session.Faulted then " failed: " + c.Session.Fault else " closed"
+                let why =
+                    if c.Session.Faulted then " failed: " + c.Session.Fault
+                    elif c.Session.PeerCloseReason >= 0 then " closed by peer (reason " + string c.Session.PeerCloseReason + ")"
+                    else " closed"
                 log ("session " + c.Session.Keys.SessionId.ToString() + why)
                 c.Close()
                 sessions.RemoveAt i

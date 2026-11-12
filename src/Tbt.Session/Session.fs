@@ -14,6 +14,15 @@ type Role =
     | Client = 0
     | Server = 1
 
+/// The session close transaction (spec 6.10a rule 6).
+type CloseState =
+    | Open = 0
+    /// We sent SESSION_CLOSE and wait for SESSION_CLOSED.
+    | Closing = 1
+    /// The peer sent SESSION_CLOSE; our SESSION_CLOSED waits for its acknowledgement.
+    | Draining = 2
+    | Closed = 3
+
 [<Struct>]
 type SessionConfig =
     { /// Parity ratio of full steps (spec 5.7).
@@ -105,6 +114,16 @@ type Session(role: Role, p: SessionParams, port: IFlowPort, clock: IClock, confi
     let mutable ackDue = false
     let mutable peerSeen = false
     let mutable fault = ""
+    // Reliable control (spec 6.10a) and the session close transaction (op 7/8).
+    let ctrl = ControlLog()
+    let ctrlBody = Array.zeroCreate<byte> 16
+    let mutable closeState = CloseState.Open
+    let mutable closeSeq = 0u
+    let mutable replySeq = 0u
+    let mutable peerCloseReason = -1
+    let mutable ctrlSent = 0L
+    let mutable ctrlExecuted = 0L
+    let mutable ctrlRejected = 0L
     let mutable winAcksSent = 0L
     let mutable nackSpan = 0
     let mutable nackDeficit = 0
@@ -130,7 +149,7 @@ type Session(role: Role, p: SessionParams, port: IFlowPort, clock: IClock, confi
               THi = (if decoder.SeenEnd > 0UL then decoder.SeenEnd - 1UL else 0UL)
               RxTimeUs = uint64 (now / 1000L); PathCount = 0
               DecodedBitmap0 = 0UL; DecodedBitmap1 = 0UL; DecodedBitmap2 = 0UL; DecodedBitmap3 = 0UL
-              CtrlAckHi = 1u; CtrlAckBitmap = 0UL }
+              CtrlAckHi = ctrl.AckHi; CtrlAckBitmap = ctrl.AckBitmap }
         symbol.Clear()
         WinAck.writeHead head symbol
         let meta =
@@ -143,6 +162,49 @@ type Session(role: Role, p: SessionParams, port: IFlowPort, clock: IClock, confi
         frame.[frame.Length - 1] <- 10uy
         tx.Seal(frame, path)
         winAcksSent <- winAcksSent + 1L
+
+    let renderCtrl (frame: Span<byte>) (path: uint16) (now: int64) =
+        let symbol = frame.Slice(Layout.SymbolOffset, s)
+        if ctrl.Pending > 0 && ctrl.TryRenderDue(now, int64 tx.SrttNs, symbol) then
+            let meta =
+                { Type = CellType.Ctrl; Flags = MetaFlags.None; Slot = 0uy; StepUsed = 0uy; Aux = 0us
+                  RxWinGrant = rx.Grant; StepId = 0UL; AckStepLo = rx.AckStepLo; CarrierWm = tx.CarrierWm path
+                  KHist = 0u; ErasureQ16 = rx.ErasureQ16 }
+            FrameMath.writeChunkHeader s frame
+            Meta.write meta (frame.Slice(Layout.MetaOffset, Layout.MetaLength))
+            frame.[frame.Length - 2] <- 13uy
+            frame.[frame.Length - 1] <- 10uy
+            tx.Seal(frame, path)
+            ctrlSent <- ctrlSent + 1L
+            true
+        else false
+
+    /// Execute one CTRL operation (rules 1, 2, 4). The acknowledgement rides the next WIN_ACK.
+    let onCtrl (symbol: ReadOnlySpan<byte>) =
+        let mutable h = Unchecked.defaultof<CtrlHead>
+        if not (Ctrl.tryReadHead symbol &h) then ctrlRejected <- ctrlRejected + 1L
+        else
+            match ctrl.Arrive h.ControlSeq with
+            | ControlArrival.Fresh ->
+                match h.Op with
+                | CtrlOp.SessionClose ->
+                    // Accept only with room for the reply (rule 5); else the peer retries.
+                    if ctrl.CanReply then
+                        replySeq <- ctrl.Reply(CtrlOp.SessionClosed, ReadOnlySpan.Empty)
+                        peerCloseReason <- int symbol.[Ctrl.HeadLength]
+                        ctrl.Executed h.ControlSeq
+                        ctrlExecuted <- ctrlExecuted + 1L
+                        if closeState = CloseState.Open then closeState <- CloseState.Draining
+                | CtrlOp.SessionClosed ->
+                    ctrl.Executed h.ControlSeq
+                    ctrlExecuted <- ctrlExecuted + 1L
+                    if closeSeq <> 0u then closeState <- CloseState.Closed
+                | _ ->
+                    // Not supported here: not executed and not acknowledged (rule 1).
+                    ctrlRejected <- ctrlRejected + 1L
+            | ControlArrival.Duplicate -> ()
+            | _ -> ctrlRejected <- ctrlRejected + 1L
+            ackDue <- true
 
     let nextSeq () =
         if stateSeq = UInt32.MaxValue then
@@ -212,6 +274,23 @@ type Session(role: Role, p: SessionParams, port: IFlowPort, clock: IClock, confi
     member _.Faulted = fault.Length > 0
     member _.Fail(reason: string) = if fault.Length = 0 then fault <- (if reason.Length > 0 then reason else "failed")
     member _.SymbolSize = s
+    /// Start the close transaction (SESSION_CLOSE, spec 6.10a op 7). False when the
+    /// session already closes or the log has no room.
+    member _.Close(reason: byte) =
+        if closeState <> CloseState.Open || closeSeq <> 0u then false
+        else
+            ctrlBody.[0] <- reason
+            closeSeq <- ctrl.Start(CtrlOp.SessionClose, ReadOnlySpan(ctrlBody, 0, 1))
+            if closeSeq <> 0u then closeState <- CloseState.Closing
+            closeSeq <> 0u
+    member _.CloseState = closeState
+    /// The close transaction ended: the carrier may close the last path.
+    member _.Closed = closeState = CloseState.Closed
+    /// The reason byte of the peer's SESSION_CLOSE, or -1.
+    member _.PeerCloseReason = peerCloseReason
+    member _.CtrlSent = ctrlSent
+    member _.CtrlExecuted = ctrlExecuted
+    member _.CtrlRejected = ctrlRejected
     member _.FrameLength = Layout.frameLength s
     member _.Keys = keys
     member _.Caps = p.Caps
@@ -244,10 +323,11 @@ type Session(role: Role, p: SessionParams, port: IFlowPort, clock: IClock, confi
                 if rx.Decoder.KConflicts > 0L && fault.Length = 0 then fault <- "peer step_used conflict"
             | CellType.WinAck ->
                 let mutable h = Unchecked.defaultof<WinAckHead>
-                if WinAck.tryReadHead (Span<byte>.op_Implicit (frame.Slice(Layout.SymbolOffset, s))) &h
-                   && h.NackFlags &&& 1uy <> 0uy then
-                    tx.OnNack(h.TLo, int h.Span, int h.Deficit)
+                if WinAck.tryReadHead (Span<byte>.op_Implicit (frame.Slice(Layout.SymbolOffset, s))) &h then
+                    ctrl.OnAck(h.CtrlAckHi, h.CtrlAckBitmap)
+                    if h.NackFlags &&& 1uy <> 0uy then tx.OnNack(h.TLo, int h.Span, int h.Deficit)
             | CellType.Heartbeat -> rx.OnHeartbeat m.StepId
+            | CellType.Ctrl -> onCtrl (Span<byte>.op_Implicit (frame.Slice(Layout.SymbolOffset, s)))
             | CellType.FlowState when credit.Enabled ->
                 let page = Span<byte>.op_Implicit (frame.Slice(Layout.SymbolOffset, s))
                 let mutable h = Unchecked.defaultof<FlowStateHead>
@@ -262,7 +342,9 @@ type Session(role: Role, p: SessionParams, port: IFlowPort, clock: IClock, confi
             m.CarrierWm
 
     /// True when a cell waits for a path.
-    member _.WantsToSend = ackDue || flowStateDue || tx.HasCandidate || (peerSeen && tx.HeartbeatDue)
+    member _.WantsToSend =
+        ackDue || flowStateDue || (ctrl.Pending > 0 && ctrl.IsDue(clock.NowNs(), int64 tx.SrttNs)) || tx.HasCandidate
+        || (peerSeen && tx.HeartbeatDue)
 
     member _.FlowStatesSent = flowStatesSent
     member _.FlowStatesRejected = flowStatesRejected
@@ -274,6 +356,7 @@ type Session(role: Role, p: SessionParams, port: IFlowPort, clock: IClock, confi
             renderWinAck frame path now
             noteAckSent now
             true
+        elif renderCtrl frame path now then true
         elif flowStateDue then
             renderFlowState frame path
             lastFlowStateNs <- now
@@ -299,6 +382,12 @@ type Session(role: Role, p: SessionParams, port: IFlowPort, clock: IClock, confi
     /// Timers: WIN_ACK at most every 10 ms while the ack state changes, else every second.
     member _.Tick() =
         let now = clock.NowNs()
+        // Close transaction (rule 6): our close ends with the peer's SESSION_CLOSED; the
+        // peer's close ends when our SESSION_CLOSED is acknowledged or the retry limit passes.
+        if ctrl.Pending > 0 && ctrl.CheckLimit now then
+            if closeState <> CloseState.Open then closeState <- CloseState.Closed
+            elif fault.Length = 0 then fault <- "control retry limit"
+        if closeState = CloseState.Draining && not (ctrl.Contains replySeq) then closeState <- CloseState.Closed
         rx.Service now
         rx.Release()
         let changed = rx.AckStepLo <> lastAckLo || rx.AckStepLo + uint64 rx.Grant <> lastGrantLimit

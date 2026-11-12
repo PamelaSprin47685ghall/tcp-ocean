@@ -5,6 +5,7 @@ module Tbt.Cli.Client
 open System
 open System.Net
 open System.Net.Sockets
+open System.Runtime.InteropServices
 open Tbt.Contracts
 open Tbt.Session
 open Tbt.Session.Handshake
@@ -75,7 +76,17 @@ let run (o: Options) =
         use poller = new Poller()
         let statsMs = int64 (o.Int("stats-s", 0)) * 1000L
         let mutable lastStats = Environment.TickCount64
-        while carrier.Alive do
+        // SIGINT/SIGTERM: close the session with SESSION_CLOSE (spec 6.10a), at most 2 s.
+        let mutable stopAt = 0L
+        let onSignal (c: PosixSignalContext) =
+            c.Cancel <- true
+            if stopAt = 0L then stopAt <- Environment.TickCount64 + 2000L
+        use _int = PosixSignalRegistration.Create(PosixSignal.SIGINT, onSignal)
+        use _term = PosixSignalRegistration.Create(PosixSignal.SIGTERM, onSignal)
+        while carrier.Alive && not (stopAt > 0L && Environment.TickCount64 > stopAt) do
+            if stopAt > 0L && session.CloseState = CloseState.Open then
+                log "closing the session"
+                session.Close 0uy |> ignore
             if statsMs > 0L && Environment.TickCount64 - lastStats >= statsMs then
                 lastStats <- Environment.TickCount64
                 log ("stats " + carrier.Describe() + " rss_kib=" + string (rssKiB ()))
@@ -89,6 +100,6 @@ let run (o: Options) =
                     | null -> go <- false
                     | s -> if not (bridge.TryAdd s) then s.Dispose()
             carrier.Service poller
-        log "all paths closed"
+        log (if session.Closed then "session closed" else "all paths closed")
         carrier.Close()
-        1
+        if session.Closed then 0 else 1

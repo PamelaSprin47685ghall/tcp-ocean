@@ -68,6 +68,9 @@ type Pair(config: SessionConfig, paths: int, loss: float, seed: int) =
     let mutable dropped = 0
 
     let mutable blackout = false
+    // One-way delay in ns (0: frames arrive in the same round).
+    let mutable delay = 0L
+    let inFlight = Queue<struct (int64 * Session * uint16 * byte[])>()
 
     let move (src: Session) (dst: Session) =
         let mutable moved = 0
@@ -77,9 +80,19 @@ type Pair(config: SessionConfig, paths: int, loss: float, seed: int) =
                 n <- n + 1
                 moved <- moved + 1
                 if rnd.NextDouble() >= loss && not (blackout && obj.ReferenceEquals(src, client)) then
-                    dst.OnFrame(uint16 p, Span frame) |> ignore
+                    if delay > 0 then inFlight.Enqueue(struct (clock.Now + delay, dst, uint16 p, Array.copy frame))
+                    else dst.OnFrame(uint16 p, Span frame) |> ignore
                 else dropped <- dropped + 1
         moved
+
+    let deliver () =
+        let mutable go = true
+        while go && inFlight.Count > 0 do
+            let struct (due, dst, p, f) = inFlight.Peek()
+            if due <= clock.Now then
+                inFlight.Dequeue() |> ignore
+                dst.OnFrame(p, Span f) |> ignore
+            else go <- false
 
     member _.Client = client
     member _.Server = server
@@ -90,6 +103,8 @@ type Pair(config: SessionConfig, paths: int, loss: float, seed: int) =
     member _.Dropped = dropped
     /// Drop every client cell while set.
     member _.Blackout with get () = blackout and set v = blackout <- v
+    /// One-way delay of every frame, in ns.
+    member _.Delay with get () = delay and set v = delay <- v
 
     /// Write bytes of slot into session s as sources; return bytes taken.
     member _.Feed(s: Session, slot: int, data: ReadOnlySpan<byte>, fin: bool) =
@@ -107,6 +122,7 @@ type Pair(config: SessionConfig, paths: int, loss: float, seed: int) =
     /// One round: 1 ms passes, both ends send up to 4 cells per path.
     member _.Round() =
         clock.Now <- clock.Now + 1_000_000L
+        deliver ()
         client.Tick()
         server.Tick()
         move client server + move server client
@@ -486,3 +502,42 @@ let ``a first data source decoded before the zero-length OPEN still opens the fl
     flows.Pump 5
     Assert.Equal<struct (int * uint32) list>([ struct (5, 1u) ], List.ofSeq port.Opened)
     Assert.Equal(20L, port.Stream(5).Length)
+
+/// Bulk from server to client on one flow; returns bytes the client got in rounds.
+let private pumpDown (pair: Pair) (slot: int) (rounds: int) =
+    let chunk = Array.create 65536 7uy
+    let start = pair.ClientPort.Stream(slot).Length
+    for _ in 1 .. rounds do
+        feedFor pair.Server slot (ReadOnlySpan chunk) false |> ignore
+        pair.Round() |> ignore
+    pair.ClientPort.Stream(slot).Length - start
+
+[<Fact>]
+let ``a stall of the peer's acknowledgements does not leave the repair round trip inflated`` () =
+    // Guard for the suspected loop (seal-to-custody samples across a repair wait feed the
+    // 1.05 x SRTT repair rounds): with 20 ms one-way delay and 5% loss it does not lock in.
+    let pair = Pair(SessionConfig.defaults, 4, 0.05, 41)
+    pair.Delay <- 20_000_000L
+    let c, s = pair.Client, pair.Server
+    let mutable b = -1
+    Assert.True(c.TryOpenFlow(&b))
+    let mutable app = Span<byte>.Empty
+    Assert.True(c.TryBeginSourceFor(b, &app))
+    c.CommitSource(b, 0, false)
+    c.Flush()
+    let mutable r = 0
+    while pair.ServerPort.Opened.Count < 1 && r < 2000 do
+        pair.Round() |> ignore
+        r <- r + 1
+    pumpDown pair b 2000 |> ignore
+    let before = pumpDown pair b 3000
+    let srttBefore = s.Tx.SrttNs
+    pair.Blackout <- true
+    pumpDown pair b 1500 |> ignore
+    pair.Blackout <- false
+    pumpDown pair b 3000 |> ignore
+    let after = pumpDown pair b 3000
+    let msg = sprintf "before %d B, after %d B, srtt %.1f ms -> %.1f ms" before after (srttBefore / 1e6) (s.Tx.SrttNs / 1e6)
+    Assert.True(before > 0L, msg)
+    Assert.True(after * 10L >= before * 8L, msg)
+    Assert.True(s.Tx.SrttNs < 4.0 * srttBefore + 5e6, msg)
