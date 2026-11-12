@@ -7,6 +7,7 @@
   </PropertyGroup>
   <ItemGroup>
     <Compile Include="Vectors.fs" />
+    <Compile Include="ReadySetTests.fs" />
     <Compile Include="CodecTests.fs" />
     <Compile Include="WireTests.fs" />
     <Compile Include="CryptoTests.fs" />
