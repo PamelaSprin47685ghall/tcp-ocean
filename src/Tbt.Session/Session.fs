@@ -63,8 +63,8 @@ type Session(role: Role, p: SessionParams, port: IFlowPort, clock: IClock, confi
     let opener = CellOpener(rxDir, s, rxKeys, mask (if client then keys.HpDown else keys.HpUp))
     let encoder = Encoder((if client then keys.GraphSeedUp else keys.GraphSeedDown), s, config.WindowSteps)
     let decoder = Decoder((if client then keys.GraphSeedDown else keys.GraphSeedUp), s, config.WindowSteps, config.MaxRows)
-    let tx = TxHalf(txDir, s, fieldOf txDir, encoder, sealer, config.Rho, config.MaxPaths)
-    let rx = RxHalf(s, fieldOf rxDir, decoder, opener, config.WindowSteps)
+    let tx = TxHalf(txDir, s, fieldOf txDir, encoder, sealer, config.Rho, config.MaxPaths, clock)
+    let rx = RxHalf(s, fieldOf rxDir, decoder, opener, config.WindowSteps, config.MaxPaths)
     let flows = FlowTable(port, DecoderStore decoder, Action<uint64, int>(fun t d -> rx.StepUndelivered(t, d)))
     let resets = Collections.Generic.Queue<int>()
     let winAckPeriodNs = 10_000_000L
@@ -75,6 +75,9 @@ type Session(role: Role, p: SessionParams, port: IFlowPort, clock: IClock, confi
     let mutable ackDue = false
     let mutable peerSeen = false
     let mutable winAcksSent = 0L
+    let mutable nackSpan = 0
+    let mutable nackDeficit = 0
+    let mutable lastNackNs = 0L
     do
         rx.Attach flows
         // The client may send at once within rx_win_grant0. The server sends no down step
@@ -90,7 +93,8 @@ type Session(role: Role, p: SessionParams, port: IFlowPort, clock: IClock, confi
     let renderWinAck (frame: Span<byte>) (path: uint16) (now: int64) =
         let symbol = frame.Slice(Layout.SymbolOffset, s)
         let head =
-            { TLo = rx.AckStepLo; Deficit = 0us; Span = 1uy; NackFlags = 0uy
+            { TLo = rx.AckStepLo; Deficit = uint16 nackDeficit; Span = byte (max 1 nackSpan)
+              NackFlags = (if nackDeficit > 0 then 1uy else 0uy)
               ErasureMeanQ16 = rx.ErasureQ16; ErasureP95Q16 = rx.ErasureQ16
               THi = (if decoder.SeenEnd > 0UL then decoder.SeenEnd - 1UL else 0UL)
               RxTimeUs = uint64 (now / 1000L); PathCount = 0
@@ -133,12 +137,18 @@ type Session(role: Role, p: SessionParams, port: IFlowPort, clock: IClock, confi
             | CellType.Data
             | CellType.Parity
             | CellType.Booster ->
-                rx.OnCoded(m, Span<byte>.op_Implicit (frame.Slice(Layout.SymbolOffset, s)))
+                rx.OnCoded(m, Span<byte>.op_Implicit (frame.Slice(Layout.SymbolOffset, s)), path, clock.NowNs())
                 rx.Release()
+            | CellType.WinAck ->
+                let mutable h = Unchecked.defaultof<WinAckHead>
+                if WinAck.tryReadHead (Span<byte>.op_Implicit (frame.Slice(Layout.SymbolOffset, s))) &h
+                   && h.NackFlags &&& 1uy <> 0uy then
+                    tx.OnNack(h.TLo, int h.Span, int h.Deficit)
+            | CellType.Heartbeat -> rx.OnHeartbeat m.StepId
             | _ -> ()
 
     /// True when a cell waits for a path.
-    member _.WantsToSend = ackDue || tx.HasCandidate
+    member _.WantsToSend = ackDue || tx.HasCandidate || (peerSeen && tx.HeartbeatDue)
 
     /// Render and seal the next cell for path. False when nothing waits.
     member _.TryProduce(path: uint16, frame: Span<byte>) =
@@ -150,6 +160,9 @@ type Session(role: Role, p: SessionParams, port: IFlowPort, clock: IClock, confi
         elif tx.TryRenderNext(frame, path, rx.AckStepLo, rx.Grant, rx.ErasureQ16) then
             noteAckSent now
             true
+        elif peerSeen && tx.HeartbeatDue then
+            tx.RenderHeartbeat(frame, path, rx.AckStepLo, rx.Grant, rx.ErasureQ16)
+            true
         elif ackDue then
             renderWinAck frame path now
             noteAckSent now
@@ -159,8 +172,20 @@ type Session(role: Role, p: SessionParams, port: IFlowPort, clock: IClock, confi
     /// Timers: WIN_ACK at most every 10 ms while the ack state changes, else every second.
     member _.Tick() =
         let now = clock.NowNs()
+        rx.Service now
+        rx.Release()
         let changed = rx.AckStepLo <> lastAckLo || rx.AckStepLo + uint64 rx.Grant <> lastGrantLimit
         if (changed && now - lastAckNs >= winAckPeriodNs) || now - lastAckNs >= keepAliveNs then ackDue <- true
+        // A NACK is state: repeat it every 10 ms while the frontier lacks rank (spec 5.8).
+        if now - lastNackNs >= winAckPeriodNs then
+            let mutable span = 0
+            let mutable deficit = 0
+            if rx.TryNack(now, &span, &deficit) then
+                nackSpan <- span
+                nackDeficit <- deficit
+                lastNackNs <- now
+                ackDue <- true
+            else nackDeficit <- 0
 
     // ---- local flows ------------------------------------------------------------------
 

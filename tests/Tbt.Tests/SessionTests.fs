@@ -65,6 +65,8 @@ type Pair(config: SessionConfig, paths: int, loss: float, seed: int) =
     let frame = Array.zeroCreate<byte> client.FrameLength
     let mutable dropped = 0
 
+    let mutable blackout = false
+
     let move (src: Session) (dst: Session) =
         let mutable moved = 0
         for p in 0 .. paths - 1 do
@@ -72,7 +74,9 @@ type Pair(config: SessionConfig, paths: int, loss: float, seed: int) =
             while n < 4 && src.TryProduce(uint16 p, Span frame) do
                 n <- n + 1
                 moved <- moved + 1
-                if rnd.NextDouble() >= loss then dst.OnFrame(uint16 p, Span frame) else dropped <- dropped + 1
+                if rnd.NextDouble() >= loss && not (blackout && obj.ReferenceEquals(src, client)) then
+                    dst.OnFrame(uint16 p, Span frame)
+                else dropped <- dropped + 1
         moved
 
     member _.Client = client
@@ -82,6 +86,8 @@ type Pair(config: SessionConfig, paths: int, loss: float, seed: int) =
     member _.ClientParams = clientParams
     member _.ServerParams = serverParams
     member _.Dropped = dropped
+    /// Drop every client cell while set.
+    member _.Blackout with get () = blackout and set v = blackout <- v
 
     /// Write bytes of slot into session s as sources; return bytes taken.
     member _.Feed(s: Session, slot: int, data: ReadOnlySpan<byte>, fin: bool) =
@@ -160,10 +166,14 @@ let private echo (pair: Pair) (payload: byte[]) (rounds: int) =
     slot
 
 [<Theory>]
-[<InlineData(0.0, 4)>]
-[<InlineData(0.03, 16)>]
-let ``echo returns every byte in order and closes both ends`` (loss: float, paths: int) =
-    let pair = Pair(SessionConfig.defaults, paths, loss, 6)
+[<InlineData(0.0, 4, 6)>]
+[<InlineData(0.03, 16, 6)>]
+[<InlineData(0.1, 8, 1)>]
+[<InlineData(0.1, 8, 2)>]
+[<InlineData(0.2, 4, 3)>]
+[<InlineData(0.3, 4, 4)>]
+let ``echo returns every byte in order and closes both ends`` (loss: float, paths: int, seed: int) =
+    let pair = Pair(SessionConfig.defaults, paths, loss, seed)
     let payload = Array.init 300_000 (fun i -> byte (i * 7 + i / 251))
     let slot = echo pair payload 20_000
     Assert.Equal<byte[]>(payload, pair.ServerPort.Data.[slot].ToArray())
@@ -175,6 +185,7 @@ let ``echo returns every byte in order and closes both ends`` (loss: float, path
     if loss > 0.0 then
         Assert.True(pair.Dropped > 0)
         Assert.True(pair.Server.Rx.Counters.Recovered > 0L)
+        Assert.True(pair.Client.Rx.Counters.Recovered > 0L)
 
 [<Fact>]
 let ``a blocked local reader stops the sender through the grant, then resumes`` () =
@@ -199,3 +210,24 @@ let ``a blocked local reader stops the sender through the grant, then resumes`` 
         pair.Round() |> ignore
     Assert.Equal(payload.Length, sent)
     Assert.Equal<byte[]>(payload, pair.ServerPort.Data.[slot].ToArray())
+
+[<Fact>]
+let ``a fully lost tail is found by HEARTBEAT and repaired by BOOSTER`` () =
+    let pair = Pair(SessionConfig.defaults, 4, 0.0, 8)
+    let c = pair.Client
+    let mutable slot = -1
+    Assert.True(c.TryOpenFlow(&slot))
+    let head = Array.init 40_000 (fun i -> byte i)
+    let tail = Array.init 3_000 (fun i -> byte (i * 3))
+    pair.Feed(c, slot, ReadOnlySpan head, false) |> ignore
+    for _ in 1 .. 50 do pair.Round() |> ignore
+    pair.Blackout <- true
+    pair.Feed(c, slot, ReadOnlySpan tail, false) |> ignore
+    for _ in 1 .. 5 do pair.Round() |> ignore
+    pair.Blackout <- false
+    let mutable r = 0
+    while r < 2000 && pair.ServerPort.Stream(slot).Length < int64 (head.Length + tail.Length) do
+        pair.Round() |> ignore
+        r <- r + 1
+    Assert.Equal<byte[]>(Array.append head tail, pair.ServerPort.Stream(slot).ToArray())
+    Assert.True(c.Tx.BoostersSent > 0L)

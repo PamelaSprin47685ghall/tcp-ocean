@@ -2,6 +2,7 @@
   <ItemGroup>
     <Compile Include="Flows.fs" />
     <Compile Include="TxHalf.fs" />
+    <Compile Include="ParityHold.fs" />
     <Compile Include="RxHalf.fs" />
     <Compile Include="Session.fs" />
     <Compile Include="Handshake.fs" />

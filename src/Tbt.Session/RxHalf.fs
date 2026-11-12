@@ -17,10 +17,23 @@ type RxCounters() =
     member val EnvelopeErrors = 0L with get, set
     member val Recovered = 0L with get, set
     member val Unsupported = 0L with get, set
+    /// Parities given to the decoder, and parities dropped unused (spec 5.9 note in ParityHold).
+    member val ParitiesUsed = 0L with get, set
+    member val ParitiesUnused = 0L with get, set
 
 [<Sealed>]
-type RxHalf(symbolSize: int, field: CodeField, decoder: Decoder, opener: CellOpener, capacitySteps: int) =
+type RxHalf(symbolSize: int, field: CodeField, decoder: Decoder, opener: CellOpener, capacitySteps: int, maxPaths: int) =
     let counters = RxCounters()
+    let hold = ParityHold(symbolSize, 2 * capacitySteps)
+    /// Per path: highest step of a DATA or PARITY cell seen, and when the path last gave one.
+    let pathStep: uint64[] = Array.zeroCreate maxPaths
+    let pathSeenNs: int64[] = Array.zeroCreate maxPaths
+    /// A path counts for the loss evidence while it gave a cell this recently.
+    let pathActiveNs = 50_000_000L
+    /// The frontier may wait this long for late cells before held parities are used.
+    let stallNs = 20_000_000L
+    let mutable frontierSince = 0L
+    let mutable lastFrontier = 0UL
     /// Sources per step that wait for delivery (decoder keeps the step while not zero).
     let undelivered: int[] = Array.zeroCreate capacitySteps
     /// Lowest step that may still hold undelivered sources.
@@ -67,6 +80,39 @@ type RxHalf(symbolSize: int, field: CodeField, decoder: Decoder, opener: CellOpe
             if not (SourceEnvelope.tryRead symbol &e) then counters.EnvelopeErrors <- counters.EnvelopeErrors + 1L
             elif e.Flags.HasFlag StreamFlags.Pad then ()
             elif flows.OnSource(t, s, e) then flows.Pump(int e.FlowSlot)
+
+    let offerParity (m: Meta) (symbol: ReadOnlySpan<byte>) =
+        counters.ParitiesUsed <- counters.ParitiesUsed + 1L
+        decoder.OfferParity(m.StepId, int m.Slot, field, m.Flags.HasFlag MetaFlags.Urgent, int m.StepUsed, symbol) |> ignore
+
+    /// Evidence that the frontier step lost cells: every active path already gave a cell of
+    /// a later step. TCP keeps the order on a path, so nothing sent earlier is still on the way.
+    let lossEvident (now: int64) =
+        let f = decoder.Frontier
+        let mutable any = false
+        let mutable all = true
+        for p in 0 .. maxPaths - 1 do
+            if pathSeenNs.[p] <> 0L && now - pathSeenNs.[p] <= pathActiveNs then
+                any <- true
+                if pathStep.[p] <= f then all <- false
+        any && all
+
+    /// Give held parities to the decoder when it needs them; drop those it cannot use.
+    let serviceHold (now: int64) (force: bool) =
+        let f = decoder.Frontier
+        if f <> lastFrontier then
+            lastFrontier <- f
+            frontierSince <- now
+        let mutable m = Unchecked.defaultof<Meta>
+        let mutable symbol = ReadOnlySpan<byte>.Empty
+        while hold.TryPeek(&m, &symbol) && m.StepId < f do
+            counters.ParitiesUnused <- counters.ParitiesUnused + 1L
+            hold.Drop()
+        if hold.Count > 0 && f < decoder.SeenEnd && (force || now - frontierSince >= stallNs || lossEvident now) then
+            while hold.TryPeek(&m, &symbol) do
+                if m.StepId >= decoder.Frontier then offerParity m symbol
+                else counters.ParitiesUnused <- counters.ParitiesUnused + 1L
+                hold.Drop()
 
     member _.Counters = counters
     member _.Decoder = decoder
@@ -118,8 +164,15 @@ type RxHalf(symbolSize: int, field: CodeField, decoder: Decoder, opener: CellOpe
                     counters.Cells <- counters.Cells + 1L
                     ValueSome m
 
-    /// Hand a coded cell (DATA, PARITY, BOOSTER) to the decoder, then deliver what is known.
-    member _.OnCoded(m: Meta, symbol: ReadOnlySpan<byte>) =
+    member _.HeldParities = hold.Count
+
+    /// Hand a coded cell (DATA, PARITY, BOOSTER) of path to the decoder, then deliver what
+    /// is known. A parity waits in the hold while the decoder has no work for it.
+    member _.OnCoded(m: Meta, symbol: ReadOnlySpan<byte>, path: uint16, now: int64) =
+        let p = int path
+        if p < maxPaths && (m.Type = CellType.Data || m.Type = CellType.Parity) then
+            if m.StepId > pathStep.[p] then pathStep.[p] <- m.StepId
+            pathSeenNs.[p] <- now
         match m.Type with
         | CellType.Data ->
             count m
@@ -129,7 +182,37 @@ type RxHalf(symbolSize: int, field: CodeField, decoder: Decoder, opener: CellOpe
             count m
             if decoder.NoteStepUsed(m.StepId, int m.StepUsed) then
                 noteHistory m.StepId m.KHist
-                decoder.OfferParity(m.StepId, int m.Slot, field, m.Flags.HasFlag MetaFlags.Urgent, int m.StepUsed, symbol) |> ignore
+                if m.StepId < decoder.Frontier then counters.ParitiesUnused <- counters.ParitiesUnused + 1L
+                elif decoder.PendingRows > 0 then offerParity m symbol
+                elif hold.IsFull then offerParity m symbol
+                else hold.Add(m, symbol)
         | CellType.Booster -> decoder.OfferBooster(m.StepId, int m.StepUsed, int m.Slot, symbol) |> ignore
         | _ -> counters.Unsupported <- counters.Unsupported + 1L
         drainKnown ()
+        serviceHold now false
+        drainKnown ()
+
+    /// Timer: held parities go to the decoder once the frontier waited too long.
+    member _.Service(now: int64) =
+        serviceHold now false
+        drainKnown ()
+
+    /// HEARTBEAT: the sender has sealed step t (spec 5.8 tail rule).
+    member _.OnHeartbeat(t: uint64) = decoder.NoteSeen t |> ignore
+
+    /// NACK state (spec 5.8): the frontier step lacks rank, and a step 65 or more later was
+    /// seen or the lack lasted 20 ms. Held parities go to the decoder first. Return the
+    /// span and rank deficit to report, or false when no NACK is due.
+    member _.TryNack(now: int64, span: byref<int>, deficit: byref<int>) =
+        let f = decoder.Frontier
+        if f >= decoder.SeenEnd then false
+        elif decoder.SeenEnd < f + 66UL && now - frontierSince < 20_000_000L then false
+        else
+            serviceHold now true
+            drainKnown ()
+            let f = decoder.Frontier
+            if f >= decoder.SeenEnd then false
+            else
+                span <- int (min 4UL (decoder.SeenEnd - f))
+                deficit <- decoder.Deficit(f, span)
+                deficit > 0

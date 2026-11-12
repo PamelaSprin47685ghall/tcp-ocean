@@ -43,3 +43,13 @@ caps bit8 只在 bit9 同时置位时发出；收到只有 bit8 的对端时视�
 上行信元（DATA、PARITY 或 WIN_ACK）后才发下行步。这样 SERVER_INIT 丢失或被重放时，
 服务端不会把加密数据发给一个没有会话密钥的对端。客户端在握手完成后立即发 WIN_ACK，
 所以代价最多一个往返。
+
+## D7 全部丢失的步：k 由 BOOSTER 解出的内容推出（spec 5.8 尾部规则）
+
+一个步的 DATA 和 PARITY 全部丢失、后面又没有新步时，接收端从 HEARTBEAT 知道这个步存在，
+但 k 不在任何 Cell 里（k_hist 只描述更早的步）。规范的 BOOSTER 覆盖全部 16 个槽，
+编码时 s ≥ k 的槽按零参与组合（5.6）。所以 16 个槽全部解出后，接收端取
+k = 1 + 最后一个非零符号的槽号。真实源符号不会全零：它的 16 字节信封含非零的
+flow_generation（或 PAD 标志）。线上格式不变。
+
+测试：`SessionTests` 中"全部丢失的尾部由 HEARTBEAT 发现、由 BOOSTER 修复"。

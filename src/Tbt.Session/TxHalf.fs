@@ -15,7 +15,11 @@ open Tbt.Wire
 type Candidate =
     { Kind: CellType
       Step: uint64
-      Index: byte }
+      /// DATA: slot; PARITY: p; BOOSTER: booster_seq.
+      Index: byte
+      /// BOOSTER: span and the round total n; else 0.
+      Span: byte
+      Round: byte }
 
 /// Smallest m such that P(Bin(k + m, 1 - eps) < need(k)) <= 1e-3 (spec 5.7 small steps).
 module SmallStep =
@@ -38,7 +42,7 @@ module SmallStep =
 
 [<Sealed>]
 type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder, sealer: CellSealer,
-            rho: float, maxPaths: int) =
+            rho: float, maxPaths: int, clock: IClock) =
     let capacity = 1 <<< 16
     let stepParities: byte[] = Array.zeroCreate capacity
     let stepFlags: MetaFlags[] = Array.zeroCreate capacity
@@ -53,11 +57,25 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
     let mutable erasure = 0.05
     let smallParities = Array.init 17 (fun k -> if k = 0 then 0 else SmallStep.parities k 0.05)
     let mutable cellsSent = 0L
+    /// Repair (spec 5.8): BOOSTER cells go before all other cells.
+    let repairs = Queue<Candidate>(256)
+    let mutable repairLo = UInt64.MaxValue
+    let mutable repairSpan = 0
+    let mutable repairSeq = 0
+    let mutable repairDeficit = 0
+    let mutable repairNs = 0L
+    let mutable boostersSent = 0L
+    /// Seal time per step, for the round-trip estimate (seal to ack).
+    let sealNs: int64[] = Array.zeroCreate encoder.Capacity
+    let mutable srttNs = 100_000_000.0
+    let mutable lastSourceNs = 0L
+    let mutable lastHeartbeatNs = 0L
 
     let index (t: uint64) = int (t &&& uint64 (capacity - 1))
 
     let seal (k: int) (small: bool) =
         let t = encoder.Seal k
+        sealNs.[int (t % uint64 sealNs.Length)] <- clock.NowNs()
         let m =
             if small then max (int (ceil (float k * rho))) smallParities.[k]
             else
@@ -67,8 +85,8 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
                 m
         stepParities.[index t] <- byte m
         stepFlags.[index t] <- (if small then MetaFlags.EndOfBurst else MetaFlags.None)
-        for s in 0 .. k - 1 do queue.Enqueue { Kind = CellType.Data; Step = t; Index = byte s }
-        for p in 0 .. m - 1 do queue.Enqueue { Kind = CellType.Parity; Step = t; Index = byte p }
+        for s in 0 .. k - 1 do queue.Enqueue { Kind = CellType.Data; Step = t; Index = byte s; Span = 0uy; Round = 0uy }
+        for p in 0 .. m - 1 do queue.Enqueue { Kind = CellType.Parity; Step = t; Index = byte p; Span = 0uy; Round = 0uy }
         filled <- 0
         t
 
@@ -97,6 +115,7 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
         SourceEnvelope.write e symbol
         symbol.Slice(Layout.EnvelopeLength + e.RealLength).Clear()
         let t = encoder.Head
+        if filled = 0 then lastSourceNs <- clock.NowNs()
         filled <- filled + 1
         if filled = CodeGraph.SlotsPerStep then seal filled false |> ignore
         t
@@ -109,6 +128,9 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
     member _.OnPeerAck(ack: uint64, grant: uint16) =
         if ack <= encoder.Head then
             if ack > peerAck then
+                // Round-trip estimate from seal to custody of the newest acked step.
+                let sample = float (clock.NowNs() - sealNs.[int ((ack - 1UL) % uint64 sealNs.Length)])
+                if sample > 0.0 then srttNs <- srttNs + (sample - srttNs) / 8.0
                 peerAck <- ack
                 if ack > CodeGraph.HistorySpan then encoder.Release(ack - CodeGraph.HistorySpan)
             let limit = peerAck + uint64 grant
@@ -124,12 +146,66 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
             erasure <- max 0.01 e
             for k in 1 .. 16 do smallParities.[k] <- SmallStep.parities k erasure
 
+    member _.SrttNs = srttNs
+    member _.BoostersSent = boostersSent
+
+    /// A NACK from the peer's WIN_ACK (spec 5.8): steps [tLo, tLo + span) lack deficit ranks.
+    /// One round sends n = ceil((deficit + 2) / (1 - eps)) BOOSTERs; rounds for the same
+    /// range wait 1.05 SRTT unless the deficit grew. When the 256 seeds of a range are used,
+    /// the range's DATA cells go again (unit rows fill the missing columns).
+    member _.OnNack(tLo: uint64, span: int, deficit: int) =
+        let now = clock.NowNs()
+        let span = int (min (uint64 (min span CodeGraph.MaxBoosterSpan)) (encoder.Head - min tLo encoder.Head))
+        if tLo >= peerAck && span >= 1 && deficit >= 1 && encoder.StepUsed tLo > 0 then
+            let same = tLo = repairLo && span = repairSpan
+            if not same || deficit > repairDeficit || float (now - repairNs) >= 1.05 * srttNs then
+                if not same then
+                    repairLo <- tLo
+                    repairSpan <- span
+                    repairSeq <- 0
+                repairDeficit <- deficit
+                repairNs <- now
+                let n = min 64 (int (ceil (float (deficit + 2) / (1.0 - min 0.9 erasure))))
+                if repairSeq + n <= 256 then
+                    for i in 0 .. n - 1 do
+                        repairs.Enqueue { Kind = CellType.Booster; Step = tLo; Index = byte (repairSeq + i)
+                                          Span = byte span; Round = byte n }
+                    repairSeq <- repairSeq + n
+                else
+                    for j in 0 .. span - 1 do
+                        let t = tLo + uint64 j
+                        for s in 0 .. encoder.StepUsed t - 1 do
+                            repairs.Enqueue { Kind = CellType.Data; Step = t; Index = byte s; Span = 0uy; Round = 0uy }
+
+    /// Tail rule (spec 5.8): input paused for 50 ms and the peer lacks steps: a HEARTBEAT
+    /// every 50 ms carries tx_head_step.
+    member _.HeartbeatDue =
+        let now = clock.NowNs()
+        peerAck < encoder.Head && encoder.Head > 0UL && queue.Count = 0 && repairs.Count = 0
+        && now - lastSourceNs >= 50_000_000L && now - lastHeartbeatNs >= 50_000_000L
+
+    /// Render and seal a HEARTBEAT for path.
+    member this.RenderHeartbeat(frame: Span<byte>, path: uint16, ackLo: uint64, grant: uint16, erasureQ16: uint16) =
+        lastHeartbeatNs <- clock.NowNs()
+        frame.Slice(Layout.SymbolOffset, symbolSize).Clear()
+        let meta =
+            { Type = CellType.Heartbeat; Flags = MetaFlags.None; Slot = 0uy; StepUsed = 0uy; Aux = 0us
+              RxWinGrant = grant; StepId = encoder.Head - 1UL; AckStepLo = ackLo
+              CarrierWm = carrierWm.[int path]; KHist = 0u; ErasureQ16 = erasureQ16 }
+        FrameMath.writeChunkHeader symbolSize frame
+        Meta.write meta (frame.Slice(Layout.MetaOffset, Layout.MetaLength))
+        frame.[frame.Length - 2] <- 13uy
+        frame.[frame.Length - 1] <- 10uy
+        this.Seal(frame, path)
+
     /// Drop queued cells of steps the peer already holds; true when a cell waits.
     member _.HasCandidate =
         let mutable c = Unchecked.defaultof<Candidate>
+        while repairs.TryPeek(&c) && c.Step + uint64 (max 1uy c.Span) <= peerAck do
+            repairs.Dequeue() |> ignore
         while queue.TryPeek(&c) && c.Step < peerAck do
             queue.Dequeue() |> ignore
-        queue.Count > 0
+        repairs.Count > 0 || queue.Count > 0
 
     /// Seal a rendered frame with the next counter of this direction (one counter seals
     /// one plaintext only).
@@ -145,7 +221,7 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
         let mutable done' = false
         let mutable ok = false
         while not done' && this.HasCandidate do
-            c <- queue.Dequeue()
+            c <- if repairs.Count > 0 then repairs.Dequeue() else queue.Dequeue()
             let t = c.Step
             let k = encoder.StepUsed t
             let symbol = frame.Slice(Layout.SymbolOffset, symbolSize)
@@ -154,8 +230,22 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
                 elif c.Kind = CellType.Data then
                     encoder.Source(t, int c.Index).CopyTo symbol
                     true
+                elif c.Kind = CellType.Booster then encoder.TryRenderBooster(t, int c.Span, int c.Index, symbol)
                 else encoder.TryRenderParity(t, int c.Index, field, false, symbol)
-            if rendered then
+            if rendered && c.Kind = CellType.Booster then
+                let meta =
+                    { Type = CellType.Booster; Flags = MetaFlags.None; Slot = c.Index; StepUsed = c.Span
+                      Aux = uint16 c.Round; RxWinGrant = grant; StepId = t; AckStepLo = ackLo
+                      CarrierWm = carrierWm.[int path]; KHist = 0u; ErasureQ16 = erasureQ16 }
+                FrameMath.writeChunkHeader symbolSize frame
+                Meta.write meta (frame.Slice(Layout.MetaOffset, Layout.MetaLength))
+                frame.[frame.Length - 2] <- 13uy
+                frame.[frame.Length - 1] <- 10uy
+                this.Seal(frame, path)
+                boostersSent <- boostersSent + 1L
+                ok <- true
+                done' <- true
+            elif rendered then
                 for i in 0 .. 5 do
                     let r = CodeGraph.Strides.[i]
                     kHist.[i] <- if t < r then 0 else (let h = encoder.StepUsed(t - r) in if h = 0 then 16 else h)
