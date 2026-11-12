@@ -1,0 +1,6 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <ItemGroup>
+    <Compile Include="Layout.fs" />
+    <Compile Include="Types.fs" />
+  </ItemGroup>
+</Project>

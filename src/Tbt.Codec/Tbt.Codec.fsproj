@@ -1,0 +1,13 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <ItemGroup>
+    <Compile Include="Gf16.fs" />
+    <Compile Include="SplitMix64.fs" />
+    <Compile Include="CodeGraph.fs" />
+    <Compile Include="StepRing.fs" />
+    <Compile Include="Encoder.fs" />
+    <Compile Include="Decoder.fs" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="../Tbt.Contracts/Tbt.Contracts.fsproj" />
+  </ItemGroup>
+</Project>

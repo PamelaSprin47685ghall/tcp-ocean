@@ -1,0 +1,13 @@
+bin/
+obj/
+artifacts/
+out/
+publish/
+TestResults/
+*.user
+*.swp
+.vs/
+.idea/
+.vscode/
+*.trx
+*.coverage
