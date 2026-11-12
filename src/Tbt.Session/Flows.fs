@@ -377,7 +377,7 @@ type FlowTable(port: IFlowPort, store: ISourceStore, stepUndelivered: Action<uin
     member _.ResetPending(slot: int) = flows.[slot].Active && flows.[slot].TxResetPending && not flows.[slot].TxEndSent
 
     /// The peer has custody of every step below ack.
-    member _.OnPeerAck(ack: uint64) =
+    member this.OnPeerAck(ack: uint64) =
         let mutable i = closing.Count - 1
         while i >= 0 do
             let f = flows.[closing.[i]]
@@ -385,7 +385,8 @@ type FlowTable(port: IFlowPort, store: ISourceStore, stepUndelivered: Action<uin
             elif ack > f.TxEndStep then
                 f.TxDone <- true
                 closing.RemoveAt i
-                tryClose f |> ignore
+                // The peer may already have opened the next generation on this slot.
+                if tryClose f && f.Pending.Count > 0 then this.Pump f.Index
             i <- i - 1
 
     /// A received source with a valid envelope. Data waits in the decoder window until the

@@ -307,3 +307,33 @@ let ``short local writes go through the reserve and keep every byte in order`` (
         r <- r + 1
     for i in 0 .. flows - 1 do
         Assert.Equal<byte[]>(data.[i], pair.ServerPort.Stream(slots.[i]).ToArray())
+
+[<Sealed>]
+type ZeroStore() =
+    let source = Array.zeroCreate<byte> 2048
+    interface ISourceStore with
+        member _.Source(_, _) = ReadOnlySpan source
+
+[<Fact>]
+let ``the next generation opens when the old one closes on the peer's ACK`` () =
+    // Server side: the client reuses a slot as soon as it has the server's FIN, so the next
+    // OPEN can arrive while the server still waits for the ACK of its own FIN.
+    let port = RecordingPort()
+    let flows = FlowTable(port, ZeroStore(), Action<uint64, int>(fun _ _ -> ()), CreditPolicy.defaults)
+    let source (step: uint64) gen flags =
+        let e: Tbt.Wire.SourceEnvelope = { RealLength = 10; FlowSlot = 3uy; Flags = flags; FlowGeneration = gen; StreamOffset = 0UL }
+        Assert.True(flows.OnSource(step, 0, e))
+        flows.Pump 3
+    source 0UL 1u (Tbt.Wire.StreamFlags.Open ||| Tbt.Wire.StreamFlags.Fin)
+    Assert.Equal(1, port.Opened.Count)
+    Assert.Contains(3, port.Finished)
+    // The server answers and ends its side in step 5.
+    flows.NextEnvelope(3, 10, true) |> ignore
+    flows.NoteEndStep(3, 5UL)
+    // Generation 2 arrives before the ACK of step 5: it waits.
+    source 1UL 2u Tbt.Wire.StreamFlags.Open
+    Assert.Equal(1, port.Opened.Count)
+    flows.OnPeerAck 6UL
+    Assert.Equal<int list>([ 3 ], List.ofSeq port.Closed)
+    Assert.Equal(2, port.Opened.Count)
+    Assert.Equal(struct (3, 2u), port.Opened.[1])
