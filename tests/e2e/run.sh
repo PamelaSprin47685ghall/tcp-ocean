@@ -119,6 +119,7 @@ run_case in_ns near timeout 120 python3 -u "$work/echo.py" check 127.0.0.1 1080 
 report mux; stop mux
 fi
 
+if [[ ${SKIP_IPERF:-0} != 1 ]]; then
 # Session 2: iperf3 cases back to back on one session (control flow idles while data runs).
 tunnel bulk 10.200.2.2:5201
 for args in "" "-R" "-P $paths" "-R -P $paths" ""; do
@@ -133,6 +134,7 @@ for args in "" "-R" "-P $paths" "-R -P $paths" ""; do
     fi
 done
 report bulk; stop bulk
+fi
 
 echo "wanem: $(tr '\n' ' ' < "$work/wanem.stats")"
 echo "commit: $commit"
