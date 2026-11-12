@@ -145,6 +145,7 @@ let run (o: Options) =
             i <- i - 1
 
     use poller = new Poller()
+    log ("readiness wait: " + string poller.Backend)
     let mutable lastStats = Environment.TickCount64
     while true do
         match listener with
