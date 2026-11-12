@@ -54,7 +54,7 @@ type SessionCarrier(session: Session, bridge: FlowBridge) =
         let rx = session.Rx
         "paths=" + string paths.Count + " frames_in=" + string framesIn + " frames_out=" + string framesOut
         + " tx_head=" + string tx.Head + " peer_ack=" + string tx.PeerAck + " grant_limit=" + string tx.GrantLimit
-        + " queued=" + string tx.Queued + " rx_ack=" + string rx.AckStepLo + " rx_base=" + string rx.Decoder.BaseStep
+        + " queued=" + string tx.Queued + " srtt_ms=" + string (int (tx.SrttNs / 1e6)) + " rx_ack=" + string rx.AckStepLo + " rx_base=" + string rx.Decoder.BaseStep
         + " recovered=" + string rx.Counters.Recovered + " interactive=" + string session.InteractiveSources + "/" + string session.Tx.UrgentSteps
         + " urgent_full=" + string session.Tx.UrgentFull + " flows=" + string bridge.Active
         + " opened=" + string session.Flows.Counters.Opened + " closed=" + string session.Flows.Counters.Closed
