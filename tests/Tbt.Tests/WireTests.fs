@@ -90,6 +90,8 @@ let ``meta round trips and rejects reserved bytes and bad slots`` () =
     Assert.True(Meta.tryRead (ReadOnlySpan b) &r)
     Assert.Equal(m, r)
     for i in 0 .. 5 do Assert.Equal(k.[i], Meta.kHistAt r.KHist i)
+    // DECISIONS.md D2: LE24, nibble i = stride i; t-1 is the low nibble of byte 32.
+    Assert.Equal("fff4f0", Vectors.toHex (ReadOnlySpan b.[32 .. 34]))
     b.[38] <- 1uy
     Assert.False(Meta.tryRead (ReadOnlySpan b) &r)
     b.[38] <- 0uy
