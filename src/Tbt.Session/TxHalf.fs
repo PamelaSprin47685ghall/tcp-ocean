@@ -88,6 +88,7 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
     let mutable minPrevNs = Int64.MaxValue
     let mutable minSinceNs = 0L
     let mutable rttSkipped = 0L
+    let mutable repairRepeats = 0L
     let mutable lastSourceNs = 0L
     let mutable lastHeartbeatNs = 0L
 
@@ -217,6 +218,8 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
     member _.MinRttNs = min minCurNs minPrevNs
     /// RTT samples skipped by the Karn rule.
     member _.RttSkipped = rttSkipped
+    /// Repair rounds repeated for the same range because the wait ran out.
+    member _.RepairRepeats = repairRepeats
     /// Wait between repair rounds for one range: 1.05 SRTT, kept within [1.05, 4] min RTT.
     member _.RepairWaitNs =
         let m = min minCurNs minPrevNs
@@ -234,6 +237,7 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
         if tLo >= peerAck && span >= 1 && deficit >= 1 && encoder.StepUsed tLo > 0 then
             let same = tLo = repairLo && span = repairSpan
             if not same || deficit > repairDeficit || float (now - repairNs) >= this.RepairWaitNs then
+                if same && deficit <= repairDeficit then repairRepeats <- repairRepeats + 1L
                 if not same then
                     repairLo <- tLo
                     repairSpan <- span
