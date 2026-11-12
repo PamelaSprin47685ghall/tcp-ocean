@@ -317,7 +317,10 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
         let mutable meta = Unchecked.defaultof<Meta>
         let mutable c = Unchecked.defaultof<Candidate>
         let mutable found = false
-        while not found && (this.HasCandidate |> ignore; repairs.TryDequeue(&c)) do
+        // Only BOOSTERs: a repeated DATA cell (the seeds of a range ran out) stays queued for
+        // TryRenderNext, which renders it with its own step meta.
+        while not found && (this.HasCandidate |> ignore; repairs.TryPeek(&c) && c.Kind = CellType.Booster) do
+            repairs.Dequeue() |> ignore
             if encoder.StepUsed c.Step > 0 && encoder.TryRenderBooster(c.Step, int c.Span, int c.Index, symbol) then
                 meta <- { Type = CellType.Booster; Flags = MetaFlags.Fill; Slot = c.Index; StepUsed = c.Span
                           Aux = uint16 c.Round; RxWinGrant = grant; StepId = c.Step; AckStepLo = ackLo
