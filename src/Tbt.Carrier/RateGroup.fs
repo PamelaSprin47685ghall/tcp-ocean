@@ -117,12 +117,19 @@ type RateGroup(clock: IClock) =
 
     member _.RepairBytes = repairBytes
     member _.InStartup = startup
+    member _.Cycle = cycle
     static member CwndGain = cwndGain
 
     /// One sample per round (min RTT, at least 5 ms): max filter over 10 rounds, startup,
     /// drain, 8-phase gain cycle. App-limited rounds keep the estimate.
     member _.Service(now: int64) =
         let rtt = minRtt ()
+        // The 0.75 phase only drains the queue the 1.25 phase built: it ends as soon as the
+        // group's in-flight bytes are down to one BDP (BBR), not after a whole round, else
+        // with no queue it idles the link for 1 round in 8 (bulk down -3.6 %).
+        if cycle = 1 && not startup && not draining && rtt <> Int64.MaxValue
+           && inflight () <= int (bw * float rtt) then
+            cycle <- 2
         if rtt <> Int64.MaxValue && members.Count > 0 then
             if sampleNs = 0L then restartSample now
             elif now - sampleNs >= max rtt 5_000_000L then

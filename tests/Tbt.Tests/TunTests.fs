@@ -487,3 +487,32 @@ let ``rate group: an ACK burst does not raise the estimate above the send rate``
     tick (41L * 25_000L)
     for _ in 1 .. 20 do tick 25_000L
     Assert.InRange(g.Bandwidth, 0.0, steady * 1.05)
+
+[<Fact>]
+let ``rate group: the 0.75 phase ends once in flight is down to one BDP`` () =
+    let clock = ManualClock()
+    let g = RateGroup(clock)
+    let a = FakeMember()
+    g.Add a
+    let tick (inflight: int) =
+        clock.Now <- clock.Now + 1_000_000L
+        g.OnSent 25_000
+        a.Delivered <- a.Delivered + 25_000L
+        a.Inflight <- inflight
+        g.TryTake(L, true) |> ignore
+        g.Service clock.Now
+    let mutable n = 0
+    while (g.InStartup || g.Describe().Contains "drain") && n < 4000 do
+        tick (if g.Describe().Contains "drain" then 500_000 else 3_000_000)
+        n <- n + 1
+    // Run to the start of the 0.75 phase with in flight above one BDP (1 MB).
+    n <- 0
+    while g.Cycle <> 1 && n < 4000 do
+        tick 1_200_000
+        n <- n + 1
+    Assert.Equal(1, g.Cycle)
+    tick 1_200_000
+    Assert.Equal(1, g.Cycle)
+    // In flight falls to one BDP: the phase ends at once, not after a round (40 ms).
+    tick 990_000
+    Assert.Equal(2, g.Cycle)
