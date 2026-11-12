@@ -358,6 +358,7 @@ let ``rate group: after startup the in-flight cap is 1.25 BDP, not 2`` () =
     // The bottleneck delivers 25 000 bytes per ms (200 Mbit/s) whatever is offered.
     for _ in 1 .. 4000 do
         clock.Now <- clock.Now + 1_000_000L
+        g.OnSent 25_000
         a.Delivered <- a.Delivered + 12_500L
         b.Delivered <- b.Delivered + 12_500L
         // A backlogged sender: above the cap (the group refuses: not app-limited), except
@@ -385,6 +386,7 @@ let ``rate group: repair copies are paced by the group like new frames`` () =
     g.Add a
     for _ in 1 .. 2000 do
         clock.Now <- clock.Now + 1_000_000L
+        g.OnSent 25_000
         a.Delivered <- a.Delivered + 25_000L
         a.Inflight <- 0
         g.Service clock.Now
@@ -462,3 +464,26 @@ let ``downlink: duplicate repair copies count as delivered once the segment is a
     f.Path.OnSegment(s2, Span p2, clock.Now)
     // Frame 1 acked now (frame 2 was counted at its SACK), plus one duplicate copy of frame 1.
     Assert.Equal(before + int64 L + int64 L, m.Delivered)
+
+[<Fact>]
+let ``rate group: an ACK burst does not raise the estimate above the send rate`` () =
+    let clock = ManualClock()
+    let g = RateGroup(clock)
+    let a = FakeMember()
+    g.Add a
+    // Steady: 25 000 B/ms sent and delivered (200 Mbit/s).
+    let tick (delivered: int64) =
+        clock.Now <- clock.Now + 1_000_000L
+        g.OnSent 25_000
+        a.Delivered <- a.Delivered + delivered
+        a.Inflight <- 2_000_000
+        g.TryTake(L, true) |> ignore
+        g.Service clock.Now
+    for _ in 1 .. 2000 do tick 25_000L
+    let steady = g.Bandwidth
+    Assert.InRange(steady, 0.0245, 0.0255)
+    // A hole holds 40 ms of ACKs, then one cumulative ACK delivers them at once.
+    for _ in 1 .. 40 do tick 0L
+    tick (41L * 25_000L)
+    for _ in 1 .. 20 do tick 25_000L
+    Assert.InRange(g.Bandwidth, 0.0, steady * 1.05)

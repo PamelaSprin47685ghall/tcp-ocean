@@ -33,6 +33,13 @@ type RateGroup(clock: IClock) =
     let mutable tokens = 0.0
     let mutable tokensNs = clock.NowNs()
     let mutable repairBytes = 0L
+    /// Bytes the group's paths sent (new frames and repair copies), and the send rate of
+    /// the last sample interval: a delivery sample may not exceed it (BBR send_elapsed).
+    /// Without the bound, an ACK burst after a repaired hole gave samples up to 375 Mbit/s
+    /// on a 200 Mbit/s link, and the 10-round max filter kept them.
+    let mutable sentBytes = 0L
+    let mutable sampleSent = 0L
+    let mutable lastSendRate = Double.MaxValue
     /// Steady-state in-flight cap over the group BDP: 1.25 lets the 1.25 probe phase fill the
     /// pipe and keeps the standing queue at the bottleneck to about 0.25 BDP (was 2.0: up to
     /// one BDP of queue, docs/cases/under-bulk-tail.md).
@@ -65,6 +72,8 @@ type RateGroup(clock: IClock) =
     let restartSample (now: int64) =
         sampleNs <- now
         sampleDelivered <- delivered ()
+        sampleSent <- sentBytes
+        lastSendRate <- Double.MaxValue
 
     member _.Add(m: IRateMember) =
         members.Add m
@@ -96,12 +105,15 @@ type RateGroup(clock: IClock) =
             false
         else true
 
-    member _.OnSent(bytes: int) = tokens <- tokens - float bytes
+    member _.OnSent(bytes: int) =
+        tokens <- tokens - float bytes
+        sentBytes <- sentBytes + int64 bytes
 
     /// Repair copies (HOLE-2) take the same pacer as new frames: they load the same bottleneck.
     member _.OnRepair(bytes: int) =
         tokens <- tokens - float bytes
         repairBytes <- repairBytes + int64 bytes
+        sentBytes <- sentBytes + int64 bytes
 
     member _.RepairBytes = repairBytes
     member _.InStartup = startup
@@ -115,7 +127,12 @@ type RateGroup(clock: IClock) =
             if sampleNs = 0L then restartSample now
             elif now - sampleNs >= max rtt 5_000_000L then
                 let d = delivered ()
-                let rate = float (max 0L (d - sampleDelivered)) / float (now - sampleNs)
+                let ackRate = float (max 0L (d - sampleDelivered)) / float (now - sampleNs)
+                let sendRate = float (sentBytes - sampleSent) / float (now - sampleNs)
+                // What was delivered in this interval was sent in about the last one.
+                let rate = min ackRate (max sendRate lastSendRate)
+                lastSendRate <- sendRate
+                sampleSent <- sentBytes
                 slot <- (slot + 1) % filter.Length
                 filter.[slot] <- if limited || rate > bw then rate else bw
                 bw <- Array.max filter
