@@ -72,8 +72,10 @@ tunnel() {
     sleep 0.5
     in_ns near "$work/jit/tbtun" client --server "$server_at" --listen 127.0.0.1:1080 --psk-file "$work/psk" --stats-s 1 \
         --paths "$paths" --stats-s 1 2>"$work/client-$name.log" &
-    sleep 2
-    grep -q "session up" "$work/client-$name.log" || { echo "handshake failed"; cat "$work/client-$name.log"; exit 1; }
+    # Under loss a lost handshake segment costs a TCP retransmit timeout (1 s and more).
+    local i
+    for i in $(seq 50); do grep -q "session up" "$work/client-$name.log" && break; sleep 0.2; done
+    grep -q "session up" "$work/client-$name.log" || { echo "handshake failed in 10 s"; cat "$work/client-$name.log"; exit 1; }
 }
 server_pid() { pids_of "$work/aot/tbtun" | head -1; }
 report() {
