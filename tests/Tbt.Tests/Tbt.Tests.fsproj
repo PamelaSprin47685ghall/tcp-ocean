@@ -10,6 +10,7 @@
     <Compile Include="CodecTests.fs" />
     <Compile Include="WireTests.fs" />
     <Compile Include="CryptoTests.fs" />
+    <Compile Include="SessionTests.fs" />
   </ItemGroup>
   <ItemGroup>
     <None Include="../vectors/*.json" CopyToOutputDirectory="PreserveNewest" LinkBase="vectors" />
@@ -22,5 +23,6 @@
     <ProjectReference Include="../../src/Tbt.Codec/Tbt.Codec.fsproj" />
     <ProjectReference Include="../../src/Tbt.Wire/Tbt.Wire.fsproj" />
     <ProjectReference Include="../../src/Tbt.Crypto/Tbt.Crypto.fsproj" />
+    <ProjectReference Include="../../src/Tbt.Session/Tbt.Session.fsproj" />
   </ItemGroup>
 </Project>
