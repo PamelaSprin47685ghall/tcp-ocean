@@ -1,0 +1,13 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <ItemGroup>
+    <Compile Include="FrameMath.fs" />
+    <Compile Include="SourceEnvelope.fs" />
+    <Compile Include="Meta.fs" />
+    <Compile Include="WinAck.fs" />
+    <Compile Include="Ctrl.fs" />
+    <Compile Include="FlowState.fs" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="../Tbt.Contracts/Tbt.Contracts.fsproj" />
+  </ItemGroup>
+</Project>

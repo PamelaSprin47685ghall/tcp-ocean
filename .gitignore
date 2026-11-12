@@ -11,3 +11,4 @@ TestResults/
 .vscode/
 *.trx
 *.coverage
+__pycache__/
