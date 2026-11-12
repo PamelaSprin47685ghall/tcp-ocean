@@ -1,0 +1,22 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <AssemblyName>tbtun</AssemblyName>
+    <PublishAot>true</PublishAot>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <UseSystemResourceKeys>true</UseSystemResourceKeys>
+    <ServerGarbageCollector>false</ServerGarbageCollector>
+    <ConcurrentGarbageCollection>false</ConcurrentGarbageCollection>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="Common.fs" />
+    <Compile Include="Client.fs" />
+    <Compile Include="Server.fs" />
+    <Compile Include="Program.fs" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="../Tbt.Contracts/Tbt.Contracts.fsproj" />
+    <ProjectReference Include="../Tbt.Session/Tbt.Session.fsproj" />
+    <ProjectReference Include="../Tbt.Carrier/Tbt.Carrier.fsproj" />
+  </ItemGroup>
+</Project>
