@@ -84,17 +84,22 @@ def check(host, port, flows, size):
 
 def ping(host, port, count, label="ping"):
     rtts = []
+    sends = []
     with socket.create_connection((host, port), timeout=30) as c:
         c.setsockopt(socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
         c.sendall(b"E")
         for i in range(count):
             msg = struct.pack("<I", i) + os.urandom(60)
             t0 = time.perf_counter()
+            if os.environ.get("PING_TRACE") and label == "ping-under-bulk": sends.append(time.perf_counter_ns())
             c.sendall(msg)
             if recv_exact(c, 64) != msg:
                 print(f"{label}: wrong echo"); return 1
             rtts.append((time.perf_counter() - t0) * 1000)
             time.sleep(0.02)
+    if os.environ.get("PING_TRACE") and label == "ping-under-bulk":
+        with open(os.environ["PING_TRACE"], "w") as f:
+            for i, r in enumerate(rtts): f.write(f"{i} {sends[i]} {r:.3f}\n")
     rtts.sort()
     q = lambda p: rtts[min(len(rtts) - 1, int(p * len(rtts)))]
     print(f"{label} n={count} p50_ms={q(0.5):.1f} p95_ms={q(0.95):.1f} p99_ms={q(0.99):.1f} max_ms={rtts[-1]:.1f}")

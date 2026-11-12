@@ -14,6 +14,11 @@ let main argv =
         2
     else
         let o = Options(argv.[1..])
+        match System.Environment.GetEnvironmentVariable "TBT_TRACE" with
+        | null | "" -> ()
+        | prefix ->
+            Tbt.Contracts.Trace.start (prefix + "." + argv.[0] + "." + string System.Environment.ProcessId)
+            System.AppDomain.CurrentDomain.ProcessExit.Add(fun _ -> Tbt.Contracts.Trace.flush ())
         match argv.[0] with
         | "client" -> Client.run o
         | "server" -> Server.run o

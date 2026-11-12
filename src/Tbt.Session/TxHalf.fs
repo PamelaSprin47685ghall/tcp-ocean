@@ -80,6 +80,8 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
     let mutable boostersSent = 0L
     /// Seal time per step, for the round-trip estimate (seal to ack).
     let sealNs: int64[] = Array.zeroCreate encoder.Capacity
+    /// Steps sealed as interactive (for the opt-in latency trace).
+    let traced: bool[] = Array.zeroCreate capacity
     let mutable srttNs = 100_000_000.0
     let mutable lastSourceNs = 0L
     let mutable lastHeartbeatNs = 0L
@@ -88,11 +90,14 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
 
     let seal (k: int) (small: bool) =
         let target = if fillingUrgent then urgent else queue
+        let wasUrgent = fillingUrgent
         if fillingUrgent then
             urgentSteps <- urgentSteps + 1L
             urgentSources <- urgentSources + int64 k
         fillingUrgent <- false
         let t = encoder.Seal k
+        traced.[index t] <- wasUrgent
+        if wasUrgent then Trace.record Trace.Seal t 0us k
         sealNs.[int (t % uint64 sealNs.Length)] <- clock.NowNs()
         let m =
             if small then max (int (ceil (float k * rho))) smallParities.[k]
@@ -278,6 +283,8 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
                     true
                 elif c.Kind = CellType.Booster then encoder.TryRenderBooster(t, int c.Span, int c.Index, symbol)
                 else encoder.TryRenderParity(t, int c.Index, field, false, symbol)
+            if rendered && TraceGate.On && traced.[index t] then
+                Trace.record Trace.Send t path (if c.Kind = CellType.Data then 0 elif c.Kind = CellType.Parity then 1 else 2)
             if rendered && c.Kind = CellType.Booster then
                 let meta =
                     { Type = CellType.Booster; Flags = MetaFlags.None; Slot = c.Index; StepUsed = c.Span
