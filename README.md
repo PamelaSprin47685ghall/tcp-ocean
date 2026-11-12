@@ -58,7 +58,7 @@ dotnet run --project src/Tbt.Cli -c Release -- client --server HOST:8443 --liste
 ```
 
 PSK 文件每行一个 64 位十六进制密钥。客户端入站是普通 TCP 监听（不是 TUN），每个本地连接是一条流；
-服务器把它连到 `--target`。这是规范第 4 章的拓扑：TBTun 承载 mihomo 的不透明 TCP 流。
+服务器把它连到 `--target`。这是规范第 4 章的拓扑：TBTun 承载上层代理的不透明 TCP 流。
 客户端始终使用未修改的内核 TCP，只有服务器端可以选 TUN 载体。
 
 ## 端到端测试

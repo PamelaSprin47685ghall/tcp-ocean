@@ -12,7 +12,7 @@
 | T9-6 | 有界批次 Q-3、就绪集 RS-1…3、会话级交互信用 CR-1…4 | RS-1…3 + Q-3 已合入(9f98c0f,见 docs/cases/ready-set.md);CR:已有 16 步授权预留与 64 Cell urgent 队列,缺步记录/源槽预留(CR-2)与耗尽时出就绪集(CR-3) |
 | T9-7 | 修复预算先给前沿(PE)、成本指标 COST-1、紧急 k(URG-5/6)、分批副本 STAG-2 | 部分:NACK 修复针对前沿;无成本指标与分批 |
 | T9-8 | 256 流小状态、FLOW_STATE、内存警示 | 有(6.10b、FlowTable、FLOW_STATE 测试);MEM-9 无 |
-| T9-9 | 分流边界 SPL、OPEN 流水 OPN、活动三态 IA | OPN-1 有;SPL/IA 无(属 mihomo 侧) |
+| T9-9 | 分流边界 SPL、OPEN 流水 OPN、活动三态 IA | OPN-1 有;SPL/IA 无(属上层代理侧) |
 | T9-10 | 路径偏斜:理想到达回放 SKW | 无 |
 | T9-11/12 | 结果记录、"只会更好"判定 | 用于 A/B(docs/cases) |
 
