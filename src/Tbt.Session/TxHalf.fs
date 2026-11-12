@@ -42,7 +42,7 @@ module SmallStep =
 
 [<Sealed>]
 type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder, sealer: CellSealer,
-            rho: float, maxPaths: int, clock: IClock) =
+            rho: float, maxPaths: int, queueLimit: int, clock: IClock) =
     let capacity = 1 <<< 16
     let stepParities: byte[] = Array.zeroCreate capacity
     let stepFlags: MetaFlags[] = Array.zeroCreate capacity
@@ -100,11 +100,14 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
     member _.Erasure = erasure
 
     /// True when a new source can go into the current step now (window and peer grant).
-    member _.CanFill = filled > 0 || (encoder.Head < grantLimit && encoder.HeldSteps < encoder.Capacity)
+    /// A new step also waits while queueLimit cells wait for a path: local input then stays in
+    /// the local sockets (back-pressure to the application) instead of in this queue.
+    member _.CanFill =
+        filled > 0 || (encoder.Head < grantLimit && encoder.HeldSteps < encoder.Capacity && queue.Count < queueLimit)
 
     /// The symbol of the next source slot. The caller writes user bytes from offset 16 on.
     member _.TryBeginSource(symbol: byref<Span<byte>>) =
-        if filled = 0 && encoder.Head >= grantLimit then false
+        if filled = 0 && (encoder.Head >= grantLimit || queue.Count >= queueLimit) then false
         else encoder.TryGetFillSlot(filled, &symbol)
 
     /// Commit the source begun last: write its envelope and zero the tail. Return the step

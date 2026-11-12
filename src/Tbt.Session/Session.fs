@@ -23,10 +23,12 @@ type SessionConfig =
       /// Pending equations in the decoder.
       MaxRows: int
       /// Path id bound (256 bulk paths, 288 with lanes).
-      MaxPaths: int }
+      MaxPaths: int
+      /// Cells that may wait for a path before new local input waits (sender queue bound).
+      TxQueueCells: int }
 
 module SessionConfig =
-    let defaults = { Rho = 0.25; WindowSteps = 4096; MaxRows = 16384; MaxPaths = 288 }
+    let defaults = { Rho = 0.25; WindowSteps = 4096; MaxRows = 16384; MaxPaths = 288; TxQueueCells = 256 }
 
 /// The negotiated result of the main handshake that a session needs.
 [<Struct>]
@@ -63,7 +65,7 @@ type Session(role: Role, p: SessionParams, port: IFlowPort, clock: IClock, confi
     let opener = CellOpener(rxDir, s, rxKeys, mask (if client then keys.HpDown else keys.HpUp))
     let encoder = Encoder((if client then keys.GraphSeedUp else keys.GraphSeedDown), s, config.WindowSteps)
     let decoder = Decoder((if client then keys.GraphSeedDown else keys.GraphSeedUp), s, config.WindowSteps, config.MaxRows)
-    let tx = TxHalf(txDir, s, fieldOf txDir, encoder, sealer, config.Rho, config.MaxPaths, clock)
+    let tx = TxHalf(txDir, s, fieldOf txDir, encoder, sealer, config.Rho, config.MaxPaths, config.TxQueueCells, clock)
     let rx = RxHalf(s, fieldOf rxDir, decoder, opener, config.WindowSteps, config.MaxPaths)
     let flows = FlowTable(port, DecoderStore decoder, Action<uint64, int>(fun t d -> rx.StepUndelivered(t, d)))
     let resets = Collections.Generic.Queue<int>()
