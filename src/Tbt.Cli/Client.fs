@@ -90,6 +90,7 @@ let run (o: Options) =
             if statsMs > 0L && Environment.TickCount64 - lastStats >= statsMs then
                 lastStats <- Environment.TickCount64
                 log ("stats " + carrier.Describe() + " rss_kib=" + string (rssKiB ()))
+                Tbt.Contracts.Trace.flush ()
             poller.WatchRead listener
             carrier.Watch poller
             poller.Wait 5000

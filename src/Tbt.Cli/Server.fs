@@ -222,4 +222,5 @@ let run (o: Options) =
             match tun with
             | null -> ()
             | t -> log ("stats " + t.Describe())
+            Tbt.Contracts.Trace.flush ()
     0

@@ -3,5 +3,6 @@
     <Compile Include="Layout.fs" />
     <Compile Include="Types.fs" />
     <Compile Include="ReadySet.fs" />
+    <Compile Include="Trace.fs" />
   </ItemGroup>
 </Project>

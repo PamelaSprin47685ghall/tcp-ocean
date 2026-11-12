@@ -76,6 +76,7 @@ type RxHalf(symbolSize: int, field: CodeField, decoder: Decoder, opener: CellOpe
         let mutable e = Unchecked.defaultof<SourceEnvelope>
         while decoder.TryTakeKnown(&t, &s, &recovered) do
             if recovered then counters.Recovered <- counters.Recovered + 1L
+            if Trace.enabled then Trace.record Trace.Known t 0us (if recovered then 1 else 0)
             let symbol = decoder.Source(t, s)
             if not (SourceEnvelope.tryRead symbol &e) then counters.EnvelopeErrors <- counters.EnvelopeErrors + 1L
             elif e.Flags.HasFlag StreamFlags.Pad then ()
@@ -170,6 +171,8 @@ type RxHalf(symbolSize: int, field: CodeField, decoder: Decoder, opener: CellOpe
     /// is known. A parity waits in the hold while the decoder has no work for it.
     member _.OnCoded(m: Meta, symbol: ReadOnlySpan<byte>, path: uint16, now: int64) =
         let p = int path
+        if Trace.enabled && (m.Type = CellType.Booster || m.Flags.HasFlag MetaFlags.EndOfBurst) then
+            Trace.record Trace.Arrive m.StepId path (if m.Type = CellType.Data then 0 elif m.Type = CellType.Parity then 1 else 2)
         if p < maxPaths && (m.Type = CellType.Data || m.Type = CellType.Parity) then
             if m.StepId > pathStep.[p] then pathStep.[p] <- m.StepId
             pathSeenNs.[p] <- now

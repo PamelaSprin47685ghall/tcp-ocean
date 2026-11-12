@@ -42,7 +42,7 @@ echo "commit: $commit"
 work=$(mktemp -d /tmp/tbtun-e2e.XXXXXX)
 user=$(id -un)
 dotnet_root=${DOTNET_ROOT:-$(dirname "$(readlink -f "$(command -v dotnet)")")}
-in_ns() { local ns=$1; shift; sudo ip netns exec "tbe_$ns" sudo -u "$user" env DOTNET_ROOT="$dotnet_root" "$@"; }
+in_ns() { local ns=$1; shift; sudo ip netns exec "tbe_$ns" sudo -u "$user" env DOTNET_ROOT="$dotnet_root" TBT_TRACE="${TBT_TRACE:-}" PING_TRACE="${PING_TRACE:-}" "$@"; }
 
 # Processes whose executable is under the work directory (or iperf3/python3 started here).
 pids_of() { for p in /proc/[0-9]*; do [[ $(sudo readlink "$p/exe" 2>/dev/null) == "$1" ]] && echo "${p#/proc/}"; done; true; }
