@@ -62,6 +62,7 @@ type TunPath(output: ITunOutput, counters: TunCounters, localIp: uint32, localPo
     static let graceNs = 15_000_000L
     static let headCap = Handshake.MaxHeadLength + Layout.BootFrameLength + 16384
     static let wrapBase = 1UL <<< 32
+    let sackOption = Array.zeroCreate<byte> 36
 
     let mutable state = TunState.SynReceived
     let mutable owner = Unchecked.defaultof<IPathOwner>
@@ -618,7 +619,7 @@ type TunPath(output: ITunOutput, counters: TunCounters, localIp: uint32, localPo
             if not (ivCount > 0 && leaseValid ()) then
                 if ivCount > 0 && sackOk then
                     let n = min 4 ivCount
-                    let o = Span<byte>(Array.zeroCreate (4 + 8 * n))
+                    let o = Span<byte>(sackOption, 0, 4 + 8 * n)
                     o.[0] <- 1uy
                     o.[1] <- 1uy
                     o.[2] <- 5uy
