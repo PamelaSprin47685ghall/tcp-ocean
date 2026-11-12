@@ -337,3 +337,32 @@ let ``the next generation opens when the old one closes on the peer's ACK`` () =
     Assert.Equal<int list>([ 3 ], List.ofSeq port.Closed)
     Assert.Equal(2, port.Opened.Count)
     Assert.Equal(struct (3, 2u), port.Opened.[1])
+
+[<Fact>]
+let ``an interactive flow goes before a full bulk queue`` () =
+    // No flow credit here, so the bulk flow stops on the cell queue only.
+    let config = { SessionConfig.defaults with Credit = { CreditPolicy.defaults with Enabled = false } }
+    let pair = Pair(config, 1, 0.0, 11)
+    let c = pair.Client
+    let mutable bulk = -1
+    let mutable chat = -1
+    Assert.True(c.TryOpenFlow(&bulk))
+    Assert.True(c.TryOpenFlow(&chat))
+    let payload = Array.init (1000 * 1328) byte
+    let sent = pair.Feed(c, bulk, ReadOnlySpan payload, false)
+    Assert.True(sent < payload.Length)
+    Assert.False(c.CanFill)
+    Assert.True(c.Tx.Queued >= SessionConfig.defaults.TxQueueCells)
+    // The bulk flow is a heavy hitter; the new flow is not.
+    Assert.False(c.IsInteractive bulk)
+    Assert.True(c.IsInteractive chat)
+    let message = Array.init 64 (fun i -> byte (200 + i))
+    let mutable app = Span<byte>.Empty
+    Assert.True(c.TryBeginSourceFor(chat, &app))
+    message.CopyTo app
+    c.CommitSource(chat, message.Length, false)
+    Assert.Equal(1L, c.InteractiveSources)
+    // One round moves 4 cells: the interactive step is among them, the bulk queue is not empty.
+    pair.Round() |> ignore
+    Assert.Equal<byte[]>(message, pair.ServerPort.Data.[chat].ToArray())
+    Assert.True(c.Tx.Queued > 200)

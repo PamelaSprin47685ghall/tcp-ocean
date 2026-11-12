@@ -62,6 +62,13 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
     let mutable cellsSent = 0L
     /// Repair (spec 5.8): BOOSTER cells go before all other cells.
     let repairs = Queue<Candidate>(256)
+    /// Interactive steps (spec 16.3 CR-1): one small session-level reserve, sent before the
+    /// bulk queue. Bulk leaves reserveSteps of the peer's step grant to it (CR-4: no grant
+    /// already given to bulk is taken back).
+    let urgent = Queue<Candidate>(64)
+    static let urgentLimit = 64
+    static let reserveSteps = 16UL
+    let mutable fillingUrgent = false
     let mutable repairLo = UInt64.MaxValue
     let mutable repairSpan = 0
     let mutable repairSeq = 0
@@ -77,6 +84,8 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
     let index (t: uint64) = int (t &&& uint64 (capacity - 1))
 
     let seal (k: int) (small: bool) =
+        let target = if fillingUrgent then urgent else queue
+        fillingUrgent <- false
         let t = encoder.Seal k
         sealNs.[int (t % uint64 sealNs.Length)] <- clock.NowNs()
         let m =
@@ -89,8 +98,8 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
         stepParities.[index t] <- byte m
         fillParity.[index t] <- byte m
         stepFlags.[index t] <- (if small then MetaFlags.EndOfBurst else MetaFlags.None)
-        for s in 0 .. k - 1 do queue.Enqueue { Kind = CellType.Data; Step = t; Index = byte s; Span = 0uy; Round = 0uy }
-        for p in 0 .. m - 1 do queue.Enqueue { Kind = CellType.Parity; Step = t; Index = byte p; Span = 0uy; Round = 0uy }
+        for s in 0 .. k - 1 do target.Enqueue { Kind = CellType.Data; Step = t; Index = byte s; Span = 0uy; Round = 0uy }
+        for p in 0 .. m - 1 do target.Enqueue { Kind = CellType.Parity; Step = t; Index = byte p; Span = 0uy; Round = 0uy }
         filled <- 0
         t
 
@@ -99,24 +108,34 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
     member _.PeerAck = peerAck
     member _.GrantLimit = grantLimit
     member _.Head = encoder.Head
-    member _.Queued = queue.Count
+    member _.Queued = queue.Count + urgent.Count
+    member _.UrgentQueued = urgent.Count
     member _.CellsSent = cellsSent
     member _.Erasure = erasure
 
-    /// True when a new source can go into the current step now (window and peer grant).
+    /// True when a new bulk source can go into the current step now (window and peer grant).
     /// A new step also waits while queueLimit cells wait for a path: local input then stays in
     /// the local sockets (back-pressure to the application) instead of in this queue.
     member _.CanFill =
-        filled > 0 || (encoder.Head < grantLimit && encoder.HeldSteps < encoder.Capacity && queue.Count < queueLimit)
+        filled > 0
+        || (encoder.Head + min reserveSteps ((grantLimit - min grantLimit peerAck) / 8UL) < grantLimit
+            && encoder.HeldSteps < encoder.Capacity && queue.Count < queueLimit)
+
+    /// True when a new interactive source can go out now: real step grant and the reserve.
+    member _.CanFillUrgent =
+        filled > 0 || (encoder.Head < grantLimit && encoder.HeldSteps < encoder.Capacity && urgent.Count < urgentLimit)
 
     /// The symbol of the next source slot. The caller writes user bytes from offset 16 on.
-    member _.TryBeginSource(symbol: byref<Span<byte>>) =
-        if filled = 0 && (encoder.Head >= grantLimit || queue.Count >= queueLimit) then false
+    /// An interactive source seals its step at once into the interactive queue.
+    member this.TryBeginSource(symbol: byref<Span<byte>>, interactive: bool) =
+        if not (if interactive then this.CanFillUrgent else this.CanFill) then false
         else encoder.TryGetFillSlot(filled, &symbol)
+
+    member this.TryBeginSource(symbol: byref<Span<byte>>) = this.TryBeginSource(&symbol, false)
 
     /// Commit the source begun last: write its envelope and zero the tail. Return the step
     /// the source belongs to.
-    member _.CommitSource(e: SourceEnvelope) =
+    member _.CommitSource(e: SourceEnvelope, interactive: bool) =
         let mutable symbol = Span<byte>.Empty
         if not (encoder.TryGetFillSlot(filled, &symbol)) then invalidOp "no source slot is open"
         SourceEnvelope.write e symbol
@@ -124,8 +143,13 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
         let t = encoder.Head
         if filled = 0 then lastSourceNs <- clock.NowNs()
         filled <- filled + 1
-        if filled = CodeGraph.SlotsPerStep then seal filled false |> ignore
+        if interactive then
+            fillingUrgent <- true
+            seal filled true |> ignore
+        elif filled = CodeGraph.SlotsPerStep then seal filled false |> ignore
         t
+
+    member this.CommitSource(e: SourceEnvelope) = this.CommitSource(e, false)
 
     /// Seal a partly filled step (input paused: 0-wait flush).
     member _.Flush() =
@@ -188,7 +212,7 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
     /// every 50 ms carries tx_head_step.
     member _.HeartbeatDue =
         let now = clock.NowNs()
-        peerAck < encoder.Head && encoder.Head > 0UL && queue.Count = 0 && repairs.Count = 0
+        peerAck < encoder.Head && encoder.Head > 0UL && queue.Count = 0 && urgent.Count = 0 && repairs.Count = 0
         && now - lastSourceNs >= 50_000_000L && now - lastHeartbeatNs >= 50_000_000L
 
     /// Render and seal a HEARTBEAT for path.
@@ -210,9 +234,11 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
         let mutable c = Unchecked.defaultof<Candidate>
         while repairs.TryPeek(&c) && c.Step + uint64 (max 1uy c.Span) <= peerAck do
             repairs.Dequeue() |> ignore
+        while urgent.TryPeek(&c) && c.Step < peerAck do
+            urgent.Dequeue() |> ignore
         while queue.TryPeek(&c) && c.Step < peerAck do
             queue.Dequeue() |> ignore
-        repairs.Count > 0 || queue.Count > 0
+        repairs.Count > 0 || urgent.Count > 0 || queue.Count > 0
 
     /// Seal a rendered frame with the next counter of this direction (one counter seals
     /// one plaintext only).
@@ -228,7 +254,7 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
         let mutable done' = false
         let mutable ok = false
         while not done' && this.HasCandidate do
-            c <- if repairs.Count > 0 then repairs.Dequeue() else queue.Dequeue()
+            c <- if repairs.Count > 0 then repairs.Dequeue() elif urgent.Count > 0 then urgent.Dequeue() else queue.Dequeue()
             let t = c.Step
             let k = encoder.StepUsed t
             let symbol = frame.Slice(Layout.SymbolOffset, symbolSize)

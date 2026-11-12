@@ -73,6 +73,13 @@ type Session(role: Role, p: SessionParams, port: IFlowPort, clock: IClock, confi
     let rx = RxHalf(s, fieldOf rxDir, decoder, opener, config.WindowSteps, config.MaxPaths)
     let both = Caps.FlowState ||| Caps.FlowState2
     let credit = { config.Credit with Enabled = config.Credit.Enabled && p.Caps &&& both = both }
+    let hhfWindowNs = 100_000_000L
+    let interactiveBytes = 16384
+    let hhfStart: int64[] = Array.zeroCreate 256
+    let hhfBytes: int[] = Array.zeroCreate 256
+    let hhfLast: int[] = Array.zeroCreate 256
+    let mutable beganInteractive = false
+    let mutable interactiveSources = 0L
     let flows = FlowTable(port, DecoderStore decoder, Action<uint64, int>(fun t d -> rx.StepUndelivered(t, d)), credit)
     let flowStatePeriodNs = 10_000_000L
     let snapshotPeriodNs = 1_000_000_000L
@@ -205,6 +212,7 @@ type Session(role: Role, p: SessionParams, port: IFlowPort, clock: IClock, confi
     member _.Tx = tx
     member _.Rx = rx
     member _.Flows = flows
+    member _.InteractiveSources = interactiveSources
     member _.WinAcksSent = winAcksSent
     member _.Opener = opener
     /// Decode frontier t_lo of the receive half.
@@ -318,11 +326,35 @@ type Session(role: Role, p: SessionParams, port: IFlowPort, clock: IClock, confi
     member _.FlowSending(slot: int) = flows.[slot].Active && not flows.[slot].TxEndSent
 
     member _.CanFill = tx.CanFill
+    member _.CanFillInteractive = tx.CanFillUrgent
+
+    /// Heavy-hitter filter (spec 16.1, HHF): a flow is interactive while it sent at most
+    /// InteractiveBytes in the current and in the last 100 ms window.
+    member _.IsInteractive(slot: int) =
+        let now = clock.NowNs()
+        let age = now - hhfStart.[slot]
+        let current, last =
+            if age >= 2L * hhfWindowNs then 0, 0
+            elif age >= hhfWindowNs then 0, hhfBytes.[slot]
+            else hhfBytes.[slot], hhfLast.[slot]
+        current <= interactiveBytes && last <= interactiveBytes
 
     /// The user-byte area (S - 16 bytes) of the next source. False when window or grant is full.
     member _.TryBeginSource(app: byref<Span<byte>>) =
         let mutable symbol = Span<byte>.Empty
+        beganInteractive <- false
         if tx.TryBeginSource(&symbol) then
+            app <- symbol.Slice Layout.EnvelopeLength
+            true
+        else false
+
+    /// As TryBeginSource, for slot: an interactive flow uses the interactive reserve and its
+    /// step goes before bulk cells (spec 16.3).
+    member this.TryBeginSourceFor(slot: int, app: byref<Span<byte>>) =
+        let interactive = this.IsInteractive slot
+        let mutable symbol = Span<byte>.Empty
+        if tx.TryBeginSource(&symbol, interactive) then
+            beganInteractive <- interactive
             app <- symbol.Slice Layout.EnvelopeLength
             true
         else false
@@ -330,7 +362,18 @@ type Session(role: Role, p: SessionParams, port: IFlowPort, clock: IClock, confi
     /// Commit the source begun last: len user bytes of slot; fin ends the stream.
     member _.CommitSource(slot: int, len: int, fin: bool) =
         let e = flows.NextEnvelope(slot, len, fin)
-        let t = tx.CommitSource e
+        // Meter the flow's bytes in 100 ms windows.
+        let now = clock.NowNs()
+        let age = now - hhfStart.[slot]
+        if age >= hhfWindowNs then
+            hhfLast.[slot] <- (if age >= 2L * hhfWindowNs then 0 else hhfBytes.[slot])
+            hhfBytes.[slot] <- 0
+            hhfStart.[slot] <- now
+        hhfBytes.[slot] <- hhfBytes.[slot] + len
+        let interactive = beganInteractive
+        beganInteractive <- false
+        if interactive then interactiveSources <- interactiveSources + 1L
+        let t = tx.CommitSource(e, interactive)
         if e.Flags &&& (StreamFlags.Fin ||| StreamFlags.Rst) <> StreamFlags.None then flows.NoteEndStep(slot, t)
 
     /// The local connection of slot failed: deliver nothing more, send RST.

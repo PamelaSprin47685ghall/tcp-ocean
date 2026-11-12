@@ -70,7 +70,7 @@ type FlowBridge(target: EndPoint voption) =
             let mutable budget = 16
             let mutable app = Span<byte>.Empty
             // The peer's flow limit bounds each read; at zero only this flow waits.
-            while budget > 0 && session.FlowSending slot && session.FlowRoom slot > 0 && session.TryBeginSource(&app) do
+            while budget > 0 && session.FlowSending slot && session.FlowRoom slot > 0 && session.TryBeginSourceFor(slot, &app) do
                 let mutable err = SocketError.Success
                 let room = session.FlowRoom slot
                 let n = socket.Receive((if room < app.Length then app.Slice(0, room) else app), SocketFlags.None, &err)

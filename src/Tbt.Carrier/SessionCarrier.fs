@@ -55,7 +55,7 @@ type SessionCarrier(session: Session, bridge: FlowBridge) =
         "paths=" + string paths.Count + " frames_in=" + string framesIn + " frames_out=" + string framesOut
         + " tx_head=" + string tx.Head + " peer_ack=" + string tx.PeerAck + " grant_limit=" + string tx.GrantLimit
         + " queued=" + string tx.Queued + " rx_ack=" + string rx.AckStepLo + " rx_base=" + string rx.Decoder.BaseStep
-        + " recovered=" + string rx.Counters.Recovered + " flows=" + string bridge.Active
+        + " recovered=" + string rx.Counters.Recovered + " interactive=" + string session.InteractiveSources + " flows=" + string bridge.Active
         + " opened=" + string session.Flows.Counters.Opened + " closed=" + string session.Flows.Counters.Closed
         + " local_fail=" + string session.Flows.Counters.LocalFailures
         + " stale=" + string session.Flows.Counters.StaleSources
@@ -74,11 +74,13 @@ type SessionCarrier(session: Session, bridge: FlowBridge) =
         let sending = session.WantsToSend
         for link in paths do link.Watch(poller, sending)
         let fill = session.CanFill
+        let fillInteractive = session.CanFillInteractive
         for slot in 0 .. 255 do
             match bridge.Local slot with
             | null -> ()
             | s ->
-                if fill && bridge.WantsRead slot then poller.WatchRead s
+                if (fill || (fillInteractive && session.IsInteractive slot)) && bridge.WantsRead slot then
+                    poller.WatchRead s
                 if bridge.WantsWrite slot then poller.WatchWrite s
 
     /// Handle what the last wait reported, then send.
@@ -90,10 +92,14 @@ type SessionCarrier(session: Session, bridge: FlowBridge) =
             | null -> ()
             | s -> if poller.IsWritable s then bridge.OnWritable slot
         bridge.Settle()
-        for slot in 0 .. 255 do
-            match bridge.Local slot with
-            | null -> ()
-            | s -> if poller.IsReadable s && bridge.WantsRead slot then bridge.Read slot
+        // Interactive flows read first (spec 16.3 Q-3: bulk input after the interactive queue).
+        for pass in 0 .. 1 do
+            for slot in 0 .. 255 do
+                match bridge.Local slot with
+                | null -> ()
+                | s ->
+                    if (session.IsInteractive slot = (pass = 0)) && poller.IsReadable s && bridge.WantsRead slot then
+                        bridge.Read slot
         session.Flush()
         session.Tick()
         writeRound ()
