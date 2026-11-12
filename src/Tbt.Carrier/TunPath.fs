@@ -52,7 +52,7 @@ type TunState =
 
 [<Sealed>]
 type TunPath(output: ITunOutput, counters: TunCounters, localIp: uint32, localPort: uint16,
-             remoteIp: uint32, remotePort: uint16, isn: uint32, clock: IClock) =
+             remoteIp: uint32, remotePort: uint16, isn: uint32, clock: IClock, group: RateGroup) =
     let now0 = clock.NowNs()
     // ---- constants ---------------------------------------------------------------------
     static let windowBytes = 4 <<< 20
@@ -639,6 +639,11 @@ type TunPath(output: ITunOutput, counters: TunCounters, localIp: uint32, localPo
             send (Packet.Rst ||| Packet.Ack) sndNxt ReadOnlySpan.Empty 0
             state <- TunState.Closed
 
+    interface IRateMember with
+        member _.Inflight = inflight
+        member _.Delivered = delivered
+        member _.MinRttNs = minRttNs
+
     interface IPath with
         member _.PathId with get () = pathId and set v = pathId <- v
         member _.FrameLength
@@ -666,7 +671,16 @@ type TunPath(output: ITunOutput, counters: TunCounters, localIp: uint32, localPo
             else
                 let l = frameLength
                 let bulk = backlog >= 16
-                if inflight + l > cwnd () || int (sndNxt + uint64 l - sndUna) > peerWnd then
+                if int (sndNxt + uint64 l - sndUna) > peerWnd then false
+                elif group.Ready then
+                    // The group gates the shared bottleneck; this path keeps its estimate.
+                    if group.TryTake(l, bulk) then
+                        frame <- Span(output.Scratch, Packet.DataOffset, l)
+                        true
+                    else
+                        if bulk then limitedThisRound <- true
+                        false
+                elif inflight + l > cwnd () then
                     if bulk then limitedThisRound <- true
                     false
                 else
@@ -700,6 +714,7 @@ type TunPath(output: ITunOutput, counters: TunCounters, localIp: uint32, localPo
             output.Write(ReadOnlySpan(p, 0, n))
             counters.SegmentsSent <- counters.SegmentsSent + 1L
             tokens <- tokens - float n
+            group.OnSent n
             sndNxt <- sndNxt + uint64 l
             ackDue <- false
 

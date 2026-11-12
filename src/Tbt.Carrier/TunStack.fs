@@ -18,6 +18,8 @@ type TunStack(fd: int, local: IPEndPoint, clock: IClock, entropy: IEntropy, maxC
     let scratch: byte[] = Array.zeroCreate 65536
     let conns = Dictionary<uint64, TunPath>()
     let fresh = List<TunPath>()
+    /// One rate group per client address (its paths share a bottleneck).
+    let groups = Dictionary<uint32, RateGroup>()
     let counters = TunCounters()
     let mutable packetsIn = 0L
     let mutable packetsOut = 0L
@@ -76,7 +78,15 @@ type TunStack(fd: int, local: IPEndPoint, clock: IClock, entropy: IEntropy, maxC
                         if seg.Flags &&& Packet.Syn <> 0uy && seg.Flags &&& Packet.Ack = 0uy
                            && conns.Count < maxConnections then
                             conns.Remove k |> ignore
-                            let c = TunPath(output, counters, localIp, localPort, seg.SrcIp, seg.SrcPort, isn (), clock)
+                            let g =
+                                match groups.TryGetValue seg.SrcIp with
+                                | true, g -> g
+                                | _ ->
+                                    let g = RateGroup(clock)
+                                    groups.[seg.SrcIp] <- g
+                                    g
+                            let c = TunPath(output, counters, localIp, localPort, seg.SrcIp, seg.SrcPort, isn (), clock, g)
+                            g.Add c
                             conns.[k] <- c
                             c.OnSyn(seg.Seq, Span<byte>.op_Implicit (packet.Slice(seg.OptionsAt, seg.OptionsLength)),
                                     1460, now)
@@ -93,7 +103,15 @@ type TunStack(fd: int, local: IPEndPoint, clock: IClock, entropy: IEntropy, maxC
         if dead > 0 then
             let gone = List<uint64>()
             for kv in conns do if kv.Value.Closed then gone.Add kv.Key
-            for k in gone do conns.Remove k |> ignore
+            for k in gone do
+                let c = conns.[k]
+                match groups.TryGetValue c.RemoteIp with
+                | true, g ->
+                    g.Remove c
+                    if g.Count = 0 then groups.Remove c.RemoteIp |> ignore
+                | _ -> ()
+                conns.Remove k |> ignore
+        for g in groups.Values do g.Service now
 
     /// True when a connection needs the next wait to be short.
     member _.Busy =
@@ -109,6 +127,7 @@ type TunStack(fd: int, local: IPEndPoint, clock: IClock, entropy: IEntropy, maxC
         + " virtual_ack=" + string counters.VirtualAcks + " fast_swallow=" + string counters.FastSwallows
         + " cells_rx=" + string counters.CellsReceived + " cells_spanning=" + string counters.CellsSpanning
         + " cells_dropped=" + string counters.CellsDropped
+        + String.Join("", groups.Values |> Seq.map (fun g -> "\n  " + g.Describe()))
         + String.Join("", conns.Values |> Seq.map (fun c -> "\n  path " + string (c :> IPath).PathId + " " + c.Describe()))
 
     /// Open the TUN device name; null when it fails.
