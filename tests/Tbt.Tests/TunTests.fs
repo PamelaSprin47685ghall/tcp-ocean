@@ -425,7 +425,7 @@ let ``downlink: the two repair copies are charged to the rate group`` () =
     f.Path.OnSegment(s, Span p, clock.Now)
     let copies = f.Out.Packets.Count - n
     Assert.Equal(2, copies)
-    Assert.Equal(int64 (copies * f.Out.Packets.[n].Length), group.RepairBytes)
+    Assert.Equal(int64 (copies * L), group.RepairBytes)
 
 [<Fact>]
 let ``downlink: duplicate repair copies count as delivered once the segment is acked`` () =
@@ -461,4 +461,4 @@ let ``downlink: duplicate repair copies count as delivered once the segment is a
     let struct (s2, p2) = clientSegment (f.Data0) (starts.[2] + uint32 L) Packet.Ack [||] ReadOnlySpan.Empty
     f.Path.OnSegment(s2, Span p2, clock.Now)
     // Frame 1 acked now (frame 2 was counted at its SACK), plus one duplicate copy of frame 1.
-    Assert.Equal(before + int64 L + int64 f.Out.Packets.[n0].Length, m.Delivered)
+    Assert.Equal(before + int64 L + int64 L, m.Delivered)

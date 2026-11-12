@@ -477,8 +477,9 @@ type TunPath(output: ITunOutput, counters: TunCounters, localIp: uint32, localPo
         counters.SegmentsLost <- counters.SegmentsLost + 1L
         tokens <- tokens - float (copies * n)
         // A demoted path has left the group's sums: its repairs do not spend the others' pacer.
-        if not demoted then group.OnRepair(copies * n)
-        s.Duplicates <- s.Duplicates + (copies - 1) * n
+        // The group counts payload bytes, as its rate samples (delivered) do.
+        if not demoted then group.OnRepair(copies * s.Length)
+        s.Duplicates <- s.Duplicates + (copies - 1) * s.Length
         s.Retx <- s.Retx + 1
         s.SentNs <- now
         s.Delivered <- delivered
@@ -811,7 +812,7 @@ type TunPath(output: ITunOutput, counters: TunCounters, localIp: uint32, localPo
             output.Write(ReadOnlySpan(p, 0, n))
             counters.SegmentsSent <- counters.SegmentsSent + 1L
             tokens <- tokens - float n
-            group.OnSent n
+            group.OnSent l
             sndNxt <- sndNxt + uint64 l
             ackDue <- false
 
