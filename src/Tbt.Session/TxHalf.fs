@@ -1,6 +1,6 @@
 /// Sending half of one direction (spec 5.7, 6.9, 6.11.1): fills steps from flow bytes,
 /// keeps the step queue, and renders and seals cells when a path asks for one (late
-/// binding: path_id is part of nonce and AAD, so a cell is sealed for the path that sends it).
+/// binding: path_id is part of nonce and AAD, so a cell is sealAt for the path that sends it).
 namespace Tbt.Session
 
 open System
@@ -80,9 +80,15 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
     let mutable boostersSent = 0L
     /// Seal time per step, for the round-trip estimate (seal to ack).
     let sealNs: int64[] = Array.zeroCreate encoder.Capacity
-    /// Steps sealed as interactive (for the opt-in latency trace).
+    /// Steps sealAt as interactive (for the opt-in latency trace).
     let traced: bool[] = Array.zeroCreate capacity
     let mutable srttNs = 100_000_000.0
+    /// Windowed minimum of clean RTT samples: the min of this and the last 10 s bucket.
+    let mutable minCurNs = Int64.MaxValue
+    let mutable minPrevNs = Int64.MaxValue
+    let mutable minSinceNs = 0L
+    let mutable rttSkipped = 0L
+    let mutable repairRepeats = 0L
     let mutable lastSourceNs = 0L
     let mutable lastHeartbeatNs = 0L
 
@@ -178,8 +184,20 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
         if ack <= encoder.Head then
             if ack > peerAck then
                 // Round-trip estimate from seal to custody of the newest acked step.
-                let sample = float (clock.NowNs() - sealNs.[int ((ack - 1UL) % uint64 sealNs.Length)])
-                if sample > 0.0 then srttNs <- srttNs + (sample - srttNs) / 8.0
+                // Karn: a step held behind a repair round started after its seal measures the
+                // repair wait, not the path; such samples would raise SRTT, which spaces repair
+                // rounds further apart, which holds steps longer (runaway).
+                let now = clock.NowNs()
+                let sealAt = sealNs.[int ((ack - 1UL) % uint64 sealNs.Length)]
+                let sample = now - sealAt
+                if repairLo < ack && repairNs >= sealAt then rttSkipped <- rttSkipped + 1L
+                elif sample > 0L then
+                    srttNs <- srttNs + (float sample - srttNs) / 8.0
+                    if now - minSinceNs >= 10_000_000_000L then
+                        minPrevNs <- minCurNs
+                        minCurNs <- Int64.MaxValue
+                        minSinceNs <- now
+                    if sample < minCurNs then minCurNs <- sample
                 peerAck <- ack
                 if ack > CodeGraph.HistorySpan then encoder.Release(ack - CodeGraph.HistorySpan)
             let limit = peerAck + uint64 grant
@@ -196,18 +214,30 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
             for k in 1 .. 16 do smallParities.[k] <- SmallStep.parities k erasure
 
     member _.SrttNs = srttNs
+    /// Windowed minimum RTT sample (Int64.MaxValue before the first clean sample).
+    member _.MinRttNs = min minCurNs minPrevNs
+    /// RTT samples skipped by the Karn rule.
+    member _.RttSkipped = rttSkipped
+    /// Repair rounds repeated for the same range because the wait ran out.
+    member _.RepairRepeats = repairRepeats
+    /// Wait between repair rounds for one range: 1.05 SRTT, kept within [1.05, 4] min RTT.
+    member _.RepairWaitNs =
+        let m = min minCurNs minPrevNs
+        let w = 1.05 * srttNs
+        if m = Int64.MaxValue then w else min (max w (1.05 * float m)) (4.0 * float m)
     member _.BoostersSent = boostersSent
 
     /// A NACK from the peer's WIN_ACK (spec 5.8): steps [tLo, tLo + span) lack deficit ranks.
     /// One round sends n = ceil((deficit + 2) / (1 - eps)) BOOSTERs; rounds for the same
-    /// range wait 1.05 SRTT unless the deficit grew. When the 256 seeds of a range are used,
+    /// range wait RepairWaitNs unless the deficit grew. When the 256 seeds of a range are used,
     /// the range's DATA cells go again (unit rows fill the missing columns).
-    member _.OnNack(tLo: uint64, span: int, deficit: int) =
+    member this.OnNack(tLo: uint64, span: int, deficit: int) =
         let now = clock.NowNs()
         let span = int (min (uint64 (min span CodeGraph.MaxBoosterSpan)) (encoder.Head - min tLo encoder.Head))
         if tLo >= peerAck && span >= 1 && deficit >= 1 && encoder.StepUsed tLo > 0 then
             let same = tLo = repairLo && span = repairSpan
-            if not same || deficit > repairDeficit || float (now - repairNs) >= 1.05 * srttNs then
+            if not same || deficit > repairDeficit || float (now - repairNs) >= this.RepairWaitNs then
+                if same && deficit <= repairDeficit then repairRepeats <- repairRepeats + 1L
                 if not same then
                     repairLo <- tLo
                     repairSpan <- span
