@@ -88,7 +88,16 @@ report() {
     cpu=$(sudo awk -v hz="$(getconf CLK_TCK)" '{printf "%.2f", ($14 + $15) / hz}' "/proc/$pid/stat")
     echo "server($1): rss_kib=$rss peak_rss_kib=$hwm cpu_s=$cpu"
 }
-stop() { for exe in "$work/jit/tbtun" "$work/aot/tbtun"; do pids_of "$exe" | xargs -r sudo kill; done; sleep 0.5; }
+# stop <name>: SIGTERM the client, which closes the session (SESSION_CLOSE, spec 6.10a);
+# the server must log the close by the peer before it is stopped.
+stop() {
+    pids_of "$work/jit/tbtun" | xargs -r sudo kill
+    for _ in $(seq 30); do [[ -z $(pids_of "$work/jit/tbtun") ]] && break; sleep 0.1; done
+    sleep 0.3
+    if grep -q "closed by peer" "$work/server-$1.log"; then echo "session close($1): ok"
+    else echo "FAILED: session close($1): the server did not log a close by the peer"; status=1; fi
+    pids_of "$work/aot/tbtun" | xargs -r sudo kill; sleep 0.5
+}
 goodput() { python3 -c 'import json,sys; d=json.load(sys.stdin); print("%.1f" % (d["end"]["sum_received"]["bits_per_second"]/1e6))'; }
 
 status=0
@@ -107,7 +116,7 @@ run_case in_ns near timeout 120 python3 -u "$work/echo.py" bulk 127.0.0.1 1080 u
 run_case in_ns near timeout 120 python3 -u "$work/echo.py" bulk 127.0.0.1 1080 down "$seconds"
 run_case in_ns near timeout 120 python3 -u "$work/echo.py" pingbulk 127.0.0.1 1080 200 "$seconds"
 run_case in_ns near timeout 120 python3 -u "$work/echo.py" check 127.0.0.1 1080 8 1000000
-report mux; stop
+report mux; stop mux
 fi
 
 # Session 2: iperf3 cases back to back on one session (control flow idles while data runs).
@@ -123,7 +132,7 @@ for args in "" "-R" "-P $paths" "-R -P $paths" ""; do
         status=1
     fi
 done
-report bulk; stop
+report bulk; stop bulk
 
 echo "wanem: $(tr '\n' ' ' < "$work/wanem.stats")"
 echo "commit: $commit"
