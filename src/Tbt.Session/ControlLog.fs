@@ -73,6 +73,32 @@ type ControlLog(retryLimitNs: int64) =
     /// An entry passed the retry limit without an acknowledgement (rule 6): a hard failure.
     member _.Failed = failed
 
+    /// True when an entry is due (never sent, or unacknowledged for 1.05 x SRTT) and not
+    /// past the retry limit. No side effects: TryRenderDue does the sending.
+    member _.IsDue(now: int64, srttNs: int64) =
+        let wait = srttNs + srttNs / 20L
+        let mutable due = false
+        let mutable i = 0
+        while not due && i < capacity do
+            if used.[i] && (sentNs.[i] < 0L || now - sentNs.[i] >= wait)
+               && not (firstNs.[i] >= 0L && now - firstNs.[i] > retryLimitNs) then
+                due <- true
+            i <- i + 1
+        due
+
+    /// Mark the log failed when an entry passed the retry limit (rule 6); returns Failed.
+    member _.CheckLimit(now: int64) =
+        for i in 0 .. capacity - 1 do
+            if used.[i] && firstNs.[i] >= 0L && now - firstNs.[i] > retryLimitNs then failed <- true
+        failed
+
+    /// True while the entry with this control_seq waits for its acknowledgement.
+    member _.Contains(seq: uint32) =
+        let mutable found = false
+        for i in 0 .. capacity - 1 do
+            if used.[i] && seqs.[i] = seq then found <- true
+        found
+
     /// The entry to send now: never sent, or unacknowledged for 1.05 x SRTT (rule 3).
     /// Writes the CTRL symbol into dst and returns true, or false when nothing is due.
     member _.TryRenderDue(now: int64, srttNs: int64, dst: Span<byte>) =
