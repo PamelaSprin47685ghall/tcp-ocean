@@ -27,6 +27,8 @@ type Encoder(graphSeed: uint64, symbolSize: int, capacitySteps: int) =
         ok
 
     member _.SymbolSize = symbolSize
+    /// Most steps held at once.
+    member _.Capacity = capacitySteps
     /// Next step number to be sealed.
     member _.Head = head
     /// Oldest step whose sources are still held.

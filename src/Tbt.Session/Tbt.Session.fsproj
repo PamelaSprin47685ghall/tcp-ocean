@@ -1,0 +1,15 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <ItemGroup>
+    <Compile Include="Flows.fs" />
+    <Compile Include="TxHalf.fs" />
+    <Compile Include="RxHalf.fs" />
+    <Compile Include="Session.fs" />
+    <Compile Include="Handshake.fs" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="../Tbt.Contracts/Tbt.Contracts.fsproj" />
+    <ProjectReference Include="../Tbt.Codec/Tbt.Codec.fsproj" />
+    <ProjectReference Include="../Tbt.Wire/Tbt.Wire.fsproj" />
+    <ProjectReference Include="../Tbt.Crypto/Tbt.Crypto.fsproj" />
+  </ItemGroup>
+</Project>

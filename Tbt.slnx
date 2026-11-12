@@ -3,6 +3,7 @@
     <Project Path="src/Tbt.Codec/Tbt.Codec.fsproj" />
     <Project Path="src/Tbt.Contracts/Tbt.Contracts.fsproj" />
     <Project Path="src/Tbt.Crypto/Tbt.Crypto.fsproj" />
+    <Project Path="src/Tbt.Session/Tbt.Session.fsproj" />
     <Project Path="src/Tbt.Wire/Tbt.Wire.fsproj" />
   </Folder>
   <Folder Name="/tests/">

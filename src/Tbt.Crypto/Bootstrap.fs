@@ -259,6 +259,7 @@ type SessionKeys(ikm: byte[], clientNonce: byte[], serverNonce: byte[], sessionI
 
     let info (label: string) (tail: byte[]) = ReadOnlySpan(Array.concat [ ctx; Kdf.ascii label; tail ])
 
+    member _.SessionId = sessionId
     member _.TranscriptHash = th
     member _.HpUp = Kdf.expand (ReadOnlySpan prk0) (info "up hp" [||]) klen
     member _.HpDown = Kdf.expand (ReadOnlySpan prk0) (info "down hp" [||]) klen
