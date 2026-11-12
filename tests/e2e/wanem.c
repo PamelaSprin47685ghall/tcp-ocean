@@ -7,6 +7,7 @@
  *   release = max(now, tx_free) + len*8/rate  (serialisation, FIFO)  ->  + OWD + jitter
  *   loss:  iid p, or Gilbert-Elliott (p, r, 1-h, 1-k), plus optional periodic full outage.
  * Config: key=value lines in a file, re-read on SIGHUP.  Stats: written to <stats> every second.
+ * drop_synack=N drops the first N TCP SYN-ACKs towards near (a handshake retransmit on demand).
  * Deterministic: loss RNG is SplitMix64 seeded from config "seed" (default 1).
  * Build: gcc -O2 -o wanem wanem.c        Run: wanem <tun-name> <config> <stats>
  */
@@ -24,7 +25,7 @@
 #include <time.h>
 #include <unistd.h>
 
-typedef struct { double owd_ms, jitter_ms, rate_mbit, loss, ge_p, ge_r, ge_1h, ge_1k, out_ms, out_every_s; long limit; uint64_t seed; } cfg_t;
+typedef struct { double owd_ms, jitter_ms, rate_mbit, loss, ge_p, ge_r, ge_1h, ge_1k, out_ms, out_every_s; long limit; uint64_t seed; long drop_synack; } cfg_t;
 typedef struct { uint64_t t_ns; uint32_t len; uint32_t seq; unsigned char *buf; } pkt_t;
 typedef struct { double tx_free_ns; int ge_bad; uint64_t in, out, drop_loss, drop_out, drop_limit; } dir_t;
 
@@ -42,13 +43,14 @@ static pkt_t hpop(void) { pkt_t r = heap[0]; heap[0] = heap[--hn]; long i = 0;
   for (;;) { long l = 2 * i + 1, m = i; if (l < hn && less(&heap[l], &heap[m])) m = l; if (l + 1 < hn && less(&heap[l + 1], &heap[m])) m = l + 1; if (m == i) break; pkt_t t = heap[i]; heap[i] = heap[m]; heap[m] = t; i = m; }
   return r; }
 static void load(const char *path) {
-  cfg_t c = { 200, 0, 1000, 0, 0, 0, 0, 0, 0, 0, 100000, 1 };
+  cfg_t c = { 200, 0, 1000, 0, 0, 0, 0, 0, 0, 0, 100000, 1, 0 };
   FILE *f = fopen(path, "r"); char k[64]; double v;
   if (f) { while (fscanf(f, " %63[^=]=%lf", k, &v) == 2) {
       if (!strcmp(k, "owd_ms")) c.owd_ms = v; else if (!strcmp(k, "jitter_ms")) c.jitter_ms = v; else if (!strcmp(k, "rate_mbit")) c.rate_mbit = v;
       else if (!strcmp(k, "loss")) c.loss = v; else if (!strcmp(k, "ge_p")) c.ge_p = v; else if (!strcmp(k, "ge_r")) c.ge_r = v;
       else if (!strcmp(k, "ge_1h")) c.ge_1h = v; else if (!strcmp(k, "ge_1k")) c.ge_1k = v; else if (!strcmp(k, "outage_ms")) c.out_ms = v;
-      else if (!strcmp(k, "outage_every_s")) c.out_every_s = v; else if (!strcmp(k, "limit")) c.limit = (long)v; else if (!strcmp(k, "seed")) c.seed = (uint64_t)v; }
+      else if (!strcmp(k, "outage_every_s")) c.out_every_s = v; else if (!strcmp(k, "limit")) c.limit = (long)v; else if (!strcmp(k, "seed")) c.seed = (uint64_t)v;
+      else if (!strcmp(k, "drop_synack")) c.drop_synack = (long)v; }
     fclose(f); }
   C = c; rng = c.seed * 0x2545F4914F6CDD1DULL;
   fprintf(stderr, "wanem: owd %.1f ms jitter %.1f rate %.0f Mbit loss %.4f ge(%.3f,%.3f,%.3f,%.3f) outage %.0f ms/%.1f s limit %ld seed %llu\n",
@@ -85,6 +87,9 @@ int main(int argc, char **argv) {
       int di = (tmp[16] == 10 && tmp[17] == 200 && tmp[18] == 1) ? 1 : 0; /* dst 10.200.1.x -> to near */
       dir_t *d = &D[di]; uint64_t tn = now_ns(); d->in++;
       if (lost(d, tn)) continue;
+      /* drop_synack=N: the first N TCP SYN-ACKs towards near are lost (handshake retransmit). */
+      if (di == 1 && C.drop_synack > 0 && tmp[9] == 6) { int ihl = (tmp[0] & 15) * 4;
+        if (n > ihl + 13 && (tmp[ihl + 13] & 0x12) == 0x12) { C.drop_synack--; d->drop_loss++; continue; } }
       if (hn >= C.limit) { d->drop_limit++; continue; }
       double ser = n * 8.0 / (C.rate_mbit * 1e6) * 1e9; if (d->tx_free_ns < tn) d->tx_free_ns = tn; d->tx_free_ns += ser;
       double rel = d->tx_free_ns + C.owd_ms * 1e6 + (C.jitter_ms > 0 ? nrm() * C.jitter_ms * 1e6 : 0);
