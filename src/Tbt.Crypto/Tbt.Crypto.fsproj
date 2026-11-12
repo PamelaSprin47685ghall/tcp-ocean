@@ -1,0 +1,14 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <ItemGroup>
+    <Compile Include="ChaCha20.fs" />
+    <Compile Include="Kdf.fs" />
+    <Compile Include="HeaderMask.fs" />
+    <Compile Include="ReplayWindow.fs" />
+    <Compile Include="CellCrypto.fs" />
+    <Compile Include="Bootstrap.fs" />
+    <Compile Include="Join.fs" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="../Tbt.Contracts/Tbt.Contracts.fsproj" />
+  </ItemGroup>
+</Project>
