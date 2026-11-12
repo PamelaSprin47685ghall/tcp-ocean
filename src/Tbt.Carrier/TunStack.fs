@@ -123,7 +123,8 @@ type TunStack(fd: int, local: IPEndPoint, clock: IClock, entropy: IEntropy, maxC
         "tun conns=" + string conns.Count + " pkts_in=" + string packetsIn + " pkts_out=" + string packetsOut
         + " write_fail=" + string writeFailures + " seg_sent=" + string counters.SegmentsSent
         + " seg_lost=" + string counters.SegmentsLost + " borrow_retx=" + string counters.BorrowRetx
-        + " tail_repairs=" + string counters.TailRepairs + " demotions=" + string counters.Demotions + " up_holes=" + string counters.UpHoles
+        + " tail_repairs=" + string counters.TailRepairs + " demotions=" + string counters.Demotions
+        + " clock_jumps=" + string counters.ClockJumps + " up_holes=" + string counters.UpHoles
         + " virtual_ack=" + string counters.VirtualAcks + " fast_swallow=" + string counters.FastSwallows
         + " cells_rx=" + string counters.CellsReceived + " cells_spanning=" + string counters.CellsSpanning
         + " cells_dropped=" + string counters.CellsDropped

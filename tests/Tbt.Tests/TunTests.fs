@@ -284,3 +284,53 @@ let ``rate group: one path that never ACKs is demoted and the other paths keep s
     Assert.Equal(b0, countB ())
     Assert.True(fb.Path.Counters.Demotions >= 1L, sprintf "B not demoted: %s | A %s | B %s | A sent %d" (group.Describe()) (fa.Path.Describe()) (fb.Path.Describe()) (countA () - a0))
     Assert.True(fb.Path.Counters.TailRepairs > 0L, "B made no repairs")
+
+[<Fact>]
+let ``downlink: a clock jump (process or box stall) does not expire every timer at once`` () =
+    // 200 ms of steady sending, each frame acked 40 ms after it went out. Then the clock
+    // jumps 200 s, as when the whole box pauses: the peer paused too, so nothing was lost.
+    // The stall is cut from the timeline: no repair storm, no 200 s RTT sample, and a real
+    // tail after the jump is still repaired, a few segments per timer.
+    let f = Fixture 1
+    f.Open()
+    let ip = f.Path :> IPath
+    ip.Backlog <- 100
+    let starts = List<uint32>()
+    let sentAt = List<int64>()
+    let l = uint32 L
+    let ack (cum: uint32) =
+        let struct (s, p) = clientSegment f.Data0 cum Packet.Ack [||] ReadOnlySpan.Empty
+        f.Path.OnSegment(s, Span p, f.Clock.Now)
+    let mutable acked = 0
+    for _ in 1 .. 200 do
+        f.Clock.Now <- f.Clock.Now + 1_000_000L
+        while acked < sentAt.Count && f.Clock.Now - sentAt.[acked] >= 40_000_000L do acked <- acked + 1
+        if acked > 0 then ack (starts.[acked - 1] + l)
+        let mutable frame = Span<byte>.Empty
+        if ip.TryBeginFrame(&frame) then
+            frame.Fill 0x33uy
+            ip.CommitFrame()
+            starts.Add (parse f.Out.Packets.[f.Out.Packets.Count - 1]).Seq
+            sentAt.Add f.Clock.Now
+        f.Path.Service f.Clock.Now
+    let outstanding = starts.Count - acked
+    Assert.True(outstanding >= 8, sprintf "outstanding %d" outstanding)
+    let tail0 = f.Path.Counters.TailRepairs
+    let sent0 = f.Path.Counters.SegmentsSent
+    // The jump; right after it the peer's ACK for half of what was sent before the stall.
+    f.Clock.Now <- f.Clock.Now + 200_000_000_000L
+    f.Path.Service f.Clock.Now
+    f.Clock.Now <- f.Clock.Now + 1_000_000L
+    let half = acked + outstanding / 2
+    ack (starts.[half - 1] + l)
+    f.Path.Service f.Clock.Now
+    Assert.Equal(tail0, f.Path.Counters.TailRepairs)
+    Assert.True(f.Path.SrttNs < 1e9, sprintf "srtt %.0f ns" f.Path.SrttNs)
+    Assert.Equal(1L, f.Path.Counters.ClockJumps)
+    // The rest is now a real tail (no more ACKs): repaired a few per timer, not all at once.
+    for _ in 1 .. 60 do
+        f.Clock.Now <- f.Clock.Now + 1_000_000L
+        f.Path.Service f.Clock.Now
+    let tail = f.Path.Counters.TailRepairs - tail0
+    Assert.True(tail >= 1L && tail <= 4L, sprintf "tail repairs in 60 ms: %d of %d" tail (outstanding - outstanding / 2))
+    Assert.True(f.Path.Counters.SegmentsSent - sent0 <= 16L, sprintf "segments sent %d" (f.Path.Counters.SegmentsSent - sent0))

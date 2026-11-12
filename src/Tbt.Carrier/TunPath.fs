@@ -33,6 +33,8 @@ type TunCounters() =
     member val TailRepairs = 0L with get, set
     /// Times a path was demoted: data in flight, nothing delivered for the demotion time.
     member val Demotions = 0L with get, set
+    /// Gaps between two calls longer than the stall limit, cut from the timeline.
+    member val ClockJumps = 0L with get, set
 
 [<Struct>]
 type SentSegment =
@@ -62,6 +64,10 @@ type TunPath(output: ITunOutput, counters: TunCounters, localIp: uint32, localPo
     static let maxGaps = 16
     static let slotCount = 32
     static let graceNs = 15_000_000L
+    /// A gap this long between two calls is a stall (process or whole box), not network time.
+    static let stallNs = 300_000_000L
+    /// Tail repairs per timer: the oldest few; their SACKs then let RACK find the rest.
+    static let tailBudget = 4
     static let headCap = Handshake.MaxHeadLength + Layout.BootFrameLength + 16384
     static let wrapBase = 1UL <<< 32
     let sackOption = Array.zeroCreate<byte> 36
@@ -136,6 +142,9 @@ type TunPath(output: ITunOutput, counters: TunCounters, localIp: uint32, localPo
     let synAckOptions = Array.zeroCreate<byte> 12
     let mutable synAckLength = 0
     let mutable demoted = false
+    /// Last time OnSegment or Service ran (stall detection), and the last tail repair.
+    let mutable seenNs = now0
+    let mutable tailNs = now0
     /// This round met the cwnd or the pacer at least once with a real backlog (not app-limited).
     let mutable limitedThisRound = false
     let mutable appLimitedRounds = 0
@@ -361,6 +370,31 @@ type TunPath(output: ITunOutput, counters: TunCounters, localIp: uint32, localPo
         demoted <- d
         d
 
+    // ---- clock jumps ------------------------------------------------------------------
+
+    /// Cut a stall from the timeline: every send, delivery and timer stamp moves forward by d,
+    /// so after the stall the timers run on from where they were. Without this, all timers
+    /// expire at once (a repair storm) and the first ACKs give RTT samples as long as the stall.
+    let catchUp (now: int64) =
+        let gap = now - seenNs
+        seenNs <- now
+        if gap > stallNs then
+            let d = gap - 1_000_000L
+            counters.ClockJumps <- counters.ClockJumps + 1L
+            for i in 0 .. ringCount - 1 do
+                let s = &ring.[at i]
+                s.SentNs <- s.SentNs + d
+                s.DeliveredNs <- s.DeliveredNs + d
+                s.FirstSentNs <- s.FirstSentNs + d
+            if rackSentNs > 0L then rackSentNs <- rackSentNs + d
+            deliveredNs <- deliveredNs + d
+            lastDeliveredSentNs <- lastDeliveredSentNs + d
+            minRttStamp <- minRttStamp + d
+            cycleNs <- cycleNs + d
+            synAckNs <- synAckNs + d
+            tailNs <- tailNs + d
+            for i in 0 .. ivCount - 1 do ivSince.[i] <- ivSince.[i] + d
+
     // ---- send: delivery accounting -----------------------------------------------------
 
     let onDelivered (s: byref<SentSegment>) (now: int64) =
@@ -503,6 +537,7 @@ type TunPath(output: ITunOutput, counters: TunCounters, localIp: uint32, localPo
     member _.BottleneckBw = btlBw
     /// Send time of the newest segment known delivered (RACK).
     member _.RackSentNs = rackSentNs
+    member _.SrttNs = srttNs
     member _.Inflight = inflight
     member _.Describe() =
         "bw_mbit=" + (btlBw * 8000.0).ToString("F1") + " srtt_ms=" + (srttNs / 1e6).ToString("F1")
@@ -556,6 +591,7 @@ type TunPath(output: ITunOutput, counters: TunCounters, localIp: uint32, localPo
 
     /// A non-SYN segment of this connection; packet is the whole IP packet.
     member _.OnSegment(seg: Packet.Segment, packet: Span<byte>, now: int64) =
+        catchUp now
         if seg.Flags &&& Packet.Rst <> 0uy then state <- TunState.Closed
         elif state <> TunState.Closed then
             if seg.Flags &&& Packet.Syn <> 0uy then
@@ -609,6 +645,7 @@ type TunPath(output: ITunOutput, counters: TunCounters, localIp: uint32, localPo
     /// Timers: swallow gaps past the grace or proven by the decode frontier, repair tail
     /// losses (constant 1.15 x SRTT, no back-off), pending ACK, ProbeBW gain cycle.
     member _.Service(now: int64) =
+        catchUp now
         if state = TunState.Established then
             if leaseValid () then
                 let mutable go = true
@@ -628,9 +665,11 @@ type TunPath(output: ITunOutput, counters: TunCounters, localIp: uint32, localPo
             // A tail is only a tail when nothing was delivered for a whole timer: while ACKs
             // come in, a growing queue makes old segments look late (spurious repairs).
             let rto = int64 (max (1.15 * srttNs) (srttNs + 10_000_000.0))
-            if ringCount > 0 && srttNs > 0.0 && now - deliveredNs > rto then
+            // One batch per timer, not one per call: later calls in the same timer would
+            // otherwise repair the next segments, and so on through the whole ring.
+            if ringCount > 0 && srttNs > 0.0 && now - deliveredNs > rto && now - tailNs > rto then
                 let mutable i = 0
-                let mutable budget = 32
+                let mutable budget = tailBudget
                 while i < ringCount && budget > 0 do
                     let s = &ring.[at i]
                     if not s.Sacked && s.SentNs >= rackSentNs && now - s.SentNs > rto then
@@ -638,6 +677,7 @@ type TunPath(output: ITunOutput, counters: TunCounters, localIp: uint32, localPo
                         counters.TailRepairs <- counters.TailRepairs + 1L
                         budget <- budget - 1
                     i <- i + 1
+                if budget < tailBudget then tailNs <- now
             if not startup && not draining && minRttNs <> Int64.MaxValue && now - cycleNs > minRttNs then
                 cycle <- (cycle + 1) % 8
                 cycleNs <- now
