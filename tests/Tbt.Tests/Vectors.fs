@@ -11,6 +11,7 @@ let private load (name: string) =
 
 let codec = lazy (load "tbt-sc2-vectors.json")
 let joinAck = lazy (load "join-ack-v22-vectors.json")
+let handshake = lazy (load "handshake-vectors.json")
 
 let str (root: JsonElement) (key: string) : string =
     match root.GetProperty(key).GetString() with

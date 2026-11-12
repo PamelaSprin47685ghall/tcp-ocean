@@ -8,6 +8,8 @@
   <ItemGroup>
     <Compile Include="Vectors.fs" />
     <Compile Include="CodecTests.fs" />
+    <Compile Include="WireTests.fs" />
+    <Compile Include="CryptoTests.fs" />
   </ItemGroup>
   <ItemGroup>
     <None Include="../vectors/*.json" CopyToOutputDirectory="PreserveNewest" LinkBase="vectors" />
@@ -18,5 +20,7 @@
   <ItemGroup>
     <ProjectReference Include="../../src/Tbt.Contracts/Tbt.Contracts.fsproj" />
     <ProjectReference Include="../../src/Tbt.Codec/Tbt.Codec.fsproj" />
+    <ProjectReference Include="../../src/Tbt.Wire/Tbt.Wire.fsproj" />
+    <ProjectReference Include="../../src/Tbt.Crypto/Tbt.Crypto.fsproj" />
   </ItemGroup>
 </Project>
