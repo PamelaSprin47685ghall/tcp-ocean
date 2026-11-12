@@ -346,7 +346,10 @@ type TunPath(output: ITunOutput, counters: TunCounters, localIp: uint32, localPo
     let onDelivered (s: byref<SentSegment>) (now: int64) =
         delivered <- delivered + int64 s.Length
         inflight <- inflight - s.Length
-        if s.SentNs > rackSentNs then rackSentNs <- s.SentNs
+        // RACK time (RFC 8985 6.2): a repaired segment counts only when the ACK cannot be
+        // for its first copy (at least min RTT after the repair). Otherwise a late ACK of the
+        // first copy would make every segment sent before the repair look lost.
+        if s.SentNs > rackSentNs && (s.Retx = 0 || now - s.SentNs >= minRttNs) then rackSentNs <- s.SentNs
         let ackElapsed = now - s.DeliveredNs
         let sendElapsed = s.SentNs - s.FirstSentNs
         let interval = max ackElapsed sendElapsed
