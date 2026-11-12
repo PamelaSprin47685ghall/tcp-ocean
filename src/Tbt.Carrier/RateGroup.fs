@@ -47,7 +47,7 @@ type RateGroup(clock: IClock) =
     /// Pacing gain of the 6 cruise phases. 1.0 with no standing queue left the link idle in
     /// small gaps (bulk down -1.6 %); slightly above 1 keeps it busy, the 1.25 BDP cap bounds
     /// the queue this can build.
-    static let cruiseGain = 1.02
+    static let cruiseGain = 1.05
 
     let minRtt () =
         let mutable r = Int64.MaxValue
