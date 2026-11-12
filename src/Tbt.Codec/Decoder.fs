@@ -163,6 +163,16 @@ type Decoder(graphSeed: uint64, symbolSize: int, capacitySteps: int, maxRows: in
     let markKnown (t: uint64) (s: int) (recovered: bool) =
         ring.SetKnown(t, s)
         if s < ring.K t then knownQueue.Enqueue(struct (t, byte s, recovered))
+        elif ring.K t = 0 && ring.KnownMask t = UInt16.MaxValue then
+            // All 16 slots of a step with unknown k are solved (its DATA and parities were
+            // lost; BOOSTERs solved it). Unused slots are zero in every combination (5.6),
+            // and a source symbol is never zero (its envelope is not), so k follows
+            // (DECISIONS.md D7).
+            let mutable k = SlotsPerStep
+            while k > 1 && not ((Span<byte>.op_Implicit (ring.Symbol(t, k - 1))).ContainsAnyExcept 0uy) do
+                k <- k - 1
+            ring.SetK(t, k)
+            for slot in 0 .. k - 1 do knownQueue.Enqueue(struct (t, byte slot, true))
 
     /// Column (t, s) became known with value v (or known zero when v is empty).
     let substitute (t: uint64) (s: int) (v: ReadOnlySpan<byte>) =
@@ -283,13 +293,17 @@ type Decoder(graphSeed: uint64, symbolSize: int, capacitySteps: int, maxRows: in
                 else n <- n + 16
         n
 
-    /// Rank deficit of steps [t, t + span): unknowns minus pending rows whose pivot is in that range.
+    /// Rank deficit of steps [t, t + span): unknowns minus pending rows whose unknowns all
+    /// lie in that range (a row that also needs later unknowns cannot solve this range alone).
     member this.Deficit(t: uint64, span: int) =
         let mutable rank = 0
+        let stop = t + uint64 span
         for r in rows do
-            let st = stepOfCol r.Pivot
-            if st >= t && st < t + uint64 span then rank <- rank + 1
+            if r.Count > 0 && stepOfCol r.Cols.[0] >= t && stepOfCol r.Cols.[r.Count - 1] < stop then rank <- rank + 1
         this.Unknowns(t, span) - rank
+
+    /// Step t exists at the sender (HEARTBEAT, spec 5.8 tail rule). False outside the window.
+    member _.NoteSeen(t: uint64) = t < frontier || ensureStep t
 
     /// Record step_used k of step t (from meta.step_used or meta.k_hist).
     /// False on a conflicting k or a step outside the window.
