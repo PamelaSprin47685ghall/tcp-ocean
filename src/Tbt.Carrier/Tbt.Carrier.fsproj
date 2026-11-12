@@ -1,9 +1,11 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <ItemGroup>
+    <Compile Include="Native.fs" />
     <Compile Include="SocketTuning.fs" />
+    <Compile Include="Poller.fs" />
+    <Compile Include="Path.fs" />
     <Compile Include="PathLink.fs" />
     <Compile Include="FlowBridge.fs" />
-    <Compile Include="Poller.fs" />
     <Compile Include="SessionCarrier.fs" />
   </ItemGroup>
   <ItemGroup>

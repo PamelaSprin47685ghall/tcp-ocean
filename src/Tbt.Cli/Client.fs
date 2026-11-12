@@ -18,7 +18,7 @@ let private bootstrap (server: IPEndPoint) (host: string) (boot: byte[]) =
     socket.ReceiveTimeout <- 10_000
     socket.SendTimeout <- 10_000
     socket.Connect server
-    let link = PathLink socket
+    let link = PathLink(socket, SocketTuning.probe ())
     link.Queue(ReadOnlySpan(requestHead host))
     link.Queue(ReadOnlySpan boot)
     while not link.TxIdle do
@@ -52,7 +52,7 @@ let run (o: Options) =
         let bridge = FlowBridge ValueNone
         let session = Session(Role.Client, p, bridge, SystemClock(), config)
         bridge.Attach session
-        let carrier = SessionCarrier(session, bridge, SocketTuning.probe ())
+        let carrier = SessionCarrier(session, bridge)
         carrier.AddPath link0
         let maxPaths = int hello.MaxPaths
         for id in 1 .. min pathCount maxPaths - 1 do

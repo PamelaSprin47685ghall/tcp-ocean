@@ -13,7 +13,7 @@ type IoResult =
     | Closed = 2
 
 [<Sealed>]
-type PathLink(socket: Socket) =
+type PathLink(socket: Socket, probe: INotSentProbe) =
     static let bufferLength = 65536
     let rx: byte[] = GC.AllocateUninitializedArray bufferLength
     let mutable rxStart = 0
@@ -22,6 +22,8 @@ type PathLink(socket: Socket) =
     let mutable txStart = 0
     let mutable txEnd = 0
     let mutable headDone = false
+    let mutable owner = Unchecked.defaultof<IPathOwner>
+    let mutable alive = true
 
     member _.Socket = socket
     member val PathId = 0us with get, set
@@ -91,4 +93,43 @@ type PathLink(socket: Socket) =
                 txStart <- txStart + n
                 IoResult.Progress
 
-    member _.Close() = socket.Dispose()
+    member _.Close() =
+        alive <- false
+        socket.Dispose()
+
+    interface IPath with
+        member this.PathId = this.PathId
+        member this.FrameLength with get () = this.FrameLength and set v = this.FrameLength <- v
+        member _.Alive = alive
+        member this.Attach(o) =
+            owner <- o
+            let mutable f = Span<byte>.Empty
+            while this.TryTakeFrame(&f) do owner.OnFrame(this.PathId, f)
+
+        member this.Watch(poller, sending) =
+            poller.WatchRead socket
+            if not this.TxIdle || sending then poller.WatchWrite socket
+
+        member this.Receive(poller) =
+            if alive && this.Send() = IoResult.Closed then this.Close()
+            if alive && poller.IsReadable socket then
+                let r = this.Receive()
+                let mutable f = Span<byte>.Empty
+                while this.TryTakeFrame(&f) do owner.OnFrame(this.PathId, f)
+                if r = IoResult.Closed then this.Close()
+
+        /// Write gating (spec 3.14): one frame at a time, and only while the kernel holds
+        /// less than NotSentLimit unsent bytes.
+        member this.TryBeginFrame(frame) =
+            if alive && this.TxIdle && probe.NotSent socket < SocketTuning.NotSentLimit then
+                txStart <- 0
+                txEnd <- 0
+                frame <- Span(tx, 0, this.FrameLength)
+                true
+            else false
+
+        member this.CommitFrame() =
+            txEnd <- this.FrameLength
+            if this.Send() = IoResult.Closed then this.Close()
+
+        member this.Close() = this.Close()

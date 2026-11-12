@@ -46,6 +46,9 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
     let capacity = 1 <<< 16
     let stepParities: byte[] = Array.zeroCreate capacity
     let stepFlags: MetaFlags[] = Array.zeroCreate capacity
+    /// Next parity index for a hole fill of the step (starts at m_t, spec 6.7.2 priority 2).
+    let fillParity: byte[] = Array.zeroCreate capacity
+    let mutable fillsSent = 0L
     let queue = Queue<Candidate>(4096)
     let carrierWm: uint64[] = Array.zeroCreate maxPaths
     let kHist: int[] = Array.zeroCreate 6
@@ -84,6 +87,7 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
                 acc <- acc - float m
                 m
         stepParities.[index t] <- byte m
+        fillParity.[index t] <- byte m
         stepFlags.[index t] <- (if small then MetaFlags.EndOfBurst else MetaFlags.None)
         for s in 0 .. k - 1 do queue.Enqueue { Kind = CellType.Data; Step = t; Index = byte s; Span = 0uy; Round = 0uy }
         for p in 0 .. m - 1 do queue.Enqueue { Kind = CellType.Parity; Step = t; Index = byte p; Span = 0uy; Round = 0uy }
@@ -265,6 +269,54 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
                 ok <- true
                 done' <- true
         ok
+
+    /// Fill for a whole-frame hole of path (borrowed shell, spec 6.7.2): a BOOSTER when one
+    /// waits, else the next unsent parity of the oldest unacknowledged step, else PAD. It
+    /// never carries a first-sent DATA cell. Always renders; meta.flags has FILL.
+    member this.RenderFill(frame: Span<byte>, path: uint16, ackLo: uint64, grant: uint16, erasureQ16: uint16) =
+        let symbol = frame.Slice(Layout.SymbolOffset, symbolSize)
+        let mutable meta = Unchecked.defaultof<Meta>
+        let mutable c = Unchecked.defaultof<Candidate>
+        let mutable found = false
+        while not found && (this.HasCandidate |> ignore; repairs.TryDequeue(&c)) do
+            if encoder.StepUsed c.Step > 0 && encoder.TryRenderBooster(c.Step, int c.Span, int c.Index, symbol) then
+                meta <- { Type = CellType.Booster; Flags = MetaFlags.Fill; Slot = c.Index; StepUsed = c.Span
+                          Aux = uint16 c.Round; RxWinGrant = grant; StepId = c.Step; AckStepLo = ackLo
+                          CarrierWm = carrierWm.[int path]; KHist = 0u; ErasureQ16 = erasureQ16 }
+                boostersSent <- boostersSent + 1L
+                found <- true
+        // Parity: the oldest steps first; a few steps, then PAD.
+        let mutable t = max peerAck encoder.Tail
+        let last = min encoder.Head (t + 4UL)
+        while not found && t < last do
+            let k = encoder.StepUsed t
+            let p = int fillParity.[index t]
+            if k > 0 && p < 48 && encoder.TryRenderParity(t, p, field, false, symbol) then
+                fillParity.[index t] <- byte (p + 1)
+                for i in 0 .. 5 do
+                    let r = CodeGraph.Strides.[i]
+                    kHist.[i] <- if t < r then 0 else (let h = encoder.StepUsed(t - r) in if h = 0 then 16 else h)
+                meta <- { Type = CellType.Parity; Flags = stepFlags.[index t] ||| MetaFlags.Fill; Slot = byte p
+                          StepUsed = byte k; Aux = uint16 stepParities.[index t]; RxWinGrant = grant; StepId = t
+                          AckStepLo = ackLo; CarrierWm = carrierWm.[int path]
+                          KHist = Meta.packKHist (ReadOnlySpan kHist); ErasureQ16 = erasureQ16 }
+                if t > carrierWm.[int path] then carrierWm.[int path] <- t
+                found <- true
+            t <- t + 1UL
+        if not found then
+            symbol.Clear()
+            meta <- { Type = CellType.Pad; Flags = MetaFlags.Fill; Slot = 0uy; StepUsed = 0uy; Aux = 0us
+                      RxWinGrant = grant; StepId = 0UL; AckStepLo = ackLo; CarrierWm = carrierWm.[int path]
+                      KHist = 0u; ErasureQ16 = erasureQ16 }
+        FrameMath.writeChunkHeader symbolSize frame
+        Meta.write meta (frame.Slice(Layout.MetaOffset, Layout.MetaLength))
+        frame.[frame.Length - 2] <- 13uy
+        frame.[frame.Length - 1] <- 10uy
+        this.Seal(frame, path)
+        fillsSent <- fillsSent + 1L
+        meta.Type
+
+    member _.FillsSent = fillsSent
 
     /// carrier_wm of path (largest DATA/PARITY step sent on it).
     member _.CarrierWm(path: uint16) = carrierWm.[int path]

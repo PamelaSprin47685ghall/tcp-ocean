@@ -79,7 +79,7 @@ let run (o: Options) =
             let bridge = FlowBridge(ValueSome(target :> EndPoint))
             let session = Session(Role.Server, a.Params, bridge, clock, config)
             bridge.Attach session
-            let carrier = SessionCarrier(session, bridge, probe)
+            let carrier = SessionCarrier(session, bridge)
             p.Link.PathId <- 0us
             reply p.Link a.Reply
             carrier.AddPath p.Link
@@ -136,7 +136,7 @@ let run (o: Options) =
                 | s ->
                     SocketTuning.path s
                     s.Blocking <- false
-                    pending.Add(Pending(PathLink s, now))
+                    pending.Add(Pending(PathLink(s, probe), now))
         servicePending poller now
         let mutable i = sessions.Count - 1
         while i >= 0 do

@@ -271,6 +271,11 @@ type Session(role: Role, p: SessionParams, port: IFlowPort, clock: IClock, confi
             true
         else false
 
+    /// Content for a whole-frame hole of path (borrowed shell, spec 6.7.2): BOOSTER, else an
+    /// extra parity of the oldest unacknowledged step, else PAD; new cell_seq, flags FILL.
+    member _.ProduceFill(path: uint16, frame: Span<byte>) =
+        tx.RenderFill(frame, path, rx.AckStepLo, rx.Grant, rx.ErasureQ16)
+
     /// Timers: WIN_ACK at most every 10 ms while the ack state changes, else every second.
     member _.Tick() =
         let now = clock.NowNs()

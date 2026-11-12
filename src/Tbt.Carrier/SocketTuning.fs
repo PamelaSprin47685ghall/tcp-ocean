@@ -11,7 +11,7 @@ type INotSentProbe =
     /// The unsent byte count, or -1 when the system cannot tell.
     abstract NotSent: socket: Socket -> int
 
-module private Native =
+module private SocketNative =
     [<DllImport("libc", SetLastError = true)>]
     extern int ioctl(nativeint fd, unativeint request, int& value)
 
@@ -22,7 +22,7 @@ type LinuxNotSentProbe() =
     interface INotSentProbe with
         member _.NotSent(socket) =
             let mutable value = 0
-            if Native.ioctl(socket.Handle, SIOCOUTQNSD, &value) = 0 then value else -1
+            if SocketNative.ioctl(socket.Handle, SIOCOUTQNSD, &value) = 0 then value else -1
 
 [<Sealed>]
 type NoNotSentProbe() =
