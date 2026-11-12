@@ -31,16 +31,12 @@ let content (frame: ReadOnlySpan<byte>) =
     else frame.Slice(5, Layout.BootBodyLength)
 
 let private seal (key: byte[]) (plain: ReadOnlySpan<byte>) (aad: ReadOnlySpan<byte>) (cipher: Span<byte>) (tag: Span<byte>) =
-    use a = new ChaCha20Poly1305(key)
-    a.Encrypt(ReadOnlySpan aeadNonce, plain, cipher, tag, aad)
+    ChaCha20Poly1305Aead(ReadOnlySpan key).Encrypt(ReadOnlySpan aeadNonce, plain, cipher, tag, aad)
 
 let private tryOpen (key: byte[]) (cipher: ReadOnlySpan<byte>) (tag: ReadOnlySpan<byte>) (aad: ReadOnlySpan<byte>) =
     let plain = Array.zeroCreate<byte> cipher.Length
-    use a = new ChaCha20Poly1305(key)
-    try
-        a.Decrypt(ReadOnlySpan aeadNonce, cipher, tag, Span plain, aad)
-        ValueSome plain
-    with :? AuthenticationTagMismatchException -> ValueNone
+    if ChaCha20Poly1305Aead(ReadOnlySpan key).TryDecrypt(ReadOnlySpan aeadNonce, cipher, tag, Span plain, aad) then ValueSome plain
+    else ValueNone
 
 /// Capability bits (spec 3.16).
 module Caps =

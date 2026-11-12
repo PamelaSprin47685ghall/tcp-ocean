@@ -2,6 +2,7 @@
   <ItemGroup>
     <Compile Include="ChaCha20.fs" />
     <Compile Include="Kdf.fs" />
+    <Compile Include="Aead.fs" />
     <Compile Include="HeaderMask.fs" />
     <Compile Include="ReplayWindow.fs" />
     <Compile Include="CellCrypto.fs" />

@@ -1,5 +1,5 @@
 /// Data-frame sealing and opening (spec 6.3, 6.4, 6.5.6, 6.6) for suite 0x02,
-/// ChaCha20-Poly1305 (RFC 8439). One instance per direction per end; single owner thread.
+/// ChaCha20-Poly1305 (RFC 8439), own non-throwing implementation. One instance per direction per end; single owner thread.
 ///
 /// Frame: chunk_hdr(5) | masked cell_seq(8) | AEAD(meta 40 | symbol S) | tag(16) | CRLF(2).
 /// Nonce (96 bits): dir | BE16 path_id | 0 | BE64 cell_seq.
@@ -8,7 +8,6 @@ namespace Tbt.Crypto
 
 open System
 open System.Buffers.Binary
-open System.Security.Cryptography
 open Tbt.Contracts
 
 /// Counter-interval key table: at most two generations (spec 6.5.6). A counter selects
@@ -17,7 +16,7 @@ open Tbt.Contracts
 type KeyTable() =
     let gens: uint32[] = Array.zeroCreate 2
     let starts: uint64[] = Array.zeroCreate 2
-    let aeads: ChaCha20Poly1305 array = Array.zeroCreate 2
+    let aeads: ChaCha20Poly1305Aead array = Array.zeroCreate 2
     let mutable count = 0
 
     member _.Count = count
@@ -31,13 +30,13 @@ type KeyTable() =
         if count = 1 && (gen <> gens.[0] + 1u || fromCounter <= starts.[0]) then invalidArg "gen" "next generation expected"
         gens.[count] <- gen
         starts.[count] <- fromCounter
-        aeads.[count] <- new ChaCha20Poly1305(key)
+        aeads.[count] <- ChaCha20Poly1305Aead key
         count <- count + 1
 
     /// Remove the older of two generations (KEY_RETIRE).
     member _.RetireOldest() =
         if count <> 2 then invalidOp "nothing to retire"
-        aeads.[0].Dispose()
+        aeads.[0].Wipe()
         gens.[0] <- gens.[1]
         starts.[0] <- starts.[1]
         aeads.[0] <- aeads.[1]
@@ -45,15 +44,10 @@ type KeyTable() =
         count <- 1
 
     /// The key for counter c, or null when c is outside every interval.
-    member _.Select(c: uint64) : ChaCha20Poly1305 | null =
+    member _.Select(c: uint64) : ChaCha20Poly1305Aead | null =
         if count = 2 && c >= starts.[1] then aeads.[1]
         elif count >= 1 && c >= starts.[0] then aeads.[0]
         else null
-
-    interface IDisposable with
-        member _.Dispose() =
-            for i in 0 .. count - 1 do aeads.[i].Dispose()
-            count <- 0
 
 module private Frame =
     let writeNonce (dir: Direction) (path: uint16) (counter: uint64) (nonce: Span<byte>) =
@@ -141,11 +135,10 @@ type CellOpener(dir: Direction, symbolSize: int, keys: KeyTable, mask: IHeaderMa
                     Frame.writeAad (Frame.readOnly frame) dir path c (Span aad)
                     let body = frame.Slice(Layout.MetaOffset, Layout.MetaLength + symbolSize)
                     let tag = frame.Slice(Layout.tagOffset symbolSize, Layout.TagLength)
-                    try
-                        aead.Decrypt(ReadOnlySpan nonce, Frame.readOnly body, Frame.readOnly tag, body, ReadOnlySpan aad)
+                    if aead.TryDecrypt(ReadOnlySpan nonce, Frame.readOnly body, Frame.readOnly tag, body, ReadOnlySpan aad) then
                         replay.Commit c
                         counter <- c
                         true
-                    with :? AuthenticationTagMismatchException ->
+                    else
                         authFails <- authFails + 1L
                         false

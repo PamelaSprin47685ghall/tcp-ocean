@@ -67,8 +67,7 @@ let buildRequest (kPath: ReadOnlySpan<byte>) (joinNonce: ReadOnlySpan<byte>) (r:
     let c = Span content
     joinNonce.CopyTo c
     (joinTag kPath joinNonce).CopyTo(c.Slice 16)
-    use a = new ChaCha20Poly1305(joinKey kPath joinNonce)
-    a.Encrypt(ReadOnlySpan zeroNonce, ReadOnlySpan plain, c.Slice(24, PlainLength), c.Slice(1064, 16), ReadOnlySpan<byte>.Empty)
+    ChaCha20Poly1305Aead(ReadOnlySpan(joinKey kPath joinNonce)).Encrypt(ReadOnlySpan zeroNonce, ReadOnlySpan plain, c.Slice(24, PlainLength), c.Slice(1064, 16), ReadOnlySpan<byte>.Empty)
     Bootstrap.frame (ReadOnlySpan content)
 
 /// Open a JOIN frame with one K_path. The join_tag only selects the key; the full tag decides.
@@ -80,16 +79,16 @@ let tryOpenRequest (kPath: ReadOnlySpan<byte>) (wire: ReadOnlySpan<byte>) =
         if not (c.Slice(16, 8).SequenceEqual(ReadOnlySpan(joinTag kPath joinNonce))) then ValueNone
         else
             let plain = Array.zeroCreate<byte> PlainLength
-            use a = new ChaCha20Poly1305(joinKey kPath joinNonce)
-            try
-                a.Decrypt(ReadOnlySpan zeroNonce, c.Slice(24, PlainLength), c.Slice(1064, 16), Span plain, ReadOnlySpan<byte>.Empty)
+            let aead = ChaCha20Poly1305Aead(ReadOnlySpan(joinKey kPath joinNonce))
+            if not (aead.TryDecrypt(ReadOnlySpan zeroNonce, c.Slice(24, PlainLength), c.Slice(1064, 16), Span plain, ReadOnlySpan<byte>.Empty)) then
+                ValueNone
+            else
                 let p = ReadOnlySpan plain
                 ValueSome
                     { PathId = BinaryPrimitives.ReadUInt16LittleEndian p
                       Incarnation = BinaryPrimitives.ReadUInt32LittleEndian(p.Slice 2)
                       MssClient = BinaryPrimitives.ReadUInt16LittleEndian(p.Slice 6)
                       Role = LanguagePrimitives.EnumOfValue<byte, JoinRole> p.[8] }
-            with :? AuthenticationTagMismatchException -> ValueNone
 
 /// JTH = SHA256(JOIN_WIRE).
 let transcriptHash (joinWire: ReadOnlySpan<byte>) = Kdf.sha256 joinWire
@@ -133,8 +132,7 @@ let buildAck (kPath: ReadOnlySpan<byte>) (joinNonce: ReadOnlySpan<byte>) (jth: R
     let c = Span content
     joinNonce.CopyTo c
     hint.CopyTo(c.Slice 16)
-    use aead = new ChaCha20Poly1305(ackKey kPath joinNonce jth)
-    aead.Encrypt(ReadOnlySpan zeroNonce, ReadOnlySpan plain, c.Slice(24, PlainLength), c.Slice(1064, 16), ReadOnlySpan(ackAad joinNonce hint jth))
+    ChaCha20Poly1305Aead(ReadOnlySpan(ackKey kPath joinNonce jth)).Encrypt(ReadOnlySpan zeroNonce, ReadOnlySpan plain, c.Slice(24, PlainLength), c.Slice(1064, 16), ReadOnlySpan(ackAad joinNonce hint jth))
     Bootstrap.frame (ReadOnlySpan content)
 
 /// Open and check a JOIN_ACK against the request the client sent (spec 6.5.7.3). ValueNone
@@ -147,12 +145,8 @@ let tryOpenAck (kPath: ReadOnlySpan<byte>) (joinNonce: ReadOnlySpan<byte>) (jth:
         ValueNone
     else
         let plain = Array.zeroCreate<byte> PlainLength
-        use aead = new ChaCha20Poly1305(ackKey kPath joinNonce jth)
-        let opened =
-            try
-                aead.Decrypt(ReadOnlySpan zeroNonce, c.Slice(24, PlainLength), c.Slice(1064, 16), Span plain, ReadOnlySpan(ackAad joinNonce hint jth))
-                true
-            with :? AuthenticationTagMismatchException -> false
+        let aead = ChaCha20Poly1305Aead(ReadOnlySpan(ackKey kPath joinNonce jth))
+        let opened = aead.TryDecrypt(ReadOnlySpan zeroNonce, c.Slice(24, PlainLength), c.Slice(1064, 16), Span plain, ReadOnlySpan(ackAad joinNonce hint jth))
         let p = ReadOnlySpan plain
         if not opened || p.[0] <> 2uy || p.[1] > 5uy || not (p.Slice(36, 32).SequenceEqual jth)
            || p.Slice(68, 4).IndexOfAnyExcept(0uy) >= 0 then

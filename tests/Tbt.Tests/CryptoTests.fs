@@ -107,14 +107,14 @@ let private makeFrame () =
 [<Fact>]
 let ``a sealed data frame matches the independent reference and opens once`` () =
     let k = keys ()
-    use table = new KeyTable()
+    let table = KeyTable()
     table.Install(0u, ReadOnlySpan(k.UpKey 0u), 0UL)
     let sealer = CellSealer(Direction.Up, 1344, table, ChaChaHeaderMask(ReadOnlySpan k.HpUp))
     let f = makeFrame ()
     let counter = Convert.ToUInt64(str hs.Value "frame_counter", 16)
     sealer.Seal(Span f, counter, 7us)
     Assert.Equal(str hs.Value "frame_hex", toHex (ReadOnlySpan f))
-    use rtable = new KeyTable()
+    let rtable = KeyTable()
     rtable.Install(0u, ReadOnlySpan(k.UpKey 0u), 0UL)
     let opener = CellOpener(Direction.Up, 1344, rtable, ChaChaHeaderMask(ReadOnlySpan k.HpUp))
     let copy = Array.copy f
@@ -129,9 +129,9 @@ let ``a sealed data frame matches the independent reference and opens once`` () 
 [<Fact>]
 let ``a frame on a wrong path or with a flipped bit fails and leaves the window unchanged`` () =
     let k = keys ()
-    use t1 = new KeyTable()
+    let t1 = KeyTable()
     t1.Install(0u, ReadOnlySpan(k.UpKey 0u), 0UL)
-    use t2 = new KeyTable()
+    let t2 = KeyTable()
     t2.Install(0u, ReadOnlySpan(k.UpKey 0u), 0UL)
     let sealer = CellSealer(Direction.Up, 1344, t1, NoHeaderMask())
     let opener = CellOpener(Direction.Up, 1344, t2, NoHeaderMask())
@@ -149,9 +149,9 @@ let ``a frame on a wrong path or with a flipped bit fails and leaves the window 
 [<Fact>]
 let ``key table selects one generation per counter interval`` () =
     let k = keys ()
-    use send = new KeyTable()
+    let send = KeyTable()
     send.Install(0u, ReadOnlySpan(k.UpKey 0u), 0UL)
-    use recv = new KeyTable()
+    let recv = KeyTable()
     recv.Install(0u, ReadOnlySpan(k.UpKey 0u), 0UL)
     recv.Install(1u, ReadOnlySpan(k.UpKey 1u), 5000UL)
     send.Install(1u, ReadOnlySpan(k.UpKey 1u), 5000UL)
@@ -195,9 +195,9 @@ let ``JOIN and JOIN_ACK match the JOINACK2 vectors byte for byte`` () =
 [<Fact>]
 let ``seal, open and parity render allocate nothing in steady state`` () =
     let k = keys ()
-    use t1 = new KeyTable()
+    let t1 = KeyTable()
     t1.Install(0u, ReadOnlySpan(k.UpKey 0u), 0UL)
-    use t2 = new KeyTable()
+    let t2 = KeyTable()
     t2.Install(0u, ReadOnlySpan(k.UpKey 0u), 0UL)
     let sealer = CellSealer(Direction.Up, 1344, t1, ChaChaHeaderMask(ReadOnlySpan k.HpUp))
     let opener = CellOpener(Direction.Up, 1344, t2, ChaChaHeaderMask(ReadOnlySpan k.HpUp))
@@ -218,3 +218,75 @@ let ``seal, open and parity render allocate nothing in steady state`` () =
             opener.TryOpen(Span f, 1us, &c) |> ignore
     Assert.Equal(0L, GC.GetAllocatedBytesForCurrentThread() - before)
     Assert.Equal(1199UL, c)
+
+[<Fact>]
+let ``Poly1305 matches RFC 8439 section 2.5.2`` () =
+    let mac = Poly1305()
+    mac.Init(ReadOnlySpan(hex "85d6be7857556d337f4452fe42d506a80103808afb0db2fd4abff6af4149f51b"))
+    mac.Update(ReadOnlySpan(Text.Encoding.ASCII.GetBytes "Cryptographic Forum Research Group"), false)
+    let tag = Array.zeroCreate<byte> 16
+    mac.Finish(Span tag)
+    Assert.Equal("a8061dc1305136c6c22b8baf0c0127a9", toHex (ReadOnlySpan tag))
+
+let private rfcAeadPlain =
+    "Ladies and Gentlemen of the class of '99: If I could offer you only one tip for the future, sunscreen would be it."
+
+[<Fact>]
+let ``AEAD matches RFC 8439 section 2.8.2`` () =
+    let aead = ChaCha20Poly1305Aead(ReadOnlySpan(hex "808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f"))
+    let nonce = hex "070000004041424344454647"
+    let aad = hex "50515253c0c1c2c3c4c5c6c7"
+    let plain = Text.Encoding.ASCII.GetBytes rfcAeadPlain
+    let cipher = Array.zeroCreate<byte> plain.Length
+    let tag = Array.zeroCreate<byte> 16
+    aead.Encrypt(ReadOnlySpan nonce, ReadOnlySpan plain, Span cipher, Span tag, ReadOnlySpan aad)
+    Assert.StartsWith("d31a8d34648e60db7b86afbc53ef7ec2a4aded51296e08fea9e2b5a736ee62d6", toHex (ReadOnlySpan cipher))
+    Assert.EndsWith("6116", toHex (ReadOnlySpan cipher))
+    Assert.Equal("1ae10b594f09e26a7e902ecbd0600691", toHex (ReadOnlySpan tag))
+    let back = Array.zeroCreate<byte> plain.Length
+    Assert.True(aead.TryDecrypt(ReadOnlySpan nonce, ReadOnlySpan cipher, ReadOnlySpan tag, Span back, ReadOnlySpan aad))
+    Assert.Equal<byte[]>(plain, back)
+    tag.[15] <- tag.[15] ^^^ 0x80uy
+    Array.Clear back
+    Assert.False(aead.TryDecrypt(ReadOnlySpan nonce, ReadOnlySpan cipher, ReadOnlySpan tag, Span back, ReadOnlySpan aad))
+    Assert.All(back, fun b -> Assert.Equal(0uy, b))
+
+[<Fact>]
+let ``AEAD agrees with the platform implementation on random inputs`` () =
+    if Security.Cryptography.ChaCha20Poly1305.IsSupported then
+        let rng = Random 7
+        for round in 0 .. 299 do
+            let key = Array.zeroCreate<byte> 32
+            let nonce = Array.zeroCreate<byte> 12
+            rng.NextBytes key
+            rng.NextBytes nonce
+            let plain = Array.zeroCreate<byte> (if round < 200 then round else rng.Next(0, 3000))
+            let aad = Array.zeroCreate<byte> (rng.Next(0, 40))
+            rng.NextBytes plain
+            rng.NextBytes aad
+            let c1 = Array.zeroCreate<byte> plain.Length
+            let t1 = Array.zeroCreate<byte> 16
+            ChaCha20Poly1305Aead(ReadOnlySpan key).Encrypt(ReadOnlySpan nonce, ReadOnlySpan plain, Span c1, Span t1, ReadOnlySpan aad)
+            let c2 = Array.zeroCreate<byte> plain.Length
+            let t2 = Array.zeroCreate<byte> 16
+            use bcl = new Security.Cryptography.ChaCha20Poly1305(key)
+            bcl.Encrypt(nonce, plain, c2, t2, aad)
+            Assert.Equal(toHex (ReadOnlySpan c2), toHex (ReadOnlySpan c1))
+            Assert.Equal(toHex (ReadOnlySpan t2), toHex (ReadOnlySpan t1))
+
+[<Fact>]
+let ``a forged frame costs no exception and no allocation`` () =
+    let k = keys ()
+    let table = KeyTable()
+    table.Install(0u, ReadOnlySpan(k.UpKey 0u), 0UL)
+    let opener = CellOpener(Direction.Up, 1344, table, ChaChaHeaderMask(ReadOnlySpan k.HpUp))
+    let forged = makeFrame ()
+    let mutable c = 0UL
+    let mutable before = 0L
+    for _ in 1 .. 2 do
+        before <- GC.GetAllocatedBytesForCurrentThread()
+        for i in 0 .. 999 do
+            forged.[100] <- byte i
+            opener.TryOpen(Span forged, 1us, &c) |> ignore
+    Assert.Equal(0L, GC.GetAllocatedBytesForCurrentThread() - before)
+    Assert.Equal(2000L, opener.AuthFails)
