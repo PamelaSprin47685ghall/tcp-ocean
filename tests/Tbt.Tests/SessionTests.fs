@@ -366,3 +366,82 @@ let ``an interactive flow goes before a full bulk queue`` () =
     pair.Round() |> ignore
     Assert.Equal<byte[]>(message, pair.ServerPort.Data.[chat].ToArray())
     Assert.True(c.Tx.Queued > 200)
+
+/// Send src bytes of slot as interactive-or-bulk sources (as the carrier does); bytes taken.
+let feedFor (s: Session) (slot: int) (data: ReadOnlySpan<byte>) (fin: bool) =
+    let mutable at = 0
+    let mutable app = Span<byte>.Empty
+    while (at < data.Length || (fin && s.FlowSending slot)) && s.FlowRoom slot > 0 && s.TryBeginSourceFor(slot, &app) do
+        let n = min (min app.Length (data.Length - at)) (s.FlowRoom slot)
+        data.Slice(at, n).CopyTo app
+        at <- at + n
+        s.CommitSource(slot, n, fin && at = data.Length)
+    s.Flush()
+    at
+
+[<Theory>]
+[<InlineData(0.0)>]
+[<InlineData(0.05)>]
+let ``bulk download with echo on one session, twice in a row, completes and closes`` (loss: float) =
+    let pair = Pair(SessionConfig.defaults, 4, loss, 21)
+    let c, s = pair.Client, pair.Server
+    let bulk = Array.init 1_500_000 (fun i -> byte (i * 13 + i / 997))
+    for case in 1 .. 2 do
+        let mutable b = -1
+        let mutable e = -1
+        Assert.True(c.TryOpenFlow(&b))
+        Assert.True(c.TryOpenFlow(&e))
+        for slot in [ b; e ] do
+            pair.ServerPort.Finished.Remove slot |> ignore
+            pair.ClientPort.Finished.Remove slot |> ignore
+        let clientB0 = pair.ClientPort.Stream(b).Length
+        let clientE0 = pair.ClientPort.Stream(e).Length
+        let serverE0 = pair.ServerPort.Stream(e).Length
+        let opened0 = pair.ServerPort.Opened.Count
+        let cClosed0 = pair.ClientPort.Closed.FindAll(fun x -> x = b || x = e).Count
+        let sClosed0 = pair.ServerPort.Closed.FindAll(fun x -> x = b || x = e).Count
+        // OPEN for both flows (zero-length sources).
+        let mutable app = Span<byte>.Empty
+        for slot in [ b; e ] do
+            Assert.True(c.TryBeginSourceFor(slot, &app))
+            c.CommitSource(slot, 0, false)
+        c.Flush()
+        let mutable r = 0
+        while pair.ServerPort.Opened.Count < opened0 + 2 && r < 2000 do
+            pair.Round() |> ignore
+            r <- r + 1
+        Assert.Equal(opened0 + 2, pair.ServerPort.Opened.Count)
+        let mutable sent = 0
+        let mutable pings = 0
+        let mutable echoed = 0L
+        let mutable pending = false
+        let ping = Array.init 64 byte
+        r <- 0
+        let closed () = pair.ClientPort.Closed.FindAll(fun x -> x = b || x = e).Count >= cClosed0 + 2
+                        && pair.ServerPort.Closed.FindAll(fun x -> x = b || x = e).Count >= sClosed0 + 2
+        while not (closed ()) && r < 60_000 do
+            if sent < bulk.Length || s.FlowSending b then
+                sent <- sent + feedFor s b (ReadOnlySpan(bulk, sent, bulk.Length - sent)) true
+            // Echo: one 64-byte ping at a time; the server returns what it got.
+            let got = pair.ServerPort.Stream(e).Length - serverE0
+            if got > echoed then
+                let back = pair.ServerPort.Stream(e).ToArray()
+                let n = feedFor s e (ReadOnlySpan(back, int (serverE0 + echoed), int (got - echoed))) false
+                echoed <- echoed + int64 n
+            if pending && pair.ClientPort.Stream(e).Length - clientE0 = int64 (64 * pings) then pending <- false
+            if not pending && pings < 20 && r % 50 = 0 then
+                if feedFor c e (ReadOnlySpan ping) false = 64 then
+                    pings <- pings + 1
+                    pending <- true
+            if pings = 20 && not pending && c.FlowSending e then
+                feedFor c e ReadOnlySpan.Empty true |> ignore
+                feedFor c b ReadOnlySpan.Empty true |> ignore
+            if s.FlowSending e && pair.ServerPort.Finished.Contains e && echoed = int64 (64 * pings) then
+                feedFor s e ReadOnlySpan.Empty true |> ignore
+            pair.Round() |> ignore
+            r <- r + 1
+        Assert.Equal(20, pings)
+        Assert.True(closed (), sprintf "case %d did not close in %d rounds" case r)
+        Assert.Equal(int64 bulk.Length, pair.ClientPort.Stream(b).Length - clientB0)
+        let down = pair.ClientPort.Stream(b).ToArray()
+        Assert.True(ReadOnlySpan(down, int clientB0, bulk.Length).SequenceEqual(ReadOnlySpan bulk))
