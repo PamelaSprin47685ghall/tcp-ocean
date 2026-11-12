@@ -44,6 +44,10 @@ type RateGroup(clock: IClock) =
     /// pipe and keeps the standing queue at the bottleneck to about 0.25 BDP (was 2.0: up to
     /// one BDP of queue, docs/cases/under-bulk-tail.md).
     static let cwndGain = 1.25
+    /// Pacing gain of the 6 cruise phases. 1.0 with no standing queue left the link idle in
+    /// small gaps (bulk down -1.6 %); slightly above 1 keeps it busy, the 1.25 BDP cap bounds
+    /// the queue this can build.
+    static let cruiseGain = 1.02
 
     let minRtt () =
         let mutable r = Int64.MaxValue
@@ -67,7 +71,7 @@ type RateGroup(clock: IClock) =
             match cycle with
             | 0 -> 1.25
             | 1 -> 0.75
-            | _ -> 1.0
+            | _ -> cruiseGain
 
     let restartSample (now: int64) =
         sampleNs <- now
