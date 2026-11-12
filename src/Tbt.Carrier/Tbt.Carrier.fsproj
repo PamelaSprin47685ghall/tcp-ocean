@@ -6,6 +6,9 @@
     <Compile Include="Path.fs" />
     <Compile Include="PathLink.fs" />
     <Compile Include="FlowBridge.fs" />
+    <Compile Include="Packet.fs" />
+    <Compile Include="TunPath.fs" />
+    <Compile Include="TunStack.fs" />
     <Compile Include="SessionCarrier.fs" />
   </ItemGroup>
   <ItemGroup>
