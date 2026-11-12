@@ -104,6 +104,7 @@ type Session(role: Role, p: SessionParams, port: IFlowPort, clock: IClock, confi
     let mutable lastAckNs = 0L
     let mutable ackDue = false
     let mutable peerSeen = false
+    let mutable fault = ""
     let mutable winAcksSent = 0L
     let mutable nackSpan = 0
     let mutable nackDeficit = 0
@@ -205,6 +206,11 @@ type Session(role: Role, p: SessionParams, port: IFlowPort, clock: IClock, confi
         flowStatesSent <- flowStatesSent + 1L
 
     member _.Role = role
+    /// The session failed (a protocol error of the peer, or an internal exception caught by
+    /// the host): it is torn down instead of left stuck. Empty while healthy.
+    member _.Fault = fault
+    member _.Faulted = fault.Length > 0
+    member _.Fail(reason: string) = if fault.Length = 0 then fault <- (if reason.Length > 0 then reason else "failed")
     member _.SymbolSize = s
     member _.FrameLength = Layout.frameLength s
     member _.Keys = keys
@@ -234,6 +240,8 @@ type Session(role: Role, p: SessionParams, port: IFlowPort, clock: IClock, confi
             | CellType.Booster ->
                 rx.OnCoded(m, Span<byte>.op_Implicit (frame.Slice(Layout.SymbolOffset, s)), path, clock.NowNs())
                 rx.Release()
+                // Two k for one step can never decode: fail now, not stall forever.
+                if rx.Decoder.KConflicts > 0L && fault.Length = 0 then fault <- "peer step_used conflict"
             | CellType.WinAck ->
                 let mutable h = Unchecked.defaultof<WinAckHead>
                 if WinAck.tryReadHead (Span<byte>.op_Implicit (frame.Slice(Layout.SymbolOffset, s))) &h

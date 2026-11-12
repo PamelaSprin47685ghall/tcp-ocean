@@ -13,6 +13,8 @@ type IPathOwner =
     abstract Frontier: uint64
     /// Content for a whole-frame hole of path (borrowed shell); renders into frame.
     abstract ProduceFill: path: uint16 * frame: Span<byte> -> unit
+    /// An exception escaped while this path worked for the owner: the owner fails.
+    abstract Fail: reason: string -> unit
 
 type IPath =
     abstract PathId: uint16 with get, set

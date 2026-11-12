@@ -90,13 +90,20 @@ let ``fuzz: random authenticated cells reach the server without an exception`` (
         if i % 50 = 0 then
             pair.Round() |> ignore
     for _ in 1 .. 200 do pair.Round() |> ignore
-    // The server keeps running. (It need not still carry flows: these cells are sealed with
-    // the peer's own keys, so only the key holder can send them; contradicting k values for
-    // the same steps can wedge that one session, which is the sender's own loss.)
-    let out = Array.zeroCreate<byte> s.FrameLength
-    for _ in 1 .. 50 do
-        pair.Round() |> ignore
-        s.TryProduce(0us, Span out) |> ignore
+    // These cells carry the peer's own keys: they may break this session, but then it must
+    // fail (and be torn down), never stall silently. Healthy means a real flow still works.
+    if not s.Faulted then
+        let mutable slot = -1
+        Assert.True(c.TryOpenFlow(&slot))
+        let data = Array.init 20000 (fun i -> byte (i * 13))
+        let mutable sent = 0
+        let mutable r = 0
+        let got () = if pair.ServerPort.Data.ContainsKey slot then int pair.ServerPort.Data.[slot].Length else 0
+        while r < 3000 && got () < data.Length && not s.Faulted do
+            if sent < data.Length then sent <- sent + pair.Feed(c, slot, ReadOnlySpan(data, sent, data.Length - sent), false)
+            pair.Round() |> ignore
+            r <- r + 1
+        Assert.True(s.Faulted || got () = data.Length, sprintf "server neither failed nor carried the flow (%d of %d bytes)" (got ()) data.Length)
 
 [<Theory>]
 [<InlineData(1)>]
@@ -167,3 +174,37 @@ let ``fuzz: cells straddling random segments (1 byte to 1460, 536 MSS) all arriv
     let firsts = got |> List.map (fun fr -> int fr.[0]) |> List.sort
     Assert.Equal<int list>([ 1 .. frames ], firsts)
     for fr in got do Assert.True(fr |> Array.forall (fun b -> b = fr.[0]), "a frame came out mixed")
+
+let private sealCell (c: Session) (m: Meta) =
+    let frame = Array.zeroCreate<byte> c.FrameLength
+    FrameMath.writeChunkHeader c.SymbolSize (Span frame)
+    Meta.write m (Span(frame, Layout.MetaOffset, Layout.MetaLength))
+    frame.[frame.Length - 2] <- 13uy
+    frame.[frame.Length - 1] <- 10uy
+    c.Tx.Seal(Span frame, 0us)
+    frame
+
+[<Fact>]
+let ``session: two k for one step from the peer fail the session at once`` () =
+    let pair = Pair(SessionConfig.defaults, 1, 0.0, 21)
+    let s = pair.Server
+    let t = s.Frontier + 2UL
+    let cell k = { Type = CellType.Data; Flags = MetaFlags.None; Slot = 0uy; StepUsed = byte k; Aux = 0us
+                   RxWinGrant = 1024us; StepId = t; AckStepLo = 0UL; CarrierWm = 0UL; KHist = 0u; ErasureQ16 = 0us }
+    s.OnFrame(0us, Span(sealCell pair.Client (cell 3))) |> ignore
+    Assert.False(s.Faulted)
+    s.OnFrame(0us, Span(sealCell pair.Client (cell 4))) |> ignore
+    Assert.True(s.Faulted)
+    Assert.Equal("peer step_used conflict", s.Fault)
+
+[<Fact>]
+let ``tun: an exception from the owner fails that owner and resets the connection, nothing escapes`` () =
+    let f = Fixture 2
+    f.Open()
+    f.Owner.Throw <- true
+    f.Send(f.Data0, ReadOnlySpan(f.Stream, 0, L), [||])
+    Assert.Equal(1L, f.Path.Counters.Faults)
+    Assert.Equal(1, f.Owner.Failures.Count)
+    Assert.True(f.Path.Closed)
+    let last = parse f.Out.Packets.[f.Out.Packets.Count - 1]
+    Assert.True(last.Flags &&& Packet.Rst <> 0uy)

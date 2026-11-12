@@ -59,6 +59,7 @@ type Decoder(graphSeed: uint64, symbolSize: int, capacitySteps: int, maxRows: in
     let pivots = Dictionary<uint64, Row>(maxRows)
     let solvedQueue = Stack<Row>()
     let knownQueue = Queue<struct (uint64 * byte * bool)>()
+    let mutable kConflicts = 0L
     let mutable mergeCols: uint64[] = Array.zeroCreate 128
     let mutable mergeCoefs: byte[] = Array.zeroCreate 128
     let pivotScratch: uint64[] = Array.zeroCreate MaxTerms
@@ -271,6 +272,8 @@ type Decoder(graphSeed: uint64, symbolSize: int, capacitySteps: int, maxRows: in
 
     /// t_lo: every step below it is complete.
     member _.Frontier = frontier
+    /// Steps for which the peer gave two different k (a protocol error of the peer).
+    member _.KConflicts = kConflicts
     /// Lowest step whose sources are still stored.
     member _.BaseStep = baseStep
     /// Highest step seen plus one.
@@ -314,7 +317,10 @@ type Decoder(graphSeed: uint64, symbolSize: int, capacitySteps: int, maxRows: in
         else
             let old = ring.K t
             if old = k then true
-            elif old <> 0 then false
+            elif old <> 0 then
+                // The authenticated peer gave two k for one step: its stream is inconsistent.
+                kConflicts <- kConflicts + 1L
+                false
             else
                 ring.SetK(t, k)
                 for s in 0 .. k - 1 do

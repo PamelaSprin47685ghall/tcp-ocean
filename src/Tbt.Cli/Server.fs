@@ -146,6 +146,8 @@ let run (o: Options) =
 
     let poller = Poller()
     let mutable lastStats = Environment.TickCount64
+    let mutable faults = 0L
+    let mutable failed = 0L
     while true do
         match listener with
         | null -> ()
@@ -186,9 +188,15 @@ let run (o: Options) =
         let mutable i = sessions.Count - 1
         while i >= 0 do
             let c = sessions.[i].Carrier
-            c.Service poller
+            // Last resort: an exception fails this session only (causes are fixed where found).
+            try c.Service poller
+            with ex ->
+                faults <- faults + 1L
+                c.Session.Fail(ex.GetType().Name + ": " + ex.Message)
             if not c.Alive then
-                log ("session " + c.Session.Keys.SessionId.ToString() + " closed")
+                if c.Session.Faulted then failed <- failed + 1L
+                let why = if c.Session.Faulted then " failed: " + c.Session.Fault else " closed"
+                log ("session " + c.Session.Keys.SessionId.ToString() + why)
                 c.Close()
                 sessions.RemoveAt i
             i <- i - 1
@@ -202,7 +210,8 @@ let run (o: Options) =
             for e in sessions do
                 fin <- fin + e.Carrier.FramesIn
                 fout <- fout + e.Carrier.FramesOut
-            log ("stats sessions=" + string sessions.Count + " frames_in=" + string fin + " frames_out=" + string fout
+            log ("stats sessions=" + string sessions.Count + " sessions_failed=" + string failed
+                 + " session_exceptions=" + string faults + " frames_in=" + string fin + " frames_out=" + string fout
                  + " rss_kib=" + string (rssKiB ()) + " alloc_kib=" + string (GC.GetTotalAllocatedBytes false / 1024L)
                  + " gc0=" + string (GC.CollectionCount 0))
             for e in sessions do log ("stats " + e.Carrier.Describe())
