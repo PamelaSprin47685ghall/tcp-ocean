@@ -114,6 +114,7 @@ type PathLink(socket: Socket, probe: INotSentProbe) =
         member this.Receive(poller) =
             if alive && this.Send() = IoResult.Closed then this.Close()
             if alive && poller.IsReadable socket then
+                if Trace.enabled then Trace.record Trace.Readable (uint64 socket.Available) this.PathId 0
                 let r = this.Receive()
                 let mutable f = Span<byte>.Empty
                 while this.TryTakeFrame(&f) do owner.OnFrame(this.PathId, f) |> ignore

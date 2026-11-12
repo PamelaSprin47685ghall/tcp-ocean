@@ -25,6 +25,10 @@ let Known = 4
 [<Literal>]
 let Rtt = 5
 
+/// path: bytes the kernel holds readable before a read (step = bytes).
+[<Literal>]
+let Readable = 6
+
 let mutable enabled = false
 let private capacity = 1 <<< 22
 let mutable private kinds: byte[] = [||]
