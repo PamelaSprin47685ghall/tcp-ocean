@@ -40,3 +40,30 @@ A = main a1ac6a1, B = ready-set 5019192, interleaved B, A.
 | A3 | 41.6 | 175.1 | 9.5 | 13.1 / 133.0 | VM stall (clock_jumps 4/8, up 170 s): void, rerun |
 
 Ping under bulk p99 spreads 100–226 ms in both arms; more pairs follow.
+
+### More pairs (A, B, A, B, A), same settings
+
+| run | ping p99 | under bulk p99 | bulk up | bulk down 1 / 2 | note |
+|---|---|---|---|---|---|
+| A3' | 41.7 | 103.6 | 151.8 | 134.3 / 133.8 | clock_jumps=0 (A3 rerun) |
+| B4 | 1827.6 | 164.5 | 148.0 | 134.2 / 132.3 | clock_jumps=4: void |
+| A4 | 73.1 | 202.4 | 141.3 | 134.8 / 133.2 | clock_jumps=0 |
+| B5 | 41.6 | 114.0 | 151.6 | 133.9 / 133.4 | clock_jumps=0 |
+| A5 | 41.8 | 108.5 | 151.8 | 134.3 / 134.2 | clock_jumps=0 |
+
+## Result (valid runs: B n=4, A n=5): merge
+
+| metric | B ready-set median (values) | A main median (values) |
+|---|---|---|
+| ping p99 ms | 42.1 (42.4 41.9 43.0 41.6) | 41.8 (41.8 41.9 41.7 73.1 41.8) |
+| under bulk p50 ms | 41.3 | 41.3 |
+| under bulk p99 ms | 127.2 (140.4 100.4 225.8 114.0) | 117.6 (117.6 145.4 103.6 202.4 108.5) |
+| bulk up Mbit | 151.6 (152.2 151.5 142.3 151.6) | 142.9 (142.9 135.9 151.8 141.3 151.8) |
+| bulk down Mbit (mean of 2) | 133.7 | 134.1 |
+| server peak RSS KiB | 61674 | 63792 |
+| server cpu_s | 10.5 | 10.5 |
+
+Under bulk p99: Mann-Whitney U = 10 of 20 (exactly even): no difference shows; the spread
+(100-226 ms) is the same in both arms. Bulk up is higher in 3 of 4 B runs. No metric
+regresses, so ready-set goes to main. This is not a full E-T9c pass (no SF/S30 scenarios,
+no 95% intervals with n=4/5); the scheduler-cost slope is shown by BridgeTests instead.
