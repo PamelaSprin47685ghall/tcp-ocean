@@ -30,23 +30,30 @@ type PendingSource =
       Length: int
       Flags: StreamFlags }
 
-/// Delivery order inside a slot: generation first, then stream offset.
+/// Delivery order inside a slot: generation, stream offset, then the OPEN source first.
+/// The zero-length OPEN and the first data source share offset 0; when the data source is
+/// decoded first (later steps can overtake), it must still sort after the OPEN.
 [<Struct; CustomComparison; CustomEquality>]
 type FlowKey =
     { Gen: uint32
-      Offset: uint64 }
+      Offset: uint64
+      /// 0 for an OPEN source, 1 otherwise.
+      Rank: byte }
 
     override k.Equals(o: obj) =
         match o with
-        | :? FlowKey as q -> k.Gen = q.Gen && k.Offset = q.Offset
+        | :? FlowKey as q -> k.Gen = q.Gen && k.Offset = q.Offset && k.Rank = q.Rank
         | _ -> false
 
-    override k.GetHashCode() = HashCode.Combine(k.Gen, k.Offset)
+    override k.GetHashCode() = HashCode.Combine(k.Gen, k.Offset, k.Rank)
 
     interface IComparable<FlowKey> with
         member k.CompareTo(q) =
             let c = k.Gen.CompareTo q.Gen
-            if c <> 0 then c else k.Offset.CompareTo q.Offset
+            if c <> 0 then c
+            else
+                let c = k.Offset.CompareTo q.Offset
+                if c <> 0 then c else k.Rank.CompareTo q.Rank
 
     interface IComparable with
         member k.CompareTo(o) =
@@ -399,7 +406,8 @@ type FlowTable(port: IFlowPort, store: ISourceStore, stepUndelivered: Action<uin
             false
         else
             f.Pending.Enqueue({ Step = step; Slot = byte slot; Offset = e.StreamOffset; Length = e.RealLength; Flags = e.Flags },
-                              { Gen = e.FlowGeneration; Offset = e.StreamOffset })
+                              { Gen = e.FlowGeneration; Offset = e.StreamOffset
+                                Rank = (if e.Flags.HasFlag StreamFlags.Open then 0uy else 1uy) })
             stepUndelivered.Invoke(step, 1)
             true
 
