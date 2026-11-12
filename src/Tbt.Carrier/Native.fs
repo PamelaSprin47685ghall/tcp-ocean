@@ -1,4 +1,4 @@
-/// Linux libc calls for the TUN device and poll(2). Blittable signatures only (NativeAOT).
+/// Linux libc calls for the TUN device, poll(2) and epoll(7). Blittable signatures only (NativeAOT).
 module internal Tbt.Carrier.Native
 
 #nowarn "9"
@@ -59,6 +59,42 @@ let poll (fds: PollFd[]) (count: int) (timeoutMs: int) =
     sysPoll(NativePtr.toNativeInt p, unativeint count, timeoutMs)
 
 let lastError () = Marshal.GetLastPInvokeError()
+
+[<DllImport("libc", EntryPoint = "epoll_create1", SetLastError = true)>]
+extern int sysEpollCreate1(int flags)
+
+[<DllImport("libc", EntryPoint = "epoll_ctl", SetLastError = true)>]
+extern int sysEpollCtl(int epfd, int op, int fd, nativeint ev)
+
+[<DllImport("libc", EntryPoint = "epoll_wait", SetLastError = true)>]
+extern int sysEpollWait(int epfd, nativeint events, int maxEvents, int timeoutMs)
+
+[<Literal>]
+let EpollCtlAdd = 1
+
+[<Literal>]
+let EpollCtlDel = 2
+
+[<Literal>]
+let EpollCtlMod = 3
+
+/// struct epoll_event: u32 events, u64 data. Packed (12 B) on x86-64, 16 B elsewhere.
+let epollEventSize = if RuntimeInformation.ProcessArchitecture = Architecture.X64 then 12 else 16
+let epollDataOffset = if epollEventSize = 12 then 4 else 8
+
+let epollCreate () = sysEpollCreate1 0x80000 (* EPOLL_CLOEXEC *)
+
+/// epoll_ctl with one event record in scratch (at least epollEventSize bytes).
+let epollCtl (epfd: int) (op: int) (fd: int) (events: uint32) (scratch: byte[]) =
+    BitConverter.TryWriteBytes(Span(scratch, 0, 4), events) |> ignore
+    BitConverter.TryWriteBytes(Span(scratch, epollDataOffset, 8), uint64 fd) |> ignore
+    use p = fixed &scratch.[0]
+    sysEpollCtl(epfd, op, fd, NativePtr.toNativeInt p)
+
+/// epoll_wait into buffer (records of epollEventSize bytes).
+let epollWait (epfd: int) (buffer: byte[]) (timeoutMs: int) =
+    use p = fixed &buffer.[0]
+    sysEpollWait(epfd, NativePtr.toNativeInt p, buffer.Length / epollEventSize, timeoutMs)
 
 /// Attach to the TUN device name (IFF_TUN | IFF_NO_PI), non-blocking. The device is made
 /// beforehand (ip tuntap add ... user <user>), so the server needs no root. -1 on failure.

@@ -144,7 +144,8 @@ let run (o: Options) =
             if leave then pending.RemoveAt i
             i <- i - 1
 
-    let poller = Poller()
+    use poller = new Poller()
+    log ("readiness wait: " + string poller.Backend)
     let mutable lastStats = Environment.TickCount64
     let mutable faults = 0L
     let mutable failed = 0L
