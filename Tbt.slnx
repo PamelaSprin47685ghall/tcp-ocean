@@ -1,0 +1,11 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/Tbt.Codec/Tbt.Codec.fsproj" />
+    <Project Path="src/Tbt.Contracts/Tbt.Contracts.fsproj" />
+    <Project Path="src/Tbt.Crypto/Tbt.Crypto.fsproj" />
+    <Project Path="src/Tbt.Wire/Tbt.Wire.fsproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/Tbt.Tests/Tbt.Tests.fsproj" />
+  </Folder>
+</Solution>
