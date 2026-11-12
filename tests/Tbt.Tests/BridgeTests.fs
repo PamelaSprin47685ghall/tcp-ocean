@@ -168,3 +168,20 @@ let ``bulk goes out in batches of at most 4 frames per path, 256 per round`` () 
     let sent = carrier.FramesOut - out0
     Assert.InRange(sent, 9L, 256L)
     bridge.CloseAll()
+
+[<Fact>]
+let ``the trace is off by default, costs no allocation off, and writes its records on`` () =
+    Assert.False(TraceGate.On)
+    let b0 = GC.GetAllocatedBytesForCurrentThread()
+    for i in 0 .. 9999 do Trace.record Trace.Seal (uint64 i) 0us 1
+    Assert.Equal(0L, GC.GetAllocatedBytesForCurrentThread() - b0)
+    let file = IO.Path.GetTempFileName()
+    Trace.start file
+    try
+        Trace.record Trace.Send 42UL 3us 1
+        Trace.flush ()
+    finally
+        TraceGate.On <- false
+    let line = IO.File.ReadAllLines(file) |> Array.find (fun l -> l.StartsWith "2 42 3 1 ")
+    Assert.True(Int64.Parse(line.Split(' ').[4]) > 0L)
+    IO.File.Delete file
