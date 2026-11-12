@@ -10,7 +10,12 @@ open Tbt.Crypto.Bootstrap
 open Tbt.Wire
 
 /// Capabilities this implementation offers (DECISIONS.md D4, D5: no lanes, no FLOWSTATE).
-let SupportedCaps = Caps.HpMask ||| Caps.StraddleOk ||| Caps.JoinAck2
+let SupportedCaps = Caps.HpMask ||| Caps.StraddleOk ||| Caps.JoinAck2 ||| Caps.FlowState ||| Caps.FlowState2
+
+/// FLOWSTATE counts only together with FLOWSTATE2 (DECISIONS.md D5).
+let private flowStatePair (caps: uint16) =
+    let both = Caps.FlowState ||| Caps.FlowState2
+    if caps &&& both = both then caps else caps &&& ~~~both
 
 /// The HTTP head of a path (spec 6.1). It ends with CRLF CRLF and is at most 1024 bytes.
 let requestHead (host: string) =
@@ -107,7 +112,7 @@ type ServerOffer(psks: byte[][], entropy: IEntropy, grant0: uint16, maxPaths: in
                                            && h.Caps &&& Caps.JoinAck2 <> 0us && h.MssClient > 0us
                                            && caches.[i].TryAdd(cn, unixTimeMs) ->
                         let symbol = FrameMath.symbolForMss (min (int h.MssClient) mssServer)
-                        let caps = h.Caps &&& SupportedCaps
+                        let caps = flowStatePair (h.Caps &&& SupportedCaps)
                         let sid = Guid(ReadOnlySpan(random entropy 16), true)
                         let sh =
                             { Status = ServerStatus.Ok; Suite = Suite.ChaCha20Poly1305; Caps = caps; SessionId = sid

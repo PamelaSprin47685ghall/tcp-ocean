@@ -29,6 +29,8 @@ type RecordingPort() =
     member val Closed = List<int>()
     member val Resets = List<int>()
     member val WriteLimit = Int32.MaxValue with get, set
+    /// Slots whose local reader is stalled (writes take nothing).
+    member val Blocked = HashSet<int>()
     member p.Stream(slot: int) =
         match p.Data.TryGetValue slot with
         | true, s -> s
@@ -39,7 +41,7 @@ type RecordingPort() =
     interface IFlowPort with
         member p.Open(slot, gen) = p.Opened.Add(struct (slot, gen))
         member p.Write(slot, data) =
-            let n = min data.Length p.WriteLimit
+            let n = if p.Blocked.Contains slot then 0 else min data.Length p.WriteLimit
             p.Stream(slot).Write(data.Slice(0, n))
             n
         member p.Finish(slot) = p.Finished.Add slot |> ignore
@@ -93,8 +95,8 @@ type Pair(config: SessionConfig, paths: int, loss: float, seed: int) =
     member _.Feed(s: Session, slot: int, data: ReadOnlySpan<byte>, fin: bool) =
         let mutable at = 0
         let mutable app = Span<byte>.Empty
-        while at < data.Length && s.TryBeginSource(&app) do
-            let n = min app.Length (data.Length - at)
+        while at < data.Length && s.FlowRoom slot > 0 && s.TryBeginSource(&app) do
+            let n = min (min app.Length (data.Length - at)) (s.FlowRoom slot)
             data.Slice(at, n).CopyTo app
             at <- at + n
             s.CommitSource(slot, n, fin && at = data.Length)
@@ -188,7 +190,7 @@ let ``echo returns every byte in order and closes both ends`` (loss: float, path
         Assert.True(pair.Client.Rx.Counters.Recovered > 0L)
 
 [<Fact>]
-let ``a blocked local reader stops the sender through the grant, then resumes`` () =
+let ``a blocked local reader stops its flow through the flow credit, then resumes`` () =
     let config = { SessionConfig.defaults with WindowSteps = 512 }
     let pair = Pair(config, 4, 0.0, 7)
     pair.ServerPort.WriteLimit <- 0
@@ -200,9 +202,11 @@ let ``a blocked local reader stops the sender through the grant, then resumes`` 
     for _ in 1 .. 1000 do
         sent <- sent + pair.Feed(c, slot, ReadOnlySpan(payload, sent, payload.Length - sent), false)
         pair.Round() |> ignore
-    // The window holds at most 512 steps of 16 sources; the rest waits at the sender.
-    Assert.True(sent > 0 && sent <= 512 * 16 * 1328, $"sent {sent}")
-    Assert.False(c.CanFill)
+    // The receiver promised one flow window past the bytes its reader took (none).
+    Assert.Equal(config.Credit.FlowWindowMax, sent)
+    Assert.Equal(0, c.FlowRoom slot)
+    Assert.Equal(sent, pair.Server.Flows.[slot].Reserve.Count)
+    Assert.True(pair.Server.FlowStatesSent > 0L)
     pair.ServerPort.WriteLimit <- Int32.MaxValue
     for _ in 1 .. 6000 do
         pair.Server.PumpFlow slot
@@ -210,6 +214,52 @@ let ``a blocked local reader stops the sender through the grant, then resumes`` 
         pair.Round() |> ignore
     Assert.Equal(payload.Length, sent)
     Assert.Equal<byte[]>(payload, pair.ServerPort.Data.[slot].ToArray())
+
+[<Theory>]
+[<InlineData(0.0)>]
+[<InlineData(0.05)>]
+let ``a stalled reader on one flow does not stop another flow`` (loss: float) =
+    // Flow A sends more than the whole decode window while its reader takes nothing.
+    // Before per-flow credit, A's undelivered steps filled the window and B stopped too.
+    let config = { SessionConfig.defaults with WindowSteps = 512 }
+    let pair = Pair(config, 4, loss, 11)
+    let c = pair.Client
+    let mutable a = -1
+    let mutable b = -1
+    Assert.True(c.TryOpenFlow(&a))
+    Assert.True(c.TryOpenFlow(&b))
+    pair.ServerPort.Blocked.Add a |> ignore
+    let bulkA = Array.init (12000 * 1328) (fun i -> byte (i * 13))
+    let dataB = Array.init 3_000_000 (fun i -> byte (i * 5 + 1))
+    let mutable sentA = 0
+    let mutable sentB = 0
+    let mutable r = 0
+    let doneB () = pair.ServerPort.Finished.Contains b
+    while r < 20_000 && not (doneB ()) do
+        sentA <- sentA + pair.Feed(c, a, ReadOnlySpan(bulkA, sentA, bulkA.Length - sentA), false)
+        if sentB < dataB.Length || c.FlowSending b then
+            sentB <- sentB + pair.Feed(c, b, ReadOnlySpan(dataB, sentB, dataB.Length - sentB), true)
+        pair.Round() |> ignore
+        r <- r + 1
+    Assert.True(doneB (), $"flow B stalled: {pair.ServerPort.Stream(b).Length} of {dataB.Length} bytes")
+    Assert.Equal<byte[]>(dataB, pair.ServerPort.Stream(b).ToArray())
+    Assert.Equal(0L, pair.ServerPort.Stream(a).Length)
+    Assert.True(sentA <= config.Credit.FlowWindowMax + 1328)
+    // Now the reader of A wakes up: A finishes too, in order.
+    pair.ServerPort.Blocked.Remove a |> ignore
+    r <- 0
+    while r < 40_000 && pair.ServerPort.Stream(a).Length < int64 bulkA.Length do
+        pair.Server.PumpFlow a
+        sentA <- sentA + pair.Feed(c, a, ReadOnlySpan(bulkA, sentA, bulkA.Length - sentA), false)
+        pair.Round() |> ignore
+        r <- r + 1
+    Assert.Equal<byte[]>(bulkA, pair.ServerPort.Stream(a).ToArray())
+
+[<Fact>]
+let ``FLOW_STATE needs both caps bits`` () =
+    let pair = Pair(SessionConfig.defaults, 1, 0.0, 12)
+    let both = Tbt.Crypto.Bootstrap.Caps.FlowState ||| Tbt.Crypto.Bootstrap.Caps.FlowState2
+    Assert.Equal(both, pair.ServerParams.Caps &&& both)
 
 [<Fact>]
 let ``a fully lost tail is found by HEARTBEAT and repaired by BOOSTER`` () =

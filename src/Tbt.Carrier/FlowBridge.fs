@@ -57,6 +57,7 @@ type FlowBridge(target: EndPoint voption) =
     /// The local socket of slot takes reads now.
     member _.WantsRead(slot: int) =
         not (isNull locals.[slot]) && not connecting.[slot] && session.FlowSending slot
+        && session.FlowRoom slot > 0
 
     /// The local socket of slot waits for writability (connect or a short write).
     member _.WantsWrite(slot: int) = not (isNull locals.[slot]) && (connecting.[slot] || wantWrite.[slot])
@@ -68,9 +69,11 @@ type FlowBridge(target: EndPoint voption) =
         | socket ->
             let mutable budget = 16
             let mutable app = Span<byte>.Empty
-            while budget > 0 && session.FlowSending slot && session.TryBeginSource(&app) do
+            // The peer's flow limit bounds each read; at zero only this flow waits.
+            while budget > 0 && session.FlowSending slot && session.FlowRoom slot > 0 && session.TryBeginSource(&app) do
                 let mutable err = SocketError.Success
-                let n = socket.Receive(app, SocketFlags.None, &err)
+                let room = session.FlowRoom slot
+                let n = socket.Receive((if room < app.Length then app.Slice(0, room) else app), SocketFlags.None, &err)
                 if err = SocketError.WouldBlock then budget <- 0
                 elif err <> SocketError.Success then
                     session.FailFlow slot

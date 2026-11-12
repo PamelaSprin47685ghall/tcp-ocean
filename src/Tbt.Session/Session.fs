@@ -25,10 +25,14 @@ type SessionConfig =
       /// Path id bound (256 bulk paths, 288 with lanes).
       MaxPaths: int
       /// Cells that may wait for a path before new local input waits (sender queue bound).
-      TxQueueCells: int }
+      TxQueueCells: int
+      /// Per-flow byte credit; it is on only when caps bit8 and bit9 are both negotiated.
+      Credit: CreditPolicy }
 
 module SessionConfig =
-    let defaults = { Rho = 0.25; WindowSteps = 4096; MaxRows = 16384; MaxPaths = 288; TxQueueCells = 256 }
+    let defaults =
+        { Rho = 0.25; WindowSteps = 4096; MaxRows = 16384; MaxPaths = 288; TxQueueCells = 256
+          Credit = CreditPolicy.defaults }
 
 /// The negotiated result of the main handshake that a session needs.
 [<Struct>]
@@ -67,7 +71,24 @@ type Session(role: Role, p: SessionParams, port: IFlowPort, clock: IClock, confi
     let decoder = Decoder((if client then keys.GraphSeedDown else keys.GraphSeedUp), s, config.WindowSteps, config.MaxRows)
     let tx = TxHalf(txDir, s, fieldOf txDir, encoder, sealer, config.Rho, config.MaxPaths, config.TxQueueCells, clock)
     let rx = RxHalf(s, fieldOf rxDir, decoder, opener, config.WindowSteps, config.MaxPaths)
-    let flows = FlowTable(port, DecoderStore decoder, Action<uint64, int>(fun t d -> rx.StepUndelivered(t, d)))
+    let both = Caps.FlowState ||| Caps.FlowState2
+    let credit = { config.Credit with Enabled = config.Credit.Enabled && p.Caps &&& both = both }
+    let flows = FlowTable(port, DecoderStore decoder, Action<uint64, int>(fun t d -> rx.StepUndelivered(t, d)), credit)
+    let flowStatePeriodNs = 10_000_000L
+    let snapshotPeriodNs = 1_000_000_000L
+    let mutable stateSeq = 0u
+    let mutable stateEpoch = 0u
+    let mutable lastFlowStateNs = 0L
+    let mutable lastSnapshotNs = 0L
+    let mutable flowStateDue = false
+    // A snapshot is frozen when it starts (spec 6.10b.3 rule 3), then sent page by page.
+    let snapshot = Array.zeroCreate<FlowRecord> 256
+    let mutable snapshotCount = 0
+    let mutable snapshotSent = 0
+    let mutable snapshotPage = 0
+    let mutable snapshotSeq = 0u
+    let mutable flowStatesSent = 0L
+    let mutable flowStatesRejected = 0L
     let resets = Collections.Generic.Queue<int>()
     let winAckPeriodNs = 10_000_000L
     let keepAliveNs = 1_000_000_000L
@@ -115,6 +136,67 @@ type Session(role: Role, p: SessionParams, port: IFlowPort, clock: IClock, confi
         tx.Seal(frame, path)
         winAcksSent <- winAcksSent + 1L
 
+    let nextSeq () =
+        if stateSeq = UInt32.MaxValue then
+            stateEpoch <- stateEpoch + 1u
+            stateSeq <- 0u
+        stateSeq <- stateSeq + 1u
+        stateSeq
+
+    let startSnapshot () =
+        snapshotCount <- 0
+        for slot in 0 .. 255 do
+            if flows.Reportable slot then
+                snapshot.[snapshotCount] <- flows.Record slot
+                snapshotCount <- snapshotCount + 1
+        snapshotSent <- 0
+        snapshotPage <- 0
+        snapshotSeq <- nextSeq ()
+
+    let snapshotPending () = snapshotSeq <> 0u
+
+    /// One FLOW_STATE page: the next snapshot page when one is open, else an increment
+    /// with the flows whose limit grew.
+    let renderFlowState (frame: Span<byte>) (path: uint16) =
+        let symbol = frame.Slice(Layout.SymbolOffset, s)
+        let room = FlowState.maxRecords s
+        if snapshotPending () then
+            let n = min room (snapshotCount - snapshotSent)
+            let last = snapshotSent + n = snapshotCount
+            FlowState.writeHead
+                { Snapshot = true; LastPage = last; RecordCount = n; TotalFlows = snapshotCount
+                  PageIndex = snapshotPage; StateSeq = snapshotSeq; StateEpoch = stateEpoch
+                  SnapshotId = snapshotSeq; AllKindsKnown = true } symbol
+            for i in 0 .. n - 1 do FlowState.writeFlow i snapshot.[snapshotSent + i] symbol
+            snapshotSent <- snapshotSent + n
+            snapshotPage <- snapshotPage + 1
+            if last then snapshotSeq <- 0u
+        else
+            let seq = nextSeq ()
+            let mutable n = 0
+            let mutable slot = 0
+            symbol.Clear()
+            while n < room && slot < 256 do
+                if flows.TakeReport slot then
+                    FlowState.writeFlow n (flows.Record slot) symbol
+                    n <- n + 1
+                slot <- slot + 1
+            // writeHead clears its span: give it the head bytes only.
+            FlowState.writeHead
+                { Snapshot = false; LastPage = false; RecordCount = n; TotalFlows = 0; PageIndex = 0
+                  StateSeq = seq; StateEpoch = stateEpoch; SnapshotId = 0u; AllKindsKnown = true }
+                (symbol.Slice(0, FlowState.HeadLength))
+        let meta =
+            { Type = CellType.FlowState; Flags = MetaFlags.None; Slot = 0uy; StepUsed = 0uy; Aux = 0us
+              RxWinGrant = rx.Grant; StepId = 0UL; AckStepLo = rx.AckStepLo; CarrierWm = tx.CarrierWm path
+              KHist = 0u; ErasureQ16 = rx.ErasureQ16 }
+        FrameMath.writeChunkHeader s frame
+        Meta.write meta (frame.Slice(Layout.MetaOffset, Layout.MetaLength))
+        frame.[frame.Length - 2] <- 13uy
+        frame.[frame.Length - 1] <- 10uy
+        tx.Seal(frame, path)
+        flowStatesSent <- flowStatesSent + 1L
+
     member _.Role = role
     member _.SymbolSize = s
     member _.FrameLength = Layout.frameLength s
@@ -147,10 +229,23 @@ type Session(role: Role, p: SessionParams, port: IFlowPort, clock: IClock, confi
                    && h.NackFlags &&& 1uy <> 0uy then
                     tx.OnNack(h.TLo, int h.Span, int h.Deficit)
             | CellType.Heartbeat -> rx.OnHeartbeat m.StepId
+            | CellType.FlowState when credit.Enabled ->
+                let page = Span<byte>.op_Implicit (frame.Slice(Layout.SymbolOffset, s))
+                let mutable h = Unchecked.defaultof<FlowStateHead>
+                // A bad page is dropped whole (spec 6.10b.2). Absence of a flow means nothing
+                // (rule 5), so each FLOW record stands alone and snapshots need no assembly.
+                if FlowState.tryReadHead page &h then
+                    for i in 0 .. h.RecordCount - 1 do
+                        if FlowState.kindAt page i = byte FlowStateKind.Flow then
+                            flows.OnPeerCredit(h.StateEpoch, h.StateSeq, FlowState.readFlow page i)
+                else flowStatesRejected <- flowStatesRejected + 1L
             | _ -> ()
 
     /// True when a cell waits for a path.
-    member _.WantsToSend = ackDue || tx.HasCandidate || (peerSeen && tx.HeartbeatDue)
+    member _.WantsToSend = ackDue || flowStateDue || tx.HasCandidate || (peerSeen && tx.HeartbeatDue)
+
+    member _.FlowStatesSent = flowStatesSent
+    member _.FlowStatesRejected = flowStatesRejected
 
     /// Render and seal the next cell for path. False when nothing waits.
     member _.TryProduce(path: uint16, frame: Span<byte>) =
@@ -158,6 +253,11 @@ type Session(role: Role, p: SessionParams, port: IFlowPort, clock: IClock, confi
         if ackDue && peerSeen then
             renderWinAck frame path now
             noteAckSent now
+            true
+        elif flowStateDue then
+            renderFlowState frame path
+            lastFlowStateNs <- now
+            flowStateDue <- snapshotPending ()
             true
         elif tx.TryRenderNext(frame, path, rx.AckStepLo, rx.Grant, rx.ErasureQ16) then
             noteAckSent now
@@ -188,11 +288,22 @@ type Session(role: Role, p: SessionParams, port: IFlowPort, clock: IClock, confi
                 lastNackNs <- now
                 ackDue <- true
             else nackDeficit <- 0
+        // FLOW_STATE (spec 6.10b.4, FST-1): changes at most every 10 ms, a snapshot every 1 s.
+        if credit.Enabled && not flowStateDue then
+            if now - lastSnapshotNs >= snapshotPeriodNs && (flows.ReportsDue > 0 || flows.RxActive > 0) then
+                lastSnapshotNs <- now
+                startSnapshot ()
+                flowStateDue <- true
+            elif flows.ReportsDue > 0 && now - lastFlowStateNs >= flowStatePeriodNs then
+                flowStateDue <- true
 
     // ---- local flows ------------------------------------------------------------------
 
     /// Client: a new local connection. False when all 256 slots are busy.
     member _.TryOpenFlow(slot: byref<int>) = flows.TryAllocate(&slot)
+
+    /// Bytes slot may still send under the peer's flow limit.
+    member _.FlowRoom(slot: int) = flows.TxRoom slot
 
     /// True while the tx side of slot takes bytes.
     member _.FlowSending(slot: int) = flows.[slot].Active && not flows.[slot].TxEndSent
