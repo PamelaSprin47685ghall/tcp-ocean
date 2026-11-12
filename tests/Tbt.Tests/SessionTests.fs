@@ -361,6 +361,7 @@ let ``an interactive flow goes before a full bulk queue`` () =
     Assert.True(c.TryBeginSourceFor(chat, &app))
     message.CopyTo app
     c.CommitSource(chat, message.Length, false)
+    c.Flush()
     Assert.Equal(1L, c.InteractiveSources)
     // One round moves 4 cells: the interactive step is among them, the bulk queue is not empty.
     pair.Round() |> ignore
@@ -445,3 +446,43 @@ let ``bulk download with echo on one session, twice in a row, completes and clos
         Assert.Equal(int64 bulk.Length, pair.ClientPort.Stream(b).Length - clientB0)
         let down = pair.ClientPort.Stream(b).ToArray()
         Assert.True(ReadOnlySpan(down, int clientB0, bulk.Length).SequenceEqual(ReadOnlySpan bulk))
+
+[<Fact>]
+let ``interactive sources of one input round share a step, and a full reserve falls back to bulk`` () =
+    let pair = Pair(SessionConfig.defaults, 1, 0.0, 12)
+    let c = pair.Client
+    let slots = Array.init 80 (fun _ -> let mutable s = -1 in Assert.True(c.TryOpenFlow(&s)); s)
+    let mutable app = Span<byte>.Empty
+    // Round 1: three small writes on three flows, one Flush: one interactive step.
+    for i in 0 .. 2 do
+        Assert.True(c.TryBeginSourceFor(slots.[i], &app))
+        c.CommitSource(slots.[i], 10, false)
+    c.Flush()
+    Assert.Equal(1L, c.Tx.UrgentSteps)
+    Assert.Equal(3L, c.Tx.UrgentSources)
+    // Many small writes, one per round, with no path: the reserve fills, then the
+    // sources still go (bulk path) and are counted.
+    for i in 3 .. 79 do
+        Assert.True(c.TryBeginSourceFor(slots.[i], &app))
+        c.CommitSource(slots.[i], 10, false)
+        c.Flush()
+    Assert.True(c.Tx.UrgentFull > 0L)
+    Assert.True(c.Tx.UrgentQueued <= 64 + 16)
+    Assert.Equal(80L, c.InteractiveSources + c.Tx.UrgentFull)
+    Assert.Equal(c.InteractiveSources, c.Tx.UrgentSources)
+
+[<Fact>]
+let ``a first data source decoded before the zero-length OPEN still opens the flow`` () =
+    // The client sends OPEN as a zero-length source, then data from offset 0 without the
+    // OPEN flag. An interactive step can overtake the OPEN's step.
+    let port = RecordingPort()
+    let flows = FlowTable(port, ZeroStore(), Action<uint64, int>(fun _ _ -> ()), CreditPolicy.defaults)
+    let env len flags : Tbt.Wire.SourceEnvelope =
+        { RealLength = len; FlowSlot = 5uy; Flags = flags; FlowGeneration = 1u; StreamOffset = 0UL }
+    Assert.True(flows.OnSource(9UL, 0, env 20 Tbt.Wire.StreamFlags.None))
+    flows.Pump 5
+    Assert.Empty(port.Opened)
+    Assert.True(flows.OnSource(8UL, 0, env 0 Tbt.Wire.StreamFlags.Open))
+    flows.Pump 5
+    Assert.Equal<struct (int * uint32) list>([ struct (5, 1u) ], List.ofSeq port.Opened)
+    Assert.Equal(20L, port.Stream(5).Length)

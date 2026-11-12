@@ -351,7 +351,9 @@ type Session(role: Role, p: SessionParams, port: IFlowPort, clock: IClock, confi
     /// As TryBeginSource, for slot: an interactive flow uses the interactive reserve and its
     /// step goes before bulk cells (spec 16.3).
     member this.TryBeginSourceFor(slot: int, app: byref<Span<byte>>) =
-        let interactive = this.IsInteractive slot
+        // A full interactive reserve sends the source on the bulk path (no wait for it).
+        let interactive =
+            this.IsInteractive slot && (tx.CanFillUrgent || (tx.NoteUrgentFull(); false))
         let mutable symbol = Span<byte>.Empty
         if tx.TryBeginSource(&symbol, interactive) then
             beganInteractive <- interactive

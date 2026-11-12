@@ -69,6 +69,9 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
     static let urgentLimit = 64
     static let reserveSteps = 16UL
     let mutable fillingUrgent = false
+    let mutable urgentFull = 0L
+    let mutable urgentSteps = 0L
+    let mutable urgentSources = 0L
     let mutable repairLo = UInt64.MaxValue
     let mutable repairSpan = 0
     let mutable repairSeq = 0
@@ -85,6 +88,9 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
 
     let seal (k: int) (small: bool) =
         let target = if fillingUrgent then urgent else queue
+        if fillingUrgent then
+            urgentSteps <- urgentSteps + 1L
+            urgentSources <- urgentSources + int64 k
         fillingUrgent <- false
         let t = encoder.Seal k
         sealNs.[int (t % uint64 sealNs.Length)] <- clock.NowNs()
@@ -110,6 +116,11 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
     member _.Head = encoder.Head
     member _.Queued = queue.Count + urgent.Count
     member _.UrgentQueued = urgent.Count
+    /// Interactive sources that took the bulk path because the interactive reserve was full.
+    member _.UrgentFull = urgentFull
+    member _.NoteUrgentFull() = urgentFull <- urgentFull + 1L
+    member _.UrgentSteps = urgentSteps
+    member _.UrgentSources = urgentSources
     member _.CellsSent = cellsSent
     member _.Erasure = erasure
 
@@ -126,8 +137,10 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
         filled > 0 || (encoder.Head < grantLimit && encoder.HeldSteps < encoder.Capacity && urgent.Count < urgentLimit)
 
     /// The symbol of the next source slot. The caller writes user bytes from offset 16 on.
-    /// An interactive source seals its step at once into the interactive queue.
+    /// An interactive source puts its step into the interactive queue.
     member this.TryBeginSource(symbol: byref<Span<byte>>, interactive: bool) =
+        // Bulk sources do not ride in an interactive step: close it first.
+        if not interactive && fillingUrgent && filled > 0 then seal filled true |> ignore
         if not (if interactive then this.CanFillUrgent else this.CanFill) then false
         else encoder.TryGetFillSlot(filled, &symbol)
 
@@ -143,10 +156,10 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
         let t = encoder.Head
         if filled = 0 then lastSourceNs <- clock.NowNs()
         filled <- filled + 1
-        if interactive then
-            fillingUrgent <- true
-            seal filled true |> ignore
-        elif filled = CodeGraph.SlotsPerStep then seal filled false |> ignore
+        // An interactive source marks its step urgent; the step seals at the end of the
+        // input round (Flush, 0-wait) or when full, so one round's sources share a step.
+        if interactive then fillingUrgent <- true
+        if filled = CodeGraph.SlotsPerStep then seal filled false |> ignore
         t
 
     member this.CommitSource(e: SourceEnvelope) = this.CommitSource(e, false)

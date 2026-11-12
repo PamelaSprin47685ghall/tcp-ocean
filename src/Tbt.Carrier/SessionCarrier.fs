@@ -55,7 +55,8 @@ type SessionCarrier(session: Session, bridge: FlowBridge) =
         "paths=" + string paths.Count + " frames_in=" + string framesIn + " frames_out=" + string framesOut
         + " tx_head=" + string tx.Head + " peer_ack=" + string tx.PeerAck + " grant_limit=" + string tx.GrantLimit
         + " queued=" + string tx.Queued + " rx_ack=" + string rx.AckStepLo + " rx_base=" + string rx.Decoder.BaseStep
-        + " recovered=" + string rx.Counters.Recovered + " interactive=" + string session.InteractiveSources + " flows=" + string bridge.Active
+        + " recovered=" + string rx.Counters.Recovered + " interactive=" + string session.InteractiveSources + "/" + string session.Tx.UrgentSteps
+        + " urgent_full=" + string session.Tx.UrgentFull + " flows=" + string bridge.Active
         + " opened=" + string session.Flows.Counters.Opened + " closed=" + string session.Flows.Counters.Closed
         + " local_fail=" + string session.Flows.Counters.LocalFailures
         + " stale=" + string session.Flows.Counters.StaleSources
