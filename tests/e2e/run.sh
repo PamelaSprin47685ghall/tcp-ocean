@@ -20,6 +20,23 @@ else
     server_at=10.200.2.2:8443
     server_args=(--listen "$server_at")
 fi
+# Poka-yoke: a clean machine and a known commit, or no run.
+preflight() {
+    local bad=0
+    if ip netns list | grep -q '^tbe_'; then echo "refuse: tbe_* network namespaces exist: $(ip netns list | grep '^tbe_' | tr '\n' ' ')"; bad=1; fi
+    # Executables named tbtun/wanem/iperf3, the .NET tbtun.dll, or echo.py servers.
+    local procs
+    procs=$(ps -eo pid=,comm=,args= | awk '$2 == "tbtun" || $2 == "wanem" || $2 == "iperf3" || /tbtun\.dll/ || /echo\.py/' | grep -v -e awk -e "^ *$$ " || true)
+    if [[ -n $procs ]]; then echo "refuse: test processes still run:"; echo "$procs"; bad=1; fi
+    if [[ -n $(git -C "$repo" status --porcelain) && ${ALLOW_DIRTY:-0} != 1 ]]; then
+        echo "refuse: the work tree has changes (ALLOW_DIRTY=1 runs anyway)"; bad=1
+    fi
+    (( bad == 0 )) || exit 2
+}
+preflight
+commit=$(git -C "$repo" rev-parse --short HEAD)
+[[ -n $(git -C "$repo" status --porcelain) ]] && commit="$commit-dirty"
+echo "commit: $commit"
 work=$(mktemp -d /tmp/tbtun-e2e.XXXXXX)
 user=$(id -un)
 dotnet_root=${DOTNET_ROOT:-$(dirname "$(readlink -f "$(command -v dotnet)")")}
@@ -105,5 +122,6 @@ done
 report bulk; stop
 
 echo "wanem: $(tr '\n' ' ' < "$work/wanem.stats")"
+echo "commit: $commit"
 echo "logs: $work"
 exit $status
