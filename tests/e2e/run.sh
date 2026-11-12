@@ -24,9 +24,11 @@ fi
 preflight() {
     local bad=0
     if ip netns list | grep -q '^tbe_'; then echo "refuse: tbe_* network namespaces exist: $(ip netns list | grep '^tbe_' | tr '\n' ' ')"; bad=1; fi
-    # Executables named tbtun/wanem/iperf3, the .NET tbtun.dll, or echo.py servers.
+    # Only our own resources: the box is shared with other agents, so other processes
+    # (even an echo server) are not ours to judge. Ours are the tbe_* namespaces (checked
+    # above) and processes started from an e2e work dir or the /tmp/dbg debug tree.
     local procs
-    procs=$(ps -eo pid=,comm=,args= | awk '$2 == "tbtun" || $2 == "wanem" || $2 == "iperf3" || /tbtun\.dll/ || /echo\.py/' | grep -v -e awk -e "^ *$$ " || true)
+    procs=$(ps -eo pid=,args= | awk '/\/tmp\/tbtun-e2e\./ || /\/tmp\/dbg\/.*tbtun/' | grep -v -e awk -e "^ *$$ " || true)
     if [[ -n $procs ]]; then echo "refuse: test processes still run:"; echo "$procs"; bad=1; fi
     if [[ -n $(git -C "$repo" status --porcelain) && ${ALLOW_DIRTY:-0} != 1 ]]; then
         echo "refuse: the work tree has changes (ALLOW_DIRTY=1 runs anyway)"; bad=1
