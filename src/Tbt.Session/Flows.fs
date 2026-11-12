@@ -20,6 +20,9 @@ type IFlowPort =
     abstract Reset: slot: int -> unit
     /// Both directions of the flow are done: close the local connection and free the slot.
     abstract Close: slot: int -> unit
+    /// The peer's byte limit for this end's tx on slot grew (spec 16.3.3 RS-2: the event
+    /// that brings a credit-blocked flow back to reading, instead of polling it).
+    abstract Credit: slot: int -> unit
 
 /// One received source that waits for delivery. Its bytes stay in the decoder window.
 [<Struct>]
@@ -308,7 +311,9 @@ type FlowTable(port: IFlowPort, store: ISourceStore, stepUndelivered: Action<uin
             f.TxCreditEpoch <- epoch
             f.TxCreditSeq <- seq
             let limit = r.DeliveredOffset + uint64 r.CreditBytes
-            if limit > f.TxLimit then f.TxLimit <- limit
+            if limit > f.TxLimit then
+                f.TxLimit <- limit
+                port.Credit r.FlowSlot
 
     /// The FLOW record this end reports for slot (its rx side).
     member _.Record(slot: int) =

@@ -28,6 +28,7 @@ type RecordingPort() =
     member val Finished = HashSet<int>()
     member val Closed = List<int>()
     member val Resets = List<int>()
+    member val Credits = 0 with get, set
     member val WriteLimit = Int32.MaxValue with get, set
     /// Slots whose local reader is stalled (writes take nothing).
     member val Blocked = HashSet<int>()
@@ -47,6 +48,7 @@ type RecordingPort() =
         member p.Finish(slot) = p.Finished.Add slot |> ignore
         member p.Reset(slot) = p.Resets.Add slot
         member p.Close(slot) = p.Closed.Add slot
+        member p.Credit(slot) = p.Credits <- p.Credits + 1
 
 let psk = Array.init 32 (fun i -> byte (i * 3 + 1))
 let unixMs = 1_800_000_000_000L
