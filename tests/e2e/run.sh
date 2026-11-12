@@ -59,6 +59,7 @@ dotnet build "$repo/src/Tbt.Cli" -c Release -o "$work/jit" >"$work/build.log"
 cp "$here/echo.py" "$work/echo.py"
 python3 -c 'import os; print(os.urandom(32).hex())' > "$work/psk"
 printf 'owd_ms=%s\nrate_mbit=%s\nloss=%s\nseed=7\n' "$owd" "$rate" "$loss" > "$work/wanem.conf"
+if [ -n "${WANEM_EXTRA:-}" ]; then printf "%b\n" "$WANEM_EXTRA" >> "$work/wanem.conf"; fi   # e.g. WANEM_EXTRA="outage_ms=300\noutage_every_s=3"
 sudo "$here/netns.sh" up "$work"
 echo "link: owd ${owd} ms each way, ${rate} Mbit/s, segment loss ${loss}; paths ${paths}; server carrier ${carrier}"
 
