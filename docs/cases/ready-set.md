@@ -25,3 +25,18 @@
   (`hot` ReadySet) are read again, so new interactive input goes before the rest of the bulk.
 - Tests: 2 counting paths, 40+ queued cells: one batch = 4 + 4 frames, a 3-frame budget = 3;
   a Service round sends 9..256. The warm Watch/Wait/Service loop allocates 0 B (100 rounds).
+
+## E-T9c A/B, first 3 + 3 (run.sh 20 ms, 200 Mbit, 5%, 4 paths, 10 s, SKIP_IPERF=1)
+
+A = main a1ac6a1, B = ready-set 5019192, interleaved B, A.
+
+| run | ping p99 | ping under bulk p99 | bulk up | bulk down 1 / 2 | note |
+|---|---|---|---|---|---|
+| B1 | 42.4 | 140.4 | 152.2 | 131.7 / 135.5 | clock_jumps=0 |
+| A1 | 41.8 | 117.6 | 142.9 | 136.0 / 132.9 | clock_jumps=0 |
+| B2 | 41.9 | 100.4 | 151.5 | 132.7 / 134.8 | clock_jumps=0 |
+| A2 | 41.9 | 145.4 | 135.9 | 132.3 / 133.0 | clock_jumps=0 |
+| B3 | 43.0 | 225.8 | 142.3 | 135.7 / 134.4 | clock_jumps=0 |
+| A3 | 41.6 | 175.1 | 9.5 | 13.1 / 133.0 | VM stall (clock_jumps 4/8, up 170 s): void, rerun |
+
+Ping under bulk p99 spreads 100–226 ms in both arms; more pairs follow.
