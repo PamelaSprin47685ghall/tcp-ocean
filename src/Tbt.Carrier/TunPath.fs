@@ -481,6 +481,8 @@ type TunPath(output: ITunOutput, counters: TunCounters, localIp: uint32, localPo
     member _.DataPhase = dataPhase
     member _.Srtt = srttNs
     member _.BottleneckBw = btlBw
+    /// Send time of the newest segment known delivered (RACK).
+    member _.RackSentNs = rackSentNs
     member _.Inflight = inflight
     member _.Describe() =
         "bw_mbit=" + (btlBw * 8000.0).ToString("F1") + " srtt_ms=" + (srttNs / 1e6).ToString("F1")

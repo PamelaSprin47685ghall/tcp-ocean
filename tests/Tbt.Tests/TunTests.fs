@@ -157,3 +157,53 @@ let ``downlink: a hole shown by SACK is refilled at once with new content, two c
         Assert.Equal(starts.[1], r.Seq)
         Assert.Equal(L, r.PayloadLength)
         Assert.True(bytes.AsSpan(r.PayloadAt, r.PayloadLength).IndexOfAnyExcept(0xABuy) < 0)
+
+let sackOption (blocks: (uint32 * uint32) list) =
+    let o = Array.zeroCreate<byte> (4 + 8 * blocks.Length)
+    o.[0] <- 1uy
+    o.[1] <- 1uy
+    o.[2] <- 5uy
+    o.[3] <- byte (2 + 8 * blocks.Length)
+    blocks |> List.iteri (fun i (a, b) ->
+        BinaryPrimitives.WriteUInt32BigEndian(Span(o, 4 + 8 * i, 4), a)
+        BinaryPrimitives.WriteUInt32BigEndian(Span(o, 8 + 8 * i, 4), b))
+    o
+
+[<Fact>]
+let ``downlink: a late ACK of a repaired segment's first copy does not move the RACK time`` () =
+    // Scripted sender: frames 0..3 every 20 ms; frame 1 is reported missing (SACK of 2) and
+    // repaired; 1 ms later the ACK covers frame 1: that ACK is for its first copy (no copy
+    // could arrive in 1 ms). RFC 8985 6.2: the RACK time stays at frame 2's send time, so
+    // segments sent between frame 2 and the repair are not declared lost on the next SACK.
+    let f = Fixture 1
+    f.Open()
+    let ip = f.Path :> IPath
+    ip.Backlog <- 100
+    let starts = List<uint32>()
+    let sentAt = List<int64>()
+    let send () =
+        f.Clock.Now <- f.Clock.Now + 20_000_000L
+        let mutable frame = Span<byte>.Empty
+        Assert.True(ip.TryBeginFrame(&frame))
+        frame.Fill 0x22uy
+        ip.CommitFrame()
+        starts.Add (parse f.Out.Packets.[f.Out.Packets.Count - 1]).Seq
+        sentAt.Add f.Clock.Now
+    for _ in 0 .. 3 do send ()
+    let ack (cum: uint32) (blocks: (uint32 * uint32) list) =
+        let struct (s, p) = clientSegment f.Data0 cum Packet.Ack (sackOption blocks) ReadOnlySpan.Empty
+        f.Path.OnSegment(s, Span p, f.Clock.Now)
+    let l = uint32 L
+    // Frame 0 acked at +45 ms after it was sent: min RTT 45 ms.
+    f.Clock.Now <- sentAt.[0] + 45_000_000L
+    ack (starts.[0] + l) []
+    // Frame 2 SACKed: frame 1 is lost, repaired now.
+    f.Clock.Now <- sentAt.[2] + 45_000_000L
+    let lost0 = f.Path.Counters.SegmentsLost
+    ack (starts.[0] + l) [ (starts.[2], starts.[2] + l) ]
+    Assert.Equal(lost0 + 1L, f.Path.Counters.SegmentsLost)
+    Assert.Equal(sentAt.[2], f.Path.RackSentNs)
+    // 1 ms later the first copy of frame 1 is acked (late, not lost).
+    f.Clock.Now <- f.Clock.Now + 1_000_000L
+    ack (starts.[2] + l) []
+    Assert.Equal(sentAt.[2], f.Path.RackSentNs)
