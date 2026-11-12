@@ -110,5 +110,61 @@ let ``watch and service visit only armed and writing flows, not all 256 slots`` 
         carrier.Service poller
     // One watch visit and two read passes per round, over one armed flow.
     Assert.InRange(carrier.SlotVisits - v0, 1L, 30L)
+    // The round loop allocates nothing once warm.
+    let b0 = GC.GetAllocatedBytesForCurrentThread()
+    for _ in 1 .. 100 do
+        carrier.Watch poller
+        poller.Wait 0 |> ignore
+        carrier.Service poller
+    Assert.Equal(0L, GC.GetAllocatedBytesForCurrentThread() - b0)
     for a in apps do a.Dispose()
+    bridge.CloseAll()
+
+/// A path that takes every frame and counts them.
+type private CountingPath(id: uint16) =
+    let buf = Array.zeroCreate<byte> 2048
+    member val Frames = 0 with get, set
+    interface IPath with
+        member val PathId = id with get, set
+        member val FrameLength = 0 with get, set
+        member _.Alive = true
+        member _.Attach(_) = ()
+        member _.Backlog with set (_: int) = ()
+        member _.Watch(_, _) = ()
+        member _.Receive(_) = ()
+        member p.TryBeginFrame(frame: byref<Span<byte>>) =
+            frame <- Span(buf, 0, (p :> IPath).FrameLength)
+            true
+        member p.CommitFrame() = p.Frames <- p.Frames + 1
+        member _.Close() = ()
+
+[<Fact>]
+let ``bulk goes out in batches of at most 4 frames per path, 256 per round`` () =
+    use listener = listen ()
+    let struct (session, bridge) = clientOnBridge ()
+    let struct (app, local) = loopPair listener
+    use app = app
+    Assert.True(bridge.TryAdd local)
+    let slot = bridge.Opened.NextUp -1
+    app.Send(Array.create 60000 3uy) |> ignore
+    for _ in 1 .. 200 do
+        if session.Tx.Queued < 40 then
+            bridge.Read slot
+            Thread.Sleep 1
+    Assert.True(session.Tx.Queued >= 40)
+    let carrier = SessionCarrier(session, bridge)
+    let a = CountingPath 0us
+    let b = CountingPath 1us
+    carrier.AddPath a
+    carrier.AddPath b
+    Assert.Equal(8, carrier.WriteBatch 256)
+    Assert.Equal(4, a.Frames)
+    Assert.Equal(4, b.Frames)
+    Assert.Equal(3, carrier.WriteBatch 3)
+    Assert.Equal(11, a.Frames + b.Frames)
+    use poller = new Poller()
+    let out0 = carrier.FramesOut
+    carrier.Service poller
+    let sent = carrier.FramesOut - out0
+    Assert.InRange(sent, 9L, 256L)
     bridge.CloseAll()

@@ -4,6 +4,7 @@ namespace Tbt.Carrier
 
 open System
 open System.Collections.Generic
+open Tbt.Contracts
 open Tbt.Session
 
 [<Sealed>]
@@ -23,13 +24,17 @@ type SessionCarrier(session: Session, bridge: FlowBridge) =
                 paths.RemoveAt i
             i <- i - 1
 
-    let writeRound () =
-        let backlog = session.Tx.Queued
-        for link in paths do link.Backlog <- backlog
-        let mutable budget = 256
+    /// Interactive slots that were readable in this round (re-read between bulk batches).
+    let hot = ReadySet()
+
+    /// Q-3 (spec 16.3): one batch gives each path at most 4 frames, within budget. Returns frames sent.
+    let writeBatch (budget0: int) =
+        let mutable budget = budget0
         let mutable progress = true
-        while progress && budget > 0 && paths.Count > 0 && session.WantsToSend do
+        let mutable passes = 0
+        while progress && passes < 4 && budget > 0 && paths.Count > 0 && session.WantsToSend do
             progress <- false
+            passes <- passes + 1
             let n = paths.Count
             let mutable j = 0
             while j < n && budget > 0 do
@@ -42,6 +47,37 @@ type SessionCarrier(session: Session, bridge: FlowBridge) =
                     progress <- true
                 j <- j + 1
             next <- (next + 1) % n
+        budget0 - budget
+
+    let readPass (poller: Poller) (interactive: bool) =
+        let armed = bridge.Armed
+        let mutable slot = armed.NextUp -1
+        while slot >= 0 do
+            slotVisits <- slotVisits + 1L
+            match bridge.Local slot with
+            | null -> ()
+            | s ->
+                if session.IsInteractive slot = interactive && poller.IsReadable s then
+                    if interactive then hot.Add slot
+                    if bridge.WantsRead slot then bridge.Read slot
+            slot <- armed.NextUp slot
+
+    /// Send at most 256 frames in batches; the interactive input is read again between batches.
+    let writeRound () =
+        let backlog = session.Tx.Queued
+        for link in paths do link.Backlog <- backlog
+        let mutable budget = 256
+        let mutable go = true
+        while go do
+            let sent = writeBatch budget
+            budget <- budget - sent
+            go <- sent > 0 && budget > 0 && session.WantsToSend
+            if go && not hot.IsEmpty then
+                let mutable slot = hot.NextUp -1
+                while slot >= 0 do
+                    slotVisits <- slotVisits + 1L
+                    if bridge.WantsRead slot && session.IsInteractive slot then bridge.Read slot
+                    slot <- hot.NextUp slot
 
     member _.Session = session
     member _.Bridge = bridge
@@ -49,6 +85,8 @@ type SessionCarrier(session: Session, bridge: FlowBridge) =
     member _.FramesIn = framesIn
     member _.FramesOut = framesOut
     member _.SlotVisits = slotVisits
+    /// One Q-3 batch (tests): at most 4 frames per path.
+    member _.WriteBatch(budget: int) = writeBatch budget
     member _.Alive = paths.Count > 0 && not session.Faulted && not session.Closed
 
     /// One line of counters for the log.
@@ -113,17 +151,9 @@ type SessionCarrier(session: Session, bridge: FlowBridge) =
             slot <- writers.NextUp slot
         bridge.Settle()
         // Interactive flows read first (spec 16.3 Q-3: bulk input after the interactive queue).
-        let armed = bridge.Armed
-        for pass in 0 .. 1 do
-            let mutable slot = armed.NextUp -1
-            while slot >= 0 do
-                slotVisits <- slotVisits + 1L
-                match bridge.Local slot with
-                | null -> ()
-                | s ->
-                    if (session.IsInteractive slot = (pass = 0)) && poller.IsReadable s && bridge.WantsRead slot then
-                        bridge.Read slot
-                slot <- armed.NextUp slot
+        hot.Clear()
+        readPass poller true
+        readPass poller false
         session.Flush()
         session.Tick()
         writeRound ()

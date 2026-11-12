@@ -17,3 +17,11 @@
   (before: 256 x 3 x 10 = 7680).
 - Caveat: an idle armed flow is still watched each round, so cost grows with armed flows,
   not strictly with readable flows.
+
+## Step 3 (Q-3): bounded bulk batches
+
+- writeRound sends in batches: each batch gives each path at most 4 frames (WriteBatch), the
+  round budget stays 256. Between batches the interactive slots that were readable this round
+  (`hot` ReadySet) are read again, so new interactive input goes before the rest of the bulk.
+- Tests: 2 counting paths, 40+ queued cells: one batch = 4 + 4 frames, a 3-frame budget = 3;
+  a Service round sends 9..256. The warm Watch/Wait/Service loop allocates 0 B (100 rounds).
