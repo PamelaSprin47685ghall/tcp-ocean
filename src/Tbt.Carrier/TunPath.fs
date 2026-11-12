@@ -597,8 +597,10 @@ type TunPath(output: ITunOutput, counters: TunCounters, localIp: uint32, localPo
                         dropSlot i
             // Tail repair.
             // Only what no SACK can show: segments sent after the last delivered one.
-            if ringCount > 0 && srttNs > 0.0 then
-                let rto = int64 (max (1.15 * srttNs) (srttNs + 10_000_000.0))
+            // A tail is only a tail when nothing was delivered for a whole timer: while ACKs
+            // come in, a growing queue makes old segments look late (spurious repairs).
+            let rto = int64 (max (1.15 * srttNs) (srttNs + 10_000_000.0))
+            if ringCount > 0 && srttNs > 0.0 && now - deliveredNs > rto then
                 let mutable i = 0
                 let mutable budget = 32
                 while i < ringCount && budget > 0 do
