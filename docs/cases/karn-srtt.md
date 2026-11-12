@@ -32,3 +32,19 @@ TxHalf, so both had it. TunPath (the server's user-space TCP) already applies Ka
 The 1000 ms case after the fix is bounded by the spec, not by SRTT. A NACK names only the
 frontier range (spec 5.8, at most 4 steps), so recovering from a long blackout costs about
 one RTT per 4 steps. This is left for the long-tail item.
+
+## netns A/B (20 ms OWD, 200 Mbit, 5 % loss, 4 paths, tun carrier; interleaved, clock_jumps=0)
+
+Steady 5 % loss, 3 vs 3 (medians, karn vs main): bulk up 151.4 / 143.9, bulk down
+135.7 / 135.6, under-bulk p99 126 / 113 ms (ranges 110-130 on both sides), CPU 2.52 / 2.47 s/Gbit.
+
+Stuck-tail scenario (same link plus `WANEM_EXTRA='outage_ms=300\noutage_every_s=3'`),
+4 vs 4: bulk up 115.9 / 114.0, down 111.8 / 112.6, under-bulk p99 500 / 502 ms (the outage
+dominates it), RSS 63.2 / 63.1 MiB, CPU 2.71 / 2.62 s/Gbit (overlapping ranges). Max session
+srtt: karn 250-287 ms on client and server, main 439-551 ms on the client and up to 1306 ms on the server.
+`repair_repeats` (rounds repeated for the same range by timeout) was 9 per side in a full
+run, so the 4 x min RTT ceiling does not cause wasted repeat rounds.
+
+Still open: under bulk up, clean samples reach ~400 ms against a 40 ms min RTT. Sealed steps
+wait roughly 350 ms before custody (client send-side queueing). That is real queueing, not a
+Karn problem; it is a matrix and long-tail item.
