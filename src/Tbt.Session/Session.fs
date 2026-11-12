@@ -207,11 +207,14 @@ type Session(role: Role, p: SessionParams, port: IFlowPort, clock: IClock, confi
     member _.Flows = flows
     member _.WinAcksSent = winAcksSent
     member _.Opener = opener
+    /// Decode frontier t_lo of the receive half.
+    member _.Frontier = rx.AckStepLo
 
-    /// Receive pipeline for one whole data frame of path (spec 6.6).
-    member _.OnFrame(path: uint16, frame: Span<byte>) =
+    /// Receive pipeline for one whole data frame of path (spec 6.6). Returns the cell's
+    /// authenticated carrier_wm, or UInt64.MaxValue when the frame did not authenticate.
+    member _.OnFrame(path: uint16, frame: Span<byte>) : uint64 =
         match rx.Open(frame, path) with
-        | ValueNone -> ()
+        | ValueNone -> UInt64.MaxValue
         | ValueSome m ->
             peerSeen <- true
             tx.OnPeerAck(m.AckStepLo, m.RxWinGrant)
@@ -240,6 +243,7 @@ type Session(role: Role, p: SessionParams, port: IFlowPort, clock: IClock, confi
                             flows.OnPeerCredit(h.StateEpoch, h.StateSeq, FlowState.readFlow page i)
                 else flowStatesRejected <- flowStatesRejected + 1L
             | _ -> ()
+            m.CarrierWm
 
     /// True when a cell waits for a path.
     member _.WantsToSend = ackDue || flowStateDue || tx.HasCandidate || (peerSeen && tx.HeartbeatDue)

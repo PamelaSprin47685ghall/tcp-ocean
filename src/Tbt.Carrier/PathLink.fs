@@ -98,13 +98,14 @@ type PathLink(socket: Socket, probe: INotSentProbe) =
         socket.Dispose()
 
     interface IPath with
-        member this.PathId = this.PathId
+        member this.PathId with get () = this.PathId and set v = this.PathId <- v
         member this.FrameLength with get () = this.FrameLength and set v = this.FrameLength <- v
         member _.Alive = alive
+        member _.Backlog with set _ = ()
         member this.Attach(o) =
             owner <- o
             let mutable f = Span<byte>.Empty
-            while this.TryTakeFrame(&f) do owner.OnFrame(this.PathId, f)
+            while this.TryTakeFrame(&f) do owner.OnFrame(this.PathId, f) |> ignore
 
         member this.Watch(poller, sending) =
             poller.WatchRead socket
@@ -115,7 +116,7 @@ type PathLink(socket: Socket, probe: INotSentProbe) =
             if alive && poller.IsReadable socket then
                 let r = this.Receive()
                 let mutable f = Span<byte>.Empty
-                while this.TryTakeFrame(&f) do owner.OnFrame(this.PathId, f)
+                while this.TryTakeFrame(&f) do owner.OnFrame(this.PathId, f) |> ignore
                 if r = IoResult.Closed then this.Close()
 
         /// Write gating (spec 3.14): one frame at a time, and only while the kernel holds

@@ -77,7 +77,7 @@ type Pair(config: SessionConfig, paths: int, loss: float, seed: int) =
                 n <- n + 1
                 moved <- moved + 1
                 if rnd.NextDouble() >= loss && not (blackout && obj.ReferenceEquals(src, client)) then
-                    dst.OnFrame(uint16 p, Span frame)
+                    dst.OnFrame(uint16 p, Span frame) |> ignore
                 else dropped <- dropped + 1
         moved
 

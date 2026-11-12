@@ -22,6 +22,8 @@ type SessionCarrier(session: Session, bridge: FlowBridge) =
             i <- i - 1
 
     let writeRound () =
+        let backlog = session.Tx.Queued
+        for link in paths do link.Backlog <- backlog
         let mutable budget = 256
         let mutable progress = true
         while progress && budget > 0 && paths.Count > 0 && session.WantsToSend do
@@ -107,4 +109,5 @@ type SessionCarrier(session: Session, bridge: FlowBridge) =
         member _.OnFrame(path, frame) =
             framesIn <- framesIn + 1L
             session.OnFrame(path, frame)
+        member _.Frontier = session.Frontier
         member _.ProduceFill(path, frame) = session.ProduceFill(path, frame) |> ignore
