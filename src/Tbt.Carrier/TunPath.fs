@@ -33,6 +33,8 @@ type TunCounters() =
     member val TailRepairs = 0L with get, set
     /// Times a path was demoted: data in flight, nothing delivered for the demotion time.
     member val Demotions = 0L with get, set
+    /// Exceptions caught at a path entry point: the owner failed, the connection was reset.
+    member val Faults = 0L with get, set
     /// Gaps between two calls longer than the stall limit, cut from the timeline.
     member val ClockJumps = 0L with get, set
 
@@ -590,7 +592,7 @@ type TunPath(output: ITunOutput, counters: TunCounters, localIp: uint32, localPo
         if ws < 0 then peerScale <- 0
 
     /// A non-SYN segment of this connection; packet is the whole IP packet.
-    member _.OnSegment(seg: Packet.Segment, packet: Span<byte>, now: int64) =
+    member private _.OnSegmentCore(seg: Packet.Segment, packet: Span<byte>, now: int64) =
         catchUp now
         if seg.Flags &&& Packet.Rst <> 0uy then state <- TunState.Closed
         elif state <> TunState.Closed then
@@ -644,7 +646,7 @@ type TunPath(output: ITunOutput, counters: TunCounters, localIp: uint32, localPo
 
     /// Timers: swallow gaps past the grace or proven by the decode frontier, repair tail
     /// losses (constant 1.15 x SRTT, no back-off), pending ACK, ProbeBW gain cycle.
-    member _.Service(now: int64) =
+    member private _.ServiceCore(now: int64) =
         catchUp now
         if state = TunState.Established then
             if leaseValid () then
@@ -700,6 +702,23 @@ type TunPath(output: ITunOutput, counters: TunCounters, localIp: uint32, localPo
                     send Packet.Ack sndNxt (Span<byte>.op_Implicit o) 0
                 else send Packet.Ack sndNxt ReadOnlySpan.Empty 0
                 ackDue <- false
+
+    /// Last resort (the causes are fixed where found): an exception from this path or its
+    /// owner fails only that owner (one session) and resets this connection.
+    member private this.Faulted(ex: exn) =
+        counters.Faults <- counters.Faults + 1L
+        if attached then owner.Fail("path " + string pathId + ": " + ex.GetType().Name + ": " + ex.Message)
+        this.Abort()
+
+    /// A non-SYN segment of this connection; packet is the whole IP packet.
+    member this.OnSegment(seg: Packet.Segment, packet: Span<byte>, now: int64) =
+        try this.OnSegmentCore(seg, packet, now)
+        with ex -> this.Faulted ex
+
+    /// Timers (see ServiceCore).
+    member this.Service(now: int64) =
+        try this.ServiceCore now
+        with ex -> this.Faulted ex
 
     /// Abort: RST to the peer.
     member _.Abort() =

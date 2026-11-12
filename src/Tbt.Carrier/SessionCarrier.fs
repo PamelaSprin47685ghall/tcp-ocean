@@ -46,7 +46,7 @@ type SessionCarrier(session: Session, bridge: FlowBridge) =
     member _.Paths = paths
     member _.FramesIn = framesIn
     member _.FramesOut = framesOut
-    member _.Alive = paths.Count > 0
+    member _.Alive = paths.Count > 0 && not session.Faulted
 
     /// One line of counters for the log.
     member _.Describe() =
@@ -118,3 +118,4 @@ type SessionCarrier(session: Session, bridge: FlowBridge) =
             session.OnFrame(path, frame)
         member _.Frontier = session.Frontier
         member _.ProduceFill(path, frame) = session.ProduceFill(path, frame) |> ignore
+        member _.Fail(reason) = session.Fail reason

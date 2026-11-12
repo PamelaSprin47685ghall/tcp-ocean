@@ -23,14 +23,18 @@ type RecordingOutput() =
 type RecordingOwner() =
     member val Frames = List<byte[]>()
     member val Fills = 0 with get, set
+    member val Failures = List<string>()
+    member val Throw = false with get, set
     interface IPathOwner with
         member o.OnFrame(_, frame) =
+            if o.Throw then invalidOp "owner failed"
             o.Frames.Add(frame.ToArray())
             0UL
         member o.ProduceFill(_, frame) =
             o.Fills <- o.Fills + 1
             frame.Fill 0xABuy
         member _.Frontier = 0UL
+        member o.Fail(reason) = o.Failures.Add reason
 
 let parse (p: byte[]) =
     let mutable s = Unchecked.defaultof<Packet.Segment>
