@@ -30,24 +30,19 @@ type NoNotSentProbe() =
         member _.NotSent(_) = -1
 
 module SocketTuning =
-    /// Unsent bytes per path that the gate allows before the frame length is known
-    /// (spec 6.8: about 16 KiB); after that 2 frames (spec 16.3 Q-1).
+    /// Unsent bytes per path that the gate allows (spec 6.8: about 16 KiB).
     [<Literal>]
     let NotSentLimit = 16384
 
     let probe () : INotSentProbe =
         if OperatingSystem.IsLinux() then LinuxNotSentProbe() else NoNotSentProbe()
 
-    /// Linux TCP_NOTSENT_LOWAT: poll reports writable while fewer unsent bytes wait.
-    let setNotSentLowat (socket: Socket) (bytes: int) =
-        if OperatingSystem.IsLinux() then
-            try socket.SetRawSocketOption(6, 25, ReadOnlySpan(BitConverter.GetBytes bytes))
-            with :? SocketException -> ()
-
-    /// Settings for a path socket: no Nagle, small unsent queue (handshake: NotSentLimit).
+    /// Settings for a path socket: no Nagle, small unsent queue (Linux TCP_NOTSENT_LOWAT).
     let path (socket: Socket) =
         socket.NoDelay <- true
-        setNotSentLowat socket NotSentLimit
+        if OperatingSystem.IsLinux() then
+            try socket.SetRawSocketOption(6, 25, ReadOnlySpan(BitConverter.GetBytes NotSentLimit))
+            with :? SocketException -> ()
 
     /// Settings for a local flow socket.
     let local (socket: Socket) = socket.NoDelay <- true

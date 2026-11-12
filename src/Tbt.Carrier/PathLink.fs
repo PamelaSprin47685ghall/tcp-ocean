@@ -24,21 +24,12 @@ type PathLink(socket: Socket, probe: INotSentProbe) =
     let mutable headDone = false
     let mutable owner = Unchecked.defaultof<IPathOwner>
     let mutable alive = true
-    let mutable frameLength = Layout.BootFrameLength
-    let mutable notSentLimit = SocketTuning.NotSentLimit
 
     member _.Socket = socket
     member val PathId = 0us with get, set
     member val Incarnation = 0u with get, set
     /// Whole frame length once the session is known; the bootstrap frame before that.
-    /// Setting it also sets the unsent bound to 2 frames (spec 16.3 Q-1): a new frame goes
-    /// in only while less than one frame waits unsent, and the kernel wakes the writer then.
-    member _.FrameLength
-        with get () = frameLength
-        and set v =
-            frameLength <- v
-            notSentLimit <- v
-            SocketTuning.setNotSentLowat socket v
+    member val FrameLength = Layout.BootFrameLength with get, set
     member _.Buffered = rxEnd - rxStart
     member _.TxIdle = txStart = txEnd
 
@@ -129,9 +120,9 @@ type PathLink(socket: Socket, probe: INotSentProbe) =
                 if r = IoResult.Closed then this.Close()
 
         /// Write gating (spec 3.14): one frame at a time, and only while the kernel holds
-        /// less than notSentLimit unsent bytes.
+        /// less than NotSentLimit unsent bytes.
         member this.TryBeginFrame(frame) =
-            if alive && this.TxIdle && probe.NotSent socket < notSentLimit then
+            if alive && this.TxIdle && probe.NotSent socket < SocketTuning.NotSentLimit then
                 txStart <- 0
                 txEnd <- 0
                 frame <- Span(tx, 0, this.FrameLength)
