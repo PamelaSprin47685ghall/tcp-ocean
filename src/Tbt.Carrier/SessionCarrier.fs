@@ -12,6 +12,8 @@ type SessionCarrier(session: Session, bridge: FlowBridge) =
     let mutable next = 0
     let mutable framesIn = 0L
     let mutable framesOut = 0L
+    /// Local slots visited by Watch and Service (RS-3: grows with armed flows, not 256).
+    let mutable slotVisits = 0L
 
     let prune () =
         let mutable i = paths.Count - 1
@@ -46,6 +48,7 @@ type SessionCarrier(session: Session, bridge: FlowBridge) =
     member _.Paths = paths
     member _.FramesIn = framesIn
     member _.FramesOut = framesOut
+    member _.SlotVisits = slotVisits
     member _.Alive = paths.Count > 0 && not session.Faulted && not session.Closed
 
     /// One line of counters for the log.
@@ -78,31 +81,49 @@ type SessionCarrier(session: Session, bridge: FlowBridge) =
         for link in paths do link.Watch(poller, sending)
         let fill = session.CanFill
         let fillInteractive = session.CanFillInteractive
-        for slot in 0 .. 255 do
+        if fill || fillInteractive then
+            let armed = bridge.Armed
+            let mutable slot = armed.NextUp -1
+            while slot >= 0 do
+                slotVisits <- slotVisits + 1L
+                match bridge.Local slot with
+                | null -> ()
+                | s -> if fill || session.IsInteractive slot then poller.WatchRead s
+                slot <- armed.NextUp slot
+        let writers = bridge.Writers
+        let mutable slot = writers.NextUp -1
+        while slot >= 0 do
+            slotVisits <- slotVisits + 1L
             match bridge.Local slot with
             | null -> ()
-            | s ->
-                if (fill || (fillInteractive && session.IsInteractive slot)) && bridge.WantsRead slot then
-                    poller.WatchRead s
-                if bridge.WantsWrite slot then poller.WatchWrite s
+            | s -> poller.WatchWrite s
+            slot <- writers.NextUp slot
 
     /// Handle what the last wait reported, then send.
     member _.Service(poller: Poller) =
         for link in paths do link.Receive poller
         prune ()
-        for slot in 0 .. 255 do
+        let writers = bridge.Writers
+        let mutable slot = writers.NextUp -1
+        while slot >= 0 do
+            slotVisits <- slotVisits + 1L
             match bridge.Local slot with
             | null -> ()
             | s -> if poller.IsWritable s then bridge.OnWritable slot
+            slot <- writers.NextUp slot
         bridge.Settle()
         // Interactive flows read first (spec 16.3 Q-3: bulk input after the interactive queue).
+        let armed = bridge.Armed
         for pass in 0 .. 1 do
-            for slot in 0 .. 255 do
+            let mutable slot = armed.NextUp -1
+            while slot >= 0 do
+                slotVisits <- slotVisits + 1L
                 match bridge.Local slot with
                 | null -> ()
                 | s ->
                     if (session.IsInteractive slot = (pass = 0)) && poller.IsReadable s && bridge.WantsRead slot then
                         bridge.Read slot
+                slot <- armed.NextUp slot
         session.Flush()
         session.Tick()
         writeRound ()

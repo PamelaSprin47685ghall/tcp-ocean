@@ -18,6 +18,24 @@ type FlowBridge(target: EndPoint voption) =
     let failed: bool[] = Array.zeroCreate slotCount
     let mutable session: Session = Unchecked.defaultof<_>
     let mutable active = 0
+    // Ready sets (spec 16.3.3 RS-1…3): the carrier visits only these slots, never all 256.
+    /// Slots with a local socket.
+    let opened = ReadySet()
+    /// Slots that wait for writability (connect or a short write).
+    let writers = ReadySet()
+    /// Slots that take reads now: connected, still sending, flow credit left. A slot that
+    /// runs out of credit leaves and comes back on the Credit event (RS-2).
+    let armed = ReadySet()
+    let failures = ReadySet()
+
+    let wantsRead (slot: int) =
+        not (isNull locals.[slot]) && not connecting.[slot] && session.FlowSending slot
+        && session.FlowRoom slot > 0
+    let rearm (slot: int) = armed.Set(slot, wantsRead slot)
+    let rewrite (slot: int) = writers.Set(slot, not (isNull locals.[slot]) && (connecting.[slot] || wantWrite.[slot]))
+    let fail (slot: int) =
+        failed.[slot] <- true
+        failures.Add slot
 
     let drop (slot: int) =
         match locals.[slot] with
@@ -28,6 +46,9 @@ type FlowBridge(target: EndPoint voption) =
             active <- active - 1
         connecting.[slot] <- false
         wantWrite.[slot] <- false
+        opened.Remove slot
+        writers.Remove slot
+        armed.Remove slot
 
     /// Start a non-blocking connect; return its first result.
     static member private Connect(socket: Socket, ep: EndPoint) =
@@ -39,6 +60,9 @@ type FlowBridge(target: EndPoint voption) =
     member _.Attach(s: Session) = session <- s
     member _.Active = active
     member _.Local(slot: int) = locals.[slot]
+    member _.Opened = opened
+    member _.Writers = writers
+    member _.Armed = armed
 
     /// Client: a local connection from the listener. False when no slot is free.
     member _.TryAdd(socket: Socket) =
@@ -49,15 +73,15 @@ type FlowBridge(target: EndPoint voption) =
             socket.Blocking <- false
             locals.[slot] <- socket
             active <- active + 1
+            opened.Add slot
             // OPEN goes out at once, so that server-first protocols work (zero-length source).
             let mutable app = Span<byte>.Empty
             if session.TryBeginSource(&app) then session.CommitSource(slot, 0, false)
+            rearm slot
             true
 
     /// The local socket of slot takes reads now.
-    member _.WantsRead(slot: int) =
-        not (isNull locals.[slot]) && not connecting.[slot] && session.FlowSending slot
-        && session.FlowRoom slot > 0
+    member _.WantsRead(slot: int) = wantsRead slot
 
     /// The local socket of slot waits for writability (connect or a short write).
     member _.WantsWrite(slot: int) = not (isNull locals.[slot]) && (connecting.[slot] || wantWrite.[slot])
@@ -84,6 +108,7 @@ type FlowBridge(target: EndPoint voption) =
                 else
                     session.CommitSource(slot, n, false)
                     budget <- budget - 1
+            rearm slot
 
     /// The local socket of slot is writable: finish a connect, then deliver again.
     member _.OnWritable(slot: int) =
@@ -93,20 +118,28 @@ type FlowBridge(target: EndPoint voption) =
             if connecting.[slot] then
                 let code = socket.GetSocketOption(SocketOptionLevel.Socket, SocketOptionName.Error) :?> int
                 connecting.[slot] <- false
-                if code <> 0 then failed.[slot] <- true
+                if code <> 0 then fail slot
             wantWrite.[slot] <- false
             if not failed.[slot] then session.PumpFlow slot
+            rewrite slot
+            rearm slot
 
     /// Report failures seen inside callbacks to the session.
     member _.Settle() =
-        for slot in 0 .. slotCount - 1 do
+        let mutable slot = failures.NextUp -1
+        while slot >= 0 do
+            failures.Remove slot
             if failed.[slot] then
                 failed.[slot] <- false
                 session.FailFlow slot
+            slot <- failures.NextUp slot
 
     /// Close every local socket (the session ended).
     member _.CloseAll() =
-        for slot in 0 .. slotCount - 1 do drop slot
+        let mutable slot = opened.NextUp -1
+        while slot >= 0 do
+            drop slot
+            slot <- opened.NextUp slot
 
     interface IFlowPort with
         member _.Open(slot, _) =
@@ -118,11 +151,14 @@ type FlowBridge(target: EndPoint voption) =
                 socket.Blocking <- false
                 locals.[slot] <- socket
                 active <- active + 1
+                opened.Add slot
                 match FlowBridge.Connect(socket, ep) with
                 | SocketError.Success -> ()
                 | SocketError.WouldBlock
                 | SocketError.InProgress -> connecting.[slot] <- true
-                | _ -> failed.[slot] <- true
+                | _ -> fail slot
+                rewrite slot
+                rearm slot
             | ValueNone -> ()
 
         member _.Write(slot, data) =
@@ -130,16 +166,20 @@ type FlowBridge(target: EndPoint voption) =
             | null -> -1
             | _ when connecting.[slot] || failed.[slot] ->
                 wantWrite.[slot] <- true
+                writers.Add slot
                 0
             | socket ->
                 let mutable err = SocketError.Success
                 let n = socket.Send(data, SocketFlags.None, &err)
                 if err = SocketError.WouldBlock then
                     wantWrite.[slot] <- true
+                    writers.Add slot
                     0
                 elif err <> SocketError.Success then -1
                 else
-                    if n < data.Length then wantWrite.[slot] <- true
+                    if n < data.Length then
+                        wantWrite.[slot] <- true
+                        writers.Add slot
                     n
 
         member _.Finish(slot) =
@@ -155,3 +195,5 @@ type FlowBridge(target: EndPoint voption) =
                 drop slot
 
         member _.Close(slot) = drop slot
+
+        member _.Credit(slot) = if not (armed.Contains slot) then rearm slot
