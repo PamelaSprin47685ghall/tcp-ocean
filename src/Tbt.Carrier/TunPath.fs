@@ -49,7 +49,9 @@ type SentSegment =
       mutable SentNs: int64
       mutable Delivered: int64
       mutable DeliveredNs: int64
-      mutable FirstSentNs: int64 }
+      mutable FirstSentNs: int64
+      /// Repair copies beyond the first, in bytes (HOLE-2 duplicates on the wire).
+      mutable Duplicates: int }
 
 type TunState =
     | SynReceived = 0
@@ -122,6 +124,7 @@ type TunPath(output: ITunOutput, counters: TunCounters, localIp: uint32, localPo
     let mutable rackSentNs = 0L
     // Delivery-rate pacer.
     let mutable delivered = 0L
+    let mutable duplicatesDelivered = 0L
     let mutable deliveredNs = now0
     let mutable lastDeliveredSentNs = now0
     let mutable srttNs = 0.0
@@ -401,6 +404,7 @@ type TunPath(output: ITunOutput, counters: TunCounters, localIp: uint32, localPo
 
     let onDelivered (s: byref<SentSegment>) (now: int64) =
         delivered <- delivered + int64 s.Length
+        duplicatesDelivered <- duplicatesDelivered + int64 s.Duplicates
         inflight <- inflight - s.Length
         // RACK time (RFC 8985 6.2): a repaired segment counts only when the ACK cannot be
         // for its first copy (at least min RTT after the repair). Otherwise a late ACK of the
@@ -472,7 +476,9 @@ type TunPath(output: ITunOutput, counters: TunCounters, localIp: uint32, localPo
         counters.SegmentsSent <- counters.SegmentsSent + int64 copies
         counters.SegmentsLost <- counters.SegmentsLost + 1L
         tokens <- tokens - float (copies * n)
-        group.OnRepair(copies * n)
+        // A demoted path has left the group's sums: its repairs do not spend the others' pacer.
+        if not demoted then group.OnRepair(copies * n)
+        s.Duplicates <- s.Duplicates + (copies - 1) * n
         s.Retx <- s.Retx + 1
         s.SentNs <- now
         s.Delivered <- delivered
@@ -637,7 +643,7 @@ type TunPath(output: ITunOutput, counters: TunCounters, localIp: uint32, localPo
                 for i in 0 .. ringCount - 1 do next.[i] <- ring.[at i]
                 ring <- next
                 ringHead <- 0
-            ring.[at ringCount] <- { Seq = sndNxt; Length = n; Kind = 0uy; Sacked = false; Retx = 0; SentNs = now
+            ring.[at ringCount] <- { Seq = sndNxt; Length = n; Kind = 0uy; Sacked = false; Retx = 0; SentNs = now; Duplicates = 0
                                      Delivered = delivered; DeliveredNs = deliveredNs; FirstSentNs = lastDeliveredSentNs }
             ringCount <- ringCount + 1
             inflight <- inflight + n
@@ -730,7 +736,8 @@ type TunPath(output: ITunOutput, counters: TunCounters, localIp: uint32, localPo
 
     interface IRateMember with
         member _.Inflight = if isDemoted (clock.NowNs()) then 0 else inflight
-        member _.Delivered = delivered
+        // Delivered segments plus their duplicate repair copies: what crossed the bottleneck.
+        member _.Delivered = delivered + duplicatesDelivered
         member _.MinRttNs = minRttNs
 
     interface IPath with
@@ -793,7 +800,7 @@ type TunPath(output: ITunOutput, counters: TunCounters, localIp: uint32, localPo
             if inflight = 0 then
                 deliveredNs <- now
                 lastDeliveredSentNs <- now
-            ring.[at ringCount] <- { Seq = sndNxt; Length = l; Kind = 1uy; Sacked = false; Retx = 0; SentNs = now
+            ring.[at ringCount] <- { Seq = sndNxt; Length = l; Kind = 1uy; Sacked = false; Retx = 0; SentNs = now; Duplicates = 0
                                      Delivered = delivered; DeliveredNs = deliveredNs; FirstSentNs = lastDeliveredSentNs }
             ringCount <- ringCount + 1
             inflight <- inflight + l

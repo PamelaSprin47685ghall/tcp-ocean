@@ -426,3 +426,39 @@ let ``downlink: the two repair copies are charged to the rate group`` () =
     let copies = f.Out.Packets.Count - n
     Assert.Equal(2, copies)
     Assert.Equal(int64 (copies * f.Out.Packets.[n].Length), group.RepairBytes)
+
+[<Fact>]
+let ``downlink: duplicate repair copies count as delivered once the segment is acked`` () =
+    let clock = ManualClock()
+    let group = RateGroup(clock)
+    let f = Fixture(1, clock, group, 40000us)
+    f.Open()
+    let ip = f.Path :> IPath
+    let m = f.Path :> IRateMember
+    ip.Backlog <- 100
+    let starts = List<uint32>()
+    for _ in 1 .. 3 do
+        clock.Now <- clock.Now + 20_000_000L
+        let mutable frame = Span<byte>.Empty
+        Assert.True(ip.TryBeginFrame(&frame))
+        frame.Fill 0x11uy
+        ip.CommitFrame()
+        starts.Add (parse f.Out.Packets.[f.Out.Packets.Count - 1]).Seq
+    let o = Array.zeroCreate<byte> 12
+    o.[0] <- 1uy
+    o.[1] <- 1uy
+    o.[2] <- 5uy
+    o.[3] <- 10uy
+    BinaryPrimitives.WriteUInt32BigEndian(Span(o, 4, 4), starts.[2])
+    BinaryPrimitives.WriteUInt32BigEndian(Span(o, 8, 4), starts.[2] + uint32 L)
+    clock.Now <- clock.Now + 40_000_000L
+    let n0 = f.Out.Packets.Count
+    let struct (s1, p1) = clientSegment (f.Data0) (starts.[1]) Packet.Ack o ReadOnlySpan.Empty
+    f.Path.OnSegment(s1, Span p1, clock.Now)
+    Assert.Equal(2, f.Out.Packets.Count - n0)
+    let before = m.Delivered
+    clock.Now <- clock.Now + 40_000_000L
+    let struct (s2, p2) = clientSegment (f.Data0) (starts.[2] + uint32 L) Packet.Ack [||] ReadOnlySpan.Empty
+    f.Path.OnSegment(s2, Span p2, clock.Now)
+    // Frame 1 acked now (frame 2 was counted at its SACK), plus one duplicate copy of frame 1.
+    Assert.Equal(before + int64 L + int64 f.Out.Packets.[n0].Length, m.Delivered)
