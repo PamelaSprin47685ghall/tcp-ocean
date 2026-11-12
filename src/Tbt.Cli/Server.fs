@@ -26,7 +26,7 @@ type private Entry(carrier: SessionCarrier, maxPaths: int) =
     member _.MaxPaths = maxPaths
 
 let run (o: Options) =
-    let listenAt = endpoint (o.Text "listen")
+    let listenAt = if o.Has "listen" then ValueSome(endpoint (o.Text "listen")) else ValueNone
     let target = endpoint (o.Text "target")
     let psks = readPsks (o.Text "psk-file")
     let mss = o.Int("mss", 1448)
@@ -39,19 +39,46 @@ let run (o: Options) =
     let offer = ServerOffer(psks, entropy, uint16 config.WindowSteps, maxPaths)
     let pending = List<Pending>()
     let sessions = List<Entry>()
-    let listener = new Socket(listenAt.AddressFamily, SocketType.Stream, ProtocolType.Tcp)
-    listener.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true)
-    listener.Bind listenAt
-    listener.Listen 512
-    listener.Blocking <- false
-    log ("server on " + listenAt.ToString() + " -> " + target.ToString())
+    // Kernel TCP listener for paths (the baseline carrier); optional when a TUN is used.
+    let listener: Socket | null =
+        match listenAt with
+        | ValueSome at ->
+            let l = new Socket(at.AddressFamily, SocketType.Stream, ProtocolType.Tcp)
+            l.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true)
+            l.Bind at
+            l.Listen 512
+            l.Blocking <- false
+            log ("server on " + at.ToString() + " (kernel TCP) -> " + target.ToString())
+            l
+        | ValueNone -> null
+    // User-space TCP on a TUN device (spec 4.1): the server's carrier for paths.
+    let tun: TunStack | null =
+        if o.Has "tun" then
+            let at = endpoint (o.Text "tun-listen")
+            match TunStack.Open(o.Text "tun", at, clock, entropy, maxPaths * 64) with
+            | null -> failwith ("cannot open TUN device " + o.Text "tun")
+            | t ->
+                log ("server on " + at.ToString() + " (user-space TCP on " + o.Text "tun" + ") -> " + target.ToString())
+                t
+        else null
+    if isNull listener && isNull tun then failwith "need --listen or --tun with --tun-listen"
 
-    let reply (link: PathLink) (frame: byte[]) =
+    let kernelReply (link: PathLink) (frame: byte[]) =
         link.Queue(ReadOnlySpan responseHead)
         link.Queue(ReadOnlySpan frame)
         link.Send() |> ignore
 
-    let tryJoinAny (link: PathLink) (frame: byte[]) =
+    let tunReply (path: TunPath) (frame: byte[]) =
+        let bytes = Array.append responseHead frame
+        path.SendReliable(ReadOnlySpan bytes)
+
+    let reply (path: IPath) (frame: byte[]) =
+        match path with
+        | :? PathLink as l -> kernelReply l frame
+        | :? TunPath as t -> tunReply t frame
+        | _ -> ()
+
+    let tryJoinAny (link: IPath) (frame: byte[]) =
         let mutable done' = false
         let mutable i = 0
         while not done' && i < sessions.Count do
@@ -64,7 +91,6 @@ let run (o: Options) =
                     let ack = joinAck s.Keys.PathKey entropy s.Keys.SessionId s.SymbolSize s.Caps e.MaxPaths (ReadOnlySpan frame) r
                                       Tbt.Crypto.Join.JoinStatus.Accept mss
                     link.PathId <- r.PathId
-                    link.Incarnation <- r.Incarnation
                     reply link ack
                     e.Carrier.AddPath link
                 else link.Close()
@@ -73,24 +99,20 @@ let run (o: Options) =
         done'
 
     /// Classify the bootstrap frame (spec 6.5.9). True when the link left the pending list.
-    let classify (p: Pending) (frame: byte[]) =
+    let classify (link: IPath) (frame: byte[]) =
         match offer.TryAccept(ReadOnlySpan frame, unixMs (), mss) with
         | ValueSome a ->
             let bridge = FlowBridge(ValueSome(target :> EndPoint))
             let session = Session(Role.Server, a.Params, bridge, clock, config)
             bridge.Attach session
             let carrier = SessionCarrier(session, bridge)
-            p.Link.PathId <- 0us
-            reply p.Link a.Reply
-            carrier.AddPath p.Link
+            link.PathId <- 0us
+            reply link a.Reply
+            carrier.AddPath link
             sessions.Add(Entry(carrier, min maxPaths (int a.Hello.MaxPaths)))
             log ("session " + a.Params.Keys.SessionId.ToString() + " up, S=" + string a.Params.Symbol)
             true
-        | ValueNone ->
-            if tryJoinAny p.Link frame then true
-            else
-                p.Silent <- true
-                false
+        | ValueNone -> tryJoinAny link frame
 
     let servicePending (poller: Poller) (now: int64) =
         let mutable i = pending.Count - 1
@@ -109,7 +131,9 @@ let run (o: Options) =
                     let mutable failed = false
                     let mutable boot = Span<byte>.Empty
                     if link.TryTakeHead(&failed) then
-                        if link.TryTakeFrame(&boot) then leave <- classify p (boot.ToArray())
+                        if link.TryTakeFrame(&boot) then
+                            leave <- classify link (boot.ToArray())
+                            if not leave then p.Silent <- true
                     elif failed then p.Silent <- true
                 if not leave && r = IoResult.Closed then
                     link.Close()
@@ -123,20 +147,41 @@ let run (o: Options) =
     let poller = Poller()
     let mutable lastStats = Environment.TickCount64
     while true do
-        poller.WatchRead listener
+        match listener with
+        | null -> ()
+        | l -> poller.WatchRead l
+        match tun with
+        | null -> ()
+        | t -> poller.WatchFd t.Fd
         for p in pending do poller.WatchRead p.Link.Socket
         for e in sessions do e.Carrier.Watch poller
-        poller.Wait 5000
+        let tunBusy =
+            match tun with
+            | null -> false
+            | t -> t.Busy
+        let busy = tunBusy || sessions.Exists(fun e -> e.Carrier.Session.WantsToSend)
+        poller.Wait(if busy then 1000 elif sessions.Count > 0 then 10_000 else 100_000)
         let now = Environment.TickCount64
-        if poller.IsReadable listener then
-            let mutable go = true
-            while go do
-                match tryAccept listener with
-                | null -> go <- false
-                | s ->
-                    SocketTuning.path s
-                    s.Blocking <- false
-                    pending.Add(Pending(PathLink(s, probe), now))
+        match listener with
+        | null -> ()
+        | l ->
+            if poller.IsReadable l then
+                let mutable go = true
+                while go do
+                    match tryAccept l with
+                    | null -> go <- false
+                    | s ->
+                        SocketTuning.path s
+                        s.Blocking <- false
+                        pending.Add(Pending(PathLink(s, probe), now))
+        match tun with
+        | null -> ()
+        | t ->
+            if poller.IsFdReadable t.Fd then t.Receive()
+            // Bootstrap frames whole on TUN paths: classify (a bad head stays silent).
+            for c in t.Fresh do
+                if c.BootState = 1 then classify c (c.BootFrame.ToArray()) |> ignore
+            t.Fresh.Clear()
         servicePending poller now
         let mutable i = sessions.Count - 1
         while i >= 0 do
@@ -147,6 +192,9 @@ let run (o: Options) =
                 c.Close()
                 sessions.RemoveAt i
             i <- i - 1
+        match tun with
+        | null -> ()
+        | t -> t.Service()
         if statsMs > 0L && now - lastStats >= statsMs then
             lastStats <- now
             let mutable fin = 0L
@@ -158,4 +206,7 @@ let run (o: Options) =
                  + " rss_kib=" + string (rssKiB ()) + " alloc_kib=" + string (GC.GetTotalAllocatedBytes false / 1024L)
                  + " gc0=" + string (GC.CollectionCount 0))
             for e in sessions do log ("stats " + e.Carrier.Describe())
+            match tun with
+            | null -> ()
+            | t -> log ("stats " + t.Describe())
     0

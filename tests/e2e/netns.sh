@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Three network namespaces near <-> wan <-> far, joined by veth pairs. The wan namespace
 # forwards every packet through wanem (user-space delay, rate and loss on a TUN device).
+# far also holds tbt0 (10.200.3.1/24) for the server's user-space TCP at 10.200.3.2.
 #   netns.sh up <workdir>      create namespaces, start wanem (config: <workdir>/wanem.conf)
 #   netns.sh down <workdir>    stop wanem, delete the namespaces
 # Needs root (run with sudo), iproute2 and gcc.
@@ -45,6 +46,14 @@ up() {
     ip -n $WAN rule add iif tbwf lookup 100 pref 101
     ip -n $WAN route add default dev tbe0 table 100
     for k in all default tbe0 tbwn tbwf; do ip netns exec $WAN sysctl -qw "net.ipv4.conf.$k.rp_filter=0"; done
+    # Server TUN (spec 12.1): the server's user-space TCP owns 10.200.3.2 behind tbt0 in far.
+    # The device belongs to the invoking user, so the server needs no root.
+    ip -n $FAR tuntap add dev tbt0 mode tun user "${SUDO_USER:-root}"
+    ip -n $FAR addr add 10.200.3.1/24 dev tbt0
+    ip -n $FAR link set tbt0 up
+    ip netns exec $FAR sysctl -qw net.ipv4.ip_forward=1
+    for k in all default tbf tbt0; do ip netns exec $FAR sysctl -qw "net.ipv4.conf.$k.rp_filter=0"; done
+    ip -n $WAN route add 10.200.3.0/24 via 10.200.2.2
 }
 
 case $cmd in
