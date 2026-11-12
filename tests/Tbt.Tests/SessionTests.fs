@@ -543,3 +543,66 @@ let ``a stall of the peer's acknowledgements does not leave the repair round tri
     Assert.True(before > 0L, msg)
     Assert.True(after * 10L >= before * 8L, msg)
     Assert.True(s.Tx.SrttNs < 4.0 * srttBefore + 5e6, msg)
+
+let karnCase (loss: float) (blackMs: int) =
+    // RTT 40 ms, 5 % loss. A 300 ms blackout strands many steps; their repair waits must not
+    // enter SRTT, else repair rounds (1.05 x SRTT apart) slow down, SRTT grows, and the
+    // tail crawls for seconds (seen in netns: srtt 286 -> 1428 ms, 4-8 steps/s).
+    let config = { SessionConfig.defaults with Credit = { CreditPolicy.defaults with Enabled = false } }
+    let pair = Pair(config, 4, loss, 31)
+    pair.Delay <- 20_000_000L
+    let c = pair.Client
+    let mutable slot = -1
+    Assert.True(c.TryOpenFlow(&slot))
+    let payload = Array.init ((500 + blackMs) * 8_000) (fun i -> byte (i * 7))
+    let mutable sent = 0
+    let feed () = sent <- sent + pair.Feed(c, slot, ReadOnlySpan(payload, sent, min 8_000 (payload.Length - sent)), false)
+    for _ in 1 .. 500 do
+        feed ()
+        pair.Round() |> ignore
+    let srtt0 = c.Tx.SrttNs
+    pair.Blackout <- true
+    for _ in 1 .. blackMs do
+        feed ()
+        pair.Round() |> ignore
+    pair.Blackout <- false
+    let mutable maxSrtt = 0.0
+    let mutable r = 0
+    while r < 20_000 && pair.ServerPort.Stream(slot).Length < int64 payload.Length do
+        feed ()
+        pair.Round() |> ignore
+        maxSrtt <- max maxSrtt c.Tx.SrttNs
+        r <- r + 1
+    let msg = sprintf "srtt before %.0f ms, max after %.0f ms, end %.0f ms; %d ms to finish; boosters %d" (srtt0 / 1e6) (maxSrtt / 1e6) (c.Tx.SrttNs / 1e6) r c.Tx.BoostersSent
+    Assert.True(pair.ServerPort.Stream(slot).Length = int64 payload.Length, msg)
+    Assert.Equal<byte[]>(payload, pair.ServerPort.Stream(slot).ToArray())
+    // SRTT stays near the path RTT (40 ms + queue), not the stall.
+    Assert.True(maxSrtt < 4.0 * max srtt0 40e6, msg)
+    Assert.True(r < 6_000, msg)
+    msg
+
+[<Theory>]
+[<InlineData(0.02, 300)>]
+[<InlineData(0.05, 300)>]
+[<InlineData(0.10, 300)>]
+let ``a repair stall does not inflate SRTT and slow every later repair (Karn)`` (loss: float, blackMs: int) =
+    // Before the fix: 2 %: SRTT 807 ms; 5 % and 10 %: SRTT 5.9 / 6.3 s, tail unfinished after 20 s.
+    karnCase loss blackMs |> ignore
+
+[<Fact>]
+let ``Karn skips samples held behind a repair but keeps clean ones`` () =
+    let config = { SessionConfig.defaults with Credit = { CreditPolicy.defaults with Enabled = false } }
+    let pair = Pair(config, 4, 0.05, 7)
+    pair.Delay <- 20_000_000L
+    let c = pair.Client
+    let mutable slot = -1
+    Assert.True(c.TryOpenFlow(&slot))
+    let data = Array.zeroCreate<byte> 8_000
+    for r in 1 .. 1000 do
+        pair.Blackout <- r > 500 && r <= 600
+        pair.Feed(c, slot, ReadOnlySpan data, false) |> ignore
+        pair.Round() |> ignore
+    Assert.True(c.Tx.RttSkipped > 0L)
+    let m = c.Tx.MinRttNs
+    Assert.True(m >= 40_000_000L && m < 60_000_000L, sprintf "min rtt %d" m)
+    Assert.True(c.Tx.RepairWaitNs <= 4.0 * float m)
