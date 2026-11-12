@@ -472,6 +472,7 @@ type TunPath(output: ITunOutput, counters: TunCounters, localIp: uint32, localPo
         counters.SegmentsSent <- counters.SegmentsSent + int64 copies
         counters.SegmentsLost <- counters.SegmentsLost + 1L
         tokens <- tokens - float (copies * n)
+        group.OnRepair(copies * n)
         s.Retx <- s.Retx + 1
         s.SentNs <- now
         s.Delivered <- delivered

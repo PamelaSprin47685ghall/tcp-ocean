@@ -32,6 +32,11 @@ type RateGroup(clock: IClock) =
     let mutable cycle = 0
     let mutable tokens = 0.0
     let mutable tokensNs = clock.NowNs()
+    let mutable repairBytes = 0L
+    /// Steady-state in-flight cap over the group BDP: 1.25 lets the 1.25 probe phase fill the
+    /// pipe and keeps the standing queue at the bottleneck to about 0.25 BDP (was 2.0: up to
+    /// one BDP of queue, docs/cases/under-bulk-tail.md).
+    static let cwndGain = 1.25
 
     let minRtt () =
         let mutable r = Int64.MaxValue
@@ -75,7 +80,7 @@ type RateGroup(clock: IClock) =
     member _.Ready = bw > 0.0 && minRtt () <> Int64.MaxValue
 
     member _.Cwnd(frameLength: int) =
-        let g = if startup then 2.885 else 2.0
+        let g = if startup then 2.885 else cwndGain
         int (g * bw * float (minRtt ())) + 4 * frameLength
 
     /// May one more frame of l bytes go now? bulk: the session has a real backlog (a refusal
@@ -92,6 +97,15 @@ type RateGroup(clock: IClock) =
         else true
 
     member _.OnSent(bytes: int) = tokens <- tokens - float bytes
+
+    /// Repair copies (HOLE-2) take the same pacer as new frames: they load the same bottleneck.
+    member _.OnRepair(bytes: int) =
+        tokens <- tokens - float bytes
+        repairBytes <- repairBytes + int64 bytes
+
+    member _.RepairBytes = repairBytes
+    member _.InStartup = startup
+    static member CwndGain = cwndGain
 
     /// One sample per round (min RTT, at least 5 ms): max filter over 10 rounds, startup,
     /// drain, 8-phase gain cycle. App-limited rounds keep the estimate.
@@ -131,5 +145,5 @@ type RateGroup(clock: IClock) =
 
     member _.Describe() =
         "group paths=" + string members.Count + " bw_mbit=" + (bw * 8000.0).ToString("F1")
-        + " inflight=" + string (inflight ()) + " phase="
+        + " inflight=" + string (inflight ()) + " repair_kib=" + string (repairBytes / 1024L) + " phase="
         + (if startup then "startup" elif draining then "drain" else "probe" + string cycle)

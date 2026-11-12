@@ -338,3 +338,91 @@ let ``downlink: a clock jump (process or box stall) does not expire every timer 
     let tail = f.Path.Counters.TailRepairs - tail0
     Assert.True(tail >= 1L && tail <= 4L, sprintf "tail repairs in 60 ms: %d of %d" tail (outstanding - outstanding / 2))
     Assert.True(f.Path.Counters.SegmentsSent - sent0 <= 16L, sprintf "segments sent %d" (f.Path.Counters.SegmentsSent - sent0))
+
+type private FakeMember() =
+    member val Inflight = 0 with get, set
+    member val Delivered = 0L with get, set
+    interface IRateMember with
+        member m.Inflight = m.Inflight
+        member m.Delivered = m.Delivered
+        member _.MinRttNs = 40_000_000L
+
+[<Fact>]
+let ``rate group: after startup the in-flight cap is 1.25 BDP, not 2`` () =
+    let clock = ManualClock()
+    let g = RateGroup(clock)
+    let a = FakeMember()
+    let b = FakeMember()
+    g.Add a
+    g.Add b
+    // The bottleneck delivers 25 000 bytes per ms (200 Mbit/s) whatever is offered.
+    for _ in 1 .. 4000 do
+        clock.Now <- clock.Now + 1_000_000L
+        a.Delivered <- a.Delivered + 12_500L
+        b.Delivered <- b.Delivered + 12_500L
+        // A backlogged sender: above the cap (the group refuses: not app-limited), except
+        // in drain, where the queue empties below one BDP (1 MB).
+        let each = if g.Describe().Contains "drain" then 400_000 else 2_000_000
+        a.Inflight <- each
+        b.Inflight <- each
+        g.TryTake(L, true) |> ignore
+        g.Service clock.Now
+    Assert.False(g.InStartup, g.Describe())
+    let bdp = g.Bandwidth * 40_000_000.0
+    Assert.InRange(g.Bandwidth, 0.024, 0.026)
+    Assert.InRange(float (g.Cwnd L), 1.25 * bdp, 1.25 * bdp + 4.0 * float L + 1.0)
+    Assert.True(float (g.Cwnd L) < 1.5 * bdp)
+    // In flight at the cap: no new frame.
+    a.Inflight <- g.Cwnd L / 2
+    b.Inflight <- g.Cwnd L / 2
+    Assert.False(g.TryTake(L, false))
+
+[<Fact>]
+let ``rate group: repair copies are paced by the group like new frames`` () =
+    let clock = ManualClock()
+    let g = RateGroup(clock)
+    let a = FakeMember()
+    g.Add a
+    for _ in 1 .. 2000 do
+        clock.Now <- clock.Now + 1_000_000L
+        a.Delivered <- a.Delivered + 25_000L
+        a.Inflight <- 0
+        g.Service clock.Now
+    Assert.True(g.Ready)
+    clock.Now <- clock.Now + 10_000_000L
+    Assert.True(g.TryTake(L, false))
+    // A burst of repairs spends the tokens: the next new frame waits.
+    g.OnRepair 1_000_000
+    Assert.False(g.TryTake(L, false))
+    Assert.Equal(1_000_000L, g.RepairBytes)
+
+[<Fact>]
+let ``downlink: the two repair copies are charged to the rate group`` () =
+    let clock = ManualClock()
+    let group = RateGroup(clock)
+    let f = Fixture(1, clock, group, 40000us)
+    f.Open()
+    let ip = f.Path :> IPath
+    ip.Backlog <- 100
+    let starts = List<uint32>()
+    for _ in 1 .. 3 do
+        clock.Now <- clock.Now + 20_000_000L
+        let mutable frame = Span<byte>.Empty
+        Assert.True(ip.TryBeginFrame(&frame))
+        frame.Fill 0x11uy
+        ip.CommitFrame()
+        starts.Add (parse f.Out.Packets.[f.Out.Packets.Count - 1]).Seq
+    let n = f.Out.Packets.Count
+    let o = Array.zeroCreate<byte> 12
+    o.[0] <- 1uy
+    o.[1] <- 1uy
+    o.[2] <- 5uy
+    o.[3] <- 10uy
+    BinaryPrimitives.WriteUInt32BigEndian(Span(o, 4, 4), starts.[2])
+    BinaryPrimitives.WriteUInt32BigEndian(Span(o, 8, 4), starts.[2] + uint32 L)
+    clock.Now <- clock.Now + 40_000_000L
+    let struct (s, p) = clientSegment (f.Data0) (starts.[1]) Packet.Ack o ReadOnlySpan.Empty
+    f.Path.OnSegment(s, Span p, clock.Now)
+    let copies = f.Out.Packets.Count - n
+    Assert.Equal(2, copies)
+    Assert.Equal(int64 (copies * f.Out.Packets.[n].Length), group.RepairBytes)
