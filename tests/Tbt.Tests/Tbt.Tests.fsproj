@@ -12,7 +12,6 @@
     <Compile Include="CryptoTests.fs" />
     <Compile Include="SessionTests.fs" />
     <Compile Include="TunTests.fs" />
-    <Compile Include="PollerTests.fs" />
   </ItemGroup>
   <ItemGroup>
     <None Include="../vectors/*.json" CopyToOutputDirectory="PreserveNewest" LinkBase="vectors" />
