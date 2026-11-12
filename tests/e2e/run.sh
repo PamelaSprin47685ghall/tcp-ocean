@@ -78,14 +78,14 @@ echo "reference, plain TCP without tunnel: $(in_ns near python3 "$work/echo.py" 
 # stalled by an earlier case shows up as a failure of the later ones.
 if [[ ${SKIP_ECHO:-0} != 1 ]]; then
 tunnel mux 10.200.2.2:7000
-run_case() { "$@" || { echo "FAILED: ${*:3}"; status=1; }; }
-run_case in_ns near python3 "$work/echo.py" check 127.0.0.1 1080 8 1000000
-run_case in_ns near python3 "$work/echo.py" check 127.0.0.1 1080 64 20000
-run_case in_ns near python3 "$work/echo.py" ping 127.0.0.1 1080 200
-run_case in_ns near python3 "$work/echo.py" bulk 127.0.0.1 1080 up "$seconds"
-run_case in_ns near python3 "$work/echo.py" bulk 127.0.0.1 1080 down "$seconds"
-run_case in_ns near python3 "$work/echo.py" pingbulk 127.0.0.1 1080 200 "$seconds"
-run_case in_ns near python3 "$work/echo.py" check 127.0.0.1 1080 8 1000000
+run_case() { "$@" || { echo "FAILED: ${*:5}"; status=1; }; }
+run_case in_ns near timeout 120 python3 "$work/echo.py" check 127.0.0.1 1080 8 1000000
+run_case in_ns near timeout 120 python3 "$work/echo.py" check 127.0.0.1 1080 64 20000
+run_case in_ns near timeout 120 python3 "$work/echo.py" ping 127.0.0.1 1080 200
+run_case in_ns near timeout 120 python3 "$work/echo.py" bulk 127.0.0.1 1080 up "$seconds"
+run_case in_ns near timeout 120 python3 "$work/echo.py" bulk 127.0.0.1 1080 down "$seconds"
+run_case in_ns near timeout 120 python3 "$work/echo.py" pingbulk 127.0.0.1 1080 200 "$seconds"
+run_case in_ns near timeout 120 python3 "$work/echo.py" check 127.0.0.1 1080 8 1000000
 report mux; stop
 fi
 
