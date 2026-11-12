@@ -283,7 +283,7 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
                     true
                 elif c.Kind = CellType.Booster then encoder.TryRenderBooster(t, int c.Span, int c.Index, symbol)
                 else encoder.TryRenderParity(t, int c.Index, field, false, symbol)
-            if rendered && Trace.enabled && traced.[index t] then
+            if rendered && TraceGate.On && traced.[index t] then
                 Trace.record Trace.Send t path (if c.Kind = CellType.Data then 0 elif c.Kind = CellType.Parity then 1 else 2)
             if rendered && c.Kind = CellType.Booster then
                 let meta =
