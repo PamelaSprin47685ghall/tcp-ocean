@@ -1,0 +1,13 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <ItemGroup>
+    <Compile Include="SocketTuning.fs" />
+    <Compile Include="PathLink.fs" />
+    <Compile Include="FlowBridge.fs" />
+    <Compile Include="Poller.fs" />
+    <Compile Include="SessionCarrier.fs" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="../Tbt.Contracts/Tbt.Contracts.fsproj" />
+    <ProjectReference Include="../Tbt.Session/Tbt.Session.fsproj" />
+  </ItemGroup>
+</Project>
