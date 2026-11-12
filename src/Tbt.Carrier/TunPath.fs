@@ -31,6 +31,8 @@ type TunCounters() =
     member val CellsReceived = 0L with get, set
     member val CellsDropped = 0L with get, set
     member val TailRepairs = 0L with get, set
+    /// Times a path was demoted: data in flight, nothing delivered for the demotion time.
+    member val Demotions = 0L with get, set
 
 [<Struct>]
 type SentSegment =
@@ -130,6 +132,10 @@ type TunPath(output: ITunOutput, counters: TunCounters, localIp: uint32, localPo
     let mutable tokens = 0.0
     let mutable tokensNs = now0
     let mutable synAckNs = now0
+    /// The SYN-ACK options, sent again unchanged when the SYN repeats.
+    let synAckOptions = Array.zeroCreate<byte> 12
+    let mutable synAckLength = 0
+    let mutable demoted = false
     /// This round met the cwnd or the pacer at least once with a real backlog (not app-limited).
     let mutable limitedThisRound = false
     let mutable appLimitedRounds = 0
@@ -341,6 +347,20 @@ type TunPath(output: ITunOutput, counters: TunCounters, localIp: uint32, localPo
                 while ivCount > maxGaps do
                     if leaseValid () then swallow false else removeInterval (ivCount - 1)
 
+    // ---- demotion ---------------------------------------------------------------------
+
+    /// A path with data in flight and no delivery for max(1 s, 3 RTO) is demoted (spec: slow
+    /// subflows are demoted, not dropped): it takes no new frames and its in-flight bytes
+    /// leave the group's sum, so one dead path cannot hold the shared cwnd of the others.
+    /// Repairs go on; the first delivery restores it.
+    let isDemoted (now: int64) =
+        let rto = max (1.15 * srttNs) (srttNs + 10_000_000.0)
+        let after = max 1_000_000_000L (int64 (3.0 * rto))
+        let d = inflight > 0 && now - deliveredNs > after
+        if d && not demoted then counters.Demotions <- counters.Demotions + 1L
+        demoted <- d
+        d
+
     // ---- send: delivery accounting -----------------------------------------------------
 
     let onDelivered (s: byref<SentSegment>) (now: int64) =
@@ -489,6 +509,7 @@ type TunPath(output: ITunOutput, counters: TunCounters, localIp: uint32, localPo
         + " min_rtt_ms=" + (if minRttNs = Int64.MaxValue then "-" else (float minRttNs / 1e6).ToString("F1"))
         + " cwnd=" + string (cwnd ()) + " inflight=" + string inflight + " peer_wnd=" + string peerWnd
         + " phase=" + (if startup then "startup" elif draining then "drain" else "probe" + string cycle)
+        + (if demoted then " demoted" else "")
     /// The HTTP head and bootstrap frame are whole: BootFrame holds the frame. -2: bad head.
     member _.BootState = if bootAt = -2 then -2 elif bootAt >= 0 && headLen >= bootAt + Layout.BootFrameLength then 1 else 0
     member _.BootFrame = ReadOnlySpan(head, bootAt, Layout.BootFrameLength)
@@ -528,6 +549,8 @@ type TunPath(output: ITunOutput, counters: TunCounters, localIp: uint32, localPo
             o.[len + 3] <- byte ourScale
             len <- len + 4
         synAckNs <- now
+        o.Slice(0, len).CopyTo(Span synAckOptions)
+        synAckLength <- len
         send (Packet.Syn ||| Packet.Ack) sndUna (Span<byte>.op_Implicit (o.Slice(0, len))) 0
         if ws < 0 then peerScale <- 0
 
@@ -538,7 +561,7 @@ type TunPath(output: ITunOutput, counters: TunCounters, localIp: uint32, localPo
             if seg.Flags &&& Packet.Syn <> 0uy then
                 // A repeated SYN: answer again with the same SYN-ACK.
                 if state = TunState.SynReceived then
-                    send (Packet.Syn ||| Packet.Ack) sndUna ReadOnlySpan.Empty 0
+                    send (Packet.Syn ||| Packet.Ack) sndUna (ReadOnlySpan(synAckOptions, 0, synAckLength)) 0
             elif seg.Flags &&& Packet.Ack <> 0uy then
                 let ack64 = unwrapTx seg.AckNo
                 if state = TunState.SynReceived && ack64 = sndUna + 1UL then
@@ -645,7 +668,7 @@ type TunPath(output: ITunOutput, counters: TunCounters, localIp: uint32, localPo
             state <- TunState.Closed
 
     interface IRateMember with
-        member _.Inflight = inflight
+        member _.Inflight = if isDemoted (clock.NowNs()) then 0 else inflight
         member _.Delivered = delivered
         member _.MinRttNs = minRttNs
 
@@ -677,6 +700,7 @@ type TunPath(output: ITunOutput, counters: TunCounters, localIp: uint32, localPo
                 let l = frameLength
                 let bulk = backlog >= 16
                 if int (sndNxt + uint64 l - sndUna) > peerWnd then false
+                elif isDemoted (clock.NowNs()) then false
                 elif group.Ready then
                     // The group gates the shared bottleneck; this path keeps its estimate.
                     if group.TryTake(l, bulk) then

@@ -51,11 +51,10 @@ let synOptions = [| 2uy; 4uy; 0x05uy; 0xB4uy; 1uy; 1uy; 4uy; 2uy; 1uy; 3uy; 3uy;
 
 /// A connection through the head and the bootstrap frame, attached, with frames
 /// 0..frames-1 of distinct content ready as the client's byte stream.
-type Fixture(frames: int) =
-    let clock = ManualClock()
+type Fixture(frames: int, clock: ManualClock, group: RateGroup, clientPort: uint16) =
     let out = RecordingOutput()
     let owner = RecordingOwner()
-    let path = TunPath(out, TunCounters(), serverIp, 8443us, clientIp, 40000us, 1000u, clock, RateGroup(clock))
+    let path = TunPath(out, TunCounters(), serverIp, 8443us, clientIp, clientPort, 1000u, clock, group)
     let clientIsn = 5000u
     let head = "POST / HTTP/1.1\r\nHost: x\r\n\r\n"B
     let boot = Array.init Tbt.Contracts.Layout.BootFrameLength (fun i -> byte (i * 7))
@@ -63,6 +62,9 @@ type Fixture(frames: int) =
     do
         let struct (syn, sp) = clientSegment clientIsn 0u Packet.Syn synOptions ReadOnlySpan.Empty
         path.OnSyn(syn.Seq, ReadOnlySpan(sp, syn.OptionsAt, syn.OptionsLength), 1460, clock.Now)
+    new(frames: int) =
+        let clock = ManualClock()
+        Fixture(frames, clock, RateGroup(clock), 40000us)
     member _.Clock = clock
     member _.Out = out
     member _.Owner = owner
@@ -207,3 +209,78 @@ let ``downlink: a late ACK of a repaired segment's first copy does not move the 
     f.Clock.Now <- f.Clock.Now + 1_000_000L
     ack (starts.[2] + l) []
     Assert.Equal(sentAt.[2], f.Path.RackSentNs)
+
+[<Fact>]
+let ``handshake: a repeated SYN gets the same SYN-ACK options (MSS, SACK, window scale)`` () =
+    let f = Fixture 1
+    let first = f.Out.Packets.[0]
+    let struct (syn, sp) = clientSegment 5000u 0u Packet.Syn synOptions ReadOnlySpan.Empty
+    f.Path.OnSegment(syn, Span sp, f.Clock.Now)
+    Assert.Equal(2, f.Out.Packets.Count)
+    let a = parse first
+    let b = parse f.Out.Packets.[1]
+    Assert.Equal(Packet.Syn ||| Packet.Ack, b.Flags)
+    Assert.True(a.OptionsLength > 0)
+    Assert.Equal<byte[]>(first.[a.OptionsAt .. a.OptionsAt + a.OptionsLength - 1],
+                         f.Out.Packets.[1].[b.OptionsAt .. b.OptionsAt + b.OptionsLength - 1])
+
+[<Fact>]
+let ``rate group: one path that never ACKs is demoted and the other paths keep sending`` () =
+    // Two paths to one client share a group. Both carry bulk with ACKs after 40 ms; then
+    // path B gets no ACK at all (as path 3 in the A/B run). Its in-flight bytes must not hold
+    // the shared cwnd: path A goes on, B takes no new frames and keeps repairing.
+    let clock = ManualClock()
+    let group = RateGroup(clock)
+    let fa = Fixture(1, clock, group, 40000us)
+    let fb = Fixture(1, clock, group, 40001us)
+    // Handshake RTT 40 ms, as the link in the e2e runs.
+    clock.Now <- clock.Now + 40_000_000L
+    fa.Open()
+    fb.Open()
+    group.Add(fa.Path :> IRateMember)
+    group.Add(fb.Path :> IRateMember)
+    let l = uint32 L
+    let ack (f: Fixture) (cum: uint32) =
+        let struct (s, p) = clientSegment f.Data0 cum Packet.Ack [||] ReadOnlySpan.Empty
+        f.Path.OnSegment(s, Span p, clock.Now)
+    let lanes =
+        [| for f in [ fa; fb ] ->
+            let ip = f.Path :> IPath
+            ip.Backlog <- 100
+            f, ip, List<uint32>(), List<int64>(), ref 0 |]
+    let step (bAcks: bool) =
+        clock.Now <- clock.Now + 1_000_000L
+        let mutable sent = [| 0; 0 |]
+        // B is asked first: a dead path that keeps taking new frames takes them from A.
+        for k in [ 1; 0 ] do
+            let f, ip, starts, sentAt, acked = lanes.[k]
+            if k = 0 || bAcks then
+                while acked.Value < sentAt.Count && clock.Now - sentAt.[acked.Value] >= 40_000_000L do
+                    acked.Value <- acked.Value + 1
+                if acked.Value > 0 then ack f (starts.[acked.Value - 1] + l)
+            let mutable frame = Span<byte>.Empty
+            let mutable go = true
+            while go && ip.TryBeginFrame(&frame) do
+                frame.Fill 0x44uy
+                ip.CommitFrame()
+                starts.Add (parse f.Out.Packets.[f.Out.Packets.Count - 1]).Seq
+                sentAt.Add clock.Now
+                sent.[k] <- sent.[k] + 1
+                if sent.[k] >= 4 then go <- false
+            f.Path.Service clock.Now
+        group.Service clock.Now
+        sent
+    for _ in 1 .. 1000 do step true |> ignore
+    Assert.True(group.Ready, sprintf "not ready: %s; A %s; sent %d" (group.Describe()) (fa.Path.Describe()) (let _, _, s, _, _ = lanes.[0] in s.Count))
+    let countA () = let _, _, starts, _, _ = lanes.[0] in starts.Count
+    let countB () = let _, _, starts, _, _ = lanes.[1] in starts.Count
+    // B goes dead.
+    for _ in 1 .. 1500 do step false |> ignore
+    let a0 = countA ()
+    let b0 = countB ()
+    for _ in 1 .. 1000 do step false |> ignore
+    // The last second: A still sends at a real rate, B sends no new frames.
+    Assert.True(countA () - a0 > 2000, sprintf "path A sent %d frames in the last second (at most 4000): %s" (countA () - a0) (group.Describe()))
+    Assert.Equal(b0, countB ())
+    Assert.True(fb.Path.Counters.Demotions >= 1L, sprintf "B not demoted: %s | A %s | B %s | A sent %d" (group.Describe()) (fa.Path.Describe()) (fb.Path.Describe()) (countA () - a0))
+    Assert.True(fb.Path.Counters.TailRepairs > 0L, "B made no repairs")
