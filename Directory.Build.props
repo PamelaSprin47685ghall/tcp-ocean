@@ -14,5 +14,7 @@
   <!-- Library code must stay usable from the NativeAOT server: no reflection, no trimming hazards. -->
   <PropertyGroup Condition="$(MSBuildProjectName.StartsWith('Tbt.')) and !$(MSBuildProjectName.EndsWith('.Tests'))">
     <IsAotCompatible>true</IsAotCompatible>
+    <!-- No generated %A ToString on records and unions: it pulls F# printf (reflection) into the AOT image. -->
+    <OtherFlags>$(OtherFlags) --reflectionfree</OtherFlags>
   </PropertyGroup>
 </Project>
