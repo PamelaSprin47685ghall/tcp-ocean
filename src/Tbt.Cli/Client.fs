@@ -76,8 +76,7 @@ let run (o: Options) =
     | JoinBootstrap.Joined ->
         let struct (link0, p, hello) = accepted.Value
         let bridge = FlowBridge ValueNone
-        let clock = CachedClock(SystemClock())
-        let session = Session(Role.Client, p, bridge, clock, config)
+        let session = Session(Role.Client, p, bridge, SystemClock(), config)
         bridge.Attach session
         let pace = o.Int("uplink-pace", 0) <> 0
         let tupleMbit = if pace then max 0.0 (o.Float("tuple-mbit", 0.0)) else 0.0
@@ -143,7 +142,6 @@ let run (o: Options) =
             poller.WatchRead listener
             carrier.Watch poller
             poller.Wait(carrier.WaitMs())
-            clock.Tick() |> ignore
             if poller.IsReadable listener then
                 let mutable go = true
                 while go do

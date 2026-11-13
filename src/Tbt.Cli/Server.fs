@@ -36,7 +36,7 @@ let run (o: Options) =
     let statsMs = int64 (o.Int("stats-s", 0)) * 1000L
     let config = { SessionConfig.defaults with WindowSteps = o.Int("window", 1024); MaxPaths = maxPaths; NewRepair = o.Int("new-repair", 0) <> 0 }
     let entropy = SystemEntropy()
-    let clock = CachedClock(SystemClock())
+    let clock = SystemClock()
     let probe = SocketTuning.probe ()
     let offer = ServerOffer(psks, entropy, uint16 config.WindowSteps, maxPaths)
     let pending = List<Pending>()
@@ -178,7 +178,6 @@ let run (o: Options) =
             | t -> t.Busy
         let busy = tunBusy || sessions.Exists(fun e -> e.Carrier.Session.WantsToSend)
         poller.Wait(if busy then 1000 elif sessions.Count > 0 then 10_000 else 100_000)
-        clock.Tick() |> ignore
         let now = Environment.TickCount64
         match listener with
         | null -> ()
