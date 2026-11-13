@@ -725,7 +725,6 @@ let ``a NACK does not enqueue repairs until the original's delivery deadline has
     clock.Now <- clock.Now + 400_000_000L
     c.Tx.OnPeerAck(1UL, 100us)
     Assert.True(c.Tx.MinRttNs <> Int64.MaxValue)
-    // A just-sealed step is NACKed immediately (as a 20 ms / +66 decoder NACK would).
     let tLo = 1UL
     Assert.True(c.Tx.Head > tLo)
     let wait = c.Tx.RepairWaitNs
@@ -737,7 +736,36 @@ let ``a NACK does not enqueue repairs until the original's delivery deadline has
     Assert.True(c.Tx.RepairWaiting, "deadline passed; a repair round is due")
 
 [<Fact>]
-let ``a NACK repairs only the prefix of the range whose originals are due`` () =
+let ``a NACK does not enqueue repairs before a minRTT sample exists`` () =
+    let config = { SessionConfig.defaults with Credit = { CreditPolicy.defaults with Enabled = false } }
+    let pair = Pair(config, 1, 0.0, 4)
+    let c = pair.Client
+    let clock = pair.Clock
+    c.Tx.InitialGrant 10_000UL
+    let mutable slot = -1
+    Assert.True(c.TryOpenFlow(&slot))
+    let chunk = Array.create 65536 7uy
+    let mutable guard = 64
+    while c.Tx.Head < 2UL && guard > 0 do
+        pair.Feed(c, slot, ReadOnlySpan chunk, false) |> ignore
+        c.Tx.Flush()
+        guard <- guard - 1
+    let sealedAt = clock.Now
+    Assert.True(c.Tx.MinRttNs = Int64.MaxValue)
+    let tLo = 1UL
+    Assert.True(c.Tx.Head > tLo)
+    clock.Now <- sealedAt + 200_000_000L
+    c.Tx.OnNack(tLo, 1, 4)
+    Assert.False(c.Tx.RepairWaiting, "no expected arrival until a minRTT sample")
+    clock.Now <- sealedAt + 400_000_000L
+    c.Tx.OnPeerAck(1UL, 100us)
+    Assert.True(c.Tx.MinRttNs <> Int64.MaxValue)
+    clock.Now <- sealedAt + int64 c.Tx.RepairWaitNs
+    c.Tx.OnNack(tLo, 1, 4)
+    Assert.True(c.Tx.RepairWaiting, "deadline passed after a minRTT sample")
+
+[<Fact>]
+let ``a NACK repairs only the steps of the range whose originals are due`` () =
     let config = { SessionConfig.defaults with Credit = { CreditPolicy.defaults with Enabled = false } }
     let pair = Pair(config, 1, 0.0, 4)
     let c = pair.Client
@@ -756,13 +784,10 @@ let ``a NACK repairs only the prefix of the range whose originals are due`` () =
     sealUntil 2UL
     let earlySealed = clock.Now
     clock.Now <- earlySealed + 400_000_000L
-    // One early step left outstanding so the NACK range starts at a due
-    // frontier; a first flush may already have sealed many steps.
     let tLo = c.Tx.Head - 1UL
     c.Tx.OnPeerAck(tLo, 100us)
     Assert.True(c.Tx.MinRttNs <> Int64.MaxValue)
     let wait = c.Tx.RepairWaitNs
-    // Seal the tail 1 ms before the frontier's deadline so only tLo is due.
     clock.Now <- earlySealed + int64 wait - 1_000_000L
     sealUntil (c.Tx.Head + 4UL)
     let span = int (c.Tx.Head - tLo)
@@ -778,13 +803,12 @@ let ``a NACK repairs only the prefix of the range whose originals are due`` () =
         n <- n + 1
     let sent = c.Tx.BoostersSent - before
     // Full-span, full-deficit would enqueue ceil((30+2)/(1-0.05)) ≈ 34 BOOSTERs.
-    // A due prefix of one (or a few) early steps gets a scaled deficit and a
-    // much smaller batch.
+    // Only the due prefix is sent; the fresh tail is armed, not sent.
     Assert.True(sent >= 1L && sent <= 16L, sprintf "boosters %d span %d wait %g" sent span wait)
     Assert.False(c.Tx.RepairWaiting)
 
 [<Fact>]
-let ``a growing NACK deficit does not skip the repair wait for the same hole`` () =
+let ``a growing NACK deficit does not skip the last-repair wait for that step`` () =
     let config = { SessionConfig.defaults with Credit = { CreditPolicy.defaults with Enabled = false } }
     let pair = Pair(config, 1, 0.0, 4)
     let c = pair.Client
@@ -813,18 +837,16 @@ let ``a growing NACK deficit does not skip the repair wait for the same hole`` (
         n <- n + 1
     let afterFirst = c.Tx.BoostersSent
     Assert.True(afterFirst >= 1L)
-    // A 10 ms WIN_ACK with a larger deficit, still inside RepairWait.
     clock.Now <- clock.Now + 10_000_000L
     c.Tx.OnNack(tLo, 1, 30)
-    Assert.False(c.Tx.RepairWaiting, "deficit growth must not skip the wait")
+    Assert.False(c.Tx.RepairWaiting, "deficit growth must not skip this step's wait")
     Assert.Equal(afterFirst, c.Tx.BoostersSent)
-    // After the deadline, another round may go.
     clock.Now <- clock.Now + int64 wait
     c.Tx.OnNack(tLo, 1, 30)
-    Assert.True(c.Tx.RepairWaiting, "a later round is due once the wait has passed")
+    Assert.True(c.Tx.RepairWaiting, "a later round is due once this step's wait has passed")
 
 [<Fact>]
-let ``a NACK does not enqueue repairs before a minRTT sample exists`` () =
+let ``a moving NACK frontier does not make a not-yet-due step eligible`` () =
     let config = { SessionConfig.defaults with Credit = { CreditPolicy.defaults with Enabled = false } }
     let pair = Pair(config, 1, 0.0, 4)
     let c = pair.Client
@@ -838,61 +860,35 @@ let ``a NACK does not enqueue repairs before a minRTT sample exists`` () =
         pair.Feed(c, slot, ReadOnlySpan chunk, false) |> ignore
         c.Tx.Flush()
         guard <- guard - 1
-    let sealedAt = clock.Now
-    Assert.True(c.Tx.MinRttNs = Int64.MaxValue)
-    let tLo = 1UL
-    Assert.True(c.Tx.Head > tLo)
-    // Well past 1.05 × the default 100 ms SRTT, but no path sample yet.
-    clock.Now <- sealedAt + 200_000_000L
-    c.Tx.OnNack(tLo, 1, 4)
-    Assert.False(c.Tx.RepairWaiting, "no expected arrival until a minRTT sample")
-    clock.Now <- sealedAt + 400_000_000L
+    let earlySealed = clock.Now
+    clock.Now <- earlySealed + 400_000_000L
     c.Tx.OnPeerAck(1UL, 100us)
-    Assert.True(c.Tx.MinRttNs <> Int64.MaxValue)
-    clock.Now <- sealedAt + int64 c.Tx.RepairWaitNs
-    c.Tx.OnNack(tLo, 1, 4)
-    Assert.True(c.Tx.RepairWaiting, "deadline passed after a minRTT sample")
-
-[<Fact>]
-let ``a sliding NACK frontier inside the last repaired span does not skip the wait`` () =
-    let config = { SessionConfig.defaults with Credit = { CreditPolicy.defaults with Enabled = false } }
-    let pair = Pair(config, 1, 0.0, 4)
-    let c = pair.Client
-    let clock = pair.Clock
-    c.Tx.InitialGrant 10_000UL
-    let mutable slot = -1
-    Assert.True(c.TryOpenFlow(&slot))
-    let chunk = Array.create 65536 7uy
-    let mutable guard = 64
-    while c.Tx.Head < 4UL && guard > 0 do
+    let wait = c.Tx.RepairWaitNs
+    // A later step, sealed 1 ms before the first step's deadline, is not due.
+    clock.Now <- earlySealed + int64 wait - 1_000_000L
+    let lateLo = c.Tx.Head
+    guard <- 64
+    while c.Tx.Head < lateLo + 2UL && guard > 0 do
         pair.Feed(c, slot, ReadOnlySpan chunk, false) |> ignore
         c.Tx.Flush()
         guard <- guard - 1
-    let sealedAt = clock.Now
-    clock.Now <- sealedAt + 400_000_000L
-    c.Tx.OnPeerAck(1UL, 100us)
-    Assert.True(c.Tx.Head >= 3UL, sprintf "head %d" c.Tx.Head)
-    let wait = c.Tx.RepairWaitNs
-    clock.Now <- sealedAt + int64 wait
-    c.Tx.OnNack(1UL, 2, 4)
-    Assert.True(c.Tx.RepairWaiting)
+    Assert.True(c.Tx.Head > lateLo, sprintf "head %d lateLo %d" c.Tx.Head lateLo)
+    clock.Now <- earlySealed + int64 wait
+    c.Tx.OnNack(1UL, 1, 4)
+    Assert.True(c.Tx.RepairWaiting, "the early step is due")
     let frame = Array.zeroCreate<byte> c.FrameLength
     let mutable n = 0
     while c.Tx.RepairWaiting && n < 64 do
         Assert.True(c.Tx.TryRenderNext(Span frame, 0us, 1UL, 100us, 0us, true))
         n <- n + 1
     let afterFirst = c.Tx.BoostersSent
-    // Frontier slides to a later step still inside the span we just repaired.
-    clock.Now <- clock.Now + 10_000_000L
-    c.Tx.OnNack(2UL, 1, 4)
-    Assert.False(c.Tx.RepairWaiting, "a sliding tLo must not skip the wait")
+    // Frontier slides to the later step: it is not yet past its own arrival.
+    c.Tx.OnNack(lateLo, 1, 4)
+    Assert.False(c.Tx.RepairWaiting, "frontier motion must not create eligibility")
     Assert.Equal(afterFirst, c.Tx.BoostersSent)
-    clock.Now <- clock.Now + int64 wait
-    c.Tx.OnNack(2UL, 1, 4)
-    Assert.True(c.Tx.RepairWaiting, "a later round is due once the wait has passed")
 
 [<Fact>]
-let ``a NACK past the last repaired span still waits RepairWait before a new round`` () =
+let ``a never-repaired step is eligible on its own deadline after another step was repaired`` () =
     let config = { SessionConfig.defaults with Credit = { CreditPolicy.defaults with Enabled = false } }
     let pair = Pair(config, 1, 0.0, 4)
     let c = pair.Client
@@ -902,7 +898,7 @@ let ``a NACK past the last repaired span still waits RepairWait before a new rou
     Assert.True(c.TryOpenFlow(&slot))
     let chunk = Array.create 65536 7uy
     let mutable guard = 64
-    while c.Tx.Head < 6UL && guard > 0 do
+    while c.Tx.Head < 5UL && guard > 0 do
         pair.Feed(c, slot, ReadOnlySpan chunk, false) |> ignore
         c.Tx.Flush()
         guard <- guard - 1
@@ -920,14 +916,54 @@ let ``a NACK past the last repaired span still waits RepairWait before a new rou
         Assert.True(c.Tx.TryRenderNext(Span frame, 0us, 1UL, 100us, 0us, true))
         n <- n + 1
     let afterFirst = c.Tx.BoostersSent
-    // A hole well past the last span: still inside RepairWait of the previous round.
+    // Step 4 was sealed with step 1, was never repaired, and is past its own
+    // arrival: a global wait would have blocked it (1b197b5); per-step does not.
     clock.Now <- clock.Now + 10_000_000L
     c.Tx.OnNack(4UL, 1, 4)
-    Assert.False(c.Tx.RepairWaiting, "a later tLo must not skip the wait")
-    Assert.Equal(afterFirst, c.Tx.BoostersSent)
-    clock.Now <- clock.Now + int64 wait
-    c.Tx.OnNack(4UL, 1, 4)
-    Assert.True(c.Tx.RepairWaiting, "a later round is due once the wait has passed")
+    Assert.True(c.Tx.RepairWaiting, "a due never-repaired step has its own deadline")
+    Assert.True(c.Tx.BoostersSent = afterFirst, "boosters are queued, not yet sent")
+    Assert.True(c.Tx.TryRenderNext(Span frame, 0us, 1UL, 100us, 0us, true))
+    Assert.True(c.Tx.BoostersSent > afterFirst)
+
+[<Fact>]
+let ``Karn still samples a never-repaired step after a neighbour was repaired`` () =
+    let config = { SessionConfig.defaults with Credit = { CreditPolicy.defaults with Enabled = false } }
+    let pair = Pair(config, 1, 0.0, 4)
+    let c = pair.Client
+    let clock = pair.Clock
+    c.Tx.InitialGrant 10_000UL
+    let mutable slot = -1
+    Assert.True(c.TryOpenFlow(&slot))
+    let chunk = Array.create 65536 7uy
+    let mutable guard = 64
+    while c.Tx.Head < 5UL && guard > 0 do
+        pair.Feed(c, slot, ReadOnlySpan chunk, false) |> ignore
+        c.Tx.Flush()
+        guard <- guard - 1
+    let sealedAt = clock.Now
+    clock.Now <- sealedAt + 400_000_000L
+    c.Tx.OnPeerAck(1UL, 100us)
+    Assert.Equal(0L, c.Tx.RttSkipped)
+    let wait = c.Tx.RepairWaitNs
+    clock.Now <- sealedAt + int64 wait
+    c.Tx.OnNack(1UL, 1, 4)
+    Assert.True(c.Tx.RepairWaiting)
+    let frame = Array.zeroCreate<byte> c.FrameLength
+    let mutable n = 0
+    while c.Tx.RepairWaiting && n < 64 do
+        Assert.True(c.Tx.TryRenderNext(Span frame, 0us, 1UL, 100us, 0us, true))
+        n <- n + 1
+    // Ack only the repaired step: that sample is skipped.
+    clock.Now <- clock.Now + 400_000_000L
+    c.Tx.OnPeerAck(2UL, 100us)
+    Assert.True(c.Tx.RttSkipped >= 1L, sprintf "skipped %d" c.Tx.RttSkipped)
+    let skipped = c.Tx.RttSkipped
+    let srtt = c.Tx.SrttNs
+    // A later never-repaired step in the same jump would have been silenced
+    // by the old global Karn rule (repairLo < ack && repairNs >= sealAt).
+    c.Tx.OnPeerAck(4UL, 100us)
+    Assert.Equal(skipped, c.Tx.RttSkipped)
+    Assert.True(c.Tx.SrttNs <> srtt, sprintf "srtt stayed %g" srtt)
 
 [<Fact>]
 let ``an ack that arrives sooner than minRTT after a BOOSTER counts as a spurious repair`` () =

@@ -76,14 +76,20 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
     let mutable urgentFull = 0L
     let mutable urgentSteps = 0L
     let mutable urgentSources = 0L
-    let mutable repairLo = UInt64.MaxValue
-    let mutable repairSpan = 0
-    let mutable repairSeq = 0
-    let mutable repairDeficit = 0
-    let mutable repairNs = 0L
     let mutable boostersSent = 0L
-    /// Seal time per step, for the round-trip estimate (seal to ack).
+    /// Seal time per step, for the round-trip estimate (seal to ack) and per-step
+    /// expected arrival (seal + RepairWait).
     let sealNs: int64[] = Array.zeroCreate encoder.Capacity
+    /// Last BOOSTER (or DATA-repair) send time for the step; 0 if never repaired.
+    let lastRepairNs: int64[] = Array.zeroCreate encoder.Capacity
+    /// BOOSTER seeds already used for this generation of the step (0..256).
+    let repairCount: int[] = Array.zeroCreate encoder.Capacity
+    /// Deficit remembered from a NACK until a due repair is sent.
+    let pendingDeficit: int[] = Array.zeroCreate encoder.Capacity
+    /// Deadline last inserted into dueQ for this step (stale heap entries are ignored).
+    let nextDeadlineNs: int64[] = Array.zeroCreate encoder.Capacity
+    /// Min-heap of (step, deadline): O(eligible), not O(in-flight).
+    let dueQ = PriorityQueue<uint64, int64>()
     /// Steps sealAt as interactive (for the opt-in latency trace).
     let traced: bool[] = Array.zeroCreate capacity
     let mutable srttNs = 100_000_000.0
@@ -114,7 +120,12 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
         let t = encoder.Seal k
         traced.[index t] <- wasUrgent
         if wasUrgent then Trace.record Trace.Seal t 0us k
-        sealNs.[int (t % uint64 sealNs.Length)] <- clock.NowNs()
+        let si = int (t % uint64 sealNs.Length)
+        sealNs.[si] <- clock.NowNs()
+        lastRepairNs.[si] <- 0L
+        repairCount.[si] <- 0
+        pendingDeficit.[si] <- 0
+        nextDeadlineNs.[si] <- 0L
         let m =
             if small then max (int (ceil (float k * rho))) smallParities.[k]
             else
@@ -197,20 +208,20 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
         if ack <= encoder.Head then
             if ack > peerAck then
                 // Round-trip estimate from seal to custody of the newest acked step.
-                // Karn: a step held behind a repair round started after its seal measures the
-                // repair wait, not the path; such samples would raise SRTT, which spaces repair
-                // rounds further apart, which holds steps longer (runaway).
-                // Only the newest covered step (ack - 1): a jump must not
-                // feed seal-to-custody of older steps in the gap into SRTT.
-                // Credit unique cells of newly acked steps before Release may drop StepUsed.
+                // Karn: only a never-repaired step measures the path. A sample
+                // taken behind a repair of *that* step measures the wait, not
+                // the path, and would stretch later deadlines. A repair of a
+                // neighbour must not silence sampling globally (8-path first
+                // echo: one early BOOSTER made rtt_skipped 191, SRTT stuck at
+                // 100 ms, minRTT unset until the burst ended). Of a jump, use
+                // the newest never-repaired step so older gaps do not enter
+                // SRTT. Credit unique cells before Release may drop StepUsed.
                 let mutable tAck = peerAck
                 while tAck < ack do
                     uniqueAcked <- uniqueAcked + int64 uniqueCells.[index tAck]
                     uniqueCells.[index tAck] <- 0
                     tAck <- tAck + 1UL
                 let now = clock.NowNs()
-                let sealAt = sealNs.[int ((ack - 1UL) % uint64 sealNs.Length)]
-                let sample = now - sealAt
                 // A BOOSTER cannot complete a minRTT after it was sent: an earlier
                 // ack is the original first copy arriving — the repair was spurious.
                 let minRtt = min minCurNs minPrevNs
@@ -222,8 +233,18 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
                         spuriousRepairs <- spuriousRepairs + 1L
                     boostSentNs.[bi] <- 0L
                     tSp <- tSp + 1UL
-                if repairLo < ack && repairNs >= sealAt then rttSkipped <- rttSkipped + 1L
-                elif sample > 0L then
+                let mutable tSamp = ack
+                let mutable foundClean = false
+                let mutable sealAt = 0L
+                while tSamp > peerAck && not foundClean do
+                    tSamp <- tSamp - 1UL
+                    let si = int (tSamp % uint64 lastRepairNs.Length)
+                    if lastRepairNs.[si] = 0L then
+                        foundClean <- true
+                        sealAt <- sealNs.[int (tSamp % uint64 sealNs.Length)]
+                if not foundClean then rttSkipped <- rttSkipped + 1L
+                elif now - sealAt > 0L then
+                    let sample = now - sealAt
                     // Clamp to k × minRTT so one long custody delay cannot
                     // drag the session SRTT (minRTT itself stays raw).
                     let m = min minCurNs minPrevNs
@@ -262,13 +283,14 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
     member _.MinRttNs = min minCurNs minPrevNs
     /// RTT samples skipped by the Karn rule.
     member _.RttSkipped = rttSkipped
-    /// Repair rounds repeated for the same range because the wait ran out.
+    /// Times a step was repaired again after its last-repair wait ran out.
     member _.RepairRepeats = repairRepeats
     /// Repair deadline: minRTT + measured queueing and variance
     /// (clamped SRTT + 4·RTTVAR), floored at minRTT and capped at 4×minRTT.
     /// 1.05×minRTT alone fires on any standing queue above 5% of minRTT
     /// (894194e), which turns paced bulk into a spurious BOOSTER storm.
-    /// Before a min sample, 1.05 × session SRTT.
+    /// Before a min sample the value is 1.05 × session SRTT, but OnNack does
+    /// not repair (expected arrival is unknown).
     member _.RepairWaitNs =
         let m = min minCurNs minPrevNs
         if m = Int64.MaxValue then 1.05 * srttNs
@@ -279,74 +301,100 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
     member _.SpuriousRepairs = spuriousRepairs
     member _.RttVarNs = rttvarNs
 
+    /// Per-step eligibility: now > seal + RepairWait and, if the step was
+    /// already repaired, now > lastRepair + RepairWait. No minRTT sample
+    /// means no expected arrival, so nothing is due. Frontier motion does
+    /// not create eligibility.
+    member private this.StepDue(t: uint64, now: int64, wait: int64) =
+        let cap = sealNs.Length
+        let si = int (t % uint64 cap)
+        let sealAt = sealNs.[si]
+        let last = lastRepairNs.[si]
+        let minRtt = min minCurNs minPrevNs
+        minRtt <> Int64.MaxValue && t >= peerAck && t < encoder.Head && encoder.StepUsed t > 0
+        && sealAt > 0L && now - sealAt >= wait && (last = 0L || now - last >= wait)
+
+    /// Record a NACK against step t and insert it into the deadline heap.
+    member private this.ArmStep(t: uint64, deficit: int, now: int64, wait: int64) =
+        if t < peerAck || t >= encoder.Head || encoder.StepUsed t = 0 || deficit < 1 then ()
+        else
+            let si = int (t % uint64 sealNs.Length)
+            let sealAt = sealNs.[si]
+            if sealAt <= 0L then ()
+            else
+                pendingDeficit.[si] <- max pendingDeficit.[si] deficit
+                let last = lastRepairNs.[si]
+                let dueAt =
+                    let first = sealAt + wait
+                    if last = 0L then first else max first (last + wait)
+                if nextDeadlineNs.[si] <> dueAt then
+                    nextDeadlineNs.[si] <- dueAt
+                    dueQ.Enqueue(t, dueAt)
+
+    /// Send a due step's own deficit as BOOSTERs (or DATA once 256 seeds are used).
+    member private this.SendStepRepair(t: uint64, now: int64) =
+        let si = int (t % uint64 sealNs.Length)
+        let deficit = pendingDeficit.[si]
+        if deficit < 1 then ()
+        else
+            let room = max 0 (256 - repairs.Count)
+            let n = min room (min 64 (int (ceil (float (deficit + 2) / (1.0 - min 0.9 erasure)))))
+            if room = 0 || n < 1 then ()
+            else
+                if lastRepairNs.[si] > 0L then repairRepeats <- repairRepeats + 1L
+                lastRepairNs.[si] <- now
+                pendingDeficit.[si] <- 0
+                nextDeadlineNs.[si] <- 0L
+                if repairCount.[si] + n <= 256 then
+                    for i in 0 .. n - 1 do
+                        repairs.Enqueue
+                            { Kind = CellType.Booster; Step = t; Index = byte (repairCount.[si] + i)
+                              Span = 1uy; Round = byte n }
+                    repairCount.[si] <- repairCount.[si] + n
+                else
+                    for s in 0 .. encoder.StepUsed t - 1 do
+                        if repairs.Count < 256 then
+                            repairs.Enqueue { Kind = CellType.Data; Step = t; Index = byte s; Span = 0uy; Round = 0uy }
+
+    /// Pop every step whose deadline has passed; O(due this call).
+    member private this.DrainDueRepairs() =
+        let minRtt = min minCurNs minPrevNs
+        if minRtt = Int64.MaxValue then ()
+        else
+            let now = clock.NowNs()
+            let wait = int64 this.RepairWaitNs
+            let mutable step = 0UL
+            let mutable deadline = 0L
+            while repairs.Count < 256 && dueQ.TryPeek(&step, &deadline) && deadline <= now do
+                dueQ.Dequeue() |> ignore
+                let si = int (step % uint64 nextDeadlineNs.Length)
+                if nextDeadlineNs.[si] <> deadline then ()
+                elif step < peerAck || pendingDeficit.[si] < 1 then
+                    nextDeadlineNs.[si] <- 0L
+                elif this.StepDue(step, now, wait) then
+                    this.SendStepRepair(step, now)
+                else
+                    this.ArmStep(step, pendingDeficit.[si], now, wait)
+
     /// A NACK from the peer's WIN_ACK (spec 5.8): steps [tLo, tLo + span) lack deficit ranks.
-    /// One round sends n = ceil((deficit + 2) / (1 - eps)) BOOSTERs. No repair until a
-    /// minRTT sample exists (expected arrival is otherwise unknown). Only the prefix
-    /// of steps whose first copy has been allowed RepairWaitNs is eligible, and the
-    /// deficit is scaled to that prefix. Rounds for the same region — same tLo, a
-    /// sliding frontier still inside the last repaired span, a growing deficit, or a
-    /// wider due prefix — always wait RepairWaitNs. When the 256 seeds of a range
-    /// are used, the range's DATA cells go again (unit rows fill the missing columns).
+    /// Each named step is armed with its share of the deficit and is sent only when
+    /// that step itself is due (seal + RepairWait, and lastRepair + RepairWait).
+    /// A moving frontier never makes a fresh step eligible. When the 256 seeds of
+    /// a step are used, its DATA cells go again.
     member this.OnNack(tLo: uint64, span: int, deficit: int) =
         let now = clock.NowNs()
         let span = int (min (uint64 (min span CodeGraph.MaxBoosterSpan)) (encoder.Head - min tLo encoder.Head))
-        if tLo >= peerAck && span >= 1 && deficit >= 1 && encoder.StepUsed tLo > 0 then
-            // Before a minRTT sample, RepairWait is 1.05 × the default 100 ms
-            // SRTT: on a 400 ms path the first NACK starts a repair, Karn
-            // skips every later sample, SRTT stays 100 ms, and the same hole
-            // repeats every 105 ms (8-path first echo: repair_repeats 74,
-            // rtt_skipped 191, minRTT unset until the burst ends).
-            let minRtt = min minCurNs minPrevNs
-            if minRtt = Int64.MaxValue then ()
-            else
-                let wait = this.RepairWaitNs
-                let mutable dueSpan = 0
-                let mutable blocked = false
-                while dueSpan < span && not blocked do
-                    let sealAt = sealNs.[int ((tLo + uint64 dueSpan) % uint64 sealNs.Length)]
-                    if sealAt <= 0L || float (now - sealAt) < wait then blocked <- true
-                    else dueSpan <- dueSpan + 1
-                if dueSpan < 1 then ()
-                else
-                    let dueDeficit = max 1 (int (ceil (float deficit * float dueSpan / float span)))
-                    // A new tLo every 10 ms (frontier sliding through the
-                    // span we just repaired) was a fresh hole and skipped
-                    // the wait (8-path end-echo: boosters 2813→4496,
-                    // spurious 33→176, repair_repeats stuck at 74).
-                    // Any recently sent repair round — even for a tLo past
-                    // the last span — must wait. Mid-bulk 0% still stormed
-                    // because the frontier jumped beyond prevEnd every
-                    // second and each jump looked like a new hole
-                    // (boosters 318→1704, spurious 30→228 in 5 s).
-                    let prevEnd = repairLo + uint64 repairSpan
-                    let sameRegion = repairNs > 0L && tLo <= prevEnd
-                    if repairNs > 0L && float (now - repairNs) < wait then ()
-                    else
-                        if repairNs > 0L then repairRepeats <- repairRepeats + 1L
-                        if not sameRegion then
-                            repairLo <- tLo
-                            repairSpan <- dueSpan
-                            repairSeq <- 0
-                        elif dueSpan > repairSpan then
-                            repairSpan <- dueSpan
-                        repairDeficit <- dueDeficit
-                        repairNs <- now
-                        // Bound the pending repair queue: a decoder lag looks like loss and would
-                        // otherwise enqueue an unbounded BOOSTER storm (uplink collapse).
-                        let room = max 0 (256 - repairs.Count)
-                        let n = min room (min 64 (int (ceil (float (dueDeficit + 2) / (1.0 - min 0.9 erasure)))))
-                        if room = 0 then ()
-                        elif repairSeq + n <= 256 then
-                            for i in 0 .. n - 1 do
-                                repairs.Enqueue { Kind = CellType.Booster; Step = tLo; Index = byte (repairSeq + i)
-                                                  Span = byte dueSpan; Round = byte n }
-                            repairSeq <- repairSeq + n
-                        else
-                            for j in 0 .. dueSpan - 1 do
-                                let t = tLo + uint64 j
-                                for s in 0 .. encoder.StepUsed t - 1 do
-                                    if repairs.Count < 256 then
-                                        repairs.Enqueue { Kind = CellType.Data; Step = t; Index = byte s; Span = 0uy; Round = 0uy }
+        let minRtt = min minCurNs minPrevNs
+        if minRtt = Int64.MaxValue || tLo < peerAck || span < 1 || deficit < 1 then ()
+        else
+            let wait = int64 this.RepairWaitNs
+            // Each named step gets its own share: a range deficit is not a
+            // licence to dump the whole batch on the frontier, and a fresh
+            // tail of the span is only armed, not sent, until it is due.
+            let share = max 1 (int (ceil (float deficit / float span)))
+            for j in 0 .. span - 1 do
+                this.ArmStep(tLo + uint64 j, share, now, wait)
+            this.DrainDueRepairs()
 
     /// Tail rule (spec 5.8): input paused for 50 ms and the peer lacks steps: a HEARTBEAT
     /// every 50 ms carries tx_head_step.
@@ -375,7 +423,8 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
         repairs.Count > 0
 
     /// Drop queued cells of steps the peer already holds; true when a cell waits.
-    member _.HasCandidate =
+    member this.HasCandidate =
+        this.DrainDueRepairs()
         let mutable c = Unchecked.defaultof<Candidate>
         while repairs.TryPeek(&c) && c.Step + uint64 (max 1uy c.Span) <= peerAck do
             repairs.Dequeue() |> ignore
