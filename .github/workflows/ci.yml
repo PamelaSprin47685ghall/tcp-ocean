@@ -1,0 +1,45 @@
+# Build, unit tests, and the NativeAOT server publish. The netns end-to-end runs
+# (tests/e2e) need root, network namespaces and a quiet 8-core box; they stay local.
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  build-test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          global-json-file: global.json
+      - name: Build (Release)
+        run: dotnet build Tbt.slnx -c Release
+      - name: Unit tests
+        run: dotnet test tests/Tbt.Tests -c Release --no-build
+
+  aot-server:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-dotnet@v4
+        with:
+          global-json-file: global.json
+      - name: NativeAOT publish
+        run: |
+          sudo apt-get update -q && sudo apt-get install -y -q clang zlib1g-dev
+          dotnet publish src/Tbt.Cli -c Release -r linux-x64 -o out/aot
+      - name: Smoke (binary starts)
+        run: |
+          test -x out/aot/tbtun
+          # No arguments: prints usage and exits 2.
+          set +e; out/aot/tbtun > usage.txt 2>&1; rc=$?; set -e
+          test "$rc" = 2 && grep -q '^usage:' usage.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: tbtun-linux-x64-aot
+          path: out/aot/tbtun
