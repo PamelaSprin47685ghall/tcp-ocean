@@ -11,6 +11,7 @@
 #   SEED (default 7), CARRIER=tun|kernel, ALLOW_DIRTY=1, SKIP_ECHO=1, SKIP_IPERF=1,
 #   SKIP_REF=1 (skip plain-TCP iperf/ping baselines), PING_COUNT (default 200),
 #   HANDSHAKE_S (default 10; raise for large path counts at long RTT),
+#   JOIN_CONCURRENCY (client --join-concurrency; default: the client's own),
 #   PAUSE=stop_s/every_s (e.g. 5/12: SIGSTOP server and client together for stop_s every every_s
 #   while a session is up, like a suspended machine; both clocks jump. Log: pause.log.
 #   docs/cases/clock-jump-cwnd.md).
@@ -158,7 +159,8 @@ tunnel() {
         2>"$work/server-$name.log" &
     sleep 0.5
     in_ns near "$work/jit/tbtun" client --server "$server_at" --listen 127.0.0.1:1080 --psk-file "$work/psk" --stats-s 1 \
-        --paths "$paths" --window "$window" --window-clamp "$window_clamp" --stats-s 1 2>"$work/client-$name.log" &
+        --paths "$paths" --window "$window" --window-clamp "$window_clamp" --stats-s 1 \
+        ${JOIN_CONCURRENCY:+--join-concurrency "$JOIN_CONCURRENCY"} 2>"$work/client-$name.log" &
     # session up is logged once path 0 is forwarding; paths ready after the
     # remaining JOINs (bounded concurrency). Raise HANDSHAKE_S for many paths
     # under loss. If the client has been seen and then exited, waiting the
@@ -341,6 +343,6 @@ ss_retrans(work / "ss-near.txt", "near")
 ss_retrans(work / "ss-far.txt", "far")
 PY
 fi
-stamp "stamp: commit=$commit owd_ms=$owd rate_mbit=$rate loss=$loss paths=$paths window=$window window_clamp=$window_clamp seed=$seed server_max_paths=$max_paths seconds=$seconds carrier=$carrier profile=${profile:-none} ping_count=$ping_count handshake_s=$handshake_s pause=${PAUSE:-none} status=$status"
+stamp "stamp: commit=$commit owd_ms=$owd rate_mbit=$rate loss=$loss paths=$paths window=$window window_clamp=$window_clamp seed=$seed server_max_paths=$max_paths seconds=$seconds carrier=$carrier profile=${profile:-none} ping_count=$ping_count handshake_s=$handshake_s pause=${PAUSE:-none} join_concurrency=${JOIN_CONCURRENCY:-default} status=$status"
 echo "logs: $work"
 exit $status
