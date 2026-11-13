@@ -370,7 +370,9 @@ type TunPath(output: ITunOutput, counters: TunCounters, localIp: uint32, localPo
     let isDemoted (now: int64) =
         let rto = max (1.15 * srttNs) (srttNs + 10_000_000.0)
         let after = max 1_000_000_000L (int64 (3.0 * rto))
-        let d = inflight > 0 && now - deliveredNs > after
+        // Only when another path of the group still delivers: if all stall together
+        // (an outage), demoting them all would only hold the recovery back.
+        let d = inflight > 0 && now - deliveredNs > after && group.AnyDeliveredSince(now - after)
         if d && not demoted then counters.Demotions <- counters.Demotions + 1L
         demoted <- d
         d
@@ -672,7 +674,6 @@ type TunPath(output: ITunOutput, counters: TunCounters, localIp: uint32, localPo
                         counters.CellsDropped <- counters.CellsDropped + 1L
                         dropSlot i
             // Tail repair.
-            // Only what no SACK can show: segments sent after the last delivered one.
             // A tail is only a tail when nothing was delivered for a whole timer: while ACKs
             // come in, a growing queue makes old segments look late (spurious repairs).
             let rto = int64 (max (1.15 * srttNs) (srttNs + 10_000_000.0))
@@ -683,7 +684,10 @@ type TunPath(output: ITunOutput, counters: TunCounters, localIp: uint32, localPo
                 let mutable budget = tailBudget
                 while i < ringCount && budget > 0 do
                     let s = &ring.[at i]
-                    if not s.Sacked && s.SentNs >= rackSentNs && now - s.SentNs > rto then
+                    // Any segment older than the timer: RACK repairs only below the highest
+                    // SACK, so a segment above it sent before rackSentNs (before a delivered
+                    // repair) has no other way back once an outage silences every ACK.
+                    if not s.Sacked && now - s.SentNs > rto then
                         repair i now
                         counters.TailRepairs <- counters.TailRepairs + 1L
                         budget <- budget - 1
@@ -740,6 +744,7 @@ type TunPath(output: ITunOutput, counters: TunCounters, localIp: uint32, localPo
         // Delivered segments plus their duplicate repair copies: what crossed the bottleneck.
         member _.Delivered = delivered + duplicatesDelivered
         member _.MinRttNs = minRttNs
+        member _.LastDeliveredNs = deliveredNs
 
     interface IPath with
         member _.PathId with get () = pathId and set v = pathId <- v
