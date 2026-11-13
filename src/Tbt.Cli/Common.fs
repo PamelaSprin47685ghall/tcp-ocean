@@ -14,6 +14,7 @@ type SystemClock() =
     static let factor = 1_000_000_000.0 / float Stopwatch.Frequency
     interface IClock with
         member _.NowNs() = int64 (float (Stopwatch.GetTimestamp()) * factor)
+        member this.FreshNs() = (this :> IClock).NowNs()
 
 [<Sealed>]
 type SystemEntropy() =

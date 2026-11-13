@@ -13,6 +13,7 @@ type ManualClock() =
     member val Now = 1_000_000_000L with get, set
     interface IClock with
         member c.NowNs() = c.Now
+        member c.FreshNs() = c.Now
 
 [<Sealed>]
 type SeededEntropy(seed: int) =
@@ -54,8 +55,12 @@ let psk = Array.init 32 (fun i -> byte (i * 3 + 1))
 let unixMs = 1_800_000_000_000L
 
 /// Both ends of a session joined by in-memory paths.
-type Pair(config: SessionConfig, paths: int, loss: float, seed: int) =
-    let clock = ManualClock()
+type Pair(config: SessionConfig, paths: int, loss: float, seed: int, ?wrapClock: ManualClock -> IClock) =
+    let inner = ManualClock()
+    let clock: IClock =
+        match wrapClock with
+        | Some f -> f inner
+        | None -> inner :> IClock
     let entropy = SeededEntropy seed
     let offer = ClientOffer(psk, Guid(Array.create 16 7uy), entropy, uint64 unixMs, 1448, 256)
     let accepted = (ServerOffer([| psk |], entropy, uint16 config.WindowSteps, 256)).TryAccept(ReadOnlySpan offer.Frame, unixMs, 1448)
@@ -82,7 +87,7 @@ type Pair(config: SessionConfig, paths: int, loss: float, seed: int) =
                 n <- n + 1
                 moved <- moved + 1
                 if rnd.NextDouble() >= loss && not (blackout && obj.ReferenceEquals(src, client)) then
-                    if delay > 0 then inFlight.Enqueue(struct (clock.Now + delay, dst, uint16 p, Array.copy frame))
+                    if delay > 0 then inFlight.Enqueue(struct (inner.Now + delay, dst, uint16 p, Array.copy frame))
                     else dst.OnFrame(uint16 p, Span frame) |> ignore
                 else dropped <- dropped + 1
         moved
@@ -91,12 +96,12 @@ type Pair(config: SessionConfig, paths: int, loss: float, seed: int) =
         let mutable go = true
         while go && inFlight.Count > 0 do
             let struct (due, dst, p, f) = inFlight.Peek()
-            if due <= clock.Now then
+            if due <= inner.Now then
                 inFlight.Dequeue() |> ignore
                 dst.OnFrame(p, Span f) |> ignore
             else go <- false
 
-    member _.Clock = clock
+    member _.Clock = inner
     member _.Client = client
     member _.Server = server
     member _.ClientPort = clientPort
@@ -124,7 +129,7 @@ type Pair(config: SessionConfig, paths: int, loss: float, seed: int) =
 
     /// One round: 1 ms passes, both ends send up to 4 cells per path.
     member _.Round() =
-        clock.Now <- clock.Now + 1_000_000L
+        inner.Now <- inner.Now + 1_000_000L
         deliver ()
         client.Tick()
         server.Tick()
@@ -699,6 +704,48 @@ let ``default repair is main's: a new range NACK enqueues BOOSTERs immediately``
     c.Tx.OnNack(1UL, 1, 4)
     Assert.True(c.Tx.RepairWaiting, "main OnNack must enqueue the first round now")
     Assert.True(c.Tx.RepairWaitNs = 1.05 * float c.Tx.MinRttNs, sprintf "wait %g" c.Tx.RepairWaitNs)
+
+[<Fact>]
+let ``a stale cached now cannot make a just-sealed step look RepairWait-expired`` () =
+    let config = { SessionConfig.defaults with NewRepair = true; Credit = { CreditPolicy.defaults with Enabled = false } }
+    let mutable cached = Unchecked.defaultof<CachedClock>
+    let pair = Pair(config, 1, 0.0, 4, fun inner ->
+        // No auto-refresh: a long iteration leaves NowNs stale, as the old
+        // per-loop Tick cache did. Seal and OnNack must still go through FreshNs.
+        cached <- CachedClock(inner, staleMs=1_000_000L, refreshEvery=Int32.MaxValue)
+        cached :> IClock)
+    let c = pair.Client
+    let clock = pair.Clock
+    c.Tx.InitialGrant 10_000UL
+    let mutable slot = -1
+    Assert.True(c.TryOpenFlow(&slot))
+    let chunk = Array.create 65536 7uy
+    let mutable guard = 64
+    while c.Tx.Head < 2UL && guard > 0 do
+        pair.Feed(c, slot, ReadOnlySpan chunk, false) |> ignore
+        c.Tx.Flush()
+        guard <- guard - 1
+    cached.Tick() |> ignore
+    clock.Now <- clock.Now + 400_000_000L
+    cached.Tick() |> ignore
+    c.Tx.OnPeerAck(1UL, 100us)
+    Assert.True(c.Tx.MinRttNs <> Int64.MaxValue)
+    let wait = int64 c.Tx.RepairWaitNs
+    let t0 = clock.Now
+    cached.Tick() |> ignore
+    // Inner time jumps many RepairWaits; the cached NowNs stays at t0.
+    clock.Now <- t0 + 5L * wait
+    let head0 = c.Tx.Head
+    guard <- 64
+    while c.Tx.Head <= head0 && guard > 0 do
+        pair.Feed(c, slot, ReadOnlySpan chunk, false) |> ignore
+        c.Tx.Flush()
+        guard <- guard - 1
+    Assert.True(c.Tx.Head > head0, "a new step must have been sealed while the cache was stale")
+    let tLo = c.Tx.Head - 1UL
+    c.Tx.OnNack(tLo, 1, 4)
+    Assert.False(c.Tx.RepairWaiting,
+        "FreshNs must stamp the seal at the advanced time; a stale cache would already be past seal+RepairWait")
 
 [<Fact>]
 let ``repair wait is minRTT plus measured queueing and variance, not 1.05 times minRTT alone`` () =

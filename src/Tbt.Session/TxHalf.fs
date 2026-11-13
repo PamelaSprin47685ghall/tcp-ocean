@@ -145,7 +145,7 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
         let si = int (t % uint64 sealNs.Length)
         spilled.[index t] <- spillPending && not wasUrgent
         spillPending <- false
-        sealNs.[si] <- clock.NowNs()
+        sealNs.[si] <- clock.FreshNs()
         lastRepairNs.[si] <- 0L
         repairCount.[si] <- 0
         pendingDeficit.[si] <- 0
@@ -444,7 +444,7 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
         let minRtt = min minCurNs minPrevNs
         if minRtt = Int64.MaxValue then ()
         else
-            let now = clock.NowNs()
+            let now = clock.FreshNs()
             let mutable step = 0UL
             let mutable deadline = 0L
             while repairs.Count < 256 && dueQ.TryPeek(&step, &deadline) && deadline <= now do
@@ -478,7 +478,7 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
             // Main: one range, BOOSTERs enqueued now. Same range waits RepairWaitNs
             // unless the deficit grew. tLo below peerAck is ignored; a due prefix
             // is not applied (that was 5df6fa4, gated with the new scheduler).
-            let now = clock.NowNs()
+            let now = clock.FreshNs()
             let span = int (min (uint64 (min span CodeGraph.MaxBoosterSpan)) (encoder.Head - min tLo encoder.Head))
             if tLo >= peerAck && span >= 1 && deficit >= 1 && encoder.StepUsed tLo > 0 then
                 let same = tLo = repairLo && span = repairSpan

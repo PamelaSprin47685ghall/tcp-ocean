@@ -914,7 +914,7 @@ type TunPath(output: ITunOutput, counters: TunCounters, localIp: uint32, localPo
         relLen <- relLen + data.Length
         let mss = peerMss
         let mutable at' = 0
-        let now = clock.NowNs()
+        let now = clock.FreshNs()
         catchUp now
         while at' < data.Length do
             let n = min mss (data.Length - at')
@@ -1109,8 +1109,8 @@ type TunPath(output: ITunOutput, counters: TunCounters, localIp: uint32, localPo
             // A send stamps the ring with now, so the stall shift must happen first: a frame
             // sent after a pause and shifted later would carry a future send time, give a
             // negative RTT and, through the group's min RTT, a negative cwnd (no sends ever).
-            catchUp (clock.NowNs())
-            let now = clock.NowNs()
+            let now = clock.FreshNs()
+            catchUp now
             if state <> TunState.Established || not attached || frameLength > peerMss then false
             // Waiting repairs go before new frames.
             elif repairQ.Count > 0 && (drainRepairs now; repairQ.Count > 0) then false
@@ -1141,7 +1141,7 @@ type TunPath(output: ITunOutput, counters: TunCounters, localIp: uint32, localPo
 
         member _.CommitFrame() =
             let l = frameLength
-            let now = clock.NowNs()
+            let now = clock.FreshNs()
             if ringCount = ring.Length then
                 let next = Array.zeroCreate<SentSegment> (ring.Length * 2)
                 for i in 0 .. ringCount - 1 do next.[i] <- ring.[at i]
