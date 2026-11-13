@@ -668,3 +668,93 @@ let ``a peer without SACK still gets every hole re-sent after a blackout (RTO fa
         // (main: srtt 1389 ms here).
         let srtt = float (System.Text.RegularExpressions.Regex.Match(msg, "srtt_ms=([0-9.]+)").Groups.[1].Value)
         Assert.True(srtt < 200.0, msg)
+
+/// SACK blocks (left, right) of a parsed packet.
+let sackBlocksOf (p: byte[]) =
+    let s = parse p
+    let o = ReadOnlySpan(p, s.OptionsAt, s.OptionsLength).ToArray()
+    let mutable i = 0
+    let blocks = List<uint32 * uint32>()
+    while i < o.Length do
+        match o.[i] with
+        | 0uy -> i <- o.Length
+        | 1uy -> i <- i + 1
+        | k ->
+            let len = int o.[i + 1]
+            if k = 5uy then
+                for b in 0 .. (len - 2) / 8 - 1 do
+                    blocks.Add(BinaryPrimitives.ReadUInt32BigEndian(ReadOnlySpan(o, i + 2 + 8 * b, 4)),
+                               BinaryPrimitives.ReadUInt32BigEndian(ReadOnlySpan(o, i + 6 + 8 * b, 4)))
+            i <- i + len
+    List.ofSeq blocks
+
+[<Fact>]
+let ``uplink: a segment re-sent after its hole was swallowed is reported as a D-SACK`` () =
+    // The kernel sender undoes its cwnd cut on a D-SACK (RFC 2883): a swallowed hole or an
+    // outage that only lost ACKs must not leave the client's window collapsed.
+    let f = Fixture 10
+    f.Open()
+    let send i =
+        f.Send(f.Data0 + uint32 (i * 1460), ReadOnlySpan(f.Stream, i * 1460, min 1460 (f.Stream.Length - i * 1460)), [||])
+    send 0
+    for i in 2 .. (f.Stream.Length - 1) / 1460 do send i
+    f.Clock.Now <- f.Clock.Now + 16_000_000L
+    f.Path.Service f.Clock.Now
+    f.Path.FlushAck()
+    let top = f.Data0 + uint32 f.Stream.Length
+    Assert.Equal(top, (parse f.Out.Packets.[f.Out.Packets.Count - 1]).AckNo)
+    Assert.Empty(sackBlocksOf f.Out.Packets.[f.Out.Packets.Count - 1])
+    // The kernel's retransmission of the swallowed segment 1.
+    send 1
+    f.Path.FlushAck()
+    let a = f.Out.Packets.[f.Out.Packets.Count - 1]
+    Assert.Equal(top, (parse a).AckNo)
+    Assert.Equal<(uint32 * uint32) list>([ f.Data0 + 1460u, f.Data0 + 2920u ], sackBlocksOf a)
+    // A plain duplicate of acked data (an ACK lost in an outage, RTO) is one too.
+    send 0
+    f.Path.FlushAck()
+    Assert.Equal<(uint32 * uint32) list>([ f.Data0, f.Data0 + 1460u ], sackBlocksOf f.Out.Packets.[f.Out.Packets.Count - 1])
+    Assert.Equal(2L, f.Path.Counters.Dsacks)
+
+[<Fact>]
+let ``uplink: during a hole's grace only a lone D-SACK goes out, never interval blocks`` () =
+    let f = Fixture 10
+    f.Open()
+    let send i =
+        f.Send(f.Data0 + uint32 (i * 1460), ReadOnlySpan(f.Stream, i * 1460, min 1460 (f.Stream.Length - i * 1460)), [||])
+    send 0
+    f.Path.FlushAck()
+    let n = f.Out.Packets.Count
+    send 3
+    send 4
+    f.Path.FlushAck()
+    Assert.Equal(n, f.Out.Packets.Count)
+    // Segment 4 again, inside the held interval: a duplicate.
+    send 4
+    f.Path.FlushAck()
+    Assert.Equal(n + 1, f.Out.Packets.Count)
+    let a = f.Out.Packets.[n]
+    Assert.Equal(f.Data0 + 1460u, (parse a).AckNo)
+    Assert.Equal<(uint32 * uint32) list>([ f.Data0 + 4u * 1460u, f.Data0 + 5u * 1460u ], sackBlocksOf a)
+    // The gap's own ACK still waits for the grace.
+    f.Path.FlushAck()
+    Assert.Equal(n + 1, f.Out.Packets.Count)
+
+[<Fact>]
+let ``uplink: no D-SACK to a peer that did not negotiate SACK`` () =
+    let clock = ManualClock()
+    let out = RecordingOutput()
+    let path = TunPath(out, TunCounters(), serverIp, 8443us, clientIp, 40001us, 1000u, clock, RateGroup(clock))
+    let noSack = [| 2uy; 4uy; 0x05uy; 0xB4uy; 1uy; 3uy; 3uy; 7uy |]
+    let struct (syn, sp) = clientSegment 5000u 0u Packet.Syn noSack ReadOnlySpan.Empty
+    path.OnSyn(syn.Seq, ReadOnlySpan(sp, syn.OptionsAt, syn.OptionsLength), 1460, clock.Now)
+    let payload = Array.create 100 1uy
+    let seg () =
+        let struct (s, p) = clientSegment 5001u 1001u Packet.Ack [||] (ReadOnlySpan payload)
+        path.OnSegment(s, Span p, clock.Now)
+    seg ()
+    path.FlushAck()
+    seg ()
+    path.FlushAck()
+    Assert.Empty(sackBlocksOf out.Packets.[out.Packets.Count - 1])
+    Assert.Equal(0L, path.Counters.Dsacks)

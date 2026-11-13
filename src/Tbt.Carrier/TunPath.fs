@@ -33,6 +33,8 @@ type TunCounters() =
     member val TailRepairs = 0L with get, set
     /// RTO fallback episodes: snd.una did not move for the RTO (no SACK needed).
     member val Rtos = 0L with get, set
+    /// ACKs that reported a duplicate segment as a D-SACK block (RFC 2883).
+    member val Dsacks = 0L with get, set
     /// Times a path was demoted: data in flight, nothing delivered for the demotion time.
     member val Demotions = 0L with get, set
     /// Exceptions caught at a path entry point: the owner failed, the connection was reset.
@@ -97,6 +99,12 @@ type TunPath(output: ITunOutput, counters: TunCounters, localIp: uint32, localPo
     let ivWm = Array.zeroCreate<uint64> (maxGaps + 2)
     let mutable ivCount = 0
     let mutable ackDue = false
+    /// Duplicate bytes to report as the first SACK block of the next ACK (RFC 2883 D-SACK):
+    /// a re-sent segment whose bytes were already acked or swallowed. The sender then knows the
+    /// retransmission was not needed and undoes its cwnd cut (Linux: undo on D-SACK), so an
+    /// outage that only lost ACKs, or a hole TBT did not need, does not shrink the kernel window.
+    let mutable dsackLo = 0UL
+    let mutable dsackHi = 0UL
     // Head phase: in-order bytes only, until the bootstrap frame is whole.
     let mutable head: byte[] = Array.zeroCreate headCap
     let mutable headLen = 0
@@ -345,6 +353,16 @@ type TunPath(output: ITunOutput, counters: TunCounters, localIp: uint32, localPo
         // Trim what is old or past the window.
         let mutable a = seq64
         let mutable d = data
+        if a < rcvNxt && d.Length > 0 then
+            dsackLo <- a
+            dsackHi <- min (a + uint64 d.Length) rcvNxt
+        elif d.Length > 0 && dataPhase then
+            // Wholly inside a held interval: a duplicate too.
+            let e = a + uint64 d.Length
+            for i in 0 .. ivCount - 1 do
+                if ivStart.[i] <= a && e <= ivEnd.[i] then
+                    dsackLo <- a
+                    dsackHi <- e
         if a < rcvNxt then
             let cut = int (min (uint64 d.Length) (rcvNxt - a))
             d <- d.Slice cut
@@ -747,20 +765,32 @@ type TunPath(output: ITunOutput, counters: TunCounters, localIp: uint32, localPo
     /// no SACK while the lease covers it).
     member _.FlushAck() =
         if ackDue && state <> TunState.Closed then
-            if not (ivCount > 0 && leaseValid ()) then
-                if ivCount > 0 && sackOk then
-                    let n = min 4 ivCount
-                    let o = Span<byte>(sackOption, 0, 4 + 8 * n)
+            let dsack = sackOk && dsackHi > dsackLo
+            let grace = ivCount > 0 && leaseValid ()
+            // In the grace only a D-SACK may go out, alone: interval blocks would be duplicate
+            // ACKs; a D-SACK block does not count as one (it covers no new data).
+            if not grace || dsack then
+                let blocks = if grace || not sackOk then 0 else min (if dsack then 3 else 4) ivCount
+                let d = if dsack then 1 else 0
+                if blocks + d > 0 then
+                    let o = Span<byte>(sackOption, 0, 4 + 8 * (blocks + d))
                     o.[0] <- 1uy
                     o.[1] <- 1uy
                     o.[2] <- 5uy
-                    o.[3] <- byte (2 + 8 * n)
-                    for i in 0 .. n - 1 do
-                        BinaryPrimitives.WriteUInt32BigEndian(o.Slice(4 + 8 * i), uint32 ivStart.[i])
-                        BinaryPrimitives.WriteUInt32BigEndian(o.Slice(8 + 8 * i), uint32 ivEnd.[i])
+                    o.[3] <- byte (2 + 8 * (blocks + d))
+                    if dsack then
+                        BinaryPrimitives.WriteUInt32BigEndian(o.Slice 4, uint32 dsackLo)
+                        BinaryPrimitives.WriteUInt32BigEndian(o.Slice 8, uint32 dsackHi)
+                        counters.Dsacks <- counters.Dsacks + 1L
+                    for i in 0 .. blocks - 1 do
+                        BinaryPrimitives.WriteUInt32BigEndian(o.Slice(4 + 8 * (i + d)), uint32 ivStart.[i])
+                        BinaryPrimitives.WriteUInt32BigEndian(o.Slice(8 + 8 * (i + d)), uint32 ivEnd.[i])
                     send Packet.Ack sndNxt (Span<byte>.op_Implicit o) 0
                 else send Packet.Ack sndNxt ReadOnlySpan.Empty 0
-                ackDue <- false
+                dsackLo <- 0UL
+                dsackHi <- 0UL
+                // A grace-time D-SACK leaves the gap's ACK for later.
+                ackDue <- grace
 
     /// Last resort (the causes are fixed where found): an exception from this path or its
     /// owner fails only that owner (one session) and resets this connection.
