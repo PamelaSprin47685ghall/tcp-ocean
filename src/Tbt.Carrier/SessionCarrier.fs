@@ -103,7 +103,17 @@ type SessionCarrier(session: Session, bridge: FlowBridge, ?uplinkPace: bool, ?tu
         let rtt =
             let m = session.Tx.MinRttNs
             if m <> Int64.MaxValue then m else max 1L (int64 session.Tx.SrttNs)
-        int (RateGroup.CwndGain * group.Bandwidth * float rtt) + 4 * fl
+        let measured = RateGroup.CwndGain * group.Bandwidth * float rtt
+        // A low first sample (kzA11U: ~7 Mbit) made a pure 1.25 BDP cap
+        // self-fulfilling (bulk up 12.4 vs 21.4). When --tuple-mbit is set,
+        // also allow 1.25 BDP of min(paths×tuple, 40 Mbit) so short echos
+        // and an 8 s bulk can probe up. Off when tupleMbit=0 so the
+        // 20 ms / 200 Mbit matrix is not given a 2.5 MiB floor (~1 Gbit
+        // at 20 ms). At 400 ms that floor is 2.5 MiB, below the 8 MiB
+        // UWOx4h startup dump.
+        let floorBw = if tupleMbit > 0.0 then min (tupleMbit * float (max 1 paths.Count)) 40.0 else 0.0
+        let floor = RateGroup.CwndGain * (floorBw / 8000.0) * float rtt
+        int (max measured floor) + 4 * fl
 
     let groupAllows (fl: int) (repair: bool) (bulk: bool) =
         if repair then
