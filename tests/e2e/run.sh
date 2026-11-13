@@ -8,7 +8,9 @@
 #   run.sh [owd_ms] [rate_mbit] [loss] [paths] [seconds]
 # Optional env: WINDOW (default 1024), WINDOW_CLAMP (default 600000; --window-clamp on both sides),
 #   MAX_PATHS (default 64; server --max-paths), TBT_BIN=dir (reuse prebuilt aot/ and jit/ under dir),
-#   SEED (default 7), CARRIER=tun|kernel, ALLOW_DIRTY=1, SKIP_ECHO=1, SKIP_IPERF=1.
+#   SEED (default 7), CARRIER=tun|kernel, ALLOW_DIRTY=1, SKIP_ECHO=1, SKIP_IPERF=1,
+#   SKIP_REF=1 (skip plain-TCP iperf/ping baselines), PING_COUNT (default 200),
+#   HANDSHAKE_S (default 10; raise for large path counts at long RTT).
 # Needs sudo, gcc, python3, iperf3, .NET 10 SDK. Logs go to a temporary directory.
 #
 # Concurrent workers serialize on /tmp/tbtun-netns.lock (flock, held for the whole run,
@@ -30,6 +32,8 @@ window=${WINDOW:-1024}
 window_clamp=${WINDOW_CLAMP:-600000}
 max_paths=${MAX_PATHS:-64}
 seed=${SEED:-7}
+ping_count=${PING_COUNT:-200}
+handshake_s=${HANDSHAKE_S:-10}
 # CARRIER=kernel: server paths on kernel TCP; CARRIER=tun: user-space TCP on tbt0 (default).
 carrier=${CARRIER:-tun}
 if [[ $carrier == tun ]]; then
@@ -133,9 +137,13 @@ tunnel() {
     in_ns near "$work/jit/tbtun" client --server "$server_at" --listen 127.0.0.1:1080 --psk-file "$work/psk" --stats-s 1 \
         --paths "$paths" --window "$window" --window-clamp "$window_clamp" --stats-s 1 2>"$work/client-$name.log" &
     # Under loss a lost handshake segment costs a TCP retransmit timeout (1 s and more).
-    local i
-    for i in $(seq 50); do grep -q "session up" "$work/client-$name.log" && break; sleep 0.2; done
-    grep -q "session up" "$work/client-$name.log" || { echo "handshake failed in 10 s"; cat "$work/client-$name.log"; exit 1; }
+    # Sequential JOINs at long RTT can exceed the default 10 s; raise HANDSHAKE_S.
+    local i t0 t1
+    t0=$(date +%s%N)
+    for i in $(seq $((handshake_s * 5))); do grep -q "session up" "$work/client-$name.log" && break; sleep 0.2; done
+    t1=$(date +%s%N)
+    stamp "handshake($name): $(awk -v t0="$t0" -v t1="$t1" 'BEGIN{printf "%.2f", (t1-t0)/1e9}')s (limit ${handshake_s}s)"
+    grep -q "session up" "$work/client-$name.log" || { echo "handshake failed in ${handshake_s} s"; cat "$work/client-$name.log"; exit 1; }
     # Client logs "session up: S=... paths=N". Window is a local --window on both sides
     # (not a distinct handshake field besides SERVER_INIT rx_win_grant0 = server WindowSteps).
     local up_line neg_paths
@@ -172,8 +180,10 @@ stop() {
 goodput() { python3 -c 'import json,sys; d=json.load(sys.stdin); print("%.1f" % (d["end"]["sum_received"]["bits_per_second"]/1e6))'; }
 
 status=0
+if [[ ${SKIP_REF:-0} != 1 ]]; then
 echo "reference, plain TCP without tunnel: 1 flow $(in_ns near iperf3 -c 10.200.2.2 -p 5201 -t "$seconds" -J | goodput) Mbit/s, $paths flows $(in_ns near iperf3 -c 10.200.2.2 -p 5201 -t "$seconds" -P "$paths" -J | goodput) Mbit/s"
 echo "reference, plain TCP without tunnel: $(in_ns near python3 "$work/echo.py" ping 10.200.2.2 7000 100)"
+fi
 
 # Session 1: every echo/latency case back to back on one session, so that a flow left
 # stalled by an earlier case shows up as a failure of the later ones.
@@ -182,11 +192,11 @@ tunnel mux 10.200.2.2:7000
 run_case() { local rc=0; "$@" || rc=$?; if (( rc )); then echo "FAILED (exit $rc$( (( rc == 124 )) && echo ", timed out")): ${*:6}"; status=1; fi; }
 run_case in_ns near timeout 120 python3 -u "$work/echo.py" check 127.0.0.1 1080 8 1000000
 run_case in_ns near timeout 120 python3 -u "$work/echo.py" check 127.0.0.1 1080 64 20000
-run_case in_ns near timeout 120 python3 -u "$work/echo.py" ping 127.0.0.1 1080 200
-run_case in_ns near timeout 120 python3 -u "$work/echo.py" bulk 127.0.0.1 1080 up "$seconds"
-run_case in_ns near timeout 120 python3 -u "$work/echo.py" bulk 127.0.0.1 1080 down "$seconds"
+run_case in_ns near timeout $(( 90 + (2 * owd + 20) * ping_count / 1000 )) python3 -u "$work/echo.py" ping 127.0.0.1 1080 "$ping_count"
+run_case in_ns near timeout $(( seconds + 90 )) python3 -u "$work/echo.py" bulk 127.0.0.1 1080 up "$seconds"
+run_case in_ns near timeout $(( seconds + 90 )) python3 -u "$work/echo.py" bulk 127.0.0.1 1080 down "$seconds"
 # pingbulk keeps bulk running until every probe finishes; allow RTT + 20 ms spacing * count, plus margin.
-run_case in_ns near timeout $(( 90 + (2 * owd + 20) * 200 / 1000 )) python3 -u "$work/echo.py" pingbulk 127.0.0.1 1080 200 "$seconds"
+run_case in_ns near timeout $(( 90 + (2 * owd + 20) * ping_count / 1000 )) python3 -u "$work/echo.py" pingbulk 127.0.0.1 1080 "$ping_count" "$seconds"
 run_case in_ns near timeout 120 python3 -u "$work/echo.py" check 127.0.0.1 1080 8 1000000
 report mux; stop mux
 fi
@@ -209,6 +219,57 @@ report bulk; stop bulk
 fi
 
 echo "wanem: $(tr '\n' ' ' < "$work/wanem.stats")"
-stamp "stamp: commit=$commit owd_ms=$owd rate_mbit=$rate loss=$loss paths=$paths window=$window window_clamp=$window_clamp seed=$seed server_max_paths=$max_paths seconds=$seconds carrier=$carrier profile=${profile:-none} status=$status"
+# Kernel TCP counters from both namespaces, while they still exist.
+if ip netns list | grep -q '^tbe_near'; then
+    sudo ip netns exec tbe_near nstat -az > "$work/nstat-near.txt" 2>/dev/null || true
+    sudo ip netns exec tbe_far  nstat -az > "$work/nstat-far.txt" 2>/dev/null || true
+    sudo ip netns exec tbe_near ss -tiemn > "$work/ss-near.txt" 2>/dev/null || true
+    sudo ip netns exec tbe_far  ss -tiemn > "$work/ss-far.txt" 2>/dev/null || true
+    python3 - "$work" <<'PY'
+import re
+import sys
+from pathlib import Path
+work = Path(sys.argv[1])
+want = [
+    "TcpInSegs", "TcpOutSegs", "TcpRetransSegs", "TcpInErrs",
+    "TcpExtTCPLostRetransmit", "TcpExtTCPRetransFail", "TcpExtTCPTimeouts",
+    "TcpExtTCPSynRetrans", "TcpExtTCPSackRecovery", "TcpExtTCPFastRetrans",
+    "TcpExtTCPSlowStartRetrans", "TcpExtTCPLossProbes", "TcpExtTCPLossProbeRecovery",
+    "TcpExtTCPDSACKRecv", "TcpExtTCPDSACKOfoRecv", "TcpExtTCPAbortOnTimeout",
+    "TcpExtTCPSpuriousRTOs", "TcpExtListenOverflows", "TcpExtListenDrops",
+    "TcpExtTCPRcvCoalesce", "TcpExtTCPBacklogDrop",
+]
+def load(path):
+    vals = {}
+    if not path.exists():
+        return vals
+    for line in path.read_text(errors="replace").splitlines():
+        parts = line.split()
+        if len(parts) >= 2 and parts[0] in want:
+            vals[parts[0]] = parts[1]
+    return vals
+for label in ("near", "far"):
+    vals = load(work / f"nstat-{label}.txt")
+    bits = " ".join(f"{k}={vals[k]}" for k in want if k in vals)
+    print(f"kernel_{label}: {bits or 'no-nstat'}")
+def ss_retrans(path, label):
+    text = path.read_text(errors="replace") if path.exists() else ""
+    sockets = 0
+    retr = 0
+    unacked = 0
+    lost_n = 0
+    for m in re.finditer(r"retrans:(\d+)/(\d+)", text):
+        sockets += 1
+        retr += int(m.group(2))
+    for m in re.finditer(r"unacked:(\d+)", text):
+        unacked += int(m.group(1))
+    for m in re.finditer(r" lost:(\d+)", text):
+        lost_n += int(m.group(1))
+    print(f"ss_{label}: sockets_with_retrans_field={sockets} retrans_sum={retr} unacked_sum={unacked} lost_sum={lost_n}")
+ss_retrans(work / "ss-near.txt", "near")
+ss_retrans(work / "ss-far.txt", "far")
+PY
+fi
+stamp "stamp: commit=$commit owd_ms=$owd rate_mbit=$rate loss=$loss paths=$paths window=$window window_clamp=$window_clamp seed=$seed server_max_paths=$max_paths seconds=$seconds carrier=$carrier profile=${profile:-none} ping_count=$ping_count handshake_s=$handshake_s status=$status"
 echo "logs: $work"
 exit $status
