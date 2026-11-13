@@ -67,7 +67,10 @@ type TunPath(output: ITunOutput, counters: TunCounters, localIp: uint32, localPo
              remoteIp: uint32, remotePort: uint16, isn: uint32, clock: IClock, group: RateGroup) =
     let now0 = clock.NowNs()
     // ---- constants ---------------------------------------------------------------------
-    static let windowBytes = 4 <<< 20
+    /// Advertised receive window per path: the spec's 600 000 B per subflow (ch. 9, same as the
+    /// client's TCP_WINDOW_CLAMP). It bounds the client's in-flight bytes per path, so the
+    /// uplink cannot build a standing queue at the bottleneck beyond it (was 4 MiB: about 350 ms).
+    static let windowBytes = SocketTuning.WindowClamp
     static let ourScale = 7
     static let maxGaps = 16
     static let slotCount = 32

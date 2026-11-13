@@ -758,3 +758,17 @@ let ``uplink: no D-SACK to a peer that did not negotiate SACK`` () =
     path.FlushAck()
     Assert.Empty(sackBlocksOf out.Packets.[out.Packets.Count - 1])
     Assert.Equal(0L, path.Counters.Dsacks)
+
+[<Fact>]
+let ``uplink: the advertised window is the spec's 600 000 B per path and bytes past it are not taken`` () =
+    // 4 MiB per path let the client kernel build a ~350 ms standing queue at the bottleneck.
+    let f = Fixture 600
+    f.Open()
+    let ack = parse f.Out.Packets.[f.Out.Packets.Count - 1]
+    let w = int ack.Window <<< 7
+    Assert.True(w <= SocketTuning.WindowClamp && w > SocketTuning.WindowClamp - 128, sprintf "window %d" w)
+    // A segment wholly past the window: nothing of it is delivered.
+    let past = f.Data0 + uint32 SocketTuning.WindowClamp + 1460u
+    f.Send(past, ReadOnlySpan(f.Stream, 0, 1460), [||])
+    Assert.Empty(f.Owner.Frames)
+    Assert.Equal(0L, f.Path.Counters.UpHoles)
