@@ -116,6 +116,13 @@ type SessionCarrier(session: Session, bridge: FlowBridge) =
 
     member _.HasPath(pathId: uint16) = paths.Exists(fun p -> p.PathId = pathId)
 
+    /// Close and drop the path with pathId (replaced by a higher incarnation).
+    member _.RemovePath(pathId: uint16) =
+        let i = paths.FindIndex(fun p -> p.PathId = pathId)
+        if i >= 0 then
+            paths.[i].Close()
+            paths.RemoveAt i
+
     member _.Watch(poller: Poller) =
         let sending = session.WantsToSend
         for link in paths do link.Watch(poller, sending)
