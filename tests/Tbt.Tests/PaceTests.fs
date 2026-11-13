@@ -104,29 +104,6 @@ let ``RateGroup repair bucket is charged separately and a dry reserve still allo
     Assert.True(g.TryTake(L, true), "new data must not starve when the repair reserve is dry")
 
 [<Fact>]
-let ``SignalLoss leaves startup only when inflight already exceeds 1.25 BDP`` () =
-    let clock = ManualClock()
-    let g = RateGroup(clock)
-    let m = Mem()
-    g.Add m
-    let primed = int64 (2000 * L)
-    m.DeliveredV <- primed
-    m.LastNsV <- clock.Now
-    g.OnSent(int primed)
-    m.InflightV <- 0
-    clock.Now <- clock.Now + 400_000_000L
-    g.Service clock.Now
-    Assert.True(g.InStartup)
-    g.SignalLoss()
-    Assert.True(g.InStartup, "a repair before the pipe is full must not end startup")
-    m.InflightV <- 64 * L
-    g.SignalLoss()
-    Assert.True(g.InStartup, "the 64-frame startup floor is not an overshoot")
-    m.InflightV <- int (2.0 * g.Bandwidth * 400_000_000.0)
-    g.SignalLoss()
-    Assert.False(g.InStartup)
-
-[<Fact>]
 let ``client recovery samples do not evict the max filter; server samples still do`` () =
     let run protect =
         let clock = ManualClock()

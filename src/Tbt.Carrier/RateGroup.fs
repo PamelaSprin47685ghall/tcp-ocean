@@ -141,23 +141,6 @@ type RateGroup(clock: IClock) =
         with get () = protectRecovery
         and set v = protectRecovery <- v
 
-    /// BBR: leave startup and drain when a repair arrives while unique inflight
-    /// is already above the cruise cap (1.25 BDP). Early BOOSTERs before the
-    /// pipe is full (8-path Karn / first echos) must not freeze a 2 Mbit
-    /// sample (A8XFfz: SignalLoss at t+1 s, bulk up 1.4). The 256-path dump
-    /// had inflight 2.3 MB > 1.25 × 18 Mbit × 0.4 s at the first BOOSTER wave.
-    member _.SignalLoss() =
-        if startup && bw > 0.0 then
-            scan ()
-            let rtt = minRtt ()
-            // The 64-frame client startup floor (~90 KiB) already exceeds 1.25 BDP
-            // of a 1–2 Mbit first sample; that must not count as overshoot (U1TkhL
-            // left startup at 1.9 Mbit, bulk up 8.1). Require a margin of 64 frames
-            // above the cruise cap.
-            if rtt <> Int64.MaxValue && inflight () > int (cwndGain * bw * float rtt) + 64 * 2048 then
-                startup <- false
-                draining <- true
-
     member _.Count = members.Count
     /// Bytes per ns; 0 before the first sample.
     member _.Bandwidth = bw

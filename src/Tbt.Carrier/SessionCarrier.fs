@@ -158,7 +158,6 @@ type SessionCarrier(session: Session, bridge: FlowBridge, ?uplinkPace: bool, ?tu
                         progress <- true
                         if charge = 1 then
                             wireOut <- wireOut + int64 fl
-                            group.SignalLoss()
                             group.OnRepair fl
                             chargePath link.PathId fl
                         elif charge = 2 then
