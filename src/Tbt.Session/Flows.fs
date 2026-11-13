@@ -123,7 +123,9 @@ type CreditPolicy =
       Initial: int
       /// Largest window one flow gets.
       FlowWindowMax: int
-      /// Receive budget for reserve bytes plus promised credit, shared by the open flows.
+      /// Receive budget of the session: every promise not yet consumed by the local reader
+      /// (bytes held in reserves plus credit not yet arrived) counts. C0 of all 256 slots is
+      /// inside it (the peer may open any slot with C0 at any time); the rest is shared.
       PoolBytes: int }
 
 module CreditPolicy =
@@ -161,6 +163,8 @@ type Flow(index: int) =
     member val RxLimit = 0UL with get, set
     /// Reports that still carry this flow (a change goes out in more than one report).
     member val ReportsDue = 0 with get, set
+    /// Shared-pool bytes this flow holds beyond its C0 (spec 6.10b.4 budget).
+    member val Charged = 0L with get, set
     member val Reserve: ByteQueue = ByteQueue(0) with get, set
 
     member f.Active = f.Gen <> 0u
@@ -208,6 +212,24 @@ type FlowTable(port: IFlowPort, store: ISourceStore, stepUndelivered: Action<uin
     /// Flows with an open rx side: they share the credit pool.
     let mutable rxActive = 0
     let mutable reportsDue = 0
+    // Pool (spec 6.10b.4, DECISIONS D8): C0 of every slot is reserved up front; the shared
+    // rest is charged per flow as RxLimit - consumed - C0, and released only by consumption
+    // or close (a promise is never taken back).
+    let c0 = int64 credit.Initial
+    let sharedPool = max 0L (int64 credit.PoolBytes - int64 slotCount * c0)
+    let mutable poolUsed = 0L
+    let consumed (f: Flow) = f.RxDelivered - uint64 f.Reserve.Count
+    /// Bytes f may still make this end hold: after the peer's FIN or RST nothing more comes,
+    /// so only the reserve; before it, the promise not yet consumed.
+    let commitment (f: Flow) =
+        if f.RxDone then int64 f.Reserve.Count else int64 (f.RxLimit - min f.RxLimit (consumed f))
+    let recharge (f: Flow) =
+        let charge = max 0L (commitment f - c0)
+        poolUsed <- poolUsed + charge - f.Charged
+        f.Charged <- charge
+    let release (f: Flow) =
+        poolUsed <- poolUsed - f.Charged
+        f.Charged <- 0L
 
     let dropHead (f: Flow) =
         let mutable src = Unchecked.defaultof<PendingSource>
@@ -227,6 +249,7 @@ type FlowTable(port: IFlowPort, store: ISourceStore, stepUndelivered: Action<uin
             dropGen f f.Gen
             f.Reserve.Clear()
             if f.RxOpened then rxActive <- rxActive - 1
+            release f
             f.Gen <- 0u
             counters.Closed <- counters.Closed + 1L
             port.Close f.Index
@@ -247,15 +270,21 @@ type FlowTable(port: IFlowPort, store: ISourceStore, stepUndelivered: Action<uin
         port.Open(f.Index, f.Gen)
 
     /// Grow the rx limit when the local connection took bytes (spec 6.10b.4: a limit only
-    /// grows). The window per flow is the pool split over the open flows, at least C0.
+    /// grows). The window per flow is C0 plus the shared pool split over the open flows, at
+    /// most FlowWindowMax, and never more than the pool still has free.
     let refreshCredit (f: Flow) =
+        if credit.Enabled && f.Active then recharge f
         if credit.Enabled && f.Active && f.RxOpened && not f.RxDone then
-            let window = max credit.Initial (min credit.FlowWindowMax (credit.PoolBytes / max 1 rxActive))
-            let taken = f.RxDelivered - uint64 f.Reserve.Count
-            let limit = taken + uint64 window
-            // Report when an eighth of the window is free again, not on every write.
-            if limit >= f.RxLimit + uint64 (window / 8) then
+            let window = max credit.Initial (min credit.FlowWindowMax (int (c0 + sharedPool / int64 (max 1 rxActive))))
+            let taken = consumed f
+            let free = sharedPool - poolUsed
+            let limit = min (taken + uint64 window) (taken + uint64 (c0 + f.Charged + free))
+            // Report when an eighth of the window is free again, not on every write; when the
+            // pool is tight, as soon as the flow's own room falls under C0 / 2.
+            let room = f.RxLimit - min f.RxLimit taken
+            if limit >= f.RxLimit + uint64 (window / 8) || (limit > f.RxLimit && room < uint64 (c0 / 2L)) then
                 f.RxLimit <- limit
+                recharge f
                 if f.ReportsDue = 0 then reportsDue <- reportsDue + 1
                 f.ReportsDue <- 2
 
@@ -294,6 +323,15 @@ type FlowTable(port: IFlowPort, store: ISourceStore, stepUndelivered: Action<uin
     /// Flows whose rx limit changed and waits for a FLOW_STATE report.
     member _.ReportsDue = reportsDue
     member _.RxActive = rxActive
+    /// Shared-pool bytes charged now (at most PoolBytes - 256 x C0).
+    member _.PoolUsed = poolUsed
+    /// Every byte this end may still have to hold: per active slot its commitment (at least
+    /// C0), C0 per free slot. Never above PoolBytes when credit is on.
+    member _.CommittedBytes =
+        let mutable total = 0L
+        for f in flows do
+            total <- total + (if f.Active then max c0 (commitment f) else c0)
+        total
 
     /// Bytes slot may still commit under the peer's limit.
     member _.TxRoom(slot: int) =

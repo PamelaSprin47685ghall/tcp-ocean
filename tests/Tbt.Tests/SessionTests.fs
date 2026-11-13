@@ -641,3 +641,59 @@ let ``the grant limit is each report's own ack plus its grant: late, duplicate a
         tx.OnPeerAck(a, g)
         model <- max model (a + uint64 g)
         Assert.Equal(model, tx.GrantLimit)
+
+[<Fact>]
+let ``256 flows opened one after another with readers that take nothing stay within the 32 MiB pool`` () =
+    let config = { SessionConfig.defaults with WindowSteps = 1024 }
+    let pair = Pair(config, 4, 0.0, 9)
+    pair.ServerPort.WriteLimit <- 0
+    let c = pair.Client
+    let s = pair.Server
+    let pool = int64 config.Credit.PoolBytes
+    let c0 = int64 config.Credit.Initial
+    let limits = Array.zeroCreate<uint64> 256
+    let check () =
+        Assert.True(s.Flows.CommittedBytes <= pool, sprintf "committed %d > pool %d" s.Flows.CommittedBytes pool)
+        for i in 0 .. 255 do
+            let l = s.Flows.[i].RxLimit
+            if s.Flows.[i].Active then
+                Assert.True(l >= limits.[i], sprintf "slot %d limit %d fell below %d" i l limits.[i])
+                limits.[i] <- l
+    // The first flow fills its whole promise: the bytes sit in its reserve (held, not consumed).
+    let payload = Array.create (9 <<< 20) 5uy
+    let mutable first = -1
+    Assert.True(c.TryOpenFlow(&first))
+    let mutable sent = 0
+    for _ in 1 .. 1500 do
+        sent <- sent + pair.Feed(c, first, ReadOnlySpan(payload, sent, payload.Length - sent), false)
+        pair.Round() |> ignore
+        check ()
+    Assert.Equal(config.Credit.FlowWindowMax, sent)
+    let mutable app = Span<byte>.Empty
+    let mutable opened = 1
+    for _ in 1 .. 255 do
+        let mutable b = -1
+        Assert.True(c.TryOpenFlow(&b))
+        Assert.True(c.TryBeginSourceFor(b, &app))
+        c.CommitSource(b, 0, false)
+        c.Flush()
+        opened <- opened + 1
+        for _ in 1 .. 20 do
+            pair.Round() |> ignore
+            check ()
+    for _ in 1 .. 200 do
+        pair.Round() |> ignore
+        check ()
+    Assert.Equal(256, s.Flows.RxActive)
+    // Every flow keeps at least C0; the sum of promises would be ~161 MiB with a per-flow split.
+    let total = [ for i in 0 .. 255 -> int64 s.Flows.[i].RxLimit ] |> List.sum
+    Assert.True(total <= pool, sprintf "sum of limits %d" total)
+    for i in 0 .. 255 do Assert.True(int64 s.Flows.[i].RxLimit >= c0)
+    // The reader of the first flow takes its bytes: the pool frees and the others can grow.
+    let usedBefore = s.Flows.PoolUsed
+    pair.ServerPort.WriteLimit <- Int32.MaxValue
+    s.PumpFlow first
+    for _ in 1 .. 50 do
+        pair.Round() |> ignore
+        check ()
+    Assert.True(s.Flows.PoolUsed <= usedBefore, sprintf "%d -> %d" usedBefore s.Flows.PoolUsed)
