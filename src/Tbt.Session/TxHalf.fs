@@ -313,10 +313,16 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
                     // span we just repaired) was a fresh hole and skipped
                     // the wait (8-path end-echo: boosters 2813→4496,
                     // spurious 33→176, repair_repeats stuck at 74).
+                    // Any recently sent repair round — even for a tLo past
+                    // the last span — must wait. Mid-bulk 0% still stormed
+                    // because the frontier jumped beyond prevEnd every
+                    // second and each jump looked like a new hole
+                    // (boosters 318→1704, spurious 30→228 in 5 s).
                     let prevEnd = repairLo + uint64 repairSpan
                     let sameRegion = repairNs > 0L && tLo <= prevEnd
-                    if not sameRegion || float (now - repairNs) >= wait then
-                        if sameRegion then repairRepeats <- repairRepeats + 1L
+                    if repairNs > 0L && float (now - repairNs) < wait then ()
+                    else
+                        if repairNs > 0L then repairRepeats <- repairRepeats + 1L
                         if not sameRegion then
                             repairLo <- tLo
                             repairSpan <- dueSpan

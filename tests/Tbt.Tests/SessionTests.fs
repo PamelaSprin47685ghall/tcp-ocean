@@ -892,6 +892,44 @@ let ``a sliding NACK frontier inside the last repaired span does not skip the wa
     Assert.True(c.Tx.RepairWaiting, "a later round is due once the wait has passed")
 
 [<Fact>]
+let ``a NACK past the last repaired span still waits RepairWait before a new round`` () =
+    let config = { SessionConfig.defaults with Credit = { CreditPolicy.defaults with Enabled = false } }
+    let pair = Pair(config, 1, 0.0, 4)
+    let c = pair.Client
+    let clock = pair.Clock
+    c.Tx.InitialGrant 10_000UL
+    let mutable slot = -1
+    Assert.True(c.TryOpenFlow(&slot))
+    let chunk = Array.create 65536 7uy
+    let mutable guard = 64
+    while c.Tx.Head < 6UL && guard > 0 do
+        pair.Feed(c, slot, ReadOnlySpan chunk, false) |> ignore
+        c.Tx.Flush()
+        guard <- guard - 1
+    let sealedAt = clock.Now
+    clock.Now <- sealedAt + 400_000_000L
+    c.Tx.OnPeerAck(1UL, 100us)
+    Assert.True(c.Tx.Head >= 5UL, sprintf "head %d" c.Tx.Head)
+    let wait = c.Tx.RepairWaitNs
+    clock.Now <- sealedAt + int64 wait
+    c.Tx.OnNack(1UL, 1, 4)
+    Assert.True(c.Tx.RepairWaiting)
+    let frame = Array.zeroCreate<byte> c.FrameLength
+    let mutable n = 0
+    while c.Tx.RepairWaiting && n < 64 do
+        Assert.True(c.Tx.TryRenderNext(Span frame, 0us, 1UL, 100us, 0us, true))
+        n <- n + 1
+    let afterFirst = c.Tx.BoostersSent
+    // A hole well past the last span: still inside RepairWait of the previous round.
+    clock.Now <- clock.Now + 10_000_000L
+    c.Tx.OnNack(4UL, 1, 4)
+    Assert.False(c.Tx.RepairWaiting, "a later tLo must not skip the wait")
+    Assert.Equal(afterFirst, c.Tx.BoostersSent)
+    clock.Now <- clock.Now + int64 wait
+    c.Tx.OnNack(4UL, 1, 4)
+    Assert.True(c.Tx.RepairWaiting, "a later round is due once the wait has passed")
+
+[<Fact>]
 let ``an ack that arrives sooner than minRTT after a BOOSTER counts as a spurious repair`` () =
     let config = { SessionConfig.defaults with Credit = { CreditPolicy.defaults with Enabled = false } }
     let pair = Pair(config, 1, 0.0, 4)
