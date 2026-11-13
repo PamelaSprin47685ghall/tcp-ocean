@@ -6,11 +6,20 @@
 # The server runs as the NativeAOT binary, the client on the JIT runtime.
 # Reports server peak RSS (VmHWM), server CPU seconds, goodput and echo latency.
 #   run.sh [owd_ms] [rate_mbit] [loss] [paths] [seconds]
+# Optional env: WINDOW (default 1024), MAX_PATHS (default 64; server --max-paths),
+#   SEED (default 7), CARRIER=tun|kernel, ALLOW_DIRTY=1, SKIP_ECHO=1, SKIP_IPERF=1.
 # Needs sudo, gcc, python3, iperf3, .NET 10 SDK. Logs go to a temporary directory.
+#
+# Concurrent workers serialize on /tmp/tbtun-netns.lock (flock, held for the whole run,
+# including cleanup). Do not start a run while another worker already holds the lock;
+# wait, do not delete its namespaces.
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 repo=$(cd "$here/../.." && pwd)
 owd=${1:-20} rate=${2:-200} loss=${3:-0} paths=${4:-4} seconds=${5:-10}
+window=${WINDOW:-1024}
+max_paths=${MAX_PATHS:-64}
+seed=${SEED:-7}
 # CARRIER=kernel: server paths on kernel TCP; CARRIER=tun: user-space TCP on tbt0 (default).
 carrier=${CARRIER:-tun}
 if [[ $carrier == tun ]]; then
@@ -20,9 +29,24 @@ else
     server_at=10.200.2.2:8443
     server_args=(--listen "$server_at")
 fi
+
+# Hold the global lock before preflight or any namespace work, and until EXIT cleanup ends.
+exec 9>/tmp/tbtun-netns.lock
+if ! flock -n 9; then
+    echo "waiting for /tmp/tbtun-netns.lock" >&2
+    flock 9
+fi
+export TBTUN_NETNS_LOCK_HELD=1
+
 # Poka-yoke: a clean machine and a known commit, or no run.
 preflight() {
     local bad=0
+    # Recover a previous run that died after creating an owned testbed. down verifies
+    # identity; it will refuse (and we then refuse) if the namespaces are not ours.
+    if [[ $(python3 "$here/tb_guard.py" status) == owned-run ]]; then
+        echo "recovering leftover owned testbed"
+        sudo TBTUN_NETNS_LOCK_HELD=1 "$here/netns.sh" down || { echo "refuse: leftover owned testbed could not be cleaned"; bad=1; }
+    fi
     if ip netns list | grep -q '^tbe_'; then echo "refuse: tbe_* network namespaces exist: $(ip netns list | grep '^tbe_' | tr '\n' ' ')"; bad=1; fi
     # Only our own resources: the box is shared with other agents, so other processes
     # (even an echo server) are not ours to judge. Ours are the tbe_* namespaces (checked
@@ -38,19 +62,23 @@ preflight() {
 preflight
 commit=$(git -C "$repo" rev-parse --short HEAD)
 [[ -n $(git -C "$repo" status --porcelain) ]] && commit="$commit-dirty"
-echo "commit: $commit"
 work=$(mktemp -d /tmp/tbtun-e2e.XXXXXX)
+stamp() { echo "$*" | tee -a "$work/stamp.txt"; }
+stamp "stamp: commit=$commit owd_ms=$owd rate_mbit=$rate loss=$loss paths=$paths window=$window seed=$seed server_max_paths=$max_paths seconds=$seconds carrier=$carrier"
+if (( paths > max_paths )); then
+    echo "warning: requested paths=$paths exceeds server --max-paths=$max_paths (default 64); handshake will negotiate at most $max_paths, and the run will fail the negotiated==requested check. Set MAX_PATHS."
+fi
 user=$(id -un)
 dotnet_root=${DOTNET_ROOT:-$(dirname "$(readlink -f "$(command -v dotnet)")")}
-in_ns() { local ns=$1; shift; sudo ip netns exec "tbe_$ns" sudo -u "$user" env DOTNET_ROOT="$dotnet_root" TBT_TRACE="${TBT_TRACE:-}" PING_TRACE="${PING_TRACE:-}" "$@"; }
+in_ns() { local ns=$1; shift; sudo ip netns exec "tbe_$ns" sudo -u "$user" env DOTNET_ROOT="$dotnet_root" TBT_TRACE="${TBT_TRACE:-}" PING_TRACE="${PING_TRACE:-}" ECHO_PROBE_LOG="${ECHO_PROBE_LOG:-}" "$@"; }
 
 # Processes whose executable is under the work directory (or iperf3/python3 started here).
 pids_of() { for p in /proc/[0-9]*; do [[ $(sudo readlink "$p/exe" 2>/dev/null) == "$1" ]] && echo "${p#/proc/}"; done; true; }
 cleanup() {
     for exe in "$work/aot/tbtun" "$work/jit/tbtun"; do pids_of "$exe" | xargs -r sudo kill 2>/dev/null || true; done
-    sudo ip netns pids tbe_far 2>/dev/null | xargs -r sudo kill 2>/dev/null || true
-    sudo ip netns pids tbe_near 2>/dev/null | xargs -r sudo kill 2>/dev/null || true
-    sudo "$here/netns.sh" down "$work"
+    # Do not kill by the fixed namespace names. netns.sh down verifies ownership, then
+    # signals leftover processes in the recorded namespaces only, then deletes them.
+    sudo TBTUN_NETNS_LOCK_HELD=1 "$here/netns.sh" down "$work"
 }
 trap cleanup EXIT
 
@@ -58,10 +86,10 @@ dotnet publish "$repo/src/Tbt.Cli" -c Release -r linux-x64 -o "$work/aot" >"$wor
 dotnet build "$repo/src/Tbt.Cli" -c Release -o "$work/jit" >"$work/build.log"
 cp "$here/echo.py" "$work/echo.py"
 python3 -c 'import os; print(os.urandom(32).hex())' > "$work/psk"
-printf 'owd_ms=%s\nrate_mbit=%s\nloss=%s\nseed=7\n' "$owd" "$rate" "$loss" > "$work/wanem.conf"
+printf 'owd_ms=%s\nrate_mbit=%s\nloss=%s\nseed=%s\n' "$owd" "$rate" "$loss" "$seed" > "$work/wanem.conf"
 if [ -n "${WANEM_EXTRA:-}" ]; then printf "%b\n" "$WANEM_EXTRA" >> "$work/wanem.conf"; fi   # e.g. WANEM_EXTRA="outage_ms=300\noutage_every_s=3"
-sudo "$here/netns.sh" up "$work"
-echo "link: owd ${owd} ms each way, ${rate} Mbit/s, segment loss ${loss}; paths ${paths}; server carrier ${carrier}"
+sudo TBTUN_NETNS_LOCK_HELD=1 "$here/netns.sh" up "$work"
+echo "link: owd ${owd} ms each way, ${rate} Mbit/s, segment loss ${loss}; paths ${paths}; window ${window}; seed ${seed}; server_max_paths ${max_paths}; server carrier ${carrier}"
 
 in_ns far python3 "$work/echo.py" serve 7000 &
 in_ns far iperf3 -s -p 5201 >/dev/null 2>&1 &
@@ -71,14 +99,27 @@ sleep 0.5
 tunnel() {
     local name=$1 target=$2
     in_ns far "$work/aot/tbtun" server "${server_args[@]}" --target "$target" --psk-file "$work/psk" --stats-s 1 \
+        --window "$window" --max-paths "$max_paths" \
         2>"$work/server-$name.log" &
     sleep 0.5
     in_ns near "$work/jit/tbtun" client --server "$server_at" --listen 127.0.0.1:1080 --psk-file "$work/psk" --stats-s 1 \
-        --paths "$paths" --stats-s 1 2>"$work/client-$name.log" &
+        --paths "$paths" --window "$window" --stats-s 1 2>"$work/client-$name.log" &
     # Under loss a lost handshake segment costs a TCP retransmit timeout (1 s and more).
     local i
     for i in $(seq 50); do grep -q "session up" "$work/client-$name.log" && break; sleep 0.2; done
     grep -q "session up" "$work/client-$name.log" || { echo "handshake failed in 10 s"; cat "$work/client-$name.log"; exit 1; }
+    # Client logs "session up: S=... paths=N". Window is a local --window on both sides
+    # (not a distinct handshake field besides SERVER_INIT rx_win_grant0 = server WindowSteps).
+    local up_line neg_paths
+    up_line=$(grep "session up" "$work/client-$name.log" | tail -1)
+    neg_paths=${up_line##*paths=}
+    neg_paths=${neg_paths%%[^0-9]*}
+    stamp "negotiated($name): paths=$neg_paths window=$window (requested paths=$paths window=$window; server_max_paths=$max_paths)"
+    if [[ "$neg_paths" != "$paths" ]]; then
+        echo "FAILED: negotiated paths=$neg_paths != requested $paths (server --max-paths default 64; set MAX_PATHS if you asked for more than the server allows)"
+        status=1
+        return 1
+    fi
 }
 server_pid() { pids_of "$work/aot/tbtun" | head -1; }
 report() {
@@ -115,7 +156,8 @@ run_case in_ns near timeout 120 python3 -u "$work/echo.py" check 127.0.0.1 1080 
 run_case in_ns near timeout 120 python3 -u "$work/echo.py" ping 127.0.0.1 1080 200
 run_case in_ns near timeout 120 python3 -u "$work/echo.py" bulk 127.0.0.1 1080 up "$seconds"
 run_case in_ns near timeout 120 python3 -u "$work/echo.py" bulk 127.0.0.1 1080 down "$seconds"
-run_case in_ns near timeout 120 python3 -u "$work/echo.py" pingbulk 127.0.0.1 1080 200 "$seconds"
+# pingbulk keeps bulk running until every probe finishes; allow RTT + 20 ms spacing * count, plus margin.
+run_case in_ns near timeout $(( 90 + (2 * owd + 20) * 200 / 1000 )) python3 -u "$work/echo.py" pingbulk 127.0.0.1 1080 200 "$seconds"
 run_case in_ns near timeout 120 python3 -u "$work/echo.py" check 127.0.0.1 1080 8 1000000
 report mux; stop mux
 fi
@@ -138,6 +180,6 @@ report bulk; stop bulk
 fi
 
 echo "wanem: $(tr '\n' ' ' < "$work/wanem.stats")"
-echo "commit: $commit"
+stamp "stamp: commit=$commit owd_ms=$owd rate_mbit=$rate loss=$loss paths=$paths window=$window seed=$seed server_max_paths=$max_paths seconds=$seconds carrier=$carrier status=$status"
 echo "logs: $work"
 exit $status
