@@ -8,7 +8,8 @@
 #   run.sh [owd_ms] [rate_mbit] [loss] [paths] [seconds]
 # Optional env: WINDOW (default 1024), WINDOW_CLAMP (default 600000; --window-clamp on both sides),
 #   MAX_PATHS (default 64; server --max-paths), TBT_BIN=dir (reuse prebuilt aot/ and jit/ under dir),
-#   SEED (default 7), CARRIER=tun|kernel, ALLOW_DIRTY=1, SKIP_ECHO=1, SKIP_IPERF=1,
+#   SEED (default 7), CARRIER=tun|kernel, ALLOW_DIRTY=1, SKIP_ECHO=1, SKIP_IPERF=1
+#   (together: still start one session, report the handshake, and stop; no echo/iperf cases),
 #   SKIP_REF=1 (skip plain-TCP iperf/ping baselines), PING_COUNT (default 200),
 #   HANDSHAKE_S (default 10; raise for large path counts at long RTT),
 #   JOIN_CONCURRENCY (client --join-concurrency; default: the client's own),
@@ -260,6 +261,14 @@ fi
 
 # Session 1: every echo/latency case back to back on one session, so that a flow left
 # stalled by an earlier case shows up as a failure of the later ones.
+# Handshake-only: SKIP_ECHO and SKIP_IPERF together used to skip tunnel() entirely,
+# so a JOIN/handshake measurement never ran. Bring one session up, report it, and stop.
+if [[ ${SKIP_ECHO:-0} == 1 && ${SKIP_IPERF:-0} == 1 ]]; then
+    tunnel mux 10.200.2.2:7000
+    report mux
+    stop mux
+fi
+
 if [[ ${SKIP_ECHO:-0} != 1 ]]; then
 tunnel mux 10.200.2.2:7000
 run_case() { local rc=0; "$@" || rc=$?; if (( rc )); then echo "FAILED (exit $rc$( (( rc == 124 )) && echo ", timed out")): ${*:6}"; status=1; fi; }
