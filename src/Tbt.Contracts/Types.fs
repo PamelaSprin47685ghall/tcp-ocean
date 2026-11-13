@@ -28,10 +28,10 @@ type IClock =
     abstract FreshNs: unit -> int64
 
 /// One sample per event-loop Tick, plus a staleness bound. Hot-path
-/// bookkeeping (RateGroup / TunPath Inflight scans) reads NowNs without
-/// a clock_gettime each time. Seal, send, and repair deadlines must call
-/// FreshNs so a long iteration cannot stamp times in the past or make a
-/// just-sealed step look RepairWait-expired.
+/// bookkeeping and send stamps use NowNs (refresh if ≥ ~1 ms old or every
+/// 32 reads) so the TX path does not clock_gettime per packet. Seal and
+/// repair-deadline checks must call FreshNs so a long iteration cannot
+/// stamp a seal in the past or make a just-sealed step look RepairWait-expired.
 [<Sealed>]
 type CachedClock(inner: IClock, ?staleMs: int64, ?refreshEvery: int) =
     let staleMs = defaultArg staleMs 1L
