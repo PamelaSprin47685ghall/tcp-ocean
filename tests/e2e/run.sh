@@ -41,12 +41,16 @@ else
 fi
 
 # Hold the global lock before preflight or any namespace work, and until EXIT cleanup ends.
-exec 9>/tmp/tbtun-netns.lock
-if ! flock -n 9; then
-    echo "waiting for /tmp/tbtun-netns.lock" >&2
-    flock 9
+# If the caller already holds it (and inherited that fact via TBTUN_NETNS_LOCK_HELD), do not
+# reopen fd 9: `exec 9>` would drop the inherited lock and then wait on the caller forever.
+if [[ ${TBTUN_NETNS_LOCK_HELD:-0} != 1 ]]; then
+    exec 9>/tmp/tbtun-netns.lock
+    if ! flock -n 9; then
+        echo "waiting for /tmp/tbtun-netns.lock" >&2
+        flock 9
+    fi
+    export TBTUN_NETNS_LOCK_HELD=1
 fi
-export TBTUN_NETNS_LOCK_HELD=1
 
 # Poka-yoke: a clean machine and a known commit, or no run.
 preflight() {
