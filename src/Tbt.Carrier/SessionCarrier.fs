@@ -20,7 +20,13 @@ type private SessionRateMember(session: Session, frameOf: unit -> int, uniqueOut
             int (max 0L (uniqueOut() - session.Tx.UniqueAcked * fl))
         member _.Delivered = session.Tx.UniqueAcked * int64 (frameOf())
         member _.CopyEstimate = max 0L (wireOut() - uniqueOut())
-        member _.MinRttNs = session.Tx.MinRttNs
+        // RateGroup.Service will not take a bw sample while minRTT is unknown.
+        // Karn can skip every seal-to-custody sample when BOOSTERs start before
+        // the first ack (8-path rtt400 sat at the 64-frame startup cap for 40 s
+        // with pace_bw=0). Fall back to SRTT so the group can still estimate.
+        member _.MinRttNs =
+            let m = session.Tx.MinRttNs
+            if m <> System.Int64.MaxValue then m else max 1L (int64 session.Tx.SrttNs)
         member _.LastDeliveredNs =
             if session.Tx.PeerAck > lastAck then
                 lastAck <- session.Tx.PeerAck
@@ -72,25 +78,38 @@ type SessionCarrier(session: Session, bridge: FlowBridge, ?uplinkPace: bool, ?tu
     let uniqueInflight (fl: int) =
         int (max 0L (uniqueOut - session.Tx.UniqueAcked * int64 fl))
 
-    /// Restart the group's sample the first time a min-RTT exists, so the first
-    /// delivery rate is not averaged over the handshake delay (that sample was
-    /// ~1 frame / several seconds and left cwnd at 4 frames forever).
+    /// Restart the group's sample on the first send opportunity that has an RTT
+    /// (true min-RTT, or SRTT when Karn has skipped every seal-to-custody sample),
+    /// so the first delivery rate is not averaged over the handshake delay (that
+    /// sample was ~1 frame / several seconds and left cwnd at 4 frames forever).
     let primeSample () =
-        if pace && not samplePrimed && session.Tx.MinRttNs <> Int64.MaxValue then
-            group.Remove member'
-            group.Add member'
-            samplePrimed <- true
+        if pace && not samplePrimed then
+            let rtt =
+                let m = session.Tx.MinRttNs
+                if m <> Int64.MaxValue then m else int64 session.Tx.SrttNs
+            if rtt > 0L then
+                group.Remove member'
+                group.Add member'
+                samplePrimed <- true
 
     /// 64 unique frames is enough to finish several encoder steps and get a
     /// real RTT sample, but far below a many-path flood. Once the group has a
-    /// healthy cwnd, TryTake is the cap (1.25 BDP).
+    /// healthy rate, unique inflight is capped at 1.25 BDP (RateGroup.Cwnd is
+    /// 2.885 BDP in startup, which dumped 8 MB into 256 paths and overflowed
+    /// the server decoder).
     let startupCap (fl: int) = 64 * fl
+
+    let cruiseCwnd (fl: int) =
+        let rtt =
+            let m = session.Tx.MinRttNs
+            if m <> Int64.MaxValue then m else max 1L (int64 session.Tx.SrttNs)
+        int (RateGroup.CwndGain * group.Bandwidth * float rtt) + 4 * fl
 
     let groupAllows (fl: int) (repair: bool) (bulk: bool) =
         if repair then
             if group.Ready && group.TryTakeRepair(fl, fl) then true
             else not group.Ready && uniqueInflight fl <= startupCap fl
-        elif group.Ready && group.TryTake(fl, bulk) then true
+        elif group.Ready && uniqueInflight fl + fl <= cruiseCwnd fl && group.TryTake(fl, bulk) then true
         else uniqueInflight fl + fl <= startupCap fl
 
     let prune () =

@@ -188,58 +188,69 @@ type RateGroup(clock: IClock) =
             cycle <- 2
         if rtt <> Int64.MaxValue && members.Count > 0 then
             if sampleNs = 0L then restartSample now
-            elif now - sampleNs >= max rtt 5_000_000L && delivered () = sampleDelivered then
-                // Nothing delivered on any path for a whole round: an outage, not a rate. A zero
-                // sample would empty the max filter in 10 rounds, and the paced repairs that
-                // end the outage would then wait on a pacer with no rate.
-                sampleNs <- now
-                sampleSent <- sentBytes
-                sampleCopies <- copyEstimate ()
-                limited <- false
-                // Shared only when the paths that wait are more than one (or the only one): a
-                // single dead path while the others have nothing in flight is not an outage.
-                let mutable waiting = 0
-                for m in members do if m.Inflight > 0 then waiting <- waiting + 1
-                if waiting >= min 2 members.Count then outageNs <- now
             elif now - sampleNs >= max rtt 5_000_000L then
                 let d = delivered ()
-                let cp = copyEstimate ()
-                // The bottleneck carried the unique bytes plus, by estimate, the extra copies:
-                // the wire rate the pacer spends (it charges every copy) is their sum.
-                goodput <- float (max 0L (d - sampleDelivered)) / float (now - sampleNs)
-                let ackRate = float (max 0L (d - sampleDelivered) + max 0L (cp - sampleCopies)) / float (now - sampleNs)
-                let sendRate = float (sentBytes - sampleSent) / float (now - sampleNs)
-                // What was delivered in this interval was sent in about the last one.
-                let rate = min ackRate (max sendRate lastSendRate)
-                lastSendRate <- sendRate
-                sampleSent <- sentBytes
-                slot <- (slot + 1) % filter.Length
-                filter.[slot] <- if limited || rate > bw then rate else bw
-                bw <- Array.max filter
-                if limited then appLimited <- 0 else appLimited <- appLimited + 1
-                if startup && limited then
-                    if bw >= fullBw * 1.25 then
-                        fullBw <- bw
-                        fullCount <- 0
-                    else
-                        fullCount <- fullCount + 1
-                        if fullCount >= 3 then
-                            startup <- false
-                            draining <- true
-                elif draining then
-                    if inflight () <= int (bw * float rtt) then
-                        draining <- false
-                        cycle <- 2
-                elif not startup then
-                    cycle <- (cycle + 1) % 8
-                    if appLimited >= 3 then
-                        startup <- true
-                        fullBw <- 0.0
-                        fullCount <- 0
-                limited <- false
-                sampleNs <- now
-                sampleDelivered <- d
-                sampleCopies <- cp
+                let dt = now - sampleNs
+                let got = float (max 0L (d - sampleDelivered))
+                let expected = bw * float dt
+                // Zero delivery, or a trickle while more than one BDP is still outstanding,
+                // is a receiver/loss stall, not a capacity sample. A 256-path 0% run let
+                // crawl-acks evict 55 Mbit from the max filter in ~4 s (inflight 8 MB) and
+                // the repair reserve, which refills at 0.5×rate, then starved.
+                let stalled =
+                    d = sampleDelivered
+                    || (bw > 0.0 && inflight () > int (bw * float rtt) && got < 0.25 * expected)
+                if stalled then
+                    let zero = d = sampleDelivered
+                    sampleNs <- now
+                    sampleSent <- sentBytes
+                    sampleCopies <- copyEstimate ()
+                    sampleDelivered <- d
+                    limited <- false
+                    // Shared only when the paths that wait are more than one (or the only one): a
+                    // single dead path while the others have nothing in flight is not an outage.
+                    if zero then
+                        let mutable waiting = 0
+                        for m in members do if m.Inflight > 0 then waiting <- waiting + 1
+                        if waiting >= min 2 members.Count then outageNs <- now
+                else
+                    let cp = copyEstimate ()
+                    // The bottleneck carried the unique bytes plus, by estimate, the extra copies:
+                    // the wire rate the pacer spends (it charges every copy) is their sum.
+                    goodput <- float (max 0L (d - sampleDelivered)) / float (now - sampleNs)
+                    let ackRate = float (max 0L (d - sampleDelivered) + max 0L (cp - sampleCopies)) / float (now - sampleNs)
+                    let sendRate = float (sentBytes - sampleSent) / float (now - sampleNs)
+                    // What was delivered in this interval was sent in about the last one.
+                    let rate = min ackRate (max sendRate lastSendRate)
+                    lastSendRate <- sendRate
+                    sampleSent <- sentBytes
+                    slot <- (slot + 1) % filter.Length
+                    filter.[slot] <- if limited || rate > bw then rate else bw
+                    bw <- Array.max filter
+                    if limited then appLimited <- 0 else appLimited <- appLimited + 1
+                    if startup && limited then
+                        if bw >= fullBw * 1.25 then
+                            fullBw <- bw
+                            fullCount <- 0
+                        else
+                            fullCount <- fullCount + 1
+                            if fullCount >= 3 then
+                                startup <- false
+                                draining <- true
+                    elif draining then
+                        if inflight () <= int (bw * float rtt) then
+                            draining <- false
+                            cycle <- 2
+                    elif not startup then
+                        cycle <- (cycle + 1) % 8
+                        if appLimited >= 3 then
+                            startup <- true
+                            fullBw <- 0.0
+                            fullCount <- 0
+                    limited <- false
+                    sampleNs <- now
+                    sampleDelivered <- d
+                    sampleCopies <- cp
 
     member _.Describe() =
         "group paths=" + string members.Count + " bw_mbit=" + (bw * 8000.0).ToString("F1")

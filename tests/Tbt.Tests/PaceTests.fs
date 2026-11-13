@@ -102,3 +102,34 @@ let ``RateGroup repair bucket is charged separately and a dry reserve still allo
     clock.Now <- clock.Now + 20_000_000L
     g.Service clock.Now
     Assert.True(g.TryTake(L, true), "new data must not starve when the repair reserve is dry")
+
+[<Fact>]
+let ``RateGroup trickle delivery with a full pipe does not evict the max filter`` () =
+    let clock = ManualClock()
+    let g = RateGroup(clock)
+    let m = Mem()
+    g.Add m
+    let primed = int64 (2000 * L)
+    m.DeliveredV <- primed
+    m.LastNsV <- clock.Now
+    g.OnSent(int primed)
+    m.InflightV <- 0
+    clock.Now <- clock.Now + 400_000_000L
+    g.Service clock.Now
+    Assert.True(g.Ready)
+    let peak = g.Bandwidth
+    Assert.True(peak * 8000.0 > 50.0, sprintf "primed bw was %f Mbit" (peak * 8000.0))
+    // More than startup cwnd (2.885 BDP) so TryTake is limited; only a trickle acks each RTT.
+    m.InflightV <- 4 * int (peak * 400_000_000.0)
+    for _ in 1 .. 12 do
+        m.DeliveredV <- m.DeliveredV + int64 (10 * L)
+        m.LastNsV <- clock.Now + 400_000_000L
+        g.TryTake(L, true) |> ignore
+        clock.Now <- clock.Now + 400_000_000L
+        g.Service clock.Now
+    let after = g.Bandwidth
+    Assert.True(
+        after >= peak * 0.9,
+        sprintf "trickle evicted bw from %f to %f Mbit" (peak * 8000.0) (after * 8000.0))
+    clock.Now <- clock.Now + 20_000_000L
+    Assert.True(g.TryTakeRepair(L, L), "repair reserve must survive a trickle stall")
