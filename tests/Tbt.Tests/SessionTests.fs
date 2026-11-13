@@ -606,3 +606,38 @@ let ``Karn skips samples held behind a repair but keeps clean ones`` () =
     let m = c.Tx.MinRttNs
     Assert.True(m >= 40_000_000L && m < 60_000_000L, sprintf "min rtt %d" m)
     Assert.True(c.Tx.RepairWaitNs <= 4.0 * float m)
+
+[<Fact>]
+let ``the grant limit is each report's own ack plus its grant: late, duplicate and reordered reports never amplify it`` () =
+    let pair = Pair(SessionConfig.defaults, 1, 0.0, 5)
+    let c = pair.Client
+    let mutable b = -1
+    Assert.True(c.TryOpenFlow(&b))
+    let chunk = Array.create 65536 7uy
+    feedFor c b (ReadOnlySpan chunk) false |> ignore
+    let tx = c.Tx
+    let head = tx.Head
+    Assert.True(head >= 4UL, sprintf "head %d" head)
+    let g0 = tx.GrantLimit
+    // A late report of an older ack: its window counts from its own ack.
+    tx.OnPeerAck(3UL, uint16 (g0 - 3UL + 100UL))
+    Assert.Equal(g0 + 100UL, tx.GrantLimit)
+    tx.OnPeerAck(1UL, uint16 (g0 - 1UL + 150UL))
+    Assert.Equal(g0 + 150UL, tx.GrantLimit)
+    Assert.Equal(3UL, tx.PeerAck)
+    // A duplicate changes nothing; a smaller grant never takes the limit back.
+    tx.OnPeerAck(3UL, uint16 (g0 - 3UL + 100UL))
+    tx.OnPeerAck(head, 1us)
+    Assert.Equal(g0 + 150UL, tx.GrantLimit)
+    // An ack beyond our head is invalid and changes nothing.
+    tx.OnPeerAck(head + 1UL, 65535us)
+    Assert.Equal(g0 + 150UL, tx.GrantLimit)
+    // Random interleaving of a report history: the limit is the max of ack + grant.
+    let rnd = Random 3
+    let reports = Array.init 200 (fun i -> struct (uint64 (rnd.Next(0, int head + 1)), uint16 (rnd.Next(0, 65536))))
+    let mutable model = tx.GrantLimit
+    for _ in 1 .. 2000 do
+        let struct (a, g) = reports.[rnd.Next reports.Length]
+        tx.OnPeerAck(a, g)
+        model <- max model (a + uint64 g)
+        Assert.Equal(model, tx.GrantLimit)

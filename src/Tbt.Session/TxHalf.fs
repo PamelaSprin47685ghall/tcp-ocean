@@ -180,6 +180,7 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
         if filled > 0 then seal filled true |> ignore
 
     /// Authenticated meta from the peer: its custody frontier and grant (spec 6.9.2, 6.9.3).
+    /// ack beyond our head is invalid and changes nothing.
     member _.OnPeerAck(ack: uint64, grant: uint16) =
         if ack <= encoder.Head then
             if ack > peerAck then
@@ -200,7 +201,9 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
                     if sample < minCurNs then minCurNs <- sample
                 peerAck <- ack
                 if ack > CodeGraph.HistorySpan then encoder.Release(ack - CodeGraph.HistorySpan)
-            let limit = peerAck + uint64 grant
+            // The grant is relative to THIS report's own ack: a late (reordered) report with an
+            // older ack must not be applied to a newer peerAck (that would amplify the grant).
+            let limit = ack + uint64 grant
             if limit > grantLimit then grantLimit <- limit
 
     /// Set the first grant (SERVER_INIT rx_win_grant0 or the peer's first cell).
