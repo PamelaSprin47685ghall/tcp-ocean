@@ -1013,3 +1013,70 @@ let ``uplink: the swallowed-range record is bounded; a forgotten range's late co
     send 0
     f.Path.FlushAck()
     Assert.Equal(1L, f.Path.Counters.Dsacks)
+
+[<Fact>]
+let ``downlink: frames sent right after a box pause, before the paths' timers ran, keep their real send time`` () =
+    // Facts: 4 paths share one rate group and send steadily, every frame acked 40 ms after it
+    // went out. The box pauses 81 s (the peer too: no ACK during it). On resume the session
+    // asks for frames first (TryBeginFrame), before any path's Service or an ACK; then the
+    // timers run; then those frames are acked 40 ms later. Their RTT is 40 ms. (It was -81 s:
+    // the stall shift moved their send time into the future, a negative min RTT made the
+    // group's cwnd negative and the downlink stopped for good, server log GVA9jQ.)
+    let clock = ManualClock()
+    let group = RateGroup(clock)
+    let fs = [| for k in 0 .. 3 -> Fixture(1, clock, group, 40000us + uint16 k) |]
+    let l = uint32 L
+    let starts = [| for _ in fs -> List<uint32>() |]
+    let sentAt = [| for _ in fs -> List<int64>() |]
+    let acked = Array.zeroCreate<int> fs.Length
+    for f in fs do
+        f.Open()
+        group.Add(f.Path :> IRateMember)
+        (f.Path :> IPath).Backlog <- 100
+    let ack k (cum: uint32) =
+        let f = fs.[k]
+        let struct (s, p) = clientSegment f.Data0 cum Packet.Ack [||] ReadOnlySpan.Empty
+        f.Path.OnSegment(s, Span p, clock.Now)
+    let trySend k =
+        let f = fs.[k]
+        let mutable frame = Span<byte>.Empty
+        if (f.Path :> IPath).TryBeginFrame(&frame) then
+            frame.Fill 0x33uy
+            (f.Path :> IPath).CommitFrame()
+            starts.[k].Add (parse f.Out.Packets.[f.Out.Packets.Count - 1]).Seq
+            sentAt.[k].Add clock.Now
+            true
+        else false
+    let tick () =
+        clock.Now <- clock.Now + 1_000_000L
+        for k in 0 .. fs.Length - 1 do
+            let a0 = acked.[k]
+            while acked.[k] < sentAt.[k].Count && clock.Now - sentAt.[k].[acked.[k]] >= 40_000_000L do
+                acked.[k] <- acked.[k] + 1
+            if acked.[k] > a0 then ack k (starts.[k].[acked.[k] - 1] + l)
+            for _ in 1 .. 4 do trySend k |> ignore
+            fs.[k].Path.Service clock.Now
+        group.Service clock.Now
+    for _ in 1 .. 1000 do tick ()
+    let sentBefore = starts |> Array.sumBy (fun x -> x.Count)
+    Assert.True(sentBefore > 1000, sprintf "frames before the pause: %d" sentBefore)
+    let minBefore = (fs.[0].Path :> IRateMember).MinRttNs
+    clock.Now <- clock.Now + 81_000_000_000L
+    let first = [| for k in 0 .. fs.Length - 1 -> starts.[k].Count |]
+    for k in 0 .. fs.Length - 1 do trySend k |> ignore
+    for k in 0 .. fs.Length - 1 do fs.[k].Path.Service clock.Now
+    group.Service clock.Now
+    // The frames that were in flight at the pause stay unacked (lost with the pause); the
+    // first acks after it cover the frames sent on resume.
+    for k in 0 .. fs.Length - 1 do
+        acked.[k] <- first.[k]
+        for i in first.[k] .. sentAt.[k].Count - 1 do sentAt.[k].[i] <- clock.Now
+    let sent0 = starts |> Array.sumBy (fun x -> x.Count)
+    for _ in 1 .. 300 do tick ()
+    for k in 0 .. fs.Length - 1 do
+        let m = (fs.[k].Path :> IRateMember).MinRttNs
+        Assert.True(m > 0L && m <= minBefore + 1_000_000L, sprintf "path %d min RTT %d ns (before %d)" k m minBefore)
+        Assert.True(fs.[k].Path.SrttNs > 0.0, sprintf "path %d srtt %.0f" k fs.[k].Path.SrttNs)
+    Assert.True(group.Cwnd L > 8 * L, sprintf "group cwnd %d" (group.Cwnd L))
+    let after = (starts |> Array.sumBy (fun x -> x.Count)) - sent0
+    Assert.True(after > 300, sprintf "frames in 300 ms after the pause: %d (before: %d in 1 s)" after sentBefore)
