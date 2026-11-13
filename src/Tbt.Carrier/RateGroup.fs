@@ -62,26 +62,37 @@ type RateGroup(clock: IClock) =
     /// the queue this can build.
     static let cruiseGain = 1.05
 
-    let minRtt () =
+    // One O(n) scan, then O(1) getters. isDemoted used to call AnyDeliveredSince
+    // from every Inflight read (O(n²) NowNs + member walks at 256 paths).
+    let mutable cachedMinRtt = Int64.MaxValue
+    let mutable cachedInflight = 0
+    let mutable cachedDelivered = 0L
+    let mutable cachedCopies = 0L
+    let mutable cachedLastDelivered = Int64.MinValue / 2L
+
+    let scan () =
         let mutable r = Int64.MaxValue
-        // A negative member value (only a clock-jump artefact) must not drive the group cwnd below 0.
-        for m in members do if m.MinRttNs >= 0L then r <- min r m.MinRttNs
-        r
-
-    let inflight () =
         let mutable n = 0
-        for m in members do n <- n + m.Inflight
-        n
+        let mutable d = 0L
+        let mutable c = 0L
+        let mutable last = Int64.MinValue / 2L
+        for m in members do
+            // A negative member value (only a clock-jump artefact) must not drive the group cwnd below 0.
+            if m.MinRttNs >= 0L then r <- min r m.MinRttNs
+            n <- n + m.Inflight
+            d <- d + m.Delivered
+            c <- c + m.CopyEstimate
+            if m.LastDeliveredNs > last then last <- m.LastDeliveredNs
+        cachedMinRtt <- r
+        cachedInflight <- n
+        cachedDelivered <- d
+        cachedCopies <- c
+        cachedLastDelivered <- last
 
-    let delivered () =
-        let mutable n = 0L
-        for m in members do n <- n + m.Delivered
-        n
-
-    let copyEstimate () =
-        let mutable n = 0L
-        for m in members do n <- n + m.CopyEstimate
-        n
+    let minRtt () = cachedMinRtt
+    let inflight () = cachedInflight
+    let delivered () = cachedDelivered
+    let copyEstimate () = cachedCopies
 
     let gain () =
         if startup then 2.885
@@ -102,20 +113,22 @@ type RateGroup(clock: IClock) =
     /// True when some member delivered at or after t: a stall on every path at once is an
     /// outage, not one dead path, and must not demote them all.
     member _.AnyDeliveredSince(t: int64) =
-        let mutable any = false
-        for i in 0 .. members.Count - 1 do
-            if members.[i].LastDeliveredNs >= t then any <- true
-        any
+        if cachedLastDelivered >= t then true
+        else
+            scan ()
+            cachedLastDelivered >= t
 
     /// Last round in which no member delivered anything.
     member _.LastOutageNs = outageNs
 
     member _.Add(m: IRateMember) =
         members.Add m
+        scan ()
         restartSample (clock.NowNs())
 
     member _.Remove(m: IRateMember) =
         members.Remove m |> ignore
+        scan ()
         restartSample (clock.NowNs())
 
     member _.Count = members.Count
@@ -125,6 +138,7 @@ type RateGroup(clock: IClock) =
 
     /// Refill both buckets; returns the recovery reserve.
     member private _.Refill(l: int) =
+        scan ()
         let now = clock.NowNs()
         let rate = gain () * bw
         let depth = max (4.0 * float l) (rate * 2_000_000.0)
@@ -179,6 +193,7 @@ type RateGroup(clock: IClock) =
     /// One sample per round (min RTT, at least 5 ms): max filter over 10 rounds, startup,
     /// drain, 8-phase gain cycle. App-limited rounds keep the estimate.
     member _.Service(now: int64) =
+        scan ()
         let rtt = minRtt ()
         // The 0.75 phase only drains the queue the 1.25 phase built: it ends as soon as the
         // group's in-flight bytes are down to one BDP (BBR), not after a whole round, else

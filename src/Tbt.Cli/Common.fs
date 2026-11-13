@@ -15,6 +15,19 @@ type SystemClock() =
     interface IClock with
         member _.NowNs() = int64 (float (Stopwatch.GetTimestamp()) * factor)
 
+/// One timestamp per event-loop iteration. TunPath.Inflight and RateGroup used to
+/// call NowNs (clock_gettime) once per path per scan, which was ~62 % of server
+/// CPU in a 256-path stall. Tick at the start of each iteration; within one
+/// pass, every reader sees the same ns (a few microseconds of skew is fine).
+[<Sealed>]
+type CachedClock(inner: IClock) =
+    let mutable now = inner.NowNs()
+    member _.Tick() =
+        now <- inner.NowNs()
+        now
+    interface IClock with
+        member _.NowNs() = now
+
 [<Sealed>]
 type SystemEntropy() =
     interface IEntropy with

@@ -842,6 +842,7 @@ type TunPath(output: ITunOutput, counters: TunCounters, localIp: uint32, localPo
     /// losses (constant 1.15 x SRTT, no back-off), pending ACK, ProbeBW gain cycle.
     member private _.ServiceCore(now: int64) =
         catchUp now
+        isDemoted now |> ignore
         if state = TunState.Established then
             if leaseValid () then
                 let mutable go = true
@@ -978,7 +979,9 @@ type TunPath(output: ITunOutput, counters: TunCounters, localIp: uint32, localPo
             state <- TunState.Closed
 
     interface IRateMember with
-        member _.Inflight = if isDemoted (clock.NowNs()) then 0 else inflight
+        // Use the flag ServiceCore refreshes once per tick; do not call
+        // isDemoted(NowNs) here (that was O(n) AnyDeliveredSince per path).
+        member _.Inflight = if demoted then 0 else inflight
         member _.Delivered = delivered
         member _.CopyEstimate = copyEstimate
         member _.MinRttNs = minRttNs
@@ -1011,14 +1014,15 @@ type TunPath(output: ITunOutput, counters: TunCounters, localIp: uint32, localPo
             // sent after a pause and shifted later would carry a future send time, give a
             // negative RTT and, through the group's min RTT, a negative cwnd (no sends ever).
             catchUp (clock.NowNs())
+            let now = clock.NowNs()
             if state <> TunState.Established || not attached || frameLength > peerMss then false
             // Waiting repairs go before new frames.
-            elif repairQ.Count > 0 && (drainRepairs (clock.NowNs()); repairQ.Count > 0) then false
+            elif repairQ.Count > 0 && (drainRepairs now; repairQ.Count > 0) then false
             else
                 let l = frameLength
                 let bulk = backlog >= 16
                 if int (sndNxt + uint64 l - sndUna) > peerWnd then false
-                elif isDemoted (clock.NowNs()) then false
+                elif isDemoted now then false
                 elif group.Ready then
                     // The group gates the shared bottleneck; this path keeps its estimate.
                     if group.TryTake(l, bulk) then
@@ -1031,7 +1035,7 @@ type TunPath(output: ITunOutput, counters: TunCounters, localIp: uint32, localPo
                     if bulk then limitedThisRound <- true
                     false
                 else
-                    refillTokens (clock.NowNs())
+                    refillTokens now
                     if tokens < 0.0 then
                         if bulk then limitedThisRound <- true
                         false
