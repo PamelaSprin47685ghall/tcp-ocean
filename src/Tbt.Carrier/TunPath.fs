@@ -30,6 +30,10 @@ type TunCounters() =
     member val CellsSpanning = 0L with get, set
     member val CellsReceived = 0L with get, set
     member val CellsDropped = 0L with get, set
+    /// Times the fragment-slot table grew (memory budget = advertised window).
+    member val ReasmGrows = 0L with get, set
+    /// Times a fragment was not stored: rcvNxt / interval merge stopped (backpressure, not a drop).
+    member val ReasmPressure = 0L with get, set
     member val TailRepairs = 0L with get, set
     /// RTO fallback episodes: snd.una did not move for the RTO (no SACK needed).
     member val Rtos = 0L with get, set
@@ -88,7 +92,8 @@ type TunPath(output: ITunOutput, counters: TunCounters, localIp: uint32, localPo
     let windowBytes = defaultArg windowClamp SocketTuning.WindowClamp
     static let ourScale = 7
     static let maxGaps = 16
-    static let slotCount = 32
+    /// Initial fragment-slot table; grows up to the advertised window (see slotBudget).
+    static let slotCount0 = 32
     static let graceNs = 15_000_000L
     /// A gap this long between two calls is a stall (process or whole box), not network time.
     static let stallNs = 300_000_000L
@@ -136,10 +141,14 @@ type TunPath(output: ITunOutput, counters: TunCounters, localIp: uint32, localPo
     let mutable bootAt = -1
     let mutable dataPhase = false
     let mutable data0 = 0UL
-    // Partial frames (spec 6.8.3 fragment slots).
-    let slotFrame = Array.create slotCount -1L
-    let slotFill = Array.zeroCreate<int> slotCount
-    let slotBuf: byte[][] = Array.init slotCount (fun _ -> Array.Empty<byte>())
+    // Partial frames (spec 6.8.3). Sized from a memory budget equal to the advertised
+    // receive window (windowBytes / frameLength slots), not a fixed 32. Overflow must
+    // not drop cells: takeBytes returns the prefix we could store and the caller holds
+    // rcvNxt / interval merge there (TCP backpressure), counted in ReasmPressure.
+    let mutable slotCap = slotCount0
+    let mutable slotFrame = Array.create slotCount0 -1L
+    let mutable slotFill = Array.zeroCreate<int> slotCount0
+    let mutable slotBuf: byte[][] = Array.init slotCount0 (fun _ -> Array.Empty<byte>())
 
     // ---- send --------------------------------------------------------------------------
     let mutable sndUna = 0UL
@@ -259,29 +268,68 @@ type TunPath(output: ITunOutput, counters: TunCounters, localIp: uint32, localPo
         slotFrame.[i] <- -1L
         slotFill.[i] <- 0
 
+    let slotBudget () =
+        let fl = max 1 frameLength
+        max slotCount0 (windowBytes / fl + 2)
+
+    let growSlots () =
+        let budget = slotBudget ()
+        if slotCap >= budget then false
+        else
+            let n = min budget (max slotCount0 (slotCap * 2))
+            let nf = Array.create n -1L
+            let nfill = Array.zeroCreate<int> n
+            let nbuf = Array.init n (fun _ -> Array.Empty<byte>())
+            Array.Copy(slotFrame, nf, slotCap)
+            Array.Copy(slotFill, nfill, slotCap)
+            Array.Copy(slotBuf, nbuf, slotCap)
+            slotFrame <- nf
+            slotFill <- nfill
+            slotBuf <- nbuf
+            slotCap <- n
+            counters.ReasmGrows <- counters.ReasmGrows + 1L
+            true
+
+    let findSlot (index: int64) =
+        let rec search () =
+            let mutable s = -1
+            let mutable free = -1
+            for i in 0 .. slotCap - 1 do
+                if slotFrame.[i] = index then s <- i
+                elif free < 0 && slotFrame.[i] < 0L then free <- i
+            if s >= 0 then s
+            elif free >= 0 then
+                slotFrame.[free] <- index
+                slotFill.[free] <- 0
+                if slotBuf.[free].Length < frameLength then slotBuf.[free] <- Array.zeroCreate frameLength
+                free
+            elif growSlots () then search ()
+            else
+                counters.ReasmPressure <- counters.ReasmPressure + 1L
+                -1
+        search ()
+
     /// Bytes [a, a + data.Length) are new in the data phase: cut them at frame borders.
+    /// Returns how many bytes from the start were stored or delivered. If a fragment
+    /// cannot be placed even after growing to the window budget, the suffix is left
+    /// unstored so the caller can hold the ACK (backpressure) instead of dropping it.
     let takeBytes (a: uint64) (data: Span<byte>) =
         let l = uint64 frameLength
         let mutable pos = a
         let mutable rest = data
-        while rest.Length > 0 do
+        let mutable stop = false
+        while rest.Length > 0 && not stop do
             let index = int64 ((pos - data0) / l)
             let off = int ((pos - data0) % l)
             let n = min rest.Length (frameLength - off)
             let start = data0 + uint64 index * l
-            if off = 0 && n = frameLength then deliver (rest.Slice(0, n)) start
+            if off = 0 && n = frameLength then
+                deliver (rest.Slice(0, n)) start
+                pos <- pos + uint64 n
+                rest <- rest.Slice n
             else
-                let mutable s = -1
-                let mutable free = -1
-                for i in 0 .. slotCount - 1 do
-                    if slotFrame.[i] = index then s <- i
-                    elif free < 0 && slotFrame.[i] < 0L then free <- i
-                if s < 0 && free >= 0 then
-                    s <- free
-                    slotFrame.[s] <- index
-                    slotFill.[s] <- 0
-                    if slotBuf.[s].Length < frameLength then slotBuf.[s] <- Array.zeroCreate frameLength
-                if s < 0 then counters.CellsDropped <- counters.CellsDropped + 1L
+                let s = findSlot index
+                if s < 0 then stop <- true
                 else
                     rest.Slice(0, n).CopyTo(Span(slotBuf.[s], off, n))
                     slotFill.[s] <- slotFill.[s] + n
@@ -290,13 +338,14 @@ type TunPath(output: ITunOutput, counters: TunCounters, localIp: uint32, localPo
                         let index' = slotFrame.[s]
                         dropSlot s
                         deliver (Span(slotBuf.[s], 0, frameLength)) (data0 + uint64 index' * l)
-            pos <- pos + uint64 n
-            rest <- rest.Slice n
+                    pos <- pos + uint64 n
+                    rest <- rest.Slice n
+        int (pos - a)
 
     /// Drop fragment slots of frames that touch [lo, hi): they can never be whole.
     let dropSlotsIn (lo: uint64) (hi: uint64) =
         let l = uint64 frameLength
-        for i in 0 .. slotCount - 1 do
+        for i in 0 .. slotCap - 1 do
             if slotFrame.[i] >= 0L then
                 let s = data0 + uint64 slotFrame.[i] * l
                 if s < hi && s + l > lo then
@@ -398,42 +447,49 @@ type TunPath(output: ITunOutput, counters: TunCounters, localIp: uint32, localPo
         let mutable pos = a
         let mutable i = 0
         while i < ivCount && ivEnd.[i] <= pos do i <- i + 1
-        while pos < b do
+        let mutable storedHi = a
+        let mutable blocked = false
+        while pos < b && not blocked do
             if i < ivCount && ivStart.[i] <= pos then
                 pos <- min b ivEnd.[i]
+                storedHi <- pos
                 i <- i + 1
             else
                 let e = if i < ivCount then min b ivStart.[i] else b
-                takeBytes pos (data.Slice(int (pos - a), int (e - pos)))
-                pos <- e
-        // Merge [a, b) into the set.
-        let mutable lo = a
-        let mutable hi = b
-        let mutable first = 0
-        while first < ivCount && ivEnd.[first] < lo do first <- first + 1
-        let mutable last = first
-        while last < ivCount && ivStart.[last] <= hi do
-            lo <- min lo ivStart.[last]
-            hi <- max hi ivEnd.[last]
-            last <- last + 1
-        let since = if last > first then ivSince.[first] else now
-        let wm = if last > first then ivWm.[first] else UInt64.MaxValue
-        let removed = last - first
-        if removed = 0 then
-            // A new interval: a new gap in front of it.
-            for j in ivCount - 1 .. -1 .. first do
-                ivStart.[j + 1] <- ivStart.[j]
-                ivEnd.[j + 1] <- ivEnd.[j]
-                ivSince.[j + 1] <- ivSince.[j]
-                ivWm.[j + 1] <- ivWm.[j]
-            ivCount <- ivCount + 1
-            counters.UpHoles <- counters.UpHoles + 1L
-        else
-            for j in 1 .. removed - 1 do removeInterval (first + 1)
-        ivStart.[first] <- lo
-        ivEnd.[first] <- hi
-        ivSince.[first] <- since
-        ivWm.[first] <- wm
+                let n = takeBytes pos (data.Slice(int (pos - a), int (e - pos)))
+                storedHi <- pos + uint64 n
+                if n < int (e - pos) then blocked <- true
+                else pos <- e
+        // Merge only the prefix we stored; an unstored suffix is not ACKed.
+        if storedHi > a then
+            let b = storedHi
+            let mutable lo = a
+            let mutable hi = b
+            let mutable first = 0
+            while first < ivCount && ivEnd.[first] < lo do first <- first + 1
+            let mutable last = first
+            while last < ivCount && ivStart.[last] <= hi do
+                lo <- min lo ivStart.[last]
+                hi <- max hi ivEnd.[last]
+                last <- last + 1
+            let since = if last > first then ivSince.[first] else now
+            let wm = if last > first then ivWm.[first] else UInt64.MaxValue
+            let removed = last - first
+            if removed = 0 then
+                // A new interval: a new gap in front of it.
+                for j in ivCount - 1 .. -1 .. first do
+                    ivStart.[j + 1] <- ivStart.[j]
+                    ivEnd.[j + 1] <- ivEnd.[j]
+                    ivSince.[j + 1] <- ivSince.[j]
+                    ivWm.[j + 1] <- ivWm.[j]
+                ivCount <- ivCount + 1
+                counters.UpHoles <- counters.UpHoles + 1L
+            else
+                for j in 1 .. removed - 1 do removeInterval (first + 1)
+            ivStart.[first] <- lo
+            ivEnd.[first] <- hi
+            ivSince.[first] <- since
+            ivWm.[first] <- wm
 
     let onData (seq64: uint64) (data: Span<byte>) (now: int64) =
         // Trim what is old or past the window.
@@ -472,8 +528,8 @@ type TunPath(output: ITunOutput, counters: TunCounters, localIp: uint32, localPo
                         elif at >= 0 || headLen >= Handshake.MaxHeadLength then bootAt <- -2
             else
                 if a = rcvNxt then
-                    takeBytes a d
-                    rcvNxt <- rcvNxt + uint64 d.Length
+                    let n = takeBytes a d
+                    rcvNxt <- rcvNxt + uint64 n
                     advance ()
                 else addInterval a (a + uint64 d.Length) now d
                 // Too many gaps: retire the oldest at once (spec 6.8.3 early_retire). Outside
@@ -853,7 +909,7 @@ type TunPath(output: ITunOutput, counters: TunCounters, localIp: uint32, localPo
             // Fragments that can no longer complete.
             if dataPhase then
                 let l = uint64 frameLength
-                for i in 0 .. slotCount - 1 do
+                for i in 0 .. slotCap - 1 do
                     if slotFrame.[i] >= 0L && data0 + uint64 slotFrame.[i] * l + l <= rcvNxt then
                         counters.CellsDropped <- counters.CellsDropped + 1L
                         dropSlot i
@@ -1001,7 +1057,7 @@ type TunPath(output: ITunOutput, counters: TunCounters, localIp: uint32, localPo
             dataPhase <- true
             data0 <- headAt + uint64 (bootAt + Layout.BootFrameLength)
             let extra = headLen - (bootAt + Layout.BootFrameLength)
-            if extra > 0 then takeBytes data0 (Span(head, bootAt + Layout.BootFrameLength, extra))
+            if extra > 0 then takeBytes data0 (Span(head, bootAt + Layout.BootFrameLength, extra)) |> ignore
             head <- Array.Empty<byte>()
             headLen <- 0
 

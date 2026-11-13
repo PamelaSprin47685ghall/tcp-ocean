@@ -1080,3 +1080,34 @@ let ``downlink: frames sent right after a box pause, before the paths' timers ra
     Assert.True(group.Cwnd L > 8 * L, sprintf "group cwnd %d" (group.Cwnd L))
     let after = (starts |> Array.sumBy (fun x -> x.Count)) - sent0
     Assert.True(after > 300, sprintf "frames in 300 ms after the pause: %d (before: %d in 1 s)" after sentBefore)
+
+[<Fact>]
+let ``uplink: more than 32 partial frames reassemble instead of being dropped`` () =
+    // 1 in-order partial plus 16 OFO intervals of two partial frames each is 33 slots
+    // (maxGaps is 16, so 40 disjoint ranges would early-retire rather than grow).
+    // A fixed 32-slot table would silently drop the 33rd; the window-budget table
+    // grows, keeps every fragment, and delivers each frame once the rest arrives.
+    let f = Fixture 50
+    f.Open()
+    let dropped0 = f.Path.Counters.CellsDropped
+    // Current frame held in a slot; rcvNxt advances over the prefix (no new gap).
+    f.Send(f.Data0, ReadOnlySpan(f.Stream, 0, 100), [||])
+    let pairs = 16
+    for k in 0 .. pairs - 1 do
+        // Frames 2+3k and 3+3k: skip one frame between pairs so intervals do not merge.
+        let a = (2 + 3 * k) * L + 50
+        f.Send(f.Data0 + uint32 a, ReadOnlySpan(f.Stream, a, L), [||])
+    Assert.True(f.Path.Counters.ReasmGrows >= 1L, "slot table should grow past 32")
+    Assert.Equal(0L, f.Path.Counters.ReasmPressure)
+    Assert.Equal(dropped0, f.Path.Counters.CellsDropped)
+    // Complete the 32 OFO frames (leave frame 0 partial so rcvNxt stays put).
+    for k in 0 .. pairs - 1 do
+        let fa = (2 + 3 * k) * L
+        let fb = fa + L
+        f.Send(f.Data0 + uint32 fa, ReadOnlySpan(f.Stream, fa, 50), [||])
+        f.Send(f.Data0 + uint32 (fb + 50), ReadOnlySpan(f.Stream, fb + 50, L - 50), [||])
+    let got = [ for fr in f.Owner.Frames -> int fr.[0] - 1 ] |> List.sort
+    let expected = [ for k in 0 .. pairs - 1 do yield 2 + 3 * k; yield 3 + 3 * k ]
+    Assert.Equal<int list>(expected, got)
+    Assert.Equal(dropped0, f.Path.Counters.CellsDropped)
+    Assert.Equal(0L, f.Path.Counters.ReasmPressure)

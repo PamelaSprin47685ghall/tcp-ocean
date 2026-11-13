@@ -129,7 +129,7 @@ type TunStack(fd: int, local: IPEndPoint, clock: IClock, entropy: IEntropy, maxC
         + " clock_jumps=" + string counters.ClockJumps + " up_holes=" + string counters.UpHoles
         + " virtual_ack=" + string counters.VirtualAcks + " fast_swallow=" + string counters.FastSwallows
         + " cells_rx=" + string counters.CellsReceived + " cells_spanning=" + string counters.CellsSpanning
-        + " cells_dropped=" + string counters.CellsDropped
+        + " cells_dropped=" + string counters.CellsDropped + " reasm_grows=" + string counters.ReasmGrows + " reasm_pressure=" + string counters.ReasmPressure
         + String.Join("", groups.Values |> Seq.map (fun g -> "\n  " + g.Describe()))
         + String.Join("", conns.Values |> Seq.map (fun c -> "\n  path " + string (c :> IPath).PathId + " " + c.Describe()))
 
