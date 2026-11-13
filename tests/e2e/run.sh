@@ -47,7 +47,20 @@ fi
 # Hold the global lock before preflight or any namespace work, and until EXIT cleanup ends.
 # If the caller already holds it (and inherited that fact via TBTUN_NETNS_LOCK_HELD), do not
 # reopen fd 9: `exec 9>` would drop the inherited lock and then wait on the caller forever.
-if [[ ${TBTUN_NETNS_LOCK_HELD:-0} != 1 ]]; then
+# The env flag is not enough: it can leak from a parent shell that does not actually hold
+# the lock. Only skip acquire when fd 9 is already an exclusive flock on the lock file.
+holds_netns_lock() {
+    local lock target
+    lock=$(readlink -f /tmp/tbtun-netns.lock 2>/dev/null) || return 1
+    [[ -e /proc/self/fd/9 ]] || return 1
+    target=$(readlink -f /proc/self/fd/9 2>/dev/null) || return 1
+    [[ $target == "$lock" ]] || return 1
+    flock -n 9
+}
+if ! holds_netns_lock; then
+    if [[ ${TBTUN_NETNS_LOCK_HELD:-0} == 1 ]]; then
+        echo "warning: TBTUN_NETNS_LOCK_HELD=1 but fd 9 is not a held lock on /tmp/tbtun-netns.lock; acquiring it ourselves" >&2
+    fi
     exec 9>/tmp/tbtun-netns.lock
     if ! flock -n 9; then
         echo "waiting for /tmp/tbtun-netns.lock" >&2
