@@ -35,6 +35,9 @@ type RateGroup(clock: IClock) =
     let mutable tokens = 0.0
     let mutable tokensNs = clock.NowNs()
     let mutable repairBytes = 0L
+    let mutable repairTokens = 0.0
+    /// Last sample round in which no path delivered anything (a shared outage).
+    let mutable outageNs = Int64.MinValue / 2L
     /// Bytes the group's paths sent (new frames and repair copies), and the send rate of
     /// the last sample interval: a delivery sample may not exceed it (BBR send_elapsed).
     /// Without the bound, an ACK burst after a repaired hole gave samples up to 375 Mbit/s
@@ -89,6 +92,9 @@ type RateGroup(clock: IClock) =
             if members.[i].LastDeliveredNs >= t then any <- true
         any
 
+    /// Last round in which no member delivered anything.
+    member _.LastOutageNs = outageNs
+
     member _.Add(m: IRateMember) =
         members.Add m
         restartSample (clock.NowNs())
@@ -102,6 +108,18 @@ type RateGroup(clock: IClock) =
     member _.Bandwidth = bw
     member _.Ready = bw > 0.0 && minRtt () <> Int64.MaxValue
 
+    /// Refill both buckets; returns the recovery reserve.
+    member private _.Refill(l: int) =
+        let now = clock.NowNs()
+        let rate = gain () * bw
+        let depth = max (4.0 * float l) (rate * 2_000_000.0)
+        let reserve = max (16.0 * float l) (rate * 2_000_000.0)
+        let dt = float (now - tokensNs)
+        tokens <- min depth (tokens + rate * dt)
+        repairTokens <- min reserve (repairTokens + 0.5 * rate * dt)
+        tokensNs <- now
+        reserve
+
     member _.Cwnd(frameLength: int) =
         let g = if startup then 2.885 else cwndGain
         int (g * bw * float (minRtt ())) + 4 * frameLength
@@ -109,15 +127,19 @@ type RateGroup(clock: IClock) =
     /// May one more frame of l bytes go now? bulk: the session has a real backlog (a refusal
     /// then marks the round as not app-limited).
     member this.TryTake(l: int, bulk: bool) =
-        let now = clock.NowNs()
-        let rate = gain () * bw
-        let depth = max (4.0 * float l) (rate * 2_000_000.0)
-        tokens <- min depth (tokens + rate * float (now - tokensNs))
-        tokensNs <- now
+        this.Refill l |> ignore
         if inflight () + l > this.Cwnd l || tokens < 0.0 then
             if bulk then limited <- true
             false
         else true
+
+    /// May a repair of bytes go now? Repairs are paced by the same tokens as new frames, which
+    /// they may run down to -reserve (bounded recovery reserve: 16 frames or 2 ms at the rate),
+    /// and by a repair bucket that refills at half the rate: recovery cannot starve the new
+    /// frames of the other paths, and new frames cannot starve recovery. OnRepair charges both.
+    member this.TryTakeRepair(bytes: int, l: int) =
+        let reserve = this.Refill l
+        repairTokens >= float bytes && tokens - float bytes >= -reserve
 
     member _.OnSent(bytes: int) =
         tokens <- tokens - float bytes
@@ -126,6 +148,7 @@ type RateGroup(clock: IClock) =
     /// Repair copies (HOLE-2) take the same pacer as new frames: they load the same bottleneck.
     member _.OnRepair(bytes: int) =
         tokens <- tokens - float bytes
+        repairTokens <- repairTokens - float bytes
         repairBytes <- repairBytes + int64 bytes
         sentBytes <- sentBytes + int64 bytes
 
@@ -146,6 +169,18 @@ type RateGroup(clock: IClock) =
             cycle <- 2
         if rtt <> Int64.MaxValue && members.Count > 0 then
             if sampleNs = 0L then restartSample now
+            elif now - sampleNs >= max rtt 5_000_000L && delivered () = sampleDelivered then
+                // Nothing delivered on any path for a whole round: an outage, not a rate. A zero
+                // sample would empty the max filter in 10 rounds, and the paced repairs that
+                // end the outage would then wait on a pacer with no rate.
+                sampleNs <- now
+                sampleSent <- sentBytes
+                limited <- false
+                // Shared only when the paths that wait are more than one (or the only one): a
+                // single dead path while the others have nothing in flight is not an outage.
+                let mutable waiting = 0
+                for m in members do if m.Inflight > 0 then waiting <- waiting + 1
+                if waiting >= min 2 members.Count then outageNs <- now
             elif now - sampleNs >= max rtt 5_000_000L then
                 let d = delivered ()
                 let ackRate = float (max 0L (d - sampleDelivered)) / float (now - sampleNs)

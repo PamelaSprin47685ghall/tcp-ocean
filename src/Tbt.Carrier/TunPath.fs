@@ -41,6 +41,12 @@ type TunCounters() =
     member val Faults = 0L with get, set
     /// Gaps between two calls longer than the stall limit, cut from the timeline.
     member val ClockJumps = 0L with get, set
+    /// Repairs requested by RACK, the tail timer or the RTO fallback (each sent once paced).
+    member val RepairRequests = 0L with get, set
+    /// Times a waiting repair found the pacer empty and waited.
+    member val RepairsDeferred = 0L with get, set
+    /// Repairs sent while the path was demoted (still charged to the bottleneck).
+    member val DemotedRepairs = 0L with get, set
 
 [<Struct>]
 type SentSegment =
@@ -55,7 +61,9 @@ type SentSegment =
       mutable DeliveredNs: int64
       mutable FirstSentNs: int64
       /// Repair copies beyond the first, in bytes (HOLE-2 duplicates on the wire).
-      mutable Duplicates: int }
+      mutable Duplicates: int
+      /// A repair is requested and waits for the pacer.
+      mutable Due: bool }
 
 type TunState =
     | SynReceived = 0
@@ -176,6 +184,7 @@ type TunPath(output: ITunOutput, counters: TunCounters, localIp: uint32, localPo
     /// Last time OnSegment or Service ran (stall detection), and the last tail repair.
     let mutable seenNs = now0
     let mutable tailNs = now0
+    let mutable demotedShift = 0
     /// This round met the cwnd or the pacer at least once with a real backlog (not app-limited).
     let mutable limitedThisRound = false
     let mutable appLimitedRounds = 0
@@ -408,7 +417,10 @@ type TunPath(output: ITunOutput, counters: TunCounters, localIp: uint32, localPo
         let after = max 1_000_000_000L (int64 (3.0 * rto))
         // Only when another path of the group still delivers: if all stall together
         // (an outage), demoting them all would only hold the recovery back.
+        // A shared outage within the time also excludes it: paths come back a few ms apart,
+        // and the last one back is not dead.
         let d = inflight > 0 && now - deliveredNs > after && group.AnyDeliveredSince(now - after)
+                && now - group.LastOutageNs > after
         if d && not demoted then counters.Demotions <- counters.Demotions + 1L
         demoted <- d
         d
@@ -517,9 +529,10 @@ type TunPath(output: ITunOutput, counters: TunCounters, localIp: uint32, localPo
         counters.SegmentsSent <- counters.SegmentsSent + int64 copies
         counters.SegmentsLost <- counters.SegmentsLost + 1L
         tokens <- tokens - float (copies * n)
-        // A demoted path has left the group's sums: its repairs do not spend the others' pacer.
-        // The group counts payload bytes, as its rate samples (delivered) do.
-        if not demoted then group.OnRepair(copies * s.Length)
+        // Every copy crosses the same bottleneck, a demoted path's too: all are charged to the
+        // group (payload bytes, as its rate samples count).
+        if demoted then counters.DemotedRepairs <- counters.DemotedRepairs + 1L
+        group.OnRepair(copies * s.Length)
         s.Duplicates <- s.Duplicates + (copies - 1) * s.Length
         s.Retx <- s.Retx + 1
         s.SentNs <- now
@@ -540,6 +553,47 @@ type TunPath(output: ITunOutput, counters: TunCounters, localIp: uint32, localPo
             elif s < seq then lo <- mid + 1
             else hi <- mid - 1
         if found >= 0 then found else lo
+
+    /// Repairs wait in order of request; the pacer spaces what is actually sent.
+    let repairQ = System.Collections.Generic.Queue<uint64>(1024)
+
+    /// RACK, the tail timer and the RTO only ask for a repair; drainRepairs sends it.
+    let requestRepair (i: int) =
+        let s = &ring.[at i]
+        if not s.Due then
+            s.Due <- true
+            repairQ.Enqueue s.Seq
+            counters.RepairRequests <- counters.RepairRequests + 1L
+
+    /// May a repair of bytes on the wire go now? The shared pacer (or this path's own before
+    /// the group has an estimate) with a bounded recovery reserve: repairs may run the tokens
+    /// down to -reserve, never further, and every byte stays charged.
+    let repairAllowed (bytes: int) (now: int64) =
+        if group.Ready then group.TryTakeRepair(bytes, frameLength)
+        else
+            refillTokens now
+            let reserve = max (16.0 * float (max 1 frameLength)) (pacingRate () * 2_000_000.0)
+            tokens - float bytes >= -reserve
+
+    let drainRepairs (now: int64) =
+        let mutable go = true
+        while go && repairQ.Count > 0 do
+            let seq = repairQ.Peek()
+            let i = if ringCount > 0 then find seq else 0
+            if i < ringCount && ring.[at i].Seq = seq && ring.[at i].Due && not ring.[at i].Sacked then
+                let s = &ring.[at i]
+                let copies = min (2 + s.Retx) 4
+                if repairAllowed (copies * s.Length) now then
+                    repairQ.Dequeue() |> ignore
+                    s.Due <- false
+                    repair i now
+                else
+                    counters.RepairsDeferred <- counters.RepairsDeferred + 1L
+                    go <- false
+            else
+                // Acked, SACKed or already gone: nothing to send.
+                repairQ.Dequeue() |> ignore
+                if i < ringCount && ring.[at i].Seq = seq then ring.[at i].Due <- false
 
     let onAck (ack64: uint64) (options: ReadOnlySpan<byte>) (wnd: uint16) (now: int64) =
         peerWnd <- int wnd <<< peerScale
@@ -576,8 +630,9 @@ type TunPath(output: ITunOutput, counters: TunCounters, localIp: uint32, localPo
             let mutable i = 0
             while i < ringCount && ring.[at i].Seq < highSacked do
                 let s = &ring.[at i]
-                if not s.Sacked && s.SentNs < rackSentNs then repair i now
+                if not s.Sacked && s.SentNs < rackSentNs then requestRepair i
                 i <- i + 1
+            drainRepairs now
         if draining && inflight <= int (btlBw * float minRttNs) then
             draining <- false
             cycle <- 2
@@ -600,6 +655,7 @@ type TunPath(output: ITunOutput, counters: TunCounters, localIp: uint32, localPo
         + " min_rtt_ms=" + (if minRttNs = Int64.MaxValue then "-" else (float minRttNs / 1e6).ToString("F1"))
         + " cwnd=" + string (cwnd ()) + " inflight=" + string inflight + " peer_wnd=" + string peerWnd
         + " phase=" + (if startup then "startup" elif draining then "drain" else "probe" + string cycle)
+        + " rq=" + string repairQ.Count + " req=" + string counters.RepairRequests + " defer=" + string counters.RepairsDeferred
         + (if demoted then " demoted" else "")
     /// The HTTP head and bootstrap frame are whole: BootFrame holds the frame. -2: bad head.
     member _.BootState = if bootAt = -2 then -2 elif bootAt >= 0 && headLen >= bootAt + Layout.BootFrameLength then 1 else 0
@@ -690,7 +746,7 @@ type TunPath(output: ITunOutput, counters: TunCounters, localIp: uint32, localPo
                 ring <- next
                 ringHead <- 0
             if ringCount = 0 then unaNs <- now
-            ring.[at ringCount] <- { Seq = sndNxt; Length = n; Kind = 0uy; Sacked = false; Retx = 0; SentNs = now; Duplicates = 0
+            ring.[at ringCount] <- { Seq = sndNxt; Length = n; Kind = 0uy; Sacked = false; Retx = 0; SentNs = now; Duplicates = 0; Due = false
                                      Delivered = delivered; DeliveredNs = deliveredNs; FirstSentNs = lastDeliveredSentNs }
             ringCount <- ringCount + 1
             inflight <- inflight + n
@@ -723,20 +779,26 @@ type TunPath(output: ITunOutput, counters: TunCounters, localIp: uint32, localPo
             let rto = int64 (max (1.15 * srttNs) (srttNs + 10_000_000.0))
             // One batch per timer, not one per call: later calls in the same timer would
             // otherwise repair the next segments, and so on through the whole ring.
-            if ringCount > 0 && srttNs > 0.0 && now - deliveredNs > rto && now - tailNs > rto then
+            // A demoted path (dead while others deliver) probes with one repair per timer and
+            // backs the timer off (x2 per firing, up to x64): its copies cost the shared
+            // bottleneck. The first delivery ends the demotion and the back-off.
+            if not demoted then demotedShift <- 0
+            let tailEvery = if demoted then rto <<< demotedShift else rto
+            if ringCount > 0 && srttNs > 0.0 && now - deliveredNs > rto && now - tailNs > tailEvery then
                 let mutable i = 0
-                let mutable budget = tailBudget
+                let mutable budget = if demoted then 1 else tailBudget
+                if demoted then demotedShift <- min 6 (demotedShift + 1)
                 while i < ringCount && budget > 0 do
                     let s = &ring.[at i]
                     // Any segment older than the timer: RACK repairs only below the highest
                     // SACK, so a segment above it sent before rackSentNs (before a delivered
                     // repair) has no other way back once an outage silences every ACK.
-                    if not s.Sacked && now - s.SentNs > rto then
-                        repair i now
+                    if not s.Sacked && not s.Due && now - s.SentNs > rto then
+                        requestRepair i
                         counters.TailRepairs <- counters.TailRepairs + 1L
                         budget <- budget - 1
                     i <- i + 1
-                if budget < tailBudget then tailNs <- now
+                if budget < (if demoted then 1 else tailBudget) then tailNs <- now
             // RTO fallback: works with any peer (no SACK, SACK stripped). Base 2 x the tail
             // timer, at least 200 ms, doubled per episode up to 3.2 s; reset when snd.una moves.
             if ringCount > 0 && srttNs > 0.0 then
@@ -750,18 +812,20 @@ type TunPath(output: ITunOutput, counters: TunCounters, localIp: uint32, localPo
                     rtoShift <- min 4 (rtoShift + 1)
                     unaNs <- now
                     counters.Rtos <- counters.Rtos + 1L
-            if rtoActive then
+            // Go-back-N is for a path that may come back as a whole; a demoted one only probes.
+            if rtoActive && not demoted then
                 if rtoSeq < sndUna then rtoSeq <- sndUna
                 let mutable i = if ringCount > 0 then find rtoSeq else 0
                 let mutable budget = tailBudget
                 while i < ringCount && budget > 0 && ring.[at i].Seq < rtoEnd do
                     let s = &ring.[at i]
-                    if not s.Sacked && s.SentNs < rtoFireNs then
-                        repair i now
+                    if not s.Sacked && not s.Due && s.SentNs < rtoFireNs then
+                        requestRepair i
                         budget <- budget - 1
                     rtoSeq <- s.Seq + uint64 s.Length
                     i <- i + 1
                 if i >= ringCount || rtoSeq >= rtoEnd then rtoActive <- false
+            drainRepairs now
             if not startup && not draining && minRttNs <> Int64.MaxValue && now - cycleNs > minRttNs then
                 cycle <- (cycle + 1) % 8
                 cycleNs <- now
@@ -851,6 +915,8 @@ type TunPath(output: ITunOutput, counters: TunCounters, localIp: uint32, localPo
 
         member _.TryBeginFrame(frame) =
             if state <> TunState.Established || not attached || frameLength > peerMss then false
+            // Waiting repairs go before new frames.
+            elif repairQ.Count > 0 && (drainRepairs (clock.NowNs()); repairQ.Count > 0) then false
             else
                 let l = frameLength
                 let bulk = backlog >= 16
@@ -888,7 +954,7 @@ type TunPath(output: ITunOutput, counters: TunCounters, localIp: uint32, localPo
                 deliveredNs <- now
                 lastDeliveredSentNs <- now
             if ringCount = 0 then unaNs <- now
-            ring.[at ringCount] <- { Seq = sndNxt; Length = l; Kind = 1uy; Sacked = false; Retx = 0; SentNs = now; Duplicates = 0
+            ring.[at ringCount] <- { Seq = sndNxt; Length = l; Kind = 1uy; Sacked = false; Retx = 0; SentNs = now; Duplicates = 0; Due = false
                                      Delivered = delivered; DeliveredNs = deliveredNs; FirstSentNs = lastDeliveredSentNs }
             ringCount <- ringCount + 1
             inflight <- inflight + l
