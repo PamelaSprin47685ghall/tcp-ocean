@@ -33,3 +33,17 @@
 `TunTests`:4 路径共享一个 RateGroup,稳态发送(40 ms RTT),ManualClock 跳 81 s(对端也停,期间无 ACK),
 恢复后先 `TryBeginFrame` 再 `Service`,40 ms 后 ACK。旧代码:`path 0 min RTT -80959000000 ns`;
 修复后各路径 min RTT/SRTT 为正、组 cwnd 正常、300 ms 内继续发送。
+
+## e2e 复现
+
+`PAUSE=5/12 tests/e2e/run.sh 20 200 0 4 10`:会话建立后每 12 s 同时 SIGSTOP 服务端和客户端 5 s
+(两侧时钟都跳,日志 `pause.log`)。
+
+- 旧代码(894194e,/tmp/tbtun-e2e.1eAgSv):2 条路径 `srtt_ms=-372 min_rtt_ms=-4968`,`seg_sent` 冻结在 14753,
+  bulk up/down、pingbulk 全部超时。
+- 修复(1009576,/tmp/tbtun-e2e.fXYulR):无负 RTT,`clock_jumps=20`(5 次 × 4 路径),会话不断,
+  每次暂停后下行回到约 195 Mbit/s(17k 段/s)。
+
+暂停 5 s 超过 echo.py 探测超时,所以 ping 有 timeout/fail,这是测法本身的代价(旧代码同样),不是回归。
+SIGSTOP 只停进程、内核照常运行(客户端内核继续 ACK);真实挂起时内核也停,但两者都会让服务端时钟跳变,
+根因相同。

@@ -10,7 +10,10 @@
 #   MAX_PATHS (default 64; server --max-paths), TBT_BIN=dir (reuse prebuilt aot/ and jit/ under dir),
 #   SEED (default 7), CARRIER=tun|kernel, ALLOW_DIRTY=1, SKIP_ECHO=1, SKIP_IPERF=1,
 #   SKIP_REF=1 (skip plain-TCP iperf/ping baselines), PING_COUNT (default 200),
-#   HANDSHAKE_S (default 10; raise for large path counts at long RTT).
+#   HANDSHAKE_S (default 10; raise for large path counts at long RTT),
+#   PAUSE=stop_s/every_s (e.g. 5/12: SIGSTOP server and client together for stop_s every every_s
+#   while a session is up, like a suspended machine; both clocks jump. Log: pause.log.
+#   docs/cases/clock-jump-cwnd.md).
 # Needs sudo, gcc, python3, iperf3, .NET 10 SDK. Logs go to a temporary directory.
 #
 # Concurrent workers serialize on /tmp/tbtun-netns.lock (flock, held for the whole run,
@@ -114,7 +117,14 @@ pids_of() {
     done
     true
 }
+pause_pid=""
+# stop_pause: end the PAUSE loop and resume anything it left stopped.
+stop_pause() {
+    if [[ -n $pause_pid ]]; then kill "$pause_pid" 2>/dev/null || true; wait "$pause_pid" 2>/dev/null || true; pause_pid=""; fi
+    for exe in "$work/aot/tbtun" "$work/jit/tbtun"; do pids_of "$exe" | xargs -r sudo kill -CONT 2>/dev/null || true; done
+}
 cleanup() {
+    stop_pause
     for exe in "$work/aot/tbtun" "$work/jit/tbtun"; do pids_of "$exe" | xargs -r sudo kill 2>/dev/null || true; done
     # Do not kill by the fixed namespace names. netns.sh down verifies ownership, then
     # signals leftover processes in the recorded namespaces only, then deletes them.
@@ -199,6 +209,23 @@ tunnel() {
         status=1
         return 1
     fi
+    if [[ -n ${PAUSE:-} ]]; then
+        local stop_s=${PAUSE%/*} every_s=${PAUSE#*/}
+        (
+            while :; do
+                sleep "$every_s"
+                ps=$(pids_of "$work/aot/tbtun"; pids_of "$work/jit/tbtun")
+                [[ -z $ps ]] && continue
+                echo "$(date +%T.%N) $name STOP $(echo $ps)" >> "$work/pause.log"
+                sudo kill -STOP $ps 2>/dev/null || true
+                sleep "$stop_s"
+                sudo kill -CONT $ps 2>/dev/null || true
+                echo "$(date +%T.%N) $name CONT" >> "$work/pause.log"
+            done
+        ) &
+        pause_pid=$!
+        stamp "pause($name): stop ${stop_s}s every ${every_s}s"
+    fi
 }
 server_pid() { pids_of "$work/aot/tbtun" | head -1; }
 report() {
@@ -213,6 +240,7 @@ report() {
 # stop <name>: SIGTERM the client, which closes the session (SESSION_CLOSE, spec 6.10a);
 # the server must log the close by the peer before it is stopped.
 stop() {
+    stop_pause
     pids_of "$work/jit/tbtun" | xargs -r sudo kill
     for _ in $(seq 30); do [[ -z $(pids_of "$work/jit/tbtun") ]] && break; sleep 0.1; done
     sleep 0.3
@@ -313,6 +341,6 @@ ss_retrans(work / "ss-near.txt", "near")
 ss_retrans(work / "ss-far.txt", "far")
 PY
 fi
-stamp "stamp: commit=$commit owd_ms=$owd rate_mbit=$rate loss=$loss paths=$paths window=$window window_clamp=$window_clamp seed=$seed server_max_paths=$max_paths seconds=$seconds carrier=$carrier profile=${profile:-none} ping_count=$ping_count handshake_s=$handshake_s status=$status"
+stamp "stamp: commit=$commit owd_ms=$owd rate_mbit=$rate loss=$loss paths=$paths window=$window window_clamp=$window_clamp seed=$seed server_max_paths=$max_paths seconds=$seconds carrier=$carrier profile=${profile:-none} ping_count=$ping_count handshake_s=$handshake_s pause=${PAUSE:-none} status=$status"
 echo "logs: $work"
 exit $status
