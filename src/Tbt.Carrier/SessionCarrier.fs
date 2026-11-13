@@ -9,18 +9,17 @@ open Tbt.Session
 
 /// One session-level member of the client uplink RateGroup. Delivery is session
 /// custody (peer_ack), not TCP ACK: the kernel can ACK while the server decoder lags.
-type private SessionRateMember(session: Session, frameOf: unit -> int, wireOut: unit -> int64) =
+type private SessionRateMember(session: Session, frameOf: unit -> int, uniqueOut: unit -> int64, wireOut: unit -> int64) =
     let mutable lastAck = 0UL
     let mutable lastNs = 0L
     interface IRateMember with
+        // Unique payload still awaiting custody, not every BOOSTER copy: counting copies
+        // against cwnd left the group unable to send after a repair burst.
         member _.Inflight =
             let fl = int64 (frameOf())
-            int (max 0L (wireOut() - int64 session.Tx.PeerAck * fl))
+            int (max 0L (uniqueOut() - int64 session.Tx.PeerAck * fl))
         member _.Delivered = int64 session.Tx.PeerAck * int64 (frameOf())
-        member _.CopyEstimate =
-            let fl = int64 (frameOf())
-            let unique = int64 (session.Tx.Head - session.Tx.PeerAck) * fl
-            max 0L (wireOut() - int64 session.Tx.PeerAck * fl - unique)
+        member _.CopyEstimate = max 0L (wireOut() - uniqueOut())
         member _.MinRttNs = session.Tx.MinRttNs
         member _.LastDeliveredNs =
             if session.Tx.PeerAck > lastAck then
@@ -38,8 +37,11 @@ type SessionCarrier(session: Session, bridge: FlowBridge, ?uplinkPace: bool, ?tu
     let mutable framesOut = 0L
     /// Bytes of DATA/PARITY/BOOSTER put on the wire (not WIN_ACK/CTRL/heartbeat).
     let mutable wireOut = 0L
+    /// DATA/PARITY bytes only (BOOSTER copies go in wireOut but not here).
+    let mutable uniqueOut = 0L
     let group = RateGroup(session.Clock)
-    let member' = SessionRateMember(session, (fun () -> session.FrameLength), (fun () -> wireOut))
+    let member' = SessionRateMember(session, (fun () -> session.FrameLength), (fun () -> uniqueOut), (fun () -> wireOut))
+    let mutable samplePrimed = false
     do if pace then group.Add member'
     let pacers = Dictionary<uint16, PathPacer>()
     /// Local slots visited by Watch and Service (RS-3: grows with armed flows, not 256).
@@ -67,16 +69,29 @@ type SessionCarrier(session: Session, bridge: FlowBridge, ?uplinkPace: bool, ?tu
         | Some p -> p.OnSent bytes
         | None -> ()
 
-    let inflightBytes () =
-        let fl = int64 session.FrameLength
-        int (max 0L (wireOut - int64 session.Tx.PeerAck * fl))
+    let uniqueInflight (fl: int) =
+        int (max 0L (uniqueOut - int64 session.Tx.PeerAck * int64 fl))
 
-    /// Before the group has a sample, TryTake uses a zero rate and would stall after one
-    /// frame. Allow 10 frames in flight (same startup floor as TunPath) until then.
+    /// Restart the group's sample the first time a min-RTT exists, so the first
+    /// delivery rate is not averaged over the handshake delay (that sample was
+    /// ~1 frame / several seconds and left cwnd at 4 frames forever).
+    let primeSample () =
+        if pace && not samplePrimed && session.Tx.MinRttNs <> Int64.MaxValue then
+            group.Remove member'
+            group.Add member'
+            samplePrimed <- true
+
+    /// 64 unique frames is enough to finish several encoder steps and get a
+    /// real RTT sample, but far below a many-path flood. Once the group has a
+    /// healthy cwnd, TryTake is the cap (1.25 BDP).
+    let startupCap (fl: int) = 64 * fl
+
     let groupAllows (fl: int) (repair: bool) (bulk: bool) =
-        if not group.Ready then inflightBytes () + fl <= 10 * fl
-        elif repair then group.TryTakeRepair(fl, fl)
-        else group.TryTake(fl, bulk)
+        if repair then
+            if group.Ready && group.TryTakeRepair(fl, fl) then true
+            else not group.Ready && uniqueInflight fl <= startupCap fl
+        elif group.Ready && group.TryTake(fl, bulk) then true
+        else uniqueInflight fl + fl <= startupCap fl
 
     let prune () =
         let mutable i = paths.Count - 1
@@ -99,6 +114,7 @@ type SessionCarrier(session: Session, bridge: FlowBridge, ?uplinkPace: bool, ?tu
         let mutable passes = 0
         let fl = session.FrameLength
         let now = session.Clock.NowNs()
+        primeSample ()
         while progress && passes < 4 && budget > 0 && paths.Count > 0 && session.WantsToSend do
             progress <- false
             passes <- passes + 1
@@ -132,6 +148,7 @@ type SessionCarrier(session: Session, bridge: FlowBridge, ?uplinkPace: bool, ?tu
                             chargePath link.PathId fl
                         elif charge = 2 then
                             wireOut <- wireOut + int64 fl
+                            uniqueOut <- uniqueOut + int64 fl
                             group.OnSent fl
                             chargePath link.PathId fl
                 j <- j + 1
@@ -210,7 +227,7 @@ type SessionCarrier(session: Session, bridge: FlowBridge, ?uplinkPace: bool, ?tu
         + (if not pace then ""
            else
             " pace_bw_mbit=" + (group.Bandwidth * 8000.0).ToString("F1")
-            + " pace_inflight=" + string (max 0L (wireOut - int64 tx.PeerAck * int64 session.FrameLength))
+            + " pace_inflight=" + string (max 0L (uniqueOut - int64 tx.PeerAck * int64 session.FrameLength))
             + " pace_phase=" + (if group.InStartup then "startup" else "probe" + string group.Cycle)
             + " pace_repair_kib=" + string (group.RepairBytes / 1024L))
 
@@ -280,7 +297,9 @@ type SessionCarrier(session: Session, bridge: FlowBridge, ?uplinkPace: bool, ?tu
         readPass poller false
         session.Flush()
         session.Tick()
-        if pace then group.Service(session.Clock.NowNs())
+        if pace then
+            primeSample ()
+            group.Service(session.Clock.NowNs())
         writeRound ()
         prune ()
 
