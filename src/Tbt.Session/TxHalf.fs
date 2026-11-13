@@ -56,6 +56,11 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
     let mutable acc = 0.0
     let mutable nextCounter = 0UL
     let mutable peerAck = 0UL
+    /// Highest step the peer has reported seeing (WIN_ACK t_hi = SeenEnd-1).
+    /// Later than the cumulative frontier when a hole sits at t_lo; this is the
+    /// SACK-like evidence RACK repair uses. DecodedBitmap is on the wire but
+    /// not yet filled, so t_hi is the per-step signal we actually get.
+    let mutable peerSeenHi = 0UL
     let mutable grantLimit = 0UL
     let mutable erasure = 0.05
     let smallParities = Array.init 17 (fun k -> if k = 0 then 0 else SmallStep.parities k 0.05)
@@ -92,6 +97,9 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
     let dueQ = PriorityQueue<uint64, int64>()
     /// Steps sealAt as interactive (for the opt-in latency trace).
     let traced: bool[] = Array.zeroCreate capacity
+    /// Bulk-queue steps that hold interactive sources spilled from a full reserve.
+    let spilled: bool[] = Array.zeroCreate capacity
+    let mutable spillPending = false
     let mutable srttNs = 100_000_000.0
     /// Jacobson/Karels EWMA of |sample − SRTT|; used with SRTT for the repair deadline.
     let mutable rttvarNs = 0.0
@@ -103,6 +111,8 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
     let mutable repairRepeats = 0L
     /// BOOSTERs sent for a step whose first copy later arrived (ack sooner than minRTT after the repair).
     let mutable spuriousRepairs = 0L
+    /// Extra reorder window beyond minRTT/4, grown when a repair was spurious.
+    let mutable reoExtraNs = 0L
     /// When a BOOSTER for this step was sealed (0: none in this generation).
     let boostSentNs: int64[] = Array.zeroCreate encoder.Capacity
     let mutable lastSourceNs = 0L
@@ -121,6 +131,8 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
         traced.[index t] <- wasUrgent
         if wasUrgent then Trace.record Trace.Seal t 0us k
         let si = int (t % uint64 sealNs.Length)
+        spilled.[index t] <- spillPending && not wasUrgent
+        spillPending <- false
         sealNs.[si] <- clock.NowNs()
         lastRepairNs.[si] <- 0L
         repairCount.[si] <- 0
@@ -150,7 +162,16 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
     member _.UrgentQueued = urgent.Count
     /// Interactive sources that took the bulk path because the interactive reserve was full.
     member _.UrgentFull = urgentFull
-    member _.NoteUrgentFull() = urgentFull <- urgentFull + 1L
+    member _.NoteUrgentFull() =
+        urgentFull <- urgentFull + 1L
+        spillPending <- true
+    /// True when the next data cell is interactive: the urgent queue, or a bulk
+    /// step that only exists because the interactive reserve was full.
+    member _.InteractiveWaiting =
+        if urgent.Count > 0 then true
+        else
+            let mutable c = Unchecked.defaultof<Candidate>
+            queue.TryPeek(&c) && spilled.[index c.Step]
     member _.UrgentSteps = urgentSteps
     member _.UrgentSources = urgentSources
     member _.CellsSent = cellsSent
@@ -231,6 +252,8 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
                     let sentAt = boostSentNs.[bi]
                     if sentAt > 0L && minRtt <> Int64.MaxValue && now - sentAt < minRtt then
                         spuriousRepairs <- spuriousRepairs + 1L
+                        // RACK: a spurious repair means the reorder window was too short.
+                        reoExtraNs <- min (minRtt - minRtt / 4L) (reoExtraNs + minRtt / 4L)
                     boostSentNs.[bi] <- 0L
                     tSp <- tSp + 1UL
                 let mutable tSamp = ack
@@ -262,6 +285,7 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
                         minSinceNs <- now
                     if sample < minCurNs then minCurNs <- sample
                 peerAck <- ack
+                if ack > 0UL then peerSeenHi <- max peerSeenHi (ack - 1UL)
                 if ack > CodeGraph.HistorySpan then encoder.Release(ack - CodeGraph.HistorySpan)
             // The grant is relative to THIS report's own ack: a late (reordered) report with an
             // older ack must not be applied to a newer peerAck (that would amplify the grant).
@@ -285,37 +309,65 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
     member _.RttSkipped = rttSkipped
     /// Times a step was repaired again after its last-repair wait ran out.
     member _.RepairRepeats = repairRepeats
-    /// Repair deadline: minRTT + measured queueing and variance
-    /// (clamped SRTT + 4·RTTVAR), floored at minRTT and capped at 4×minRTT.
-    /// 1.05×minRTT alone fires on any standing queue above 5% of minRTT
-    /// (894194e), which turns paced bulk into a spurious BOOSTER storm.
-    /// Before a min sample the value is 1.05 × session SRTT, but OnNack does
-    /// not repair (expected arrival is unknown).
+    /// Tail-loss timer: SRTT + 4·RTTVAR, floored at 1.25×minRTT and capped at 4×minRTT.
+    /// Used only when no later step has been seen. Mid-window holes are evidence-driven
+    /// (later-sealed step seen, plus minRTT + reo_wnd) so a pure timer cannot race the
+    /// original under pacing jitter. Before a min sample the value is 1.05 × session
+    /// SRTT, but OnNack does not repair (expected arrival is unknown).
     member _.RepairWaitNs =
         let m = min minCurNs minPrevNs
         if m = Int64.MaxValue then 1.05 * srttNs
         else
             let wait = max srttNs (float m) + 4.0 * rttvarNs
-            min (max wait (float m)) (4.0 * float m)
+            min (max wait (1.25 * float m)) (4.0 * float m)
+    /// RACK reorder window: minRTT/4, growing toward minRTT as repairs prove spurious.
+    member _.ReoWndNs =
+        let m = min minCurNs minPrevNs
+        if m = Int64.MaxValue then 0L
+        else min m (m / 4L + reoExtraNs)
+    member _.PeerSeenHi = peerSeenHi
     member _.BoostersSent = boostersSent
     member _.SpuriousRepairs = spuriousRepairs
     member _.RttVarNs = rttvarNs
 
-    /// Per-step eligibility: now > seal + RepairWait and, if the step was
-    /// already repaired, now > lastRepair + RepairWait. No minRTT sample
-    /// means no expected arrival, so nothing is due. Frontier motion does
-    /// not create eligibility.
-    member private this.StepDue(t: uint64, now: int64, wait: int64) =
-        let cap = sealNs.Length
-        let si = int (t % uint64 cap)
+    /// WIN_ACK t_hi: the peer has seen a cell of this step (or below). Cumulative
+    /// peer_ack alone cannot show that a later step arrived while a hole sits
+    /// at the frontier.
+    member _.OnPeerSeen(thi: uint64) =
+        if thi > peerSeenHi then peerSeenHi <- thi
+
+    /// Deadline for step t: if a later-sealed step has been seen, wait until
+    /// that step's seal + minRTT + reo_wnd (it has already been acknowledged,
+    /// and a short reorder window remains). Otherwise this is a tail loss:
+    /// seal + RepairWait. A previous repair of this step also waits RepairWait.
+    member private this.DueAt(t: uint64) =
+        let si = int (t % uint64 sealNs.Length)
         let sealAt = sealNs.[si]
         let last = lastRepairNs.[si]
         let minRtt = min minCurNs minPrevNs
+        let tail = int64 this.RepairWaitNs
+        let later = peerSeenHi
+        let first =
+            if later > t && later < encoder.Head then
+                let li = int (later % uint64 sealNs.Length)
+                let laterSeal = sealNs.[li]
+                if laterSeal > 0L then laterSeal + minRtt + this.ReoWndNs
+                else sealAt + tail
+            else sealAt + tail
+        if last = 0L then first else max first (last + tail)
+
+    /// Per-step eligibility. No minRTT sample means no expected arrival.
+    /// Seeing a later step never itself creates eligibility: the reorder
+    /// (or tail) deadline must also have passed.
+    member private this.StepDue(t: uint64, now: int64) =
+        let si = int (t % uint64 sealNs.Length)
+        let sealAt = sealNs.[si]
+        let minRtt = min minCurNs minPrevNs
         minRtt <> Int64.MaxValue && t >= peerAck && t < encoder.Head && encoder.StepUsed t > 0
-        && sealAt > 0L && now - sealAt >= wait && (last = 0L || now - last >= wait)
+        && sealAt > 0L && now >= this.DueAt t
 
     /// Record a NACK against step t and insert it into the deadline heap.
-    member private this.ArmStep(t: uint64, deficit: int, now: int64, wait: int64) =
+    member private this.ArmStep(t: uint64, deficit: int) =
         if t < peerAck || t >= encoder.Head || encoder.StepUsed t = 0 || deficit < 1 then ()
         else
             let si = int (t % uint64 sealNs.Length)
@@ -323,10 +375,7 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
             if sealAt <= 0L then ()
             else
                 pendingDeficit.[si] <- max pendingDeficit.[si] deficit
-                let last = lastRepairNs.[si]
-                let dueAt =
-                    let first = sealAt + wait
-                    if last = 0L then first else max first (last + wait)
+                let dueAt = this.DueAt t
                 if nextDeadlineNs.[si] <> dueAt then
                     nextDeadlineNs.[si] <- dueAt
                     dueQ.Enqueue(t, dueAt)
@@ -362,7 +411,6 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
         if minRtt = Int64.MaxValue then ()
         else
             let now = clock.NowNs()
-            let wait = int64 this.RepairWaitNs
             let mutable step = 0UL
             let mutable deadline = 0L
             while repairs.Count < 256 && dueQ.TryPeek(&step, &deadline) && deadline <= now do
@@ -371,29 +419,25 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
                 if nextDeadlineNs.[si] <> deadline then ()
                 elif step < peerAck || pendingDeficit.[si] < 1 then
                     nextDeadlineNs.[si] <- 0L
-                elif this.StepDue(step, now, wait) then
+                elif this.StepDue(step, now) then
                     this.SendStepRepair(step, now)
                 else
-                    this.ArmStep(step, pendingDeficit.[si], now, wait)
+                    this.ArmStep(step, pendingDeficit.[si])
 
     /// A NACK from the peer's WIN_ACK (spec 5.8): steps [tLo, tLo + span) lack deficit ranks.
-    /// Each named step is armed with its share of the deficit and is sent only when
-    /// that step itself is due (seal + RepairWait, and lastRepair + RepairWait).
-    /// A moving frontier never makes a fresh step eligible. When the 256 seeds of
-    /// a step are used, its DATA cells go again.
+    /// Each named step is armed with its share of the deficit and is sent only when that
+    /// step is presumed lost: a later-sealed step has been seen and the reorder window
+    /// after that step's expected arrival has passed, or — for the outstanding tail
+    /// with no later evidence — the longer tail timer has passed. When the 256 seeds
+    /// of a step are used, its DATA cells go again.
     member this.OnNack(tLo: uint64, span: int, deficit: int) =
-        let now = clock.NowNs()
         let span = int (min (uint64 (min span CodeGraph.MaxBoosterSpan)) (encoder.Head - min tLo encoder.Head))
         let minRtt = min minCurNs minPrevNs
         if minRtt = Int64.MaxValue || tLo < peerAck || span < 1 || deficit < 1 then ()
         else
-            let wait = int64 this.RepairWaitNs
-            // Each named step gets its own share: a range deficit is not a
-            // licence to dump the whole batch on the frontier, and a fresh
-            // tail of the span is only armed, not sent, until it is due.
             let share = max 1 (int (ceil (float deficit / float span)))
             for j in 0 .. span - 1 do
-                this.ArmStep(tLo + uint64 j, share, now, wait)
+                this.ArmStep(tLo + uint64 j, share)
             this.DrainDueRepairs()
 
     /// Tail rule (spec 5.8): input paused for 50 ms and the peer lacks steps: a HEARTBEAT

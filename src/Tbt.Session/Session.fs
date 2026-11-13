@@ -327,6 +327,7 @@ type Session(role: Role, p: SessionParams, port: IFlowPort, clock: IClock, confi
                 let mutable h = Unchecked.defaultof<WinAckHead>
                 if WinAck.tryReadHead (Span<byte>.op_Implicit (frame.Slice(Layout.SymbolOffset, s))) &h then
                     ctrl.OnAck(h.CtrlAckHi, h.CtrlAckBitmap)
+                    tx.OnPeerSeen h.THi
                     if h.NackFlags &&& 1uy <> 0uy then tx.OnNack(h.TLo, int h.Span, int h.Deficit)
             | CellType.Heartbeat -> rx.OnHeartbeat m.StepId
             | CellType.Ctrl -> onCtrl (Span<byte>.op_Implicit (frame.Slice(Layout.SymbolOffset, s)))
