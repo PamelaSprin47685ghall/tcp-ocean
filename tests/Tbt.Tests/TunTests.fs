@@ -772,3 +772,27 @@ let ``uplink: the advertised window is the spec's 600 000 B per path and bytes p
     f.Send(past, ReadOnlySpan(f.Stream, 0, 1460), [||])
     Assert.Empty(f.Owner.Frames)
     Assert.Equal(0L, f.Path.Counters.UpHoles)
+
+[<Fact>]
+let ``uplink: --window-clamp overrides the advertised path window`` () =
+    // SYN-ACK advertises 65535 (unscaled); the clamp applies once the path is established.
+    let clock = ManualClock()
+    let out = RecordingOutput()
+    let clamp = 4 * 1024 * 1024
+    let path = TunPath(out, TunCounters(), serverIp, 8443us, clientIp, 40000us, 1000u, clock, RateGroup(clock), clamp)
+    let struct (syn, sp) = clientSegment 5000u 0u Packet.Syn synOptions ReadOnlySpan.Empty
+    path.OnSyn(syn.Seq, ReadOnlySpan(sp, syn.OptionsAt, syn.OptionsLength), 1460, clock.Now)
+    let synAck = parse out.Packets.[0]
+    let payload = [| 1uy |]
+    let struct (ackPkt, ap) = clientSegment 5001u (synAck.Seq + 1u) (Packet.Ack ||| Packet.Psh) [||] (ReadOnlySpan payload)
+    path.OnSegment(ackPkt, Span ap, clock.Now)
+    path.FlushAck()
+    let acks = [ for p in out.Packets -> parse p ]
+    let ack = acks |> List.findBack (fun a -> a.Flags &&& Packet.Syn = 0uy && a.Flags &&& Packet.Ack <> 0uy)
+    let w = int ack.Window <<< 7
+    Assert.True(w <= clamp && w > clamp - 128, sprintf "window %d" w)
+    // Default construction is unchanged.
+    let d = Fixture 1
+    d.Open()
+    let dw = int (parse d.Out.Packets.[d.Out.Packets.Count - 1]).Window <<< 7
+    Assert.True(dw <= SocketTuning.WindowClamp && dw > SocketTuning.WindowClamp - 128, sprintf "default window %d" dw)

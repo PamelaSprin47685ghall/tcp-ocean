@@ -9,7 +9,9 @@ open System.Net
 open Tbt.Contracts
 
 [<Sealed>]
-type TunStack(fd: int, local: IPEndPoint, clock: IClock, entropy: IEntropy, maxConnections: int) =
+type TunStack(fd: int, local: IPEndPoint, clock: IClock, entropy: IEntropy, maxConnections: int,
+              ?windowClamp: int) =
+    let windowClamp = defaultArg windowClamp SocketTuning.WindowClamp
     let localIp =
         let b = local.Address.GetAddressBytes()
         Buffers.Binary.BinaryPrimitives.ReadUInt32BigEndian(ReadOnlySpan b)
@@ -85,7 +87,7 @@ type TunStack(fd: int, local: IPEndPoint, clock: IClock, entropy: IEntropy, maxC
                                     let g = RateGroup(clock)
                                     groups.[seg.SrcIp] <- g
                                     g
-                            let c = TunPath(output, counters, localIp, localPort, seg.SrcIp, seg.SrcPort, isn (), clock, g)
+                            let c = TunPath(output, counters, localIp, localPort, seg.SrcIp, seg.SrcPort, isn (), clock, g, windowClamp)
                             g.Add c
                             conns.[k] <- c
                             c.OnSyn(seg.Seq, Span<byte>.op_Implicit (packet.Slice(seg.OptionsAt, seg.OptionsLength)),
@@ -132,6 +134,7 @@ type TunStack(fd: int, local: IPEndPoint, clock: IClock, entropy: IEntropy, maxC
         + String.Join("", conns.Values |> Seq.map (fun c -> "\n  path " + string (c :> IPath).PathId + " " + c.Describe()))
 
     /// Open the TUN device name; null when it fails.
-    static member Open(name: string, local: IPEndPoint, clock: IClock, entropy: IEntropy, maxConnections: int) : TunStack | null =
+    static member Open(name: string, local: IPEndPoint, clock: IClock, entropy: IEntropy, maxConnections: int,
+                       ?windowClamp: int) : TunStack | null =
         let fd = Native.openTun name
-        if fd < 0 then null else TunStack(fd, local, clock, entropy, maxConnections)
+        if fd < 0 then null else TunStack(fd, local, clock, entropy, maxConnections, ?windowClamp=windowClamp)

@@ -32,6 +32,7 @@ let run (o: Options) =
     let psks = readPsks (o.Text "psk-file")
     let mss = o.Int("mss", 1448)
     let maxPaths = o.Int("max-paths", 64)
+    let windowClamp = o.Int("window-clamp", SocketTuning.WindowClamp)
     let statsMs = int64 (o.Int("stats-s", 0)) * 1000L
     let config = { SessionConfig.defaults with WindowSteps = o.Int("window", 1024); MaxPaths = maxPaths }
     let entropy = SystemEntropy()
@@ -56,10 +57,11 @@ let run (o: Options) =
     let tun: TunStack | null =
         if o.Has "tun" then
             let at = endpoint (o.Text "tun-listen")
-            match TunStack.Open(o.Text "tun", at, clock, entropy, maxPaths * 64) with
+            match TunStack.Open(o.Text "tun", at, clock, entropy, maxPaths * 64, windowClamp) with
             | null -> failwith ("cannot open TUN device " + o.Text "tun")
             | t ->
-                log ("server on " + at.ToString() + " (user-space TCP on " + o.Text "tun" + ") -> " + target.ToString())
+                log ("server on " + at.ToString() + " (user-space TCP on " + o.Text "tun" + ") -> " + target.ToString()
+                     + " window_clamp=" + string windowClamp)
                 t
         else null
     if isNull listener && isNull tun then failwith "need --listen or --tun with --tun-listen"
@@ -186,7 +188,7 @@ let run (o: Options) =
                     match tryAccept l with
                     | null -> go <- false
                     | s ->
-                        SocketTuning.path s
+                        SocketTuning.path(s, windowClamp)
                         s.Blocking <- false
                         pending.Add(Pending(PathLink(s, probe), now))
         match tun with

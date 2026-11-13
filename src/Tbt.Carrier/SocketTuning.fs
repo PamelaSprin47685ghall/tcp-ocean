@@ -44,13 +44,14 @@ module SocketTuning =
         if OperatingSystem.IsLinux() then LinuxNotSentProbe() else NoNotSentProbe()
 
     /// Settings for a path socket: no Nagle, small unsent queue (Linux TCP_NOTSENT_LOWAT).
-    let path (socket: Socket) =
+    /// clamp is TCP_WINDOW_CLAMP in bytes (default WindowClamp, spec ch. 9).
+    let path (socket: Socket, clamp: int) =
         socket.NoDelay <- true
         if OperatingSystem.IsLinux() then
             try socket.SetRawSocketOption(6, 25, ReadOnlySpan(BitConverter.GetBytes NotSentLimit))
             with :? SocketException -> ()
             // TCP_WINDOW_CLAMP; autotuning stays on (no SO_RCVBUF, spec 3.6).
-            try socket.SetRawSocketOption(6, 10, ReadOnlySpan(BitConverter.GetBytes WindowClamp))
+            try socket.SetRawSocketOption(6, 10, ReadOnlySpan(BitConverter.GetBytes clamp))
             with :? SocketException -> ()
 
     /// Settings for a local flow socket.

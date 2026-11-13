@@ -13,9 +13,9 @@ open Tbt.Carrier
 open Tbt.Cli.Common
 
 /// Connect, send head and bootstrap frame, wait for the reply head and bootstrap frame.
-let private bootstrap (server: IPEndPoint) (host: string) (boot: byte[]) =
+let private bootstrap (server: IPEndPoint) (host: string) (boot: byte[]) (windowClamp: int) =
     let socket = new Socket(server.AddressFamily, SocketType.Stream, ProtocolType.Tcp)
-    SocketTuning.path socket
+    SocketTuning.path(socket, windowClamp)
     socket.ReceiveTimeout <- 10_000
     socket.SendTimeout <- 10_000
     socket.Connect server
@@ -41,10 +41,11 @@ let run (o: Options) =
     let psk = (readPsks (o.Text "psk-file")).[0]
     let pathCount = o.Int("paths", 4)
     let mss = o.Int("mss", 1448)
+    let windowClamp = o.Int("window-clamp", SocketTuning.WindowClamp)
     let config = { SessionConfig.defaults with WindowSteps = o.Int("window", 1024) }
     let entropy = SystemEntropy()
     let offer = ClientOffer(psk, Guid.NewGuid(), entropy, uint64 (unixMs ()), mss, max 1 pathCount)
-    let struct (link0, reply) = bootstrap server host offer.Frame
+    let struct (link0, reply) = bootstrap server host offer.Frame windowClamp
     match offer.TryAccept(ReadOnlySpan reply) with
     | ValueNone ->
         log "handshake failed"
@@ -59,7 +60,7 @@ let run (o: Options) =
         for id in 1 .. min pathCount maxPaths - 1 do
             let join = JoinOffer(p.Keys.PathKey, entropy, p.Keys.SessionId, p.Symbol, p.Caps, maxPaths, uint16 id, 1u, mss)
             try
-                let struct (link, ack) = bootstrap server host join.Frame
+                let struct (link, ack) = bootstrap server host join.Frame windowClamp
                 if (join.TryAccept(ReadOnlySpan ack)).IsSome then
                     link.PathId <- uint16 id
                     link.Incarnation <- 1u
@@ -68,7 +69,7 @@ let run (o: Options) =
                     log ("path " + string id + ": join refused")
                     link.Close()
             with :? SocketException as e -> log ("path " + string id + ": " + e.Message)
-        log ("session up: S=" + string p.Symbol + " paths=" + string carrier.Paths.Count)
+        log ("session up: S=" + string p.Symbol + " paths=" + string carrier.Paths.Count + " window_clamp=" + string windowClamp)
         let listener = new Socket(listenAt.AddressFamily, SocketType.Stream, ProtocolType.Tcp)
         listener.Bind listenAt
         listener.Listen 128

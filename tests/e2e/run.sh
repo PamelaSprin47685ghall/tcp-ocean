@@ -6,7 +6,8 @@
 # The server runs as the NativeAOT binary, the client on the JIT runtime.
 # Reports server peak RSS (VmHWM), server CPU seconds, goodput and echo latency.
 #   run.sh [owd_ms] [rate_mbit] [loss] [paths] [seconds]
-# Optional env: WINDOW (default 1024), MAX_PATHS (default 64; server --max-paths),
+# Optional env: WINDOW (default 1024), WINDOW_CLAMP (default 600000; --window-clamp on both sides),
+#   MAX_PATHS (default 64; server --max-paths), TBT_BIN=dir (reuse prebuilt aot/ and jit/ under dir),
 #   SEED (default 7), CARRIER=tun|kernel, ALLOW_DIRTY=1, SKIP_ECHO=1, SKIP_IPERF=1.
 # Needs sudo, gcc, python3, iperf3, .NET 10 SDK. Logs go to a temporary directory.
 #
@@ -26,6 +27,7 @@ else
     owd=${1:-20} rate=${2:-200} loss=${3:-0} paths=${4:-4} seconds=${5:-10}
 fi
 window=${WINDOW:-1024}
+window_clamp=${WINDOW_CLAMP:-600000}
 max_paths=${MAX_PATHS:-64}
 seed=${SEED:-7}
 # CARRIER=kernel: server paths on kernel TCP; CARRIER=tun: user-space TCP on tbt0 (default).
@@ -72,7 +74,7 @@ commit=$(git -C "$repo" rev-parse --short HEAD)
 [[ -n $(git -C "$repo" status --porcelain) ]] && commit="$commit-dirty"
 work=$(mktemp -d /tmp/tbtun-e2e.XXXXXX)
 stamp() { echo "$*" | tee -a "$work/stamp.txt"; }
-stamp "stamp: commit=$commit owd_ms=$owd rate_mbit=$rate loss=$loss paths=$paths window=$window seed=$seed server_max_paths=$max_paths seconds=$seconds carrier=$carrier profile=${profile:-none}"
+stamp "stamp: commit=$commit owd_ms=$owd rate_mbit=$rate loss=$loss paths=$paths window=$window window_clamp=$window_clamp seed=$seed server_max_paths=$max_paths seconds=$seconds carrier=$carrier profile=${profile:-none}"
 if (( paths > max_paths )); then
     echo "warning: requested paths=$paths exceeds server --max-paths=$max_paths (default 64); handshake will negotiate at most $max_paths, and the run will fail the negotiated==requested check. Set MAX_PATHS."
 fi
@@ -90,14 +92,19 @@ cleanup() {
 }
 trap cleanup EXIT
 
-dotnet publish "$repo/src/Tbt.Cli" -c Release -r linux-x64 -o "$work/aot" >"$work/publish.log"
-dotnet build "$repo/src/Tbt.Cli" -c Release -o "$work/jit" >"$work/build.log"
+if [[ -n ${TBT_BIN:-} ]]; then
+    ln -s "$(cd "$TBT_BIN/aot" && pwd)" "$work/aot"
+    ln -s "$(cd "$TBT_BIN/jit" && pwd)" "$work/jit"
+else
+    dotnet publish "$repo/src/Tbt.Cli" -c Release -r linux-x64 -o "$work/aot" >"$work/publish.log"
+    dotnet build "$repo/src/Tbt.Cli" -c Release -o "$work/jit" >"$work/build.log"
+fi
 cp "$here/echo.py" "$work/echo.py"
 python3 -c 'import os; print(os.urandom(32).hex())' > "$work/psk"
 printf 'owd_ms=%s\nrate_mbit=%s\nloss=%s\nseed=%s\n' "$owd" "$rate" "$loss" "$seed" > "$work/wanem.conf"
 if [ -n "${WANEM_EXTRA:-}" ]; then printf "%b\n" "$WANEM_EXTRA" >> "$work/wanem.conf"; fi   # e.g. WANEM_EXTRA="outage_ms=300\noutage_every_s=3"
 sudo TBTUN_NETNS_LOCK_HELD=1 "$here/netns.sh" up "$work"
-echo "link: owd ${owd} ms each way, ${rate} Mbit/s, segment loss ${loss}; paths ${paths}; window ${window}; seed ${seed}; server_max_paths ${max_paths}; server carrier ${carrier}"
+echo "link: owd ${owd} ms each way, ${rate} Mbit/s, segment loss ${loss}; paths ${paths}; window ${window}; window_clamp ${window_clamp}; seed ${seed}; server_max_paths ${max_paths}; server carrier ${carrier}"
 
 in_ns far python3 "$work/echo.py" serve 7000 &
 in_ns far iperf3 -s -p 5201 >/dev/null 2>&1 &
@@ -107,11 +114,11 @@ sleep 0.5
 tunnel() {
     local name=$1 target=$2
     in_ns far "$work/aot/tbtun" server "${server_args[@]}" --target "$target" --psk-file "$work/psk" --stats-s 1 \
-        --window "$window" --max-paths "$max_paths" \
+        --window "$window" --window-clamp "$window_clamp" --max-paths "$max_paths" \
         2>"$work/server-$name.log" &
     sleep 0.5
     in_ns near "$work/jit/tbtun" client --server "$server_at" --listen 127.0.0.1:1080 --psk-file "$work/psk" --stats-s 1 \
-        --paths "$paths" --window "$window" --stats-s 1 2>"$work/client-$name.log" &
+        --paths "$paths" --window "$window" --window-clamp "$window_clamp" --stats-s 1 2>"$work/client-$name.log" &
     # Under loss a lost handshake segment costs a TCP retransmit timeout (1 s and more).
     local i
     for i in $(seq 50); do grep -q "session up" "$work/client-$name.log" && break; sleep 0.2; done
@@ -122,7 +129,7 @@ tunnel() {
     up_line=$(grep "session up" "$work/client-$name.log" | tail -1)
     neg_paths=${up_line##*paths=}
     neg_paths=${neg_paths%%[^0-9]*}
-    stamp "negotiated($name): paths=$neg_paths window=$window (requested paths=$paths window=$window; server_max_paths=$max_paths)"
+    stamp "negotiated($name): paths=$neg_paths window=$window window_clamp=$window_clamp (requested paths=$paths window=$window window_clamp=$window_clamp; server_max_paths=$max_paths)"
     if [[ "$neg_paths" != "$paths" ]]; then
         echo "FAILED: negotiated paths=$neg_paths != requested $paths (server --max-paths default 64; set MAX_PATHS if you asked for more than the server allows)"
         status=1
@@ -188,6 +195,6 @@ report bulk; stop bulk
 fi
 
 echo "wanem: $(tr '\n' ' ' < "$work/wanem.stats")"
-stamp "stamp: commit=$commit owd_ms=$owd rate_mbit=$rate loss=$loss paths=$paths window=$window seed=$seed server_max_paths=$max_paths seconds=$seconds carrier=$carrier profile=${profile:-none} status=$status"
+stamp "stamp: commit=$commit owd_ms=$owd rate_mbit=$rate loss=$loss paths=$paths window=$window window_clamp=$window_clamp seed=$seed server_max_paths=$max_paths seconds=$seconds carrier=$carrier profile=${profile:-none} status=$status"
 echo "logs: $work"
 exit $status
