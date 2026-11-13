@@ -72,6 +72,8 @@ PSK 文件每行一个 64 位十六进制密钥。客户端入站是普通 TCP �
 服务端 `--max-paths` 默认是 64。客户端 `--paths` 若大于该值，实际建立的路径数以协商值为准；
 `tests/e2e/run.sh` 会核对二者一致，多于 64 条路径时需同时设 `MAX_PATHS`。
 
+`--window-clamp`（默认 600000）同时设置客户端路径套接字的 TCP_WINDOW_CLAMP 和 TUN 服务端通告的每路径接收窗口。对照见 `docs/cases/uplink-window.md`。
+
 ## 端到端测试
 
 `tests/e2e/run.sh [owd_ms] [rate_mbit] [loss] [paths] [seconds]` 建立三个网络命名空间，
