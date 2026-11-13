@@ -17,8 +17,8 @@ type private SessionRateMember(session: Session, frameOf: unit -> int, uniqueOut
         // against cwnd left the group unable to send after a repair burst.
         member _.Inflight =
             let fl = int64 (frameOf())
-            int (max 0L (uniqueOut() - int64 session.Tx.PeerAck * fl))
-        member _.Delivered = int64 session.Tx.PeerAck * int64 (frameOf())
+            int (max 0L (uniqueOut() - session.Tx.UniqueAcked * fl))
+        member _.Delivered = session.Tx.UniqueAcked * int64 (frameOf())
         member _.CopyEstimate = max 0L (wireOut() - uniqueOut())
         member _.MinRttNs = session.Tx.MinRttNs
         member _.LastDeliveredNs =
@@ -70,7 +70,7 @@ type SessionCarrier(session: Session, bridge: FlowBridge, ?uplinkPace: bool, ?tu
         | None -> ()
 
     let uniqueInflight (fl: int) =
-        int (max 0L (uniqueOut - int64 session.Tx.PeerAck * int64 fl))
+        int (max 0L (uniqueOut - session.Tx.UniqueAcked * int64 fl))
 
     /// Restart the group's sample the first time a min-RTT exists, so the first
     /// delivery rate is not averaged over the handshake delay (that sample was
@@ -227,7 +227,7 @@ type SessionCarrier(session: Session, bridge: FlowBridge, ?uplinkPace: bool, ?tu
         + (if not pace then ""
            else
             " pace_bw_mbit=" + (group.Bandwidth * 8000.0).ToString("F1")
-            + " pace_inflight=" + string (max 0L (uniqueOut - int64 tx.PeerAck * int64 session.FrameLength))
+            + " pace_inflight=" + string (max 0L (uniqueOut - tx.UniqueAcked * int64 session.FrameLength))
             + " pace_phase=" + (if group.InStartup then "startup" else "probe" + string group.Cycle)
             + " pace_repair_kib=" + string (group.RepairBytes / 1024L))
 

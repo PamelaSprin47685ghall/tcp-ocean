@@ -60,6 +60,10 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
     let mutable erasure = 0.05
     let smallParities = Array.init 17 (fun k -> if k = 0 then 0 else SmallStep.parities k 0.05)
     let mutable cellsSent = 0L
+    /// First-copy DATA/PARITY cells per step (not BOOSTERs), still in the window.
+    let uniqueCells: int[] = Array.zeroCreate capacity
+    /// Cumulative first-copy cells the peer has in custody (sum of uniqueCells over acked steps).
+    let mutable uniqueAcked = 0L
     /// Repair (spec 5.8): BOOSTER cells go before all other cells.
     let repairs = Queue<Candidate>(256)
     /// Interactive steps (spec 16.3 CR-1): one small session-level reserve, sent before the
@@ -133,6 +137,8 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
     member _.UrgentSteps = urgentSteps
     member _.UrgentSources = urgentSources
     member _.CellsSent = cellsSent
+    /// First-copy DATA/PARITY cells the peer has in custody.
+    member _.UniqueAcked = uniqueAcked
     member _.Erasure = erasure
 
     /// True when a new bulk source can go into the current step now (window and peer grant).
@@ -190,6 +196,12 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
                 // rounds further apart, which holds steps longer (runaway).
                 // Only the newest covered step (ack - 1): a jump must not
                 // feed seal-to-custody of older steps in the gap into SRTT.
+                // Credit unique cells of newly acked steps before Release may drop StepUsed.
+                let mutable tAck = peerAck
+                while tAck < ack do
+                    uniqueAcked <- uniqueAcked + int64 uniqueCells.[index tAck]
+                    uniqueCells.[index tAck] <- 0
+                    tAck <- tAck + 1UL
                 let now = clock.NowNs()
                 let sealAt = sealNs.[int ((ack - 1UL) % uint64 sealNs.Length)]
                 let sample = now - sealAt
@@ -355,6 +367,7 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
                     ok <- true
                     done' <- true
                 elif rendered then
+                    uniqueCells.[index t] <- uniqueCells.[index t] + 1
                     for i in 0 .. 5 do
                         let r = CodeGraph.Strides.[i]
                         kHist.[i] <- if t < r then 0 else (let h = encoder.StepUsed(t - r) in if h = 0 then 16 else h)
