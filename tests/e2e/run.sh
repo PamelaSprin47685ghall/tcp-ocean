@@ -153,12 +153,16 @@ tunnel() {
     # Sequential JOINs at long RTT can exceed the default 10 s; raise HANDSHAKE_S.
     local i t0 t1
     t0=$(date +%s%N)
+    local seen_client=0
     for i in $(seq $((handshake_s * 5))); do
         grep -q "session up" "$work/client-$name.log" && break
-        # session up is logged only after every JOIN; if the client has already
-        # exited (e.g. an uncaught bootstrap exception), waiting the full
-        # HANDSHAKE_S only occupies the shared lock.
-        if [[ -z $(pids_of "$work/jit/tbtun") ]]; then
+        # session up is logged only after every JOIN. If the client has been
+        # seen and then exited (uncaught bootstrap exception), waiting the
+        # full HANDSHAKE_S only occupies the shared lock. Do not treat "not
+        # yet started" as an exit: pids_of is empty for a moment after launch.
+        if [[ -n $(pids_of "$work/jit/tbtun") ]]; then
+            seen_client=1
+        elif (( seen_client )); then
             echo "client exited before session up"
             break
         fi
