@@ -75,9 +75,12 @@ let tryRepeated (attempts: int) (backoffMs: int -> int) (sleepMs: int -> unit) (
     loop 0
 
 [<Literal>]
-let DefaultConcurrency = 16
+let DefaultConcurrency = 8
 
 /// In-flight JOIN cap used by the client (at least 1, at most 16).
+/// Default is 8: 16 concurrent JOINs to the TUN server left JOIN_ACKs
+/// unreceived until the client ReceiveTimeout (group paths oscillated 17↔1
+/// every 31 s). 8 in flight was verified on rtt400.
 let clampConcurrency (n: int) = min 16 (max 1 n)
 
 /// Waves needed to join `remaining` paths at this concurrency.
@@ -96,9 +99,12 @@ let runBounded (concurrency: int) (items: 'T[]) (work: 'T -> unit) =
     let tasks =
         [| for item in items do
                let captured = item
-               Threading.Tasks.Task.Run(fun () ->
+               // LongRunning: bootstrap Connect/Receive blocks, and must not
+               // sit on the shared thread-pool workers.
+               Threading.Tasks.Task.Factory.StartNew((fun () ->
                    sem.Wait()
                    try work captured
-                   finally sem.Release() |> ignore) |]
+                   finally sem.Release() |> ignore),
+                   Threading.Tasks.TaskCreationOptions.LongRunning) |]
     if tasks.Length > 0 then Threading.Tasks.Task.WaitAll(tasks)
 

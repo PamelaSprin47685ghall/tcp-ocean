@@ -67,9 +67,10 @@ let ``a non-path-0 exhaustion is a GaveUp value, not an exception the caller mus
 
 [<Fact>]
 let ``join waves for 256 paths at concurrency 16 is 16, and concurrency is clamped`` () =
-    Assert.Equal(16, DefaultConcurrency)
+    Assert.Equal(8, DefaultConcurrency)
     Assert.Equal(16, clampConcurrency 99)
     Assert.Equal(1, clampConcurrency 0)
+    Assert.Equal(32, waves 255 DefaultConcurrency)
     Assert.Equal(16, waves 255 16)
     Assert.Equal(1, waves 7 16)
     Assert.Equal(0, waves 0 8)
