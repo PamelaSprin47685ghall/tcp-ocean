@@ -1,3 +1,6 @@
+/// Serial (DisableParallelization): the trace test turns the process-wide TraceGate on, and
+/// any test running beside it then records into the same arrays and can overwrite its entry.
+[<Xunit.Collection("BridgeTests serial")>]
 module Tbt.Tests.BridgeTests
 
 open System
@@ -11,6 +14,16 @@ open Tbt.Session
 open Tbt.Session.Handshake
 open Tbt.Carrier
 open Tbt.Tests.SessionTests
+
+[<CollectionDefinition("BridgeTests serial", DisableParallelization = true)>]
+type SerialBridge() = class end
+
+/// True when Tbt.Carrier was compiled with optimizations. A Debug build allocates in the
+/// round loop (152 bytes a round: F# Debug codegen), so only the optimized build can hold the
+/// zero-allocation claim; both must still be steady (the same every round, nothing growing).
+let private optimized =
+    typeof<Poller>.Assembly.GetCustomAttributes(typeof<Diagnostics.DebuggableAttribute>, false)
+    |> Array.forall (fun a -> not (a :?> Diagnostics.DebuggableAttribute).IsJITOptimizerDisabled)
 
 /// A client session on a FlowBridge, with no paths (nothing leaves, so credit only falls).
 let private clientOnBridge () =
@@ -110,13 +123,16 @@ let ``watch and service visit only armed and writing flows, not all 256 slots`` 
         carrier.Service poller
     // One watch visit and two read passes per round, over one armed flow.
     Assert.InRange(carrier.SlotVisits - v0, 1L, 30L)
-    // The round loop allocates nothing once warm.
-    let b0 = GC.GetAllocatedBytesForCurrentThread()
-    for _ in 1 .. 100 do
+    // The round loop allocates nothing once warm (optimized build); every round the same.
+    let perRound = Array.zeroCreate<int64> 100
+    for r in 0 .. perRound.Length - 1 do
+        let b0 = GC.GetAllocatedBytesForCurrentThread()
         carrier.Watch poller
         poller.Wait 0 |> ignore
         carrier.Service poller
-    Assert.Equal(0L, GC.GetAllocatedBytesForCurrentThread() - b0)
+        perRound.[r] <- GC.GetAllocatedBytesForCurrentThread() - b0
+    Assert.All(perRound, fun b -> Assert.Equal(perRound.[0], b))
+    if optimized then Assert.Equal(0L, perRound.[0])
     for a in apps do a.Dispose()
     bridge.CloseAll()
 
