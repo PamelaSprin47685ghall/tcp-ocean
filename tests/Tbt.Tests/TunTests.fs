@@ -518,7 +518,7 @@ let ``rate group: the 0.75 phase ends once in flight is down to one BDP`` () =
     tick 990_000
     Assert.Equal(2, g.Cycle)
 
-let blackoutRun (paths: int) (lossP: float) (seed: int) (lost: int64 -> bool) (ms: int) =
+let blackoutRunWith (sack: bool) (paths: int) (lossP: float) (seed: int) (lost: int64 -> bool) (ms: int) =
     // netns (5 % loss + 300 ms outage every 3 s): all paths stalled together, all were demoted,
     // no segment was sent again and the downlink stayed dead for minutes.
     // Two paths in one group; a model receiver per path (20 ms one way, cumulative ACKs).
@@ -577,7 +577,7 @@ let blackoutRun (paths: int) (lossP: float) (seed: int) (lost: int64 -> bool) (m
                         while got.[k].TryGetValue(cum.[k], &l) do
                             cum.[k] <- cum.[k] + uint32 l
                             lastProgress.[k] <- now - t0
-                        acks.[k].Enqueue(struct (now + 40_000_000L, cum.[k], sackOf k))
+                        acks.[k].Enqueue(struct (now + 40_000_000L, cum.[k], (if sack then sackOf k else [||])))
             seen.[k] <- f.Out.Packets.Count
             if now - t0 = 500_000_000L then cumAtBlack.[k] <- cum.[k]
             // ACKs come back 20 ms later (40 ms after the send); those in the blackout are lost.
@@ -598,6 +598,8 @@ let blackoutRun (paths: int) (lossP: float) (seed: int) (lost: int64 -> bool) (m
         group.Service now
     [ for k in 0 .. paths - 1 ->
         sprintf "path %d: re-sent in blackout %d, sent after %d, last progress %d ms, cum %d; %s" k resentIn.[k] sentAfter.[k] (lastProgress.[k] / 1_000_000L) (int (cum.[k] - cumAtBlack.[k])) (fs.[k].Path.Describe()), lastProgress.[k], fs.[k].Path.Counters.Demotions ]
+
+let blackoutRun = blackoutRunWith true
 
 [<Fact>]
 let ``a blackout on every path does not leave them demoted and dead`` () =
@@ -653,3 +655,16 @@ let ``segments sent before a delivered repair are still re-sent when an outage s
         let q = parse f.Out.Packets.[i]
         if q.PayloadLength > 0 then resent.Add q.Seq |> ignore
     Assert.True(resent.Contains starts.[h], sprintf "re-sent %A; %s" (Seq.toList resent) (f.Path.Describe()))
+
+[<Fact>]
+let ``a peer without SACK still gets every hole re-sent after a blackout (RTO fallback)`` () =
+    // A peer that disables SACK (or a middlebox that strips it) sends only cumulative ACKs:
+    // no RACK, and the tail timer does not see the hole. Before the RTO fallback a path made
+    // no progress for the 2.2 s after the blackout.
+    let r = blackoutRunWith false 2 0.0 1 (fun t -> t >= 500_000_000L && t < 1_800_000_000L) 4000
+    for msg, last, _ in r do
+        Assert.True(last > 3_500_000_000L, msg)
+        // Segments acked only when a repair fills the hole before them give no RTT sample
+        // (main: srtt 1389 ms here).
+        let srtt = float (System.Text.RegularExpressions.Regex.Match(msg, "srtt_ms=([0-9.]+)").Groups.[1].Value)
+        Assert.True(srtt < 200.0, msg)

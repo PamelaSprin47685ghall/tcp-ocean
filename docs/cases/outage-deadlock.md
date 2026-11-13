@@ -31,3 +31,17 @@ and once on karn (already on main), so it predates both.
   deliver after the blackout.
 - Also seen: with cumulative-only ACKs (no SACK) the same blackout left a path with no progress
   after it. Linux always sends SACK, so this is not pursued here.
+
+## Follow-up: peers without SACK (branch rto)
+A peer that disables SACK, or a middlebox that strips it, sends cumulative ACKs only. RACK
+never runs, and the tail timer cannot tell where the hole is. In the model blackout test main
+sent 108 segments after the blackout and made no progress for 2.2 s, and srtt inflated to
+1389 ms.
+- RTO fallback, independent of SACK and RACK: if snd.una has not moved for max(2 x tail timer,
+  200 ms), doubled per episode up to 3.2 s, every unsacked segment sent before the timer is
+  lost and goes again from snd.una (go-back-N), 4 per service call. The backoff resets when
+  snd.una moves. Counted as `rtos`, and shifted on clock jumps like every other timer.
+- RTT samples: when a cumulative advance is released by a repaired segment, the segments
+  behind it waited for the hole, so they give no sample.
+Test: `a peer without SACK still gets every hole re-sent after a blackout (RTO fallback)`
+fails on main and passes with the fix (srtt < 200 ms).
