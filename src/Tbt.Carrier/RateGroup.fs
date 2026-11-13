@@ -53,6 +53,11 @@ type RateGroup(clock: IClock) =
     let mutable sentBytes = 0L
     let mutable sampleSent = 0L
     let mutable lastSendRate = Double.MaxValue
+    let mutable sampleRepair = 0L
+    /// When true (client uplink only), a low-delivery sample taken while repairs
+    /// were sent is not a capacity sample (Group 2: recovery rounds do not evict
+    /// the max filter). Server groups leave this false, so downlink is unchanged.
+    let mutable protectRecovery = false
     /// Steady-state in-flight cap over the group BDP: 1.25 lets the 1.25 probe phase fill the
     /// pipe and keeps the standing queue at the bottleneck to about 0.25 BDP (was 2.0: up to
     /// one BDP of queue, docs/cases/under-bulk-tail.md).
@@ -108,6 +113,7 @@ type RateGroup(clock: IClock) =
         sampleDelivered <- delivered ()
         sampleCopies <- copyEstimate ()
         sampleSent <- sentBytes
+        sampleRepair <- repairBytes
         lastSendRate <- Double.MaxValue
 
     /// True when some member delivered at or after t: a stall on every path at once is an
@@ -130,6 +136,17 @@ type RateGroup(clock: IClock) =
         members.Remove m |> ignore
         scan ()
         restartSample (clock.NowNs())
+
+    member _.ProtectRecovery
+        with get () = protectRecovery
+        and set v = protectRecovery <- v
+
+    /// BBR: leave startup and drain at the first sign of loss. Client uplink
+    /// calls this when a BOOSTER is charged; the server does not.
+    member _.SignalLoss() =
+        if startup then
+            startup <- false
+            draining <- true
 
     member _.Count = members.Count
     /// Bytes per ns; 0 before the first sample.
@@ -227,34 +244,44 @@ type RateGroup(clock: IClock) =
                 // What was delivered in this interval was sent in about the last one.
                 let rate = min ackRate (max sendRate lastSendRate)
                 lastSendRate <- sendRate
+                let recovering = protectRecovery && repairBytes > sampleRepair
                 sampleSent <- sentBytes
-                slot <- (slot + 1) % filter.Length
-                filter.[slot] <- if limited || rate > bw then rate else bw
-                bw <- Array.max filter
-                if limited then appLimited <- 0 else appLimited <- appLimited + 1
-                if startup && limited then
-                    if bw >= fullBw * 1.25 then
-                        fullBw <- bw
-                        fullCount <- 0
-                    else
-                        fullCount <- fullCount + 1
-                        if fullCount >= 3 then
-                            startup <- false
-                            draining <- true
-                elif draining then
-                    if inflight () <= int (bw * float rtt) then
-                        draining <- false
-                        cycle <- 2
-                elif not startup then
-                    cycle <- (cycle + 1) % 8
-                    if appLimited >= 3 then
-                        startup <- true
-                        fullBw <- 0.0
-                        fullCount <- 0
-                limited <- false
-                sampleNs <- now
-                sampleDelivered <- d
-                sampleCopies <- cp
+                sampleRepair <- repairBytes
+                if recovering && rate < bw then
+                    // Crawl-acks during recovery are not capacity: keep the max filter
+                    // so the repair reserve (0.5×rate) is not starved (UWOx4h: 55→0 in 4 s).
+                    limited <- false
+                    sampleNs <- now
+                    sampleDelivered <- d
+                    sampleCopies <- cp
+                else
+                    slot <- (slot + 1) % filter.Length
+                    filter.[slot] <- if limited || rate > bw then rate else bw
+                    bw <- Array.max filter
+                    if limited then appLimited <- 0 else appLimited <- appLimited + 1
+                    if startup && limited then
+                        if bw >= fullBw * 1.25 then
+                            fullBw <- bw
+                            fullCount <- 0
+                        else
+                            fullCount <- fullCount + 1
+                            if fullCount >= 3 then
+                                startup <- false
+                                draining <- true
+                    elif draining then
+                        if inflight () <= int (bw * float rtt) then
+                            draining <- false
+                            cycle <- 2
+                    elif not startup then
+                        cycle <- (cycle + 1) % 8
+                        if appLimited >= 3 then
+                            startup <- true
+                            fullBw <- 0.0
+                            fullCount <- 0
+                    limited <- false
+                    sampleNs <- now
+                    sampleDelivered <- d
+                    sampleCopies <- cp
 
     member _.Describe() =
         "group paths=" + string members.Count + " bw_mbit=" + (bw * 8000.0).ToString("F1")

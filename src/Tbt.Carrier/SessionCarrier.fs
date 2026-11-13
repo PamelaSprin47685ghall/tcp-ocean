@@ -48,7 +48,10 @@ type SessionCarrier(session: Session, bridge: FlowBridge, ?uplinkPace: bool, ?tu
     let group = RateGroup(session.Clock)
     let member' = SessionRateMember(session, (fun () -> session.FrameLength), (fun () -> uniqueOut), (fun () -> wireOut))
     let mutable samplePrimed = false
-    do if pace then group.Add member'
+    do
+        if pace then
+            group.Add member'
+            group.ProtectRecovery <- true
     let pacers = Dictionary<uint16, PathPacer>()
     /// Local slots visited by Watch and Service (RS-3: grows with armed flows, not 256).
     let mutable slotVisits = 0L
@@ -155,6 +158,7 @@ type SessionCarrier(session: Session, bridge: FlowBridge, ?uplinkPace: bool, ?tu
                         progress <- true
                         if charge = 1 then
                             wireOut <- wireOut + int64 fl
+                            group.SignalLoss()
                             group.OnRepair fl
                             chargePath link.PathId fl
                         elif charge = 2 then

@@ -102,3 +102,50 @@ let ``RateGroup repair bucket is charged separately and a dry reserve still allo
     clock.Now <- clock.Now + 20_000_000L
     g.Service clock.Now
     Assert.True(g.TryTake(L, true), "new data must not starve when the repair reserve is dry")
+
+[<Fact>]
+let ``SignalLoss leaves startup and begins drain`` () =
+    let clock = ManualClock()
+    let g = RateGroup(clock)
+    let m = Mem()
+    g.Add m
+    let primed = int64 (2000 * L)
+    m.DeliveredV <- primed
+    m.LastNsV <- clock.Now
+    g.OnSent(int primed)
+    clock.Now <- clock.Now + 400_000_000L
+    g.Service clock.Now
+    Assert.True(g.InStartup)
+    g.SignalLoss()
+    Assert.False(g.InStartup)
+
+[<Fact>]
+let ``client recovery samples do not evict the max filter; server samples still do`` () =
+    let run protect =
+        let clock = ManualClock()
+        let g = RateGroup(clock)
+        g.ProtectRecovery <- protect
+        let m = Mem()
+        g.Add m
+        let primed = int64 (2000 * L)
+        m.DeliveredV <- primed
+        m.LastNsV <- clock.Now
+        g.OnSent(int primed)
+        m.InflightV <- 0
+        clock.Now <- clock.Now + 400_000_000L
+        g.Service clock.Now
+        let peak = g.Bandwidth
+        m.InflightV <- 4 * int (peak * 400_000_000.0)
+        for _ in 1 .. 12 do
+            m.DeliveredV <- m.DeliveredV + int64 (10 * L)
+            m.LastNsV <- clock.Now + 400_000_000L
+            g.OnRepair L
+            g.TryTake(L, true) |> ignore
+            clock.Now <- clock.Now + 400_000_000L
+            g.Service clock.Now
+        peak, g.Bandwidth
+    let peakC, afterC = run true
+    Assert.True(peakC * 8000.0 > 50.0, sprintf "primed bw was %f" (peakC * 8000.0))
+    Assert.True(afterC >= peakC * 0.9, sprintf "client evicted %f to %f" (peakC * 8000.0) (afterC * 8000.0))
+    let peakS, afterS = run false
+    Assert.True(afterS < peakS * 0.5, sprintf "server should still take trickle samples (%f -> %f)" (peakS * 8000.0) (afterS * 8000.0))
