@@ -34,6 +34,10 @@ type TunCounters() =
     member val ReasmGrows = 0L with get, set
     /// Times a fragment was not stored: rcvNxt / interval merge stopped (backpressure, not a drop).
     member val ReasmPressure = 0L with get, set
+    /// Times the OFO interval (gap) table grew (memory budget = advertised window).
+    member val GapGrows = 0L with get, set
+    /// Times a new gap was not stored: backpressure, not early_retire swallow.
+    member val GapPressure = 0L with get, set
     member val TailRepairs = 0L with get, set
     /// RTO fallback episodes: snd.una did not move for the RTO (no SACK needed).
     member val Rtos = 0L with get, set
@@ -91,7 +95,8 @@ type TunPath(output: ITunOutput, counters: TunCounters, localIp: uint32, localPo
     /// Overridable by --window-clamp; default remains WindowClamp.
     let windowBytes = defaultArg windowClamp SocketTuning.WindowClamp
     static let ourScale = 7
-    static let maxGaps = 16
+    /// Initial OFO interval (gap) table; grows up to the advertised window (see gapBudget).
+    static let gapCount0 = 16
     /// Initial fragment-slot table; grows up to the advertised window (see slotBudget).
     static let slotCount0 = 32
     static let graceNs = 15_000_000L
@@ -114,12 +119,17 @@ type TunPath(output: ITunOutput, counters: TunCounters, localIp: uint32, localPo
     // ---- receive -----------------------------------------------------------------------
     let mutable rcvNxt = 0UL
     let mutable peerFinAt = UInt64.MaxValue
-    let ivStart = Array.zeroCreate<uint64> (maxGaps + 2)
-    let ivEnd = Array.zeroCreate<uint64> (maxGaps + 2)
+    // OFO intervals (spec 6.8.3 early_retire used a fixed 16). Sized from the same
+    // advertised-window budget as fragment slots. Overflow must not swallow: a new
+    // gap is refused (TCP backpressure, GapPressure) so sender aggressiveness is
+    // not turned into virtual-ACK loss.
+    let mutable gapCap = gapCount0
+    let mutable ivStart = Array.zeroCreate<uint64> (gapCount0 + 2)
+    let mutable ivEnd = Array.zeroCreate<uint64> (gapCount0 + 2)
     /// When the gap in front of interval i was first seen.
-    let ivSince = Array.zeroCreate<int64> (maxGaps + 2)
+    let mutable ivSince = Array.zeroCreate<int64> (gapCount0 + 2)
     /// carrier_wm of the first authenticated cell after the gap in front of interval i.
-    let ivWm = Array.zeroCreate<uint64> (maxGaps + 2)
+    let mutable ivWm = Array.zeroCreate<uint64> (gapCount0 + 2)
     let mutable ivCount = 0
     let mutable ackDue = false
     /// Duplicate bytes to report as the first SACK block of the next ACK (RFC 2883 D-SACK):
@@ -441,6 +451,31 @@ type TunPath(output: ITunOutput, counters: TunCounters, localIp: uint32, localPo
         if fast then counters.FastSwallows <- counters.FastSwallows + 1L
         ackDue <- true
 
+    let gapBudget () =
+        let fl = max 1 frameLength
+        max gapCount0 (windowBytes / fl + 2)
+
+    let growGaps () =
+        let budget = gapBudget ()
+        if gapCap >= budget then false
+        else
+            let n = min budget (max gapCount0 (gapCap * 2))
+            let ns = Array.zeroCreate<uint64> (n + 2)
+            let ne = Array.zeroCreate<uint64> (n + 2)
+            let nsi = Array.zeroCreate<int64> (n + 2)
+            let nw = Array.zeroCreate<uint64> (n + 2)
+            Array.Copy(ivStart, ns, ivCount)
+            Array.Copy(ivEnd, ne, ivCount)
+            Array.Copy(ivSince, nsi, ivCount)
+            Array.Copy(ivWm, nw, ivCount)
+            ivStart <- ns
+            ivEnd <- ne
+            ivSince <- nsi
+            ivWm <- nw
+            gapCap <- n
+            counters.GapGrows <- counters.GapGrows + 1L
+            true
+
     /// Insert [a, b) into the interval set (b > rcvNxt, a > rcvNxt): new bytes only.
     let addInterval (a: uint64) (b: uint64) (now: int64) (data: Span<byte>) =
         // Walk the set; give takeBytes each piece not yet held.
@@ -456,10 +491,17 @@ type TunPath(output: ITunOutput, counters: TunCounters, localIp: uint32, localPo
                 i <- i + 1
             else
                 let e = if i < ivCount then min b ivStart.[i] else b
-                let n = takeBytes pos (data.Slice(int (pos - a), int (e - pos)))
-                storedHi <- pos + uint64 n
-                if n < int (e - pos) then blocked <- true
-                else pos <- e
+                // A disjoint piece that touches neither neighbour is a new gap.
+                let extendPrev = i > 0 && ivEnd.[i - 1] = pos
+                let extendNext = i < ivCount && e >= ivStart.[i]
+                if not extendPrev && not extendNext && ivCount >= gapCap && not (growGaps ()) then
+                    counters.GapPressure <- counters.GapPressure + 1L
+                    blocked <- true
+                else
+                    let n = takeBytes pos (data.Slice(int (pos - a), int (e - pos)))
+                    storedHi <- pos + uint64 n
+                    if n < int (e - pos) then blocked <- true
+                    else pos <- e
         // Merge only the prefix we stored; an unstored suffix is not ACKed.
         if storedHi > a then
             let b = storedHi
@@ -532,10 +574,8 @@ type TunPath(output: ITunOutput, counters: TunCounters, localIp: uint32, localPo
                     rcvNxt <- rcvNxt + uint64 n
                     advance ()
                 else addInterval a (a + uint64 d.Length) now d
-                // Too many gaps: retire the oldest at once (spec 6.8.3 early_retire). Outside
-                // the lease, forget the newest interval: TCP sends it again.
-                while ivCount > maxGaps do
-                    if leaseValid () then swallow false else removeInterval (ivCount - 1)
+                // Capacity is the window budget. A full table back-pressures in addInterval
+                // (no early_retire swallow). Grace-timer / frontier swallow is unchanged.
 
     // ---- demotion ---------------------------------------------------------------------
 

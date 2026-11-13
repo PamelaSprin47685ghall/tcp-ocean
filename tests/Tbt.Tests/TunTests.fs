@@ -1084,7 +1084,7 @@ let ``downlink: frames sent right after a box pause, before the paths' timers ra
 [<Fact>]
 let ``uplink: more than 32 partial frames reassemble instead of being dropped`` () =
     // 1 in-order partial plus 16 OFO intervals of two partial frames each is 33 slots
-    // (maxGaps is 16, so 40 disjoint ranges would early-retire rather than grow).
+    // (enough to force the slot table past 32; the gap table also grows).
     // A fixed 32-slot table would silently drop the 33rd; the window-budget table
     // grows, keeps every fragment, and delivers each frame once the rest arrives.
     let f = Fixture 50
@@ -1111,3 +1111,32 @@ let ``uplink: more than 32 partial frames reassemble instead of being dropped`` 
     Assert.Equal<int list>(expected, got)
     Assert.Equal(dropped0, f.Path.Counters.CellsDropped)
     Assert.Equal(0L, f.Path.Counters.ReasmPressure)
+
+[<Fact>]
+let ``uplink: more than 16 OFO gaps are kept instead of early-retired`` () =
+    // 40 disjoint partial frames after a hole: a fixed 16-gap table would
+    // early-retire (swallow) the oldest and increment CellsDropped. The
+    // window-budget table grows, stores every gap, and does not virtually ACK them.
+    let f = Fixture 50
+    f.Open()
+    let dropped0 = f.Path.Counters.CellsDropped
+    let acks0 = f.Path.Counters.VirtualAcks
+    f.Send(f.Data0, ReadOnlySpan(f.Stream, 0, 100), [||])
+    let n = 40
+    for k in 0 .. n - 1 do
+        let at = (2 + k) * L
+        f.Send(f.Data0 + uint32 at, ReadOnlySpan(f.Stream, at, 100), [||])
+    Assert.True(f.Path.Counters.GapGrows >= 1L, "gap table should grow past 16")
+    Assert.Equal(0L, f.Path.Counters.GapPressure)
+    Assert.Equal(dropped0, f.Path.Counters.CellsDropped)
+    Assert.Equal(acks0, f.Path.Counters.VirtualAcks)
+    // Complete the 40 OFO frames; they must all deliver (none were swallowed).
+    for k in 0 .. n - 1 do
+        let at = (2 + k) * L + 100
+        f.Send(f.Data0 + uint32 at, ReadOnlySpan(f.Stream, at, L - 100), [||])
+    let got = [ for fr in f.Owner.Frames -> int fr.[0] - 1 ] |> List.sort
+    let expected = [ 2 .. 41 ]
+    Assert.Equal<int list>(expected, got)
+    Assert.Equal(dropped0, f.Path.Counters.CellsDropped)
+    Assert.Equal(acks0, f.Path.Counters.VirtualAcks)
+    Assert.Equal(0L, f.Path.Counters.GapPressure)
