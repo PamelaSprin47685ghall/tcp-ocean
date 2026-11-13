@@ -12,7 +12,12 @@ open Tbt.Contracts
 /// What the group reads from one member path.
 type IRateMember =
     abstract Inflight: int
+    /// Unique payload bytes the peer acknowledged (cumulative ACK or SACK evidence); a
+    /// segment counts once however many copies were sent.
     abstract Delivered: int64
+    /// Estimate, not evidence: repair copies beyond the first of segments that were acked,
+    /// taken to have crossed the bottleneck too (no ACK tells which copy arrived).
+    abstract CopyEstimate: int64
     abstract MinRttNs: int64
     /// Last time the member delivered anything (cumulative ACK or SACK).
     abstract LastDeliveredNs: int64
@@ -25,6 +30,9 @@ type RateGroup(clock: IClock) =
     let mutable bw = 0.0
     let mutable sampleNs = 0L
     let mutable sampleDelivered = 0L
+    let mutable sampleCopies = 0L
+    /// Unique delivery rate of the last sample (goodput, bytes per ns), for the log.
+    let mutable goodput = 0.0
     let mutable limited = false
     let mutable startup = true
     let mutable draining = false
@@ -69,6 +77,11 @@ type RateGroup(clock: IClock) =
         for m in members do n <- n + m.Delivered
         n
 
+    let copyEstimate () =
+        let mutable n = 0L
+        for m in members do n <- n + m.CopyEstimate
+        n
+
     let gain () =
         if startup then 2.885
         elif draining then 1.0 / 2.885
@@ -81,6 +94,7 @@ type RateGroup(clock: IClock) =
     let restartSample (now: int64) =
         sampleNs <- now
         sampleDelivered <- delivered ()
+        sampleCopies <- copyEstimate ()
         sampleSent <- sentBytes
         lastSendRate <- Double.MaxValue
 
@@ -153,6 +167,10 @@ type RateGroup(clock: IClock) =
         sentBytes <- sentBytes + int64 bytes
 
     member _.RepairBytes = repairBytes
+    /// Payload bytes the group's paths put on the wire: new frames and every repair copy.
+    member _.WireSentBytes = sentBytes
+    /// Unique delivery rate of the last sample (bytes per ns).
+    member _.Goodput = goodput
     member _.InStartup = startup
     member _.Cycle = cycle
     static member CwndGain = cwndGain
@@ -175,6 +193,7 @@ type RateGroup(clock: IClock) =
                 // end the outage would then wait on a pacer with no rate.
                 sampleNs <- now
                 sampleSent <- sentBytes
+                sampleCopies <- copyEstimate ()
                 limited <- false
                 // Shared only when the paths that wait are more than one (or the only one): a
                 // single dead path while the others have nothing in flight is not an outage.
@@ -183,7 +202,11 @@ type RateGroup(clock: IClock) =
                 if waiting >= min 2 members.Count then outageNs <- now
             elif now - sampleNs >= max rtt 5_000_000L then
                 let d = delivered ()
-                let ackRate = float (max 0L (d - sampleDelivered)) / float (now - sampleNs)
+                let cp = copyEstimate ()
+                // The bottleneck carried the unique bytes plus, by estimate, the extra copies:
+                // the wire rate the pacer spends (it charges every copy) is their sum.
+                goodput <- float (max 0L (d - sampleDelivered)) / float (now - sampleNs)
+                let ackRate = float (max 0L (d - sampleDelivered) + max 0L (cp - sampleCopies)) / float (now - sampleNs)
                 let sendRate = float (sentBytes - sampleSent) / float (now - sampleNs)
                 // What was delivered in this interval was sent in about the last one.
                 let rate = min ackRate (max sendRate lastSendRate)
@@ -215,8 +238,10 @@ type RateGroup(clock: IClock) =
                 limited <- false
                 sampleNs <- now
                 sampleDelivered <- d
+                sampleCopies <- cp
 
     member _.Describe() =
         "group paths=" + string members.Count + " bw_mbit=" + (bw * 8000.0).ToString("F1")
+        + " goodput_mbit=" + (goodput * 8000.0).ToString("F1") + " copy_est_kib=" + string (copyEstimate () / 1024L)
         + " inflight=" + string (inflight ()) + " repair_kib=" + string (repairBytes / 1024L) + " phase="
         + (if startup then "startup" elif draining then "drain" else "probe" + string cycle)

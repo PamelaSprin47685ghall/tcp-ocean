@@ -158,7 +158,9 @@ type TunPath(output: ITunOutput, counters: TunCounters, localIp: uint32, localPo
     let mutable heldBehindRepair = false
     // Delivery-rate pacer.
     let mutable delivered = 0L
-    let mutable duplicatesDelivered = 0L
+    let mutable copyEstimate = 0L
+    /// Payload bytes put on the wire: new frames and every repair copy.
+    let mutable wireSent = 0L
     let mutable deliveredNs = now0
     let mutable lastDeliveredSentNs = now0
     let mutable srttNs = 0.0
@@ -456,7 +458,7 @@ type TunPath(output: ITunOutput, counters: TunCounters, localIp: uint32, localPo
 
     let onDelivered (s: byref<SentSegment>) (now: int64) =
         delivered <- delivered + int64 s.Length
-        duplicatesDelivered <- duplicatesDelivered + int64 s.Duplicates
+        copyEstimate <- copyEstimate + int64 s.Duplicates
         inflight <- inflight - s.Length
         // RACK time (RFC 8985 6.2): a repaired segment counts only when the ACK cannot be
         // for its first copy (at least min RTT after the repair). Otherwise a late ACK of the
@@ -526,6 +528,7 @@ type TunPath(output: ITunOutput, counters: TunCounters, localIp: uint32, localPo
                              (Packet.Ack ||| Packet.Psh) (window ()) ReadOnlySpan.Empty s.Length ipId
         ipId <- ipId + 1us
         for _ in 1 .. copies do output.Write(ReadOnlySpan(p, 0, n))
+        wireSent <- wireSent + int64 (copies * s.Length)
         counters.SegmentsSent <- counters.SegmentsSent + int64 copies
         counters.SegmentsLost <- counters.SegmentsLost + 1L
         tokens <- tokens - float (copies * n)
@@ -650,6 +653,12 @@ type TunPath(output: ITunOutput, counters: TunCounters, localIp: uint32, localPo
     member _.RackSentNs = rackSentNs
     member _.SrttNs = srttNs
     member _.Inflight = inflight
+    /// Unique payload bytes acknowledged (ACK/SACK evidence).
+    member _.UniqueDelivered = delivered
+    /// Estimate: extra repair copies of acknowledged segments (see IRateMember.CopyEstimate).
+    member _.CopyEstimate = copyEstimate
+    /// Payload bytes put on the wire, every copy included.
+    member _.WireSentBytes = wireSent
     member _.Describe() =
         "bw_mbit=" + (btlBw * 8000.0).ToString("F1") + " srtt_ms=" + (srttNs / 1e6).ToString("F1")
         + " min_rtt_ms=" + (if minRttNs = Int64.MaxValue then "-" else (float minRttNs / 1e6).ToString("F1"))
@@ -886,8 +895,8 @@ type TunPath(output: ITunOutput, counters: TunCounters, localIp: uint32, localPo
 
     interface IRateMember with
         member _.Inflight = if isDemoted (clock.NowNs()) then 0 else inflight
-        // Delivered segments plus their duplicate repair copies: what crossed the bottleneck.
-        member _.Delivered = delivered + duplicatesDelivered
+        member _.Delivered = delivered
+        member _.CopyEstimate = copyEstimate
         member _.MinRttNs = minRttNs
         member _.LastDeliveredNs = deliveredNs
 
@@ -964,6 +973,7 @@ type TunPath(output: ITunOutput, counters: TunCounters, localIp: uint32, localPo
             ipId <- ipId + 1us
             output.Write(ReadOnlySpan(p, 0, n))
             counters.SegmentsSent <- counters.SegmentsSent + 1L
+            wireSent <- wireSent + int64 l
             tokens <- tokens - float n
             group.OnSent l
             sndNxt <- sndNxt + uint64 l

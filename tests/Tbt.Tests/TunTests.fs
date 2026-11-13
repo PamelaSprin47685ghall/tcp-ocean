@@ -345,6 +345,7 @@ type private FakeMember() =
     interface IRateMember with
         member m.Inflight = m.Inflight
         member m.Delivered = m.Delivered
+        member _.CopyEstimate = 0L
         member _.MinRttNs = 40_000_000L
         member _.LastDeliveredNs = 0L
 
@@ -380,7 +381,9 @@ let ``rate group: after startup the in-flight cap is 1.25 BDP, not 2`` () =
     Assert.False(g.TryTake(L, false))
 
 [<Fact>]
-let ``rate group: repair copies are paced by the group like new frames`` () =
+let ``rate group: after a 1 MB repair burst the next new frame waits until the pacer has paid it back`` () =
+    // Facts: the bottleneck delivers 25 000 B per ms; at t the paths put 1 000 000 B of repair
+    // copies on the wire. The next new frame is admitted only once that much time has passed.
     let clock = ManualClock()
     let g = RateGroup(clock)
     let a = FakeMember()
@@ -394,10 +397,22 @@ let ``rate group: repair copies are paced by the group like new frames`` () =
     Assert.True(g.Ready)
     clock.Now <- clock.Now + 10_000_000L
     Assert.True(g.TryTake(L, false))
-    // A burst of repairs spends the tokens: the next new frame waits.
+    let wire0 = g.WireSentBytes
     g.OnRepair 1_000_000
-    Assert.False(g.TryTake(L, false))
     Assert.Equal(1_000_000L, g.RepairBytes)
+    Assert.Equal(wire0 + 1_000_000L, g.WireSentBytes)
+    // Pacing rate = gain x bw (the phase does not move: no Service call); the debt is 1 MB
+    // less the bucket that was full (2 ms at the rate).
+    let rate = g.Bandwidth * (if g.InStartup then 2.885 elif g.Cycle = 0 then 1.25 elif g.Cycle = 1 then 0.75 else 1.05)
+    let firstOk =
+        let mutable t = 0
+        while t < 200 && not (g.TryTake(L, false)) do
+            clock.Now <- clock.Now + 1_000_000L
+            t <- t + 1
+        t
+    let expected = (1_000_000.0 - rate * 2_000_000.0) / rate / 1e6
+    Assert.True(firstOk >= int (expected * 0.75) && firstOk <= int (expected * 1.6) + 2,
+                sprintf "first new frame after %d ms, expected about %.1f ms (startup %b, phase %d)" firstOk expected g.InStartup g.Cycle)
 
 [<Fact>]
 let ``downlink: the two repair copies are charged to the rate group`` () =
@@ -431,13 +446,15 @@ let ``downlink: the two repair copies are charged to the rate group`` () =
     Assert.Equal(int64 (copies * L), group.RepairBytes)
 
 [<Fact>]
-let ``downlink: duplicate repair copies count as delivered once the segment is acked`` () =
+let ``downlink: a repaired segment is delivered once; its extra copy is a labeled estimate and wire cost`` () =
+    // Facts: frames 0..2 at 20 ms steps; the client SACKs frame 2 with the cumulative ACK at
+    // frame 1 (frame 1 missing); the server writes frame 1 twice at that moment; 40 ms later
+    // the cumulative ACK covers frame 2.
     let clock = ManualClock()
     let group = RateGroup(clock)
     let f = Fixture(1, clock, group, 40000us)
     f.Open()
     let ip = f.Path :> IPath
-    let m = f.Path :> IRateMember
     ip.Backlog <- 100
     let starts = List<uint32>()
     for _ in 1 .. 3 do
@@ -447,24 +464,33 @@ let ``downlink: duplicate repair copies count as delivered once the segment is a
         frame.Fill 0x11uy
         ip.CommitFrame()
         starts.Add (parse f.Out.Packets.[f.Out.Packets.Count - 1]).Seq
-    let o = Array.zeroCreate<byte> 12
-    o.[0] <- 1uy
-    o.[1] <- 1uy
-    o.[2] <- 5uy
-    o.[3] <- 10uy
-    BinaryPrimitives.WriteUInt32BigEndian(Span(o, 4, 4), starts.[2])
-    BinaryPrimitives.WriteUInt32BigEndian(Span(o, 8, 4), starts.[2] + uint32 L)
+    let wire0 = f.Path.WireSentBytes
+    let unique0 = f.Path.UniqueDelivered
+    Assert.Equal(0L, f.Path.CopyEstimate)
     clock.Now <- clock.Now + 40_000_000L
     let n0 = f.Out.Packets.Count
-    let struct (s1, p1) = clientSegment (f.Data0) (starts.[1]) Packet.Ack o ReadOnlySpan.Empty
+    let struct (s1, p1) =
+        clientSegment f.Data0 starts.[1] Packet.Ack (sackOption [ (starts.[2], starts.[2] + uint32 L) ]) ReadOnlySpan.Empty
     f.Path.OnSegment(s1, Span p1, clock.Now)
-    Assert.Equal(2, f.Out.Packets.Count - n0)
-    let before = m.Delivered
+    // Sent: exactly two packets, both frame 1, both now.
+    let sent = [ for i in n0 .. f.Out.Packets.Count - 1 -> parse f.Out.Packets.[i] ]
+    Assert.Equal(2, sent.Length)
+    for q in sent do
+        Assert.Equal(starts.[1], q.Seq)
+        Assert.Equal(L, q.PayloadLength)
+    Assert.Equal(wire0 + 2L * int64 L, f.Path.WireSentBytes)
+    // Received evidence so far: frame 0 (cumulative ACK) and frame 2 (SACK), once each.
+    Assert.Equal(unique0 + 2L * int64 L, f.Path.UniqueDelivered)
     clock.Now <- clock.Now + 40_000_000L
-    let struct (s2, p2) = clientSegment (f.Data0) (starts.[2] + uint32 L) Packet.Ack [||] ReadOnlySpan.Empty
+    let struct (s2, p2) = clientSegment f.Data0 (starts.[2] + uint32 L) Packet.Ack [||] ReadOnlySpan.Empty
     f.Path.OnSegment(s2, Span p2, clock.Now)
-    // Frame 1 acked now (frame 2 was counted at its SACK), plus one duplicate copy of frame 1.
-    Assert.Equal(before + int64 L + int64 L, m.Delivered)
+    // Frame 1 is acked: unique delivery grows by one frame, not two.
+    Assert.Equal(unique0 + 3L * int64 L, f.Path.UniqueDelivered)
+    let m = f.Path :> IRateMember
+    Assert.Equal(f.Path.UniqueDelivered, m.Delivered)
+    // The second copy is not evidence: it is counted apart, as an estimate.
+    Assert.Equal(int64 L, f.Path.CopyEstimate)
+    Assert.Equal(int64 L, m.CopyEstimate)
 
 [<Fact>]
 let ``rate group: an ACK burst does not raise the estimate above the send rate`` () =
