@@ -16,7 +16,15 @@
 set -euo pipefail
 here=$(cd "$(dirname "$0")" && pwd)
 repo=$(cd "$here/../.." && pwd)
-owd=${1:-20} rate=${2:-200} loss=${3:-0} paths=${4:-4} seconds=${5:-10}
+profile=${PROFILE:-}
+if [[ $profile == rtt400 ]]; then
+    owd=${1:-200} rate=${2:-1000} loss=${3:-0} paths=${4:-4} seconds=${5:-10}
+    if [[ -z ${WANEM_EXTRA:-} ]]; then
+        WANEM_EXTRA="tuple_mbit=4\ntuple_bucket_bytes=32000"
+    fi
+else
+    owd=${1:-20} rate=${2:-200} loss=${3:-0} paths=${4:-4} seconds=${5:-10}
+fi
 window=${WINDOW:-1024}
 max_paths=${MAX_PATHS:-64}
 seed=${SEED:-7}
@@ -43,7 +51,7 @@ preflight() {
     local bad=0
     # Recover a previous run that died after creating an owned testbed. down verifies
     # identity; it will refuse (and we then refuse) if the namespaces are not ours.
-    if [[ $(python3 "$here/tb_guard.py" status) == owned-run ]]; then
+    if [[ $(sudo python3 "$here/tb_guard.py" status) == owned-run ]]; then
         echo "recovering leftover owned testbed"
         sudo TBTUN_NETNS_LOCK_HELD=1 "$here/netns.sh" down || { echo "refuse: leftover owned testbed could not be cleaned"; bad=1; }
     fi
@@ -64,7 +72,7 @@ commit=$(git -C "$repo" rev-parse --short HEAD)
 [[ -n $(git -C "$repo" status --porcelain) ]] && commit="$commit-dirty"
 work=$(mktemp -d /tmp/tbtun-e2e.XXXXXX)
 stamp() { echo "$*" | tee -a "$work/stamp.txt"; }
-stamp "stamp: commit=$commit owd_ms=$owd rate_mbit=$rate loss=$loss paths=$paths window=$window seed=$seed server_max_paths=$max_paths seconds=$seconds carrier=$carrier"
+stamp "stamp: commit=$commit owd_ms=$owd rate_mbit=$rate loss=$loss paths=$paths window=$window seed=$seed server_max_paths=$max_paths seconds=$seconds carrier=$carrier profile=${profile:-none}"
 if (( paths > max_paths )); then
     echo "warning: requested paths=$paths exceeds server --max-paths=$max_paths (default 64); handshake will negotiate at most $max_paths, and the run will fail the negotiated==requested check. Set MAX_PATHS."
 fi
@@ -180,6 +188,6 @@ report bulk; stop bulk
 fi
 
 echo "wanem: $(tr '\n' ' ' < "$work/wanem.stats")"
-stamp "stamp: commit=$commit owd_ms=$owd rate_mbit=$rate loss=$loss paths=$paths window=$window seed=$seed server_max_paths=$max_paths seconds=$seconds carrier=$carrier status=$status"
+stamp "stamp: commit=$commit owd_ms=$owd rate_mbit=$rate loss=$loss paths=$paths window=$window seed=$seed server_max_paths=$max_paths seconds=$seconds carrier=$carrier profile=${profile:-none} status=$status"
 echo "logs: $work"
 exit $status

@@ -155,9 +155,13 @@ def protected_base():
 def main(args):
     command, *args = args
     if command == 'status':
-        # Unprivileged: does a manifest exist?
-        if BASE.joinpath('run.json').exists():
-            print('owned-run')
+        # May be called unprivileged. A root-only runtime dir must not crash the caller.
+        try:
+            if BASE.joinpath('run.json').exists():
+                print('owned-run')
+                return 0
+        except OSError:
+            print('no-run')
             return 0
         print('no-run')
         return 0
