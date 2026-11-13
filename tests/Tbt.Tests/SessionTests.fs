@@ -824,6 +824,74 @@ let ``a growing NACK deficit does not skip the repair wait for the same hole`` (
     Assert.True(c.Tx.RepairWaiting, "a later round is due once the wait has passed")
 
 [<Fact>]
+let ``a NACK does not enqueue repairs before a minRTT sample exists`` () =
+    let config = { SessionConfig.defaults with Credit = { CreditPolicy.defaults with Enabled = false } }
+    let pair = Pair(config, 1, 0.0, 4)
+    let c = pair.Client
+    let clock = pair.Clock
+    c.Tx.InitialGrant 10_000UL
+    let mutable slot = -1
+    Assert.True(c.TryOpenFlow(&slot))
+    let chunk = Array.create 65536 7uy
+    let mutable guard = 64
+    while c.Tx.Head < 2UL && guard > 0 do
+        pair.Feed(c, slot, ReadOnlySpan chunk, false) |> ignore
+        c.Tx.Flush()
+        guard <- guard - 1
+    let sealedAt = clock.Now
+    Assert.True(c.Tx.MinRttNs = Int64.MaxValue)
+    let tLo = 1UL
+    Assert.True(c.Tx.Head > tLo)
+    // Well past 1.05 × the default 100 ms SRTT, but no path sample yet.
+    clock.Now <- sealedAt + 200_000_000L
+    c.Tx.OnNack(tLo, 1, 4)
+    Assert.False(c.Tx.RepairWaiting, "no expected arrival until a minRTT sample")
+    clock.Now <- sealedAt + 400_000_000L
+    c.Tx.OnPeerAck(1UL, 100us)
+    Assert.True(c.Tx.MinRttNs <> Int64.MaxValue)
+    clock.Now <- sealedAt + int64 c.Tx.RepairWaitNs
+    c.Tx.OnNack(tLo, 1, 4)
+    Assert.True(c.Tx.RepairWaiting, "deadline passed after a minRTT sample")
+
+[<Fact>]
+let ``a sliding NACK frontier inside the last repaired span does not skip the wait`` () =
+    let config = { SessionConfig.defaults with Credit = { CreditPolicy.defaults with Enabled = false } }
+    let pair = Pair(config, 1, 0.0, 4)
+    let c = pair.Client
+    let clock = pair.Clock
+    c.Tx.InitialGrant 10_000UL
+    let mutable slot = -1
+    Assert.True(c.TryOpenFlow(&slot))
+    let chunk = Array.create 65536 7uy
+    let mutable guard = 64
+    while c.Tx.Head < 4UL && guard > 0 do
+        pair.Feed(c, slot, ReadOnlySpan chunk, false) |> ignore
+        c.Tx.Flush()
+        guard <- guard - 1
+    let sealedAt = clock.Now
+    clock.Now <- sealedAt + 400_000_000L
+    c.Tx.OnPeerAck(1UL, 100us)
+    Assert.True(c.Tx.Head >= 3UL, sprintf "head %d" c.Tx.Head)
+    let wait = c.Tx.RepairWaitNs
+    clock.Now <- sealedAt + int64 wait
+    c.Tx.OnNack(1UL, 2, 4)
+    Assert.True(c.Tx.RepairWaiting)
+    let frame = Array.zeroCreate<byte> c.FrameLength
+    let mutable n = 0
+    while c.Tx.RepairWaiting && n < 64 do
+        Assert.True(c.Tx.TryRenderNext(Span frame, 0us, 1UL, 100us, 0us, true))
+        n <- n + 1
+    let afterFirst = c.Tx.BoostersSent
+    // Frontier slides to a later step still inside the span we just repaired.
+    clock.Now <- clock.Now + 10_000_000L
+    c.Tx.OnNack(2UL, 1, 4)
+    Assert.False(c.Tx.RepairWaiting, "a sliding tLo must not skip the wait")
+    Assert.Equal(afterFirst, c.Tx.BoostersSent)
+    clock.Now <- clock.Now + int64 wait
+    c.Tx.OnNack(2UL, 1, 4)
+    Assert.True(c.Tx.RepairWaiting, "a later round is due once the wait has passed")
+
+[<Fact>]
 let ``an ack that arrives sooner than minRTT after a BOOSTER counts as a spurious repair`` () =
     let config = { SessionConfig.defaults with Credit = { CreditPolicy.defaults with Enabled = false } }
     let pair = Pair(config, 1, 0.0, 4)

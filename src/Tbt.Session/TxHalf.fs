@@ -280,63 +280,67 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
     member _.RttVarNs = rttvarNs
 
     /// A NACK from the peer's WIN_ACK (spec 5.8): steps [tLo, tLo + span) lack deficit ranks.
-    /// One round sends n = ceil((deficit + 2) / (1 - eps)) BOOSTERs; rounds for the same
-    /// hole (same tLo) always wait RepairWaitNs — a growing deficit or a wider due
-    /// prefix must not skip the wait. When the 256 seeds of a range are used,
-    /// the range's DATA cells go again (unit rows fill the missing columns).
+    /// One round sends n = ceil((deficit + 2) / (1 - eps)) BOOSTERs. No repair until a
+    /// minRTT sample exists (expected arrival is otherwise unknown). Only the prefix
+    /// of steps whose first copy has been allowed RepairWaitNs is eligible, and the
+    /// deficit is scaled to that prefix. Rounds for the same region — same tLo, a
+    /// sliding frontier still inside the last repaired span, a growing deficit, or a
+    /// wider due prefix — always wait RepairWaitNs. When the 256 seeds of a range
+    /// are used, the range's DATA cells go again (unit rows fill the missing columns).
     member this.OnNack(tLo: uint64, span: int, deficit: int) =
         let now = clock.NowNs()
         let span = int (min (uint64 (min span CodeGraph.MaxBoosterSpan)) (encoder.Head - min tLo encoder.Head))
         if tLo >= peerAck && span >= 1 && deficit >= 1 && encoder.StepUsed tLo > 0 then
-            // Only the prefix of the NACK range whose first copy has been
-            // allowed its deadline is eligible. Gating on tLo alone and then
-            // repairing the whole span treats just-sealed steps of a startup
-            // burst as due (0% first-down: 59→1293 BOOSTERs in 4 s, unique
-            // send stalled). A 20 ms / +66 decoder NACK starts at the
-            // frontier and routinely covers those fresh steps.
-            let wait = this.RepairWaitNs
-            let mutable dueSpan = 0
-            let mutable blocked = false
-            while dueSpan < span && not blocked do
-                let sealAt = sealNs.[int ((tLo + uint64 dueSpan) % uint64 sealNs.Length)]
-                if sealAt <= 0L || float (now - sealAt) < wait then blocked <- true
-                else dueSpan <- dueSpan + 1
-            if dueSpan < 1 then ()
+            // Before a minRTT sample, RepairWait is 1.05 × the default 100 ms
+            // SRTT: on a 400 ms path the first NACK starts a repair, Karn
+            // skips every later sample, SRTT stays 100 ms, and the same hole
+            // repeats every 105 ms (8-path first echo: repair_repeats 74,
+            // rtt_skipped 191, minRTT unset until the burst ends).
+            let minRtt = min minCurNs minPrevNs
+            if minRtt = Int64.MaxValue then ()
             else
-                let dueDeficit = max 1 (int (ceil (float deficit * float dueSpan / float span)))
-                // Same hole: deficit growth and a widening due prefix must not
-                // skip RepairWait. A 10 ms WIN_ACK whose reported deficit grew
-                // (decoder lag, more of the range now due) was enqueueing a
-                // BOOSTER round every period and drove 8-path 0% mid-bulk and
-                // end-echo storms (spurious_repairs 137–348). Freshly sealed
-                // steps are already excluded from dueSpan / dueDeficit.
-                let sameHole = tLo = repairLo
-                if not sameHole || float (now - repairNs) >= wait then
-                    if sameHole && repairNs > 0L then repairRepeats <- repairRepeats + 1L
-                    if not sameHole then
-                        repairLo <- tLo
-                        repairSpan <- dueSpan
-                        repairSeq <- 0
-                    elif dueSpan > repairSpan then
-                        repairSpan <- dueSpan
-                    repairDeficit <- dueDeficit
-                    repairNs <- now
-                    // Bound the pending repair queue: a decoder lag looks like loss and would
-                    // otherwise enqueue an unbounded BOOSTER storm (uplink collapse).
-                    let room = max 0 (256 - repairs.Count)
-                    let n = min room (min 64 (int (ceil (float (dueDeficit + 2) / (1.0 - min 0.9 erasure)))))
-                    if room = 0 then ()
-                    elif repairSeq + n <= 256 then
-                        for i in 0 .. n - 1 do
-                            repairs.Enqueue { Kind = CellType.Booster; Step = tLo; Index = byte (repairSeq + i)
-                                              Span = byte dueSpan; Round = byte n }
-                        repairSeq <- repairSeq + n
-                    else
-                        for j in 0 .. dueSpan - 1 do
-                            let t = tLo + uint64 j
-                            for s in 0 .. encoder.StepUsed t - 1 do
-                                if repairs.Count < 256 then
-                                    repairs.Enqueue { Kind = CellType.Data; Step = t; Index = byte s; Span = 0uy; Round = 0uy }
+                let wait = this.RepairWaitNs
+                let mutable dueSpan = 0
+                let mutable blocked = false
+                while dueSpan < span && not blocked do
+                    let sealAt = sealNs.[int ((tLo + uint64 dueSpan) % uint64 sealNs.Length)]
+                    if sealAt <= 0L || float (now - sealAt) < wait then blocked <- true
+                    else dueSpan <- dueSpan + 1
+                if dueSpan < 1 then ()
+                else
+                    let dueDeficit = max 1 (int (ceil (float deficit * float dueSpan / float span)))
+                    // A new tLo every 10 ms (frontier sliding through the
+                    // span we just repaired) was a fresh hole and skipped
+                    // the wait (8-path end-echo: boosters 2813→4496,
+                    // spurious 33→176, repair_repeats stuck at 74).
+                    let prevEnd = repairLo + uint64 repairSpan
+                    let sameRegion = repairNs > 0L && tLo <= prevEnd
+                    if not sameRegion || float (now - repairNs) >= wait then
+                        if sameRegion then repairRepeats <- repairRepeats + 1L
+                        if not sameRegion then
+                            repairLo <- tLo
+                            repairSpan <- dueSpan
+                            repairSeq <- 0
+                        elif dueSpan > repairSpan then
+                            repairSpan <- dueSpan
+                        repairDeficit <- dueDeficit
+                        repairNs <- now
+                        // Bound the pending repair queue: a decoder lag looks like loss and would
+                        // otherwise enqueue an unbounded BOOSTER storm (uplink collapse).
+                        let room = max 0 (256 - repairs.Count)
+                        let n = min room (min 64 (int (ceil (float (dueDeficit + 2) / (1.0 - min 0.9 erasure)))))
+                        if room = 0 then ()
+                        elif repairSeq + n <= 256 then
+                            for i in 0 .. n - 1 do
+                                repairs.Enqueue { Kind = CellType.Booster; Step = tLo; Index = byte (repairSeq + i)
+                                                  Span = byte dueSpan; Round = byte n }
+                            repairSeq <- repairSeq + n
+                        else
+                            for j in 0 .. dueSpan - 1 do
+                                let t = tLo + uint64 j
+                                for s in 0 .. encoder.StepUsed t - 1 do
+                                    if repairs.Count < 256 then
+                                        repairs.Enqueue { Kind = CellType.Data; Step = t; Index = byte s; Span = 0uy; Round = 0uy }
 
     /// Tail rule (spec 5.8): input paused for 50 ms and the peer lacks steps: a HEARTBEAT
     /// every 50 ms carries tx_head_step.
