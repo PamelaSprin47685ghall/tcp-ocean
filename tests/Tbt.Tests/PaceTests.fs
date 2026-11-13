@@ -104,7 +104,7 @@ let ``RateGroup repair bucket is charged separately and a dry reserve still allo
     Assert.True(g.TryTake(L, true), "new data must not starve when the repair reserve is dry")
 
 [<Fact>]
-let ``SignalLoss leaves startup and begins drain`` () =
+let ``SignalLoss leaves startup only when inflight already exceeds 1.25 BDP`` () =
     let clock = ManualClock()
     let g = RateGroup(clock)
     let m = Mem()
@@ -113,9 +113,13 @@ let ``SignalLoss leaves startup and begins drain`` () =
     m.DeliveredV <- primed
     m.LastNsV <- clock.Now
     g.OnSent(int primed)
+    m.InflightV <- 0
     clock.Now <- clock.Now + 400_000_000L
     g.Service clock.Now
     Assert.True(g.InStartup)
+    g.SignalLoss()
+    Assert.True(g.InStartup, "a repair before the pipe is full must not end startup")
+    m.InflightV <- int (2.0 * g.Bandwidth * 400_000_000.0)
     g.SignalLoss()
     Assert.False(g.InStartup)
 
