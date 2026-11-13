@@ -150,7 +150,11 @@ type RateGroup(clock: IClock) =
         if startup && bw > 0.0 then
             scan ()
             let rtt = minRtt ()
-            if rtt <> Int64.MaxValue && inflight () > int (cwndGain * bw * float rtt) then
+            // The 64-frame client startup floor (~90 KiB) already exceeds 1.25 BDP
+            // of a 1–2 Mbit first sample; that must not count as overshoot (U1TkhL
+            // left startup at 1.9 Mbit, bulk up 8.1). Require a margin of 64 frames
+            // above the cruise cap.
+            if rtt <> Int64.MaxValue && inflight () > int (cwndGain * bw * float rtt) + 64 * 2048 then
                 startup <- false
                 draining <- true
 
