@@ -31,6 +31,8 @@ type TunCounters() =
     member val CellsReceived = 0L with get, set
     member val CellsDropped = 0L with get, set
     member val TailRepairs = 0L with get, set
+    /// RTO fallback episodes: snd.una did not move for the RTO (no SACK needed).
+    member val Rtos = 0L with get, set
     /// Times a path was demoted: data in flight, nothing delivered for the demotion time.
     member val Demotions = 0L with get, set
     /// Exceptions caught at a path entry point: the owner failed, the connection was reset.
@@ -122,6 +124,17 @@ type TunPath(output: ITunOutput, counters: TunCounters, localIp: uint32, localPo
     let mutable ringCount = 0
     let mutable inflight = 0
     let mutable rackSentNs = 0L
+    /// RTO fallback (independent of SACK and RACK): snd.una still for the RTO makes every
+    /// unsacked segment sent before it lost; they go again from snd.una (go-back-N), paced.
+    let mutable unaNs = 0L
+    let mutable rtoShift = 0
+    let mutable rtoActive = false
+    let mutable rtoFireNs = 0L
+    let mutable rtoSeq = 0UL
+    let mutable rtoEnd = 0UL
+    /// Set while a cumulative advance is released by a repaired segment: the segments behind
+    /// it waited for the hole, so they give no RTT sample.
+    let mutable heldBehindRepair = false
     // Delivery-rate pacer.
     let mutable delivered = 0L
     let mutable duplicatesDelivered = 0L
@@ -400,6 +413,8 @@ type TunPath(output: ITunOutput, counters: TunCounters, localIp: uint32, localPo
             cycleNs <- cycleNs + d
             synAckNs <- synAckNs + d
             tailNs <- tailNs + d
+            unaNs <- unaNs + d
+            if rtoActive then rtoFireNs <- rtoFireNs + d
             for i in 0 .. ivCount - 1 do ivSince.[i] <- ivSince.[i] + d
 
     // ---- send: delivery accounting -----------------------------------------------------
@@ -417,7 +432,8 @@ type TunPath(output: ITunOutput, counters: TunCounters, localIp: uint32, localPo
         let interval = max ackElapsed sendElapsed
         deliveredNs <- now
         lastDeliveredSentNs <- s.SentNs
-        if s.Retx = 0 then
+        if s.Retx > 0 then heldBehindRepair <- true
+        if s.Retx = 0 && not heldBehindRepair then
             let rtt = float (now - s.SentNs)
             srttNs <- if srttNs = 0.0 then rtt else 0.875 * srttNs + 0.125 * rtt
             let r = now - s.SentNs
@@ -506,11 +522,15 @@ type TunPath(output: ITunOutput, counters: TunCounters, localIp: uint32, localPo
         peerWnd <- int wnd <<< peerScale
         if ack64 > sndUna && ack64 <= sndNxt then
             sndUna <- ack64
+            unaNs <- now
+            rtoShift <- 0
+            heldBehindRepair <- false
             while ringCount > 0 && ring.[ringHead].Seq + uint64 ring.[ringHead].Length <= sndUna do
                 let s = &ring.[ringHead]
                 if not s.Sacked then onDelivered &s now
                 ringHead <- (ringHead + 1) % ring.Length
                 ringCount <- ringCount - 1
+            heldBehindRepair <- false
             if relLen > 0 && sndUna >= relBase + uint64 relLen then relLen <- 0
         // SACK blocks.
         let mutable blocksAt = 0
@@ -646,6 +666,7 @@ type TunPath(output: ITunOutput, counters: TunCounters, localIp: uint32, localPo
                 for i in 0 .. ringCount - 1 do next.[i] <- ring.[at i]
                 ring <- next
                 ringHead <- 0
+            if ringCount = 0 then unaNs <- now
             ring.[at ringCount] <- { Seq = sndNxt; Length = n; Kind = 0uy; Sacked = false; Retx = 0; SentNs = now; Duplicates = 0
                                      Delivered = delivered; DeliveredNs = deliveredNs; FirstSentNs = lastDeliveredSentNs }
             ringCount <- ringCount + 1
@@ -693,6 +714,31 @@ type TunPath(output: ITunOutput, counters: TunCounters, localIp: uint32, localPo
                         budget <- budget - 1
                     i <- i + 1
                 if budget < tailBudget then tailNs <- now
+            // RTO fallback: works with any peer (no SACK, SACK stripped). Base 2 x the tail
+            // timer, at least 200 ms, doubled per episode up to 3.2 s; reset when snd.una moves.
+            if ringCount > 0 && srttNs > 0.0 then
+                let rto = int64 (max (1.15 * srttNs) (srttNs + 10_000_000.0))
+                let timeout = min 3_200_000_000L ((max (2L * rto) 200_000_000L) <<< rtoShift)
+                if now - unaNs > timeout then
+                    rtoActive <- true
+                    rtoFireNs <- now
+                    rtoSeq <- sndUna
+                    rtoEnd <- sndNxt
+                    rtoShift <- min 4 (rtoShift + 1)
+                    unaNs <- now
+                    counters.Rtos <- counters.Rtos + 1L
+            if rtoActive then
+                if rtoSeq < sndUna then rtoSeq <- sndUna
+                let mutable i = if ringCount > 0 then find rtoSeq else 0
+                let mutable budget = tailBudget
+                while i < ringCount && budget > 0 && ring.[at i].Seq < rtoEnd do
+                    let s = &ring.[at i]
+                    if not s.Sacked && s.SentNs < rtoFireNs then
+                        repair i now
+                        budget <- budget - 1
+                    rtoSeq <- s.Seq + uint64 s.Length
+                    i <- i + 1
+                if i >= ringCount || rtoSeq >= rtoEnd then rtoActive <- false
             if not startup && not draining && minRttNs <> Int64.MaxValue && now - cycleNs > minRttNs then
                 cycle <- (cycle + 1) % 8
                 cycleNs <- now
@@ -806,6 +852,7 @@ type TunPath(output: ITunOutput, counters: TunCounters, localIp: uint32, localPo
             if inflight = 0 then
                 deliveredNs <- now
                 lastDeliveredSentNs <- now
+            if ringCount = 0 then unaNs <- now
             ring.[at ringCount] <- { Seq = sndNxt; Length = l; Kind = 1uy; Sacked = false; Retx = 0; SentNs = now; Duplicates = 0
                                      Delivered = delivered; DeliveredNs = deliveredNs; FirstSentNs = lastDeliveredSentNs }
             ringCount <- ringCount + 1
