@@ -153,7 +153,17 @@ tunnel() {
     # Sequential JOINs at long RTT can exceed the default 10 s; raise HANDSHAKE_S.
     local i t0 t1
     t0=$(date +%s%N)
-    for i in $(seq $((handshake_s * 5))); do grep -q "session up" "$work/client-$name.log" && break; sleep 0.2; done
+    for i in $(seq $((handshake_s * 5))); do
+        grep -q "session up" "$work/client-$name.log" && break
+        # session up is logged only after every JOIN; if the client has already
+        # exited (e.g. an uncaught bootstrap exception), waiting the full
+        # HANDSHAKE_S only occupies the shared lock.
+        if [[ -z $(pids_of "$work/jit/tbtun") ]]; then
+            echo "client exited before session up"
+            break
+        fi
+        sleep 0.2
+    done
     t1=$(date +%s%N)
     stamp "handshake($name): $(awk -v t0="$t0" -v t1="$t1" 'BEGIN{printf "%.2f", (t1-t0)/1e9}')s (limit ${handshake_s}s)"
     grep -q "session up" "$work/client-$name.log" || { echo "handshake failed in ${handshake_s} s"; cat "$work/client-$name.log"; exit 1; }
