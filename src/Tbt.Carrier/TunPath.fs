@@ -543,7 +543,7 @@ type TunPath(output: ITunOutput, counters: TunCounters, localIp: uint32, localPo
         deliveredNs <- now
         lastDeliveredSentNs <- s.SentNs
         if s.Retx > 0 then heldBehindRepair <- true
-        if s.Retx = 0 && not heldBehindRepair && now > s.SentNs then
+        if s.Retx = 0 && not heldBehindRepair && now >= s.SentNs then
             let rtt = float (now - s.SentNs)
             srttNs <- if srttNs = 0.0 then rtt else 0.875 * srttNs + 0.125 * rtt
             let r = now - s.SentNs
