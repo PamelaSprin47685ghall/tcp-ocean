@@ -64,3 +64,29 @@ let ``a non-path-0 exhaustion is a GaveUp value, not an exception the caller mus
     match r with
     | GaveUp msg -> Assert.Equal("connect timed out", msg)
     | Joined -> failwith "expected exhaustion"
+
+[<Fact>]
+let ``join waves for 256 paths at concurrency 16 is 16, and concurrency is clamped`` () =
+    Assert.Equal(16, DefaultConcurrency)
+    Assert.Equal(16, clampConcurrency 99)
+    Assert.Equal(1, clampConcurrency 0)
+    Assert.Equal(16, waves 255 16)
+    Assert.Equal(1, waves 7 16)
+    Assert.Equal(0, waves 0 8)
+    Assert.Equal(8, waves 64 8)
+
+[<Fact>]
+let ``runBounded never exceeds concurrency and finishes every item`` () =
+    let inflight = ref 0
+    let peak = ref 0
+    let seen = System.Collections.Concurrent.ConcurrentBag<int>()
+    let items = [| 1 .. 40 |]
+    runBounded 8 items (fun i ->
+        let n = System.Threading.Interlocked.Increment inflight
+        lock peak (fun () -> if n > peak.Value then peak.Value <- n)
+        System.Threading.Thread.Sleep 15
+        seen.Add i
+        System.Threading.Interlocked.Decrement inflight |> ignore)
+    Assert.Equal(40, seen.Count)
+    Assert.InRange(peak.Value, 1, 8)
+

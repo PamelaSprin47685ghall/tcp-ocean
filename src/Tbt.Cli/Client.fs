@@ -7,6 +7,8 @@ open System.Net
 open System.Net.Sockets
 open System.Runtime.InteropServices
 open System.Threading
+open System.Threading.Tasks
+open System.Collections.Concurrent
 open Tbt.Contracts
 open Tbt.Session
 open Tbt.Session.Handshake
@@ -79,10 +81,13 @@ let run (o: Options) =
         let carrier = SessionCarrier(session, bridge)
         carrier.AddPath link0
         let maxPaths = int hello.MaxPaths
-        // A retry of the same path id must bump the incarnation; a new nonce at
-        // an equal incarnation is closed by admission. Failures after the budget
-        // are logged and skipped — they must not kill the process.
-        for id in 1 .. min pathCount maxPaths - 1 do
+        // Forward as soon as path 0 is up; remaining JOINs run with bounded
+        // concurrency and are attached on this thread via `pending`.
+        log ("session up: S=" + string p.Symbol + " paths=" + string carrier.Paths.Count + " window_clamp=" + string windowClamp)
+        let concurrency = JoinBootstrap.clampConcurrency (o.Int("join-concurrency", JoinBootstrap.DefaultConcurrency))
+        let pending = ConcurrentQueue<PathLink>()
+        let mutable readyLogged = false
+        let joinOne (id: int) =
             match JoinBootstrap.tryRepeated attempts backoff Thread.Sleep (fun i ->
                 let inc = uint32 (i + 1)
                 let join = JoinOffer(p.Keys.PathKey, entropy, p.Keys.SessionId, p.Symbol, p.Caps, maxPaths, uint16 id, inc, mss)
@@ -90,13 +95,25 @@ let run (o: Options) =
                 if (join.TryAccept(ReadOnlySpan ack)).IsSome then
                     link.PathId <- uint16 id
                     link.Incarnation <- inc
-                    carrier.AddPath link
+                    pending.Enqueue link
                 else
                     link.Close()
                     failwith "join refused") with
             | JoinBootstrap.Joined -> ()
             | JoinBootstrap.GaveUp msg -> log ("path " + string id + ": " + msg)
-        log ("session up: S=" + string p.Symbol + " paths=" + string carrier.Paths.Count + " window_clamp=" + string windowClamp)
+        let ids = [| 1 .. min pathCount maxPaths - 1 |]
+        let joinTask =
+            if ids.Length = 0 then Task.CompletedTask
+            else Task.Run(fun () -> JoinBootstrap.runBounded concurrency ids joinOne)
+        let attachJoined () =
+            let mutable link = Unchecked.defaultof<PathLink>
+            while pending.TryDequeue(&link) do
+                carrier.AddPath link
+                log ("path " + string link.PathId + " joined, paths=" + string carrier.Paths.Count)
+            if not readyLogged && joinTask.IsCompleted && pending.IsEmpty then
+                readyLogged <- true
+                log ("paths ready: paths=" + string carrier.Paths.Count)
+        attachJoined ()
         let listener = new Socket(listenAt.AddressFamily, SocketType.Stream, ProtocolType.Tcp)
         listener.Bind listenAt
         listener.Listen 128
@@ -112,6 +129,7 @@ let run (o: Options) =
         use _int = PosixSignalRegistration.Create(PosixSignal.SIGINT, onSignal)
         use _term = PosixSignalRegistration.Create(PosixSignal.SIGTERM, onSignal)
         while carrier.Alive && not (stopAt > 0L && Environment.TickCount64 > stopAt) do
+            attachJoined ()
             if stopAt > 0L && session.CloseState = CloseState.Open then
                 log "closing the session"
                 session.Close 0uy |> ignore
@@ -130,5 +148,7 @@ let run (o: Options) =
                     | s -> if not (bridge.TryAdd s) then s.Dispose()
             carrier.Service poller
         log (if session.Closed then "session closed" else "all paths closed")
+        try joinTask.Wait 2000 |> ignore with _ -> ()
+        attachJoined ()
         carrier.Close()
         if session.Closed then 0 else 1

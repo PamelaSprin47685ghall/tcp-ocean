@@ -73,3 +73,32 @@ let tryRepeated (attempts: int) (backoffMs: int -> int) (sleepMs: int -> unit) (
                 sleepMs (backoffMs i)
                 loop (i + 1)
     loop 0
+
+[<Literal>]
+let DefaultConcurrency = 16
+
+/// In-flight JOIN cap used by the client (at least 1, at most 16).
+let clampConcurrency (n: int) = min 16 (max 1 n)
+
+/// Waves needed to join `remaining` paths at this concurrency.
+let waves (remaining: int) (concurrency: int) =
+    let c = clampConcurrency concurrency
+    let n = max 0 remaining
+    if n = 0 then 0 else (n + c - 1) / c
+
+/// Run `work` for each item with at most `concurrency` in flight. Blocks until
+/// every item has finished. Exceptions from `work` are collected and rethrown
+/// as AggregateException after the others finish; a well-behaved `work` does
+/// not throw (see `tryRepeated`).
+let runBounded (concurrency: int) (items: 'T[]) (work: 'T -> unit) =
+    let c = clampConcurrency concurrency
+    use sem = new Threading.SemaphoreSlim(c)
+    let tasks =
+        [| for item in items do
+               let captured = item
+               Threading.Tasks.Task.Run(fun () ->
+                   sem.Wait()
+                   try work captured
+                   finally sem.Release() |> ignore) |]
+    if tasks.Length > 0 then Threading.Tasks.Task.WaitAll(tasks)
+

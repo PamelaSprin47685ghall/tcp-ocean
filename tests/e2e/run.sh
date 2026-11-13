@@ -149,32 +149,48 @@ tunnel() {
     sleep 0.5
     in_ns near "$work/jit/tbtun" client --server "$server_at" --listen 127.0.0.1:1080 --psk-file "$work/psk" --stats-s 1 \
         --paths "$paths" --window "$window" --window-clamp "$window_clamp" --stats-s 1 2>"$work/client-$name.log" &
-    # Under loss a lost handshake segment costs a TCP retransmit timeout (1 s and more).
-    # Sequential JOINs at long RTT can exceed the default 10 s; raise HANDSHAKE_S.
-    local i t0 t1
+    # session up is logged once path 0 is forwarding; paths ready after the
+    # remaining JOINs (bounded concurrency). Raise HANDSHAKE_S for many paths
+    # under loss. If the client has been seen and then exited, waiting the
+    # full HANDSHAKE_S only occupies the shared lock. Do not treat "not yet
+    # started" as an exit: pids_of is empty for a moment after launch.
+    local i t0 t_up t1 now
     t0=$(date +%s%N)
     local seen_client=0
-    for i in $(seq $((handshake_s * 5))); do
+    local limit_ns=$((handshake_s * 1000000000))
+    while :; do
         grep -q "session up" "$work/client-$name.log" && break
-        # session up is logged only after every JOIN. If the client has been
-        # seen and then exited (uncaught bootstrap exception), waiting the
-        # full HANDSHAKE_S only occupies the shared lock. Do not treat "not
-        # yet started" as an exit: pids_of is empty for a moment after launch.
         if [[ -n $(pids_of "$work/jit/tbtun") ]]; then
             seen_client=1
         elif (( seen_client )); then
             echo "client exited before session up"
             break
         fi
+        now=$(date +%s%N)
+        (( now - t0 >= limit_ns )) && break
+        sleep 0.2
+    done
+    t_up=$(date +%s%N)
+    stamp "session_up($name): $(awk -v t0="$t0" -v t1="$t_up" 'BEGIN{printf "%.2f", (t1-t0)/1e9}')s"
+    grep -q "session up" "$work/client-$name.log" || { echo "handshake failed in ${handshake_s} s"; cat "$work/client-$name.log"; exit 1; }
+    while :; do
+        grep -q "paths ready:" "$work/client-$name.log" && break
+        if [[ -z $(pids_of "$work/jit/tbtun") ]] && (( seen_client )); then
+            echo "client exited before paths ready"
+            break
+        fi
+        now=$(date +%s%N)
+        (( now - t0 >= limit_ns )) && break
         sleep 0.2
     done
     t1=$(date +%s%N)
     stamp "handshake($name): $(awk -v t0="$t0" -v t1="$t1" 'BEGIN{printf "%.2f", (t1-t0)/1e9}')s (limit ${handshake_s}s)"
-    grep -q "session up" "$work/client-$name.log" || { echo "handshake failed in ${handshake_s} s"; cat "$work/client-$name.log"; exit 1; }
-    # Client logs "session up: S=... paths=N". Window is a local --window on both sides
-    # (not a distinct handshake field besides SERVER_INIT rx_win_grant0 = server WindowSteps).
+    grep -q "paths ready:" "$work/client-$name.log" || { echo "paths not ready in ${handshake_s} s"; cat "$work/client-$name.log"; exit 1; }
+    # "paths ready: paths=N" is the negotiated count. Window is a local --window
+    # on both sides (not a distinct handshake field besides SERVER_INIT
+    # rx_win_grant0 = server WindowSteps).
     local up_line neg_paths
-    up_line=$(grep "session up" "$work/client-$name.log" | tail -1)
+    up_line=$(grep "paths ready:" "$work/client-$name.log" | tail -1)
     neg_paths=${up_line##*paths=}
     neg_paths=${neg_paths%%[^0-9]*}
     stamp "negotiated($name): paths=$neg_paths window=$window window_clamp=$window_clamp (requested paths=$paths window=$window window_clamp=$window_clamp; server_max_paths=$max_paths)"
