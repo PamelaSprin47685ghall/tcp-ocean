@@ -676,8 +676,33 @@ let ``an oversized seal-to-custody sample is clamped to three times minRTT`` () 
 
 
 [<Fact>]
-let ``repair wait is minRTT plus measured queueing and variance, not 1.05 times minRTT alone`` () =
+let ``default repair is main's: a new range NACK enqueues BOOSTERs immediately`` () =
     let config = { SessionConfig.defaults with Credit = { CreditPolicy.defaults with Enabled = false } }
+    let pair = Pair(config, 1, 0.0, 4)
+    let c = pair.Client
+    let clock = pair.Clock
+    c.Tx.InitialGrant 10_000UL
+    Assert.False(c.Tx.NewRepair)
+    let mutable slot = -1
+    Assert.True(c.TryOpenFlow(&slot))
+    let chunk = Array.create 65536 7uy
+    let mutable guard = 64
+    while c.Tx.Head < 2UL && guard > 0 do
+        pair.Feed(c, slot, ReadOnlySpan chunk, false) |> ignore
+        c.Tx.Flush()
+        guard <- guard - 1
+    clock.Now <- clock.Now + 400_000_000L
+    c.Tx.OnPeerAck(1UL, 100us)
+    Assert.True(c.Tx.MinRttNs <> Int64.MaxValue)
+    // Main: first NACK of a new range does not wait. The new scheduler would
+    // arm the step and wait the tail timer (~1.25×minRTT).
+    c.Tx.OnNack(1UL, 1, 4)
+    Assert.True(c.Tx.RepairWaiting, "main OnNack must enqueue the first round now")
+    Assert.True(c.Tx.RepairWaitNs = 1.05 * float c.Tx.MinRttNs, sprintf "wait %g" c.Tx.RepairWaitNs)
+
+[<Fact>]
+let ``repair wait is minRTT plus measured queueing and variance, not 1.05 times minRTT alone`` () =
+    let config = { SessionConfig.defaults with NewRepair = true; Credit = { CreditPolicy.defaults with Enabled = false } }
     let pair = Pair(config, 1, 0.0, 4)
     let c = pair.Client
     let clock = pair.Clock
@@ -708,7 +733,7 @@ let ``repair wait is minRTT plus measured queueing and variance, not 1.05 times 
 
 [<Fact>]
 let ``a NACK of the outstanding tail waits the long tail timer, not the short reorder window`` () =
-    let config = { SessionConfig.defaults with Credit = { CreditPolicy.defaults with Enabled = false } }
+    let config = { SessionConfig.defaults with NewRepair = true; Credit = { CreditPolicy.defaults with Enabled = false } }
     let pair = Pair(config, 1, 0.0, 4)
     let c = pair.Client
     let clock = pair.Clock
@@ -738,7 +763,7 @@ let ``a NACK of the outstanding tail waits the long tail timer, not the short re
 
 [<Fact>]
 let ``a step is presumed lost only after a later-sealed step is seen and the reorder window passes`` () =
-    let config = { SessionConfig.defaults with Credit = { CreditPolicy.defaults with Enabled = false } }
+    let config = { SessionConfig.defaults with NewRepair = true; Credit = { CreditPolicy.defaults with Enabled = false } }
     let pair = Pair(config, 1, 0.0, 4)
     let c = pair.Client
     let clock = pair.Clock
@@ -767,7 +792,7 @@ let ``a step is presumed lost only after a later-sealed step is seen and the reo
 
 [<Fact>]
 let ``a NACK does not enqueue repairs before a minRTT sample exists`` () =
-    let config = { SessionConfig.defaults with Credit = { CreditPolicy.defaults with Enabled = false } }
+    let config = { SessionConfig.defaults with NewRepair = true; Credit = { CreditPolicy.defaults with Enabled = false } }
     let pair = Pair(config, 1, 0.0, 4)
     let c = pair.Client
     let clock = pair.Clock
@@ -796,7 +821,7 @@ let ``a NACK does not enqueue repairs before a minRTT sample exists`` () =
 
 [<Fact>]
 let ``a NACK repairs only the steps of the range whose originals are due`` () =
-    let config = { SessionConfig.defaults with Credit = { CreditPolicy.defaults with Enabled = false } }
+    let config = { SessionConfig.defaults with NewRepair = true; Credit = { CreditPolicy.defaults with Enabled = false } }
     let pair = Pair(config, 1, 0.0, 4)
     let c = pair.Client
     let clock = pair.Clock
@@ -837,7 +862,7 @@ let ``a NACK repairs only the steps of the range whose originals are due`` () =
 
 [<Fact>]
 let ``a growing NACK deficit does not skip the last-repair wait for that step`` () =
-    let config = { SessionConfig.defaults with Credit = { CreditPolicy.defaults with Enabled = false } }
+    let config = { SessionConfig.defaults with NewRepair = true; Credit = { CreditPolicy.defaults with Enabled = false } }
     let pair = Pair(config, 1, 0.0, 4)
     let c = pair.Client
     let clock = pair.Clock
@@ -875,7 +900,7 @@ let ``a growing NACK deficit does not skip the last-repair wait for that step`` 
 
 [<Fact>]
 let ``seeing a later step does not make a not-yet-due hole eligible`` () =
-    let config = { SessionConfig.defaults with Credit = { CreditPolicy.defaults with Enabled = false } }
+    let config = { SessionConfig.defaults with NewRepair = true; Credit = { CreditPolicy.defaults with Enabled = false } }
     let pair = Pair(config, 1, 0.0, 4)
     let c = pair.Client
     let clock = pair.Clock
@@ -913,7 +938,7 @@ let ``seeing a later step does not make a not-yet-due hole eligible`` () =
 
 [<Fact>]
 let ``a never-repaired tail step is eligible on its own timer after another step was repaired`` () =
-    let config = { SessionConfig.defaults with Credit = { CreditPolicy.defaults with Enabled = false } }
+    let config = { SessionConfig.defaults with NewRepair = true; Credit = { CreditPolicy.defaults with Enabled = false } }
     let pair = Pair(config, 1, 0.0, 4)
     let c = pair.Client
     let clock = pair.Clock
@@ -949,7 +974,7 @@ let ``a never-repaired tail step is eligible on its own timer after another step
 
 [<Fact>]
 let ``Karn still samples a never-repaired step after a neighbour was repaired`` () =
-    let config = { SessionConfig.defaults with Credit = { CreditPolicy.defaults with Enabled = false } }
+    let config = { SessionConfig.defaults with NewRepair = true; Credit = { CreditPolicy.defaults with Enabled = false } }
     let pair = Pair(config, 1, 0.0, 4)
     let c = pair.Client
     let clock = pair.Clock
@@ -986,7 +1011,7 @@ let ``Karn still samples a never-repaired step after a neighbour was repaired`` 
 
 [<Fact>]
 let ``a spurious repair widens the reorder window`` () =
-    let config = { SessionConfig.defaults with Credit = { CreditPolicy.defaults with Enabled = false } }
+    let config = { SessionConfig.defaults with NewRepair = true; Credit = { CreditPolicy.defaults with Enabled = false } }
     let pair = Pair(config, 1, 0.0, 4)
     let c = pair.Client
     let clock = pair.Clock
@@ -1018,7 +1043,7 @@ let ``a spurious repair widens the reorder window`` () =
 
 [<Fact>]
 let ``an ack that arrives sooner than minRTT after a BOOSTER counts as a spurious repair`` () =
-    let config = { SessionConfig.defaults with Credit = { CreditPolicy.defaults with Enabled = false } }
+    let config = { SessionConfig.defaults with NewRepair = true; Credit = { CreditPolicy.defaults with Enabled = false } }
     let pair = Pair(config, 1, 0.0, 4)
     let c = pair.Client
     let clock = pair.Clock

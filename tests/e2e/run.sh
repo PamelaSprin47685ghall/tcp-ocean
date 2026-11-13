@@ -42,6 +42,8 @@ tuple_mbit=${TUPLE_MBIT:-0}
 # Client uplink RateGroup is off unless UPLINK_PACE=1. The rtt400 4 Mbit/path
 # cap only applies when that pacer is on.
 uplink_pace=${UPLINK_PACE:-0}
+# New per-step / evidence repair scheduler (default off = main OnNack). Both sides.
+new_repair=${NEW_REPAIR:-0}
 if [[ $uplink_pace != 0 && $profile == rtt400 && $tuple_mbit == 0 ]]; then tuple_mbit=4; fi
 seed=${SEED:-7}
 ping_count=${PING_COUNT:-200}
@@ -162,14 +164,17 @@ sleep 0.5
 # One tunnel = one session; each session runs several cases back to back.
 tunnel() {
     local name=$1 target=$2
+    local server_extra=()
+    if [[ $new_repair != 0 ]]; then server_extra+=(--new-repair 1); fi
     in_ns far "$work/aot/tbtun" server "${server_args[@]}" --target "$target" --psk-file "$work/psk" --stats-s 1 \
-        --window "$window" --window-clamp "$window_clamp" --max-paths "$max_paths" \
+        --window "$window" --window-clamp "$window_clamp" --max-paths "$max_paths" "${server_extra[@]}" \
         2>"$work/server-$name.log" &
     sleep 0.5
     local client_args=(--server "$server_at" --listen 127.0.0.1:1080 --psk-file "$work/psk" --stats-s 1
         --paths "$paths" --window "$window" --window-clamp "$window_clamp")
     if [[ $uplink_pace != 0 ]]; then client_args+=(--uplink-pace 1); fi
     if [[ $tuple_mbit != 0 ]]; then client_args+=(--tuple-mbit "$tuple_mbit"); fi
+    if [[ $new_repair != 0 ]]; then client_args+=(--new-repair 1); fi
     if [[ -n ${JOIN_CONCURRENCY:-} ]]; then client_args+=(--join-concurrency "$JOIN_CONCURRENCY"); fi
     in_ns near "$work/jit/tbtun" client "${client_args[@]}" 2>"$work/client-$name.log" &
     # session up is logged once path 0 is forwarding; paths ready after the

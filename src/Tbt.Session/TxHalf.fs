@@ -114,8 +114,17 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
     /// Extra reorder window beyond minRTT/4, grown when a repair was spurious.
     let mutable reoExtraNs = 0L
     /// When true (server downlink), mid-window holes use RACK evidence (t_hi).
-    /// The client leaves this off until arrival-based delivery samples are in.
+    /// Only consulted when newRepair is on.
     let mutable evidenceRepair = false
+    /// Opt-in per-step / evidence / tail-timer scheduler. Off = main's span OnNack,
+    /// 1.05×minRTT wait, and Karn over the last repair range, exactly.
+    let mutable newRepair = false
+    /// Main (flag-off) repair-range state: one BOOSTER span, one wait clock.
+    let mutable repairLo = 0UL
+    let mutable repairSpan = 0
+    let mutable repairSeq = 0
+    let mutable repairNs = 0L
+    let mutable repairDeficit = 0
     /// When a BOOSTER for this step was sealed (0: none in this generation).
     let boostSentNs: int64[] = Array.zeroCreate encoder.Capacity
     let mutable lastSourceNs = 0L
@@ -246,47 +255,64 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
                     uniqueCells.[index tAck] <- 0
                     tAck <- tAck + 1UL
                 let now = clock.NowNs()
-                // A BOOSTER cannot complete a minRTT after it was sent: an earlier
-                // ack is the original first copy arriving — the repair was spurious.
-                let minRtt = min minCurNs minPrevNs
-                let mutable tSp = peerAck
-                while tSp < ack do
-                    let bi = int (tSp % uint64 boostSentNs.Length)
-                    let sentAt = boostSentNs.[bi]
-                    if sentAt > 0L && minRtt <> Int64.MaxValue && now - sentAt < minRtt then
-                        spuriousRepairs <- spuriousRepairs + 1L
-                        // RACK: a spurious repair means the reorder window was too short.
-                        reoExtraNs <- min (minRtt - minRtt / 4L) (reoExtraNs + minRtt / 4L)
-                    boostSentNs.[bi] <- 0L
-                    tSp <- tSp + 1UL
-                let mutable tSamp = ack
-                let mutable foundClean = false
-                let mutable sealAt = 0L
-                while tSamp > peerAck && not foundClean do
-                    tSamp <- tSamp - 1UL
-                    let si = int (tSamp % uint64 lastRepairNs.Length)
-                    if lastRepairNs.[si] = 0L then
-                        foundClean <- true
-                        sealAt <- sealNs.[int (tSamp % uint64 sealNs.Length)]
-                if not foundClean then rttSkipped <- rttSkipped + 1L
-                elif now - sealAt > 0L then
+                if newRepair then
+                    // A BOOSTER cannot complete a minRTT after it was sent: an earlier
+                    // ack is the original first copy arriving — the repair was spurious.
+                    let minRtt = min minCurNs minPrevNs
+                    let mutable tSp = peerAck
+                    while tSp < ack do
+                        let bi = int (tSp % uint64 boostSentNs.Length)
+                        let sentAt = boostSentNs.[bi]
+                        if sentAt > 0L && minRtt <> Int64.MaxValue && now - sentAt < minRtt then
+                            spuriousRepairs <- spuriousRepairs + 1L
+                            // RACK: a spurious repair means the reorder window was too short.
+                            reoExtraNs <- min (minRtt - minRtt / 4L) (reoExtraNs + minRtt / 4L)
+                        boostSentNs.[bi] <- 0L
+                        tSp <- tSp + 1UL
+                    let mutable tSamp = ack
+                    let mutable foundClean = false
+                    let mutable sealAt = 0L
+                    while tSamp > peerAck && not foundClean do
+                        tSamp <- tSamp - 1UL
+                        let si = int (tSamp % uint64 lastRepairNs.Length)
+                        if lastRepairNs.[si] = 0L then
+                            foundClean <- true
+                            sealAt <- sealNs.[int (tSamp % uint64 sealNs.Length)]
+                    if not foundClean then rttSkipped <- rttSkipped + 1L
+                    elif now - sealAt > 0L then
+                        let sample = now - sealAt
+                        let m = min minCurNs minPrevNs
+                        let used =
+                            if m = Int64.MaxValue then sample
+                            else min sample (3L * m)
+                        // RFC 6298: RTTVAR first from the pre-update SRTT, then SRTT.
+                        let err = float used - srttNs
+                        if rttvarNs = 0.0 then rttvarNs <- abs err / 2.0
+                        else rttvarNs <- rttvarNs + (abs err - rttvarNs) / 4.0
+                        srttNs <- srttNs + (float used - srttNs) / 8.0
+                        if now - minSinceNs >= 10_000_000_000L then
+                            minPrevNs <- minCurNs
+                            minCurNs <- Int64.MaxValue
+                            minSinceNs <- now
+                        if sample < minCurNs then minCurNs <- sample
+                else
+                    // Main Karn: a step held behind a repair round started after its
+                    // seal measures the wait, not the path. Only the newest covered
+                    // step (ack - 1) enters SRTT. No RTTVAR (the wait does not use it).
+                    let sealAt = sealNs.[int ((ack - 1UL) % uint64 sealNs.Length)]
                     let sample = now - sealAt
-                    // Clamp to k × minRTT so one long custody delay cannot
-                    // drag the session SRTT (minRTT itself stays raw).
-                    let m = min minCurNs minPrevNs
-                    let used =
-                        if m = Int64.MaxValue then sample
-                        else min sample (3L * m)
-                    // RFC 6298: RTTVAR first from the pre-update SRTT, then SRTT.
-                    let err = float used - srttNs
-                    if rttvarNs = 0.0 then rttvarNs <- abs err / 2.0
-                    else rttvarNs <- rttvarNs + (abs err - rttvarNs) / 4.0
-                    srttNs <- srttNs + (float used - srttNs) / 8.0
-                    if now - minSinceNs >= 10_000_000_000L then
-                        minPrevNs <- minCurNs
-                        minCurNs <- Int64.MaxValue
-                        minSinceNs <- now
-                    if sample < minCurNs then minCurNs <- sample
+                    if repairLo < ack && repairNs >= sealAt then rttSkipped <- rttSkipped + 1L
+                    elif sample > 0L then
+                        let m = min minCurNs minPrevNs
+                        let used =
+                            if m = Int64.MaxValue then sample
+                            else min sample (3L * m)
+                        srttNs <- srttNs + (float used - srttNs) / 8.0
+                        if now - minSinceNs >= 10_000_000_000L then
+                            minPrevNs <- minCurNs
+                            minCurNs <- Int64.MaxValue
+                            minSinceNs <- now
+                        if sample < minCurNs then minCurNs <- sample
                 peerAck <- ack
                 if ack > 0UL then peerSeenHi <- max peerSeenHi (ack - 1UL)
                 if ack > CodeGraph.HistorySpan then encoder.Release(ack - CodeGraph.HistorySpan)
@@ -312,17 +338,19 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
     member _.RttSkipped = rttSkipped
     /// Times a step was repaired again after its last-repair wait ran out.
     member _.RepairRepeats = repairRepeats
-    /// Tail-loss timer: SRTT + 4·RTTVAR, floored at 1.25×minRTT and capped at 4×minRTT.
-    /// Used only when no later step has been seen. Mid-window holes are evidence-driven
-    /// (later-sealed step seen, plus minRTT + reo_wnd) so a pure timer cannot race the
-    /// original under pacing jitter. Before a min sample the value is 1.05 × session
-    /// SRTT, but OnNack does not repair (expected arrival is unknown).
+    /// Wait between repair rounds. Flag off: main's 1.05 × path minRTT (else 1.05 × SRTT).
+    /// Flag on: SRTT + 4·RTTVAR, floored at 1.25×minRTT and capped at 4×minRTT; used
+    /// only as the tail-loss timer. Mid-window holes are evidence-driven.
     member _.RepairWaitNs =
         let m = min minCurNs minPrevNs
         if m = Int64.MaxValue then 1.05 * srttNs
+        elif not newRepair then 1.05 * float m
         else
             let wait = max srttNs (float m) + 4.0 * rttvarNs
             min (max wait (1.25 * float m)) (4.0 * float m)
+    member _.NewRepair
+        with get () = newRepair
+        and set v = newRepair <- v
     /// RACK reorder window: minRTT/4, growing toward minRTT as repairs prove spurious.
     member _.ReoWndNs =
         let m = min minCurNs minPrevNs
@@ -437,14 +465,42 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
     /// with no later evidence — the longer tail timer has passed. When the 256 seeds
     /// of a step are used, its DATA cells go again.
     member this.OnNack(tLo: uint64, span: int, deficit: int) =
-        let span = int (min (uint64 (min span CodeGraph.MaxBoosterSpan)) (encoder.Head - min tLo encoder.Head))
-        let minRtt = min minCurNs minPrevNs
-        if minRtt = Int64.MaxValue || tLo < peerAck || span < 1 || deficit < 1 then ()
+        if newRepair then
+            let span = int (min (uint64 (min span CodeGraph.MaxBoosterSpan)) (encoder.Head - min tLo encoder.Head))
+            let minRtt = min minCurNs minPrevNs
+            if minRtt = Int64.MaxValue || tLo < peerAck || span < 1 || deficit < 1 then ()
+            else
+                let share = max 1 (int (ceil (float deficit / float span)))
+                for j in 0 .. span - 1 do
+                    this.ArmStep(tLo + uint64 j, share)
+                this.DrainDueRepairs()
         else
-            let share = max 1 (int (ceil (float deficit / float span)))
-            for j in 0 .. span - 1 do
-                this.ArmStep(tLo + uint64 j, share)
-            this.DrainDueRepairs()
+            // Main: one range, BOOSTERs enqueued now. Same range waits RepairWaitNs
+            // unless the deficit grew. tLo below peerAck is ignored; a due prefix
+            // is not applied (that was 5df6fa4, gated with the new scheduler).
+            let now = clock.NowNs()
+            let span = int (min (uint64 (min span CodeGraph.MaxBoosterSpan)) (encoder.Head - min tLo encoder.Head))
+            if tLo >= peerAck && span >= 1 && deficit >= 1 && encoder.StepUsed tLo > 0 then
+                let same = tLo = repairLo && span = repairSpan
+                if not same || deficit > repairDeficit || float (now - repairNs) >= this.RepairWaitNs then
+                    if same && deficit <= repairDeficit then repairRepeats <- repairRepeats + 1L
+                    if not same then
+                        repairLo <- tLo
+                        repairSpan <- span
+                        repairSeq <- 0
+                    repairDeficit <- deficit
+                    repairNs <- now
+                    let n = min 64 (int (ceil (float (deficit + 2) / (1.0 - min 0.9 erasure))))
+                    if repairSeq + n <= 256 then
+                        for i in 0 .. n - 1 do
+                            repairs.Enqueue { Kind = CellType.Booster; Step = tLo; Index = byte (repairSeq + i)
+                                              Span = byte span; Round = byte n }
+                        repairSeq <- repairSeq + n
+                    else
+                        for j in 0 .. span - 1 do
+                            let t = tLo + uint64 j
+                            for s in 0 .. encoder.StepUsed t - 1 do
+                                repairs.Enqueue { Kind = CellType.Data; Step = t; Index = byte s; Span = 0uy; Round = 0uy }
 
     /// Tail rule (spec 5.8): input paused for 50 ms and the peer lacks steps: a HEARTBEAT
     /// every 50 ms carries tx_head_step.
@@ -474,7 +530,7 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
 
     /// Drop queued cells of steps the peer already holds; true when a cell waits.
     member this.HasCandidate =
-        this.DrainDueRepairs()
+        if newRepair then this.DrainDueRepairs()
         let mutable c = Unchecked.defaultof<Candidate>
         while repairs.TryPeek(&c) && c.Step + uint64 (max 1uy c.Span) <= peerAck do
             repairs.Dequeue() |> ignore

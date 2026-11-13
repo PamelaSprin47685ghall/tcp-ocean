@@ -53,7 +53,7 @@ let run (o: Options) =
     let pathCount = o.Int("paths", 4)
     let mss = o.Int("mss", 1448)
     let windowClamp = o.Int("window-clamp", SocketTuning.WindowClamp)
-    let config = { SessionConfig.defaults with WindowSteps = o.Int("window", 1024) }
+    let config = { SessionConfig.defaults with WindowSteps = o.Int("window", 1024); NewRepair = o.Int("new-repair", 0) <> 0 }
     let entropy = SystemEntropy()
     let rttMs = max 1 (o.Int("rtt-ms", JoinBootstrap.DefaultRttMs))
     let loss = min 0.9 (max 0.0 (o.Float("loss", JoinBootstrap.DefaultLoss)))

@@ -4,8 +4,8 @@ open Tbt.Cli.Common
 
 let private usage =
     "usage:\n"
-    + "  tbtun client --server HOST:PORT --listen ADDR:PORT --psk-file FILE [--paths 4] [--mss 1448] [--window 1024] [--window-clamp 600000] [--uplink-pace 0] [--tuple-mbit 0]\n"
-    + "  tbtun server --listen ADDR:PORT --target HOST:PORT --psk-file FILE [--max-paths 64] [--mss 1448] [--window 1024] [--window-clamp 600000] [--stats-s 0]"
+    + "  tbtun client --server HOST:PORT --listen ADDR:PORT --psk-file FILE [--paths 4] [--mss 1448] [--window 1024] [--window-clamp 600000] [--uplink-pace 0] [--tuple-mbit 0] [--new-repair 0]\n"
+    + "  tbtun server --listen ADDR:PORT --target HOST:PORT --psk-file FILE [--max-paths 64] [--mss 1448] [--window 1024] [--window-clamp 600000] [--new-repair 0] [--stats-s 0]"
 
 [<EntryPoint>]
 let main argv =

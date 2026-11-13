@@ -36,12 +36,14 @@ type SessionConfig =
       /// Cells that may wait for a path before new local input waits (sender queue bound).
       TxQueueCells: int
       /// Per-flow byte credit; it is on only when caps bit8 and bit9 are both negotiated.
-      Credit: CreditPolicy }
+      Credit: CreditPolicy
+      /// Per-step / evidence-driven repair scheduler (default off = main's span OnNack).
+      NewRepair: bool }
 
 module SessionConfig =
     let defaults =
         { Rho = 0.25; WindowSteps = 4096; MaxRows = 16384; MaxPaths = 288; TxQueueCells = 256
-          Credit = CreditPolicy.defaults }
+          Credit = CreditPolicy.defaults; NewRepair = false }
 
 /// The negotiated result of the main handshake that a session needs.
 [<Struct>]
@@ -80,9 +82,11 @@ type Session(role: Role, p: SessionParams, port: IFlowPort, clock: IClock, confi
     let decoder = Decoder((if client then keys.GraphSeedDown else keys.GraphSeedUp), s, config.WindowSteps, config.MaxRows)
     let tx = TxHalf(txDir, s, fieldOf txDir, encoder, sealer, config.Rho, config.MaxPaths, config.TxQueueCells, clock)
     do
-        // Evidence-driven (RACK) repair is the server's downlink default. Client
-        // uplink keeps the per-step tail timer until delivery samples use t_hi.
-        if not client then tx.EvidenceRepair <- true
+        // The new per-step / evidence / tail-timer scheduler is opt-in. Off is
+        // main's span OnNack exactly. When on, the server also uses RACK evidence.
+        if config.NewRepair then
+            tx.NewRepair <- true
+            if not client then tx.EvidenceRepair <- true
     let rx = RxHalf(s, fieldOf rxDir, decoder, opener, config.WindowSteps, config.MaxPaths)
     let both = Caps.FlowState ||| Caps.FlowState2
     let credit = { config.Credit with Enabled = config.Credit.Enabled && p.Caps &&& both = both }

@@ -34,7 +34,7 @@ let run (o: Options) =
     let maxPaths = o.Int("max-paths", 64)
     let windowClamp = o.Int("window-clamp", SocketTuning.WindowClamp)
     let statsMs = int64 (o.Int("stats-s", 0)) * 1000L
-    let config = { SessionConfig.defaults with WindowSteps = o.Int("window", 1024); MaxPaths = maxPaths }
+    let config = { SessionConfig.defaults with WindowSteps = o.Int("window", 1024); MaxPaths = maxPaths; NewRepair = o.Int("new-repair", 0) <> 0 }
     let entropy = SystemEntropy()
     let clock = CachedClock(SystemClock())
     let probe = SocketTuning.probe ()
