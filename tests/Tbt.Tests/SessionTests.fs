@@ -784,6 +784,46 @@ let ``a NACK repairs only the prefix of the range whose originals are due`` () =
     Assert.False(c.Tx.RepairWaiting)
 
 [<Fact>]
+let ``a growing NACK deficit does not skip the repair wait for the same hole`` () =
+    let config = { SessionConfig.defaults with Credit = { CreditPolicy.defaults with Enabled = false } }
+    let pair = Pair(config, 1, 0.0, 4)
+    let c = pair.Client
+    let clock = pair.Clock
+    c.Tx.InitialGrant 10_000UL
+    let mutable slot = -1
+    Assert.True(c.TryOpenFlow(&slot))
+    let chunk = Array.create 65536 7uy
+    let mutable guard = 64
+    while c.Tx.Head < 2UL && guard > 0 do
+        pair.Feed(c, slot, ReadOnlySpan chunk, false) |> ignore
+        c.Tx.Flush()
+        guard <- guard - 1
+    let sealedAt = clock.Now
+    clock.Now <- sealedAt + 400_000_000L
+    c.Tx.OnPeerAck(1UL, 100us)
+    let tLo = 1UL
+    let wait = c.Tx.RepairWaitNs
+    clock.Now <- sealedAt + int64 wait
+    c.Tx.OnNack(tLo, 1, 4)
+    Assert.True(c.Tx.RepairWaiting)
+    let frame = Array.zeroCreate<byte> c.FrameLength
+    let mutable n = 0
+    while c.Tx.RepairWaiting && n < 64 do
+        Assert.True(c.Tx.TryRenderNext(Span frame, 0us, 1UL, 100us, 0us, true))
+        n <- n + 1
+    let afterFirst = c.Tx.BoostersSent
+    Assert.True(afterFirst >= 1L)
+    // A 10 ms WIN_ACK with a larger deficit, still inside RepairWait.
+    clock.Now <- clock.Now + 10_000_000L
+    c.Tx.OnNack(tLo, 1, 30)
+    Assert.False(c.Tx.RepairWaiting, "deficit growth must not skip the wait")
+    Assert.Equal(afterFirst, c.Tx.BoostersSent)
+    // After the deadline, another round may go.
+    clock.Now <- clock.Now + int64 wait
+    c.Tx.OnNack(tLo, 1, 30)
+    Assert.True(c.Tx.RepairWaiting, "a later round is due once the wait has passed")
+
+[<Fact>]
 let ``an ack that arrives sooner than minRTT after a BOOSTER counts as a spurious repair`` () =
     let config = { SessionConfig.defaults with Credit = { CreditPolicy.defaults with Enabled = false } }
     let pair = Pair(config, 1, 0.0, 4)

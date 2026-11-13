@@ -281,7 +281,8 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
 
     /// A NACK from the peer's WIN_ACK (spec 5.8): steps [tLo, tLo + span) lack deficit ranks.
     /// One round sends n = ceil((deficit + 2) / (1 - eps)) BOOSTERs; rounds for the same
-    /// range wait RepairWaitNs unless the deficit grew. When the 256 seeds of a range are used,
+    /// hole (same tLo) always wait RepairWaitNs — a growing deficit or a wider due
+    /// prefix must not skip the wait. When the 256 seeds of a range are used,
     /// the range's DATA cells go again (unit rows fill the missing columns).
     member this.OnNack(tLo: uint64, span: int, deficit: int) =
         let now = clock.NowNs()
@@ -303,10 +304,16 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
             if dueSpan < 1 then ()
             else
                 let dueDeficit = max 1 (int (ceil (float deficit * float dueSpan / float span)))
-                let same = tLo = repairLo && dueSpan = repairSpan
-                if not same || dueDeficit > repairDeficit || float (now - repairNs) >= wait then
-                    if same && dueDeficit <= repairDeficit then repairRepeats <- repairRepeats + 1L
-                    if tLo <> repairLo then
+                // Same hole: deficit growth and a widening due prefix must not
+                // skip RepairWait. A 10 ms WIN_ACK whose reported deficit grew
+                // (decoder lag, more of the range now due) was enqueueing a
+                // BOOSTER round every period and drove 8-path 0% mid-bulk and
+                // end-echo storms (spurious_repairs 137–348). Freshly sealed
+                // steps are already excluded from dueSpan / dueDeficit.
+                let sameHole = tLo = repairLo
+                if not sameHole || float (now - repairNs) >= wait then
+                    if sameHole && repairNs > 0L then repairRepeats <- repairRepeats + 1L
+                    if not sameHole then
                         repairLo <- tLo
                         repairSpan <- dueSpan
                         repairSeq <- 0
