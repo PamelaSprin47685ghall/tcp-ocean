@@ -87,7 +87,16 @@ dotnet_root=${DOTNET_ROOT:-$(dirname "$(readlink -f "$(command -v dotnet)")")}
 in_ns() { local ns=$1; shift; sudo ip netns exec "tbe_$ns" sudo -u "$user" env DOTNET_ROOT="$dotnet_root" TBT_TRACE="${TBT_TRACE:-}" PING_TRACE="${PING_TRACE:-}" ECHO_PROBE_LOG="${ECHO_PROBE_LOG:-}" "$@"; }
 
 # Processes whose executable is under the work directory (or iperf3/python3 started here).
-pids_of() { for p in /proc/[0-9]*; do [[ $(sudo readlink "$p/exe" 2>/dev/null) == "$1" ]] && echo "${p#/proc/}"; done; true; }
+pids_of() {
+    local want want_real exe
+    want=$1
+    want_real=$(readlink -f "$want" 2>/dev/null || echo "$want")
+    for p in /proc/[0-9]*; do
+        exe=$(sudo readlink "$p/exe" 2>/dev/null) || continue
+        if [[ $exe == "$want" || $exe == "$want_real" ]]; then echo "${p#/proc/}"; fi
+    done
+    true
+}
 cleanup() {
     for exe in "$work/aot/tbtun" "$work/jit/tbtun"; do pids_of "$exe" | xargs -r sudo kill 2>/dev/null || true; done
     # Do not kill by the fixed namespace names. netns.sh down verifies ownership, then
@@ -143,6 +152,7 @@ tunnel() {
 server_pid() { pids_of "$work/aot/tbtun" | head -1; }
 report() {
     local pid; pid=$(server_pid)
+    if [[ -z $pid ]]; then echo "server($1): pid not found"; return 0; fi
     local hwm rss cpu
     hwm=$(sudo awk '/VmHWM/ {print $2}' "/proc/$pid/status")
     rss=$(sudo awk '/VmRSS/ {print $2}' "/proc/$pid/status")
