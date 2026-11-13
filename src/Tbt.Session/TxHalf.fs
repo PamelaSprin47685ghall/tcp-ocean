@@ -256,8 +256,12 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
                     repairSeq <- 0
                 repairDeficit <- deficit
                 repairNs <- now
-                let n = min 64 (int (ceil (float (deficit + 2) / (1.0 - min 0.9 erasure))))
-                if repairSeq + n <= 256 then
+                // Bound the pending repair queue: a decoder lag looks like loss and would
+                // otherwise enqueue an unbounded BOOSTER storm (uplink collapse).
+                let room = max 0 (256 - repairs.Count)
+                let n = min room (min 64 (int (ceil (float (deficit + 2) / (1.0 - min 0.9 erasure)))))
+                if room = 0 then ()
+                elif repairSeq + n <= 256 then
                     for i in 0 .. n - 1 do
                         repairs.Enqueue { Kind = CellType.Booster; Step = tLo; Index = byte (repairSeq + i)
                                           Span = byte span; Round = byte n }
@@ -266,7 +270,8 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
                     for j in 0 .. span - 1 do
                         let t = tLo + uint64 j
                         for s in 0 .. encoder.StepUsed t - 1 do
-                            repairs.Enqueue { Kind = CellType.Data; Step = t; Index = byte s; Span = 0uy; Round = 0uy }
+                            if repairs.Count < 256 then
+                                repairs.Enqueue { Kind = CellType.Data; Step = t; Index = byte s; Span = 0uy; Round = 0uy }
 
     /// Tail rule (spec 5.8): input paused for 50 ms and the peer lacks steps: a HEARTBEAT
     /// every 50 ms carries tx_head_step.
@@ -289,6 +294,11 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
         frame.[frame.Length - 1] <- 10uy
         this.Seal(frame, path)
 
+    /// True when a BOOSTER (or other repair cell) is at the head of the send queues.
+    member this.RepairWaiting =
+        this.HasCandidate |> ignore
+        repairs.Count > 0
+
     /// Drop queued cells of steps the peer already holds; true when a cell waits.
     member _.HasCandidate =
         let mutable c = Unchecked.defaultof<Candidate>
@@ -309,53 +319,57 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
 
     /// Render the next queued DATA or PARITY cell for path into frame and seal it.
     /// ackLo, grant and erasureQ16 are this end's receive state. False when nothing waits.
-    member this.TryRenderNext(frame: Span<byte>, path: uint16, ackLo: uint64, grant: uint16, erasureQ16: uint16) =
+    member this.TryRenderNext(frame: Span<byte>, path: uint16, ackLo: uint64, grant: uint16, erasureQ16: uint16, ?allowRepair: bool) =
         let mutable c = Unchecked.defaultof<Candidate>
         let mutable done' = false
+        let allowRepair = defaultArg allowRepair true
         let mutable ok = false
         while not done' && this.HasCandidate do
-            c <- if repairs.Count > 0 then repairs.Dequeue() elif urgent.Count > 0 then urgent.Dequeue() else queue.Dequeue()
-            let t = c.Step
-            let k = encoder.StepUsed t
-            let symbol = frame.Slice(Layout.SymbolOffset, symbolSize)
-            let rendered =
-                if k = 0 then false
-                elif c.Kind = CellType.Data then
-                    encoder.Source(t, int c.Index).CopyTo symbol
-                    true
-                elif c.Kind = CellType.Booster then encoder.TryRenderBooster(t, int c.Span, int c.Index, symbol)
-                else encoder.TryRenderParity(t, int c.Index, field, false, symbol)
-            if rendered && TraceGate.On && traced.[index t] then
-                Trace.record Trace.Send t path (if c.Kind = CellType.Data then 0 elif c.Kind = CellType.Parity then 1 else 2)
-            if rendered && c.Kind = CellType.Booster then
-                let meta =
-                    { Type = CellType.Booster; Flags = MetaFlags.None; Slot = c.Index; StepUsed = c.Span
-                      Aux = uint16 c.Round; RxWinGrant = grant; StepId = t; AckStepLo = ackLo
-                      CarrierWm = carrierWm.[int path]; KHist = 0u; ErasureQ16 = erasureQ16 }
-                FrameMath.writeChunkHeader symbolSize frame
-                Meta.write meta (frame.Slice(Layout.MetaOffset, Layout.MetaLength))
-                frame.[frame.Length - 2] <- 13uy
-                frame.[frame.Length - 1] <- 10uy
-                this.Seal(frame, path)
-                boostersSent <- boostersSent + 1L
-                ok <- true
+            if not allowRepair && repairs.Count > 0 && urgent.Count = 0 && queue.Count = 0 then
                 done' <- true
-            elif rendered then
-                for i in 0 .. 5 do
-                    let r = CodeGraph.Strides.[i]
-                    kHist.[i] <- if t < r then 0 else (let h = encoder.StepUsed(t - r) in if h = 0 then 16 else h)
-                let meta =
-                    { Type = c.Kind; Flags = stepFlags.[index t]; Slot = c.Index; StepUsed = byte k
-                      Aux = uint16 stepParities.[index t]; RxWinGrant = grant; StepId = t; AckStepLo = ackLo
-                      CarrierWm = carrierWm.[int path]; KHist = Meta.packKHist (ReadOnlySpan kHist); ErasureQ16 = erasureQ16 }
-                FrameMath.writeChunkHeader symbolSize frame
-                Meta.write meta (frame.Slice(Layout.MetaOffset, Layout.MetaLength))
-                frame.[frame.Length - 2] <- 13uy
-                frame.[frame.Length - 1] <- 10uy
-                if t > carrierWm.[int path] then carrierWm.[int path] <- t
-                this.Seal(frame, path)
-                ok <- true
-                done' <- true
+            else
+                c <- if allowRepair && repairs.Count > 0 then repairs.Dequeue() elif urgent.Count > 0 then urgent.Dequeue() else queue.Dequeue()
+                let t = c.Step
+                let k = encoder.StepUsed t
+                let symbol = frame.Slice(Layout.SymbolOffset, symbolSize)
+                let rendered =
+                    if k = 0 then false
+                    elif c.Kind = CellType.Data then
+                        encoder.Source(t, int c.Index).CopyTo symbol
+                        true
+                    elif c.Kind = CellType.Booster then encoder.TryRenderBooster(t, int c.Span, int c.Index, symbol)
+                    else encoder.TryRenderParity(t, int c.Index, field, false, symbol)
+                if rendered && TraceGate.On && traced.[index t] then
+                    Trace.record Trace.Send t path (if c.Kind = CellType.Data then 0 elif c.Kind = CellType.Parity then 1 else 2)
+                if rendered && c.Kind = CellType.Booster then
+                    let meta =
+                        { Type = CellType.Booster; Flags = MetaFlags.None; Slot = c.Index; StepUsed = c.Span
+                          Aux = uint16 c.Round; RxWinGrant = grant; StepId = t; AckStepLo = ackLo
+                          CarrierWm = carrierWm.[int path]; KHist = 0u; ErasureQ16 = erasureQ16 }
+                    FrameMath.writeChunkHeader symbolSize frame
+                    Meta.write meta (frame.Slice(Layout.MetaOffset, Layout.MetaLength))
+                    frame.[frame.Length - 2] <- 13uy
+                    frame.[frame.Length - 1] <- 10uy
+                    this.Seal(frame, path)
+                    boostersSent <- boostersSent + 1L
+                    ok <- true
+                    done' <- true
+                elif rendered then
+                    for i in 0 .. 5 do
+                        let r = CodeGraph.Strides.[i]
+                        kHist.[i] <- if t < r then 0 else (let h = encoder.StepUsed(t - r) in if h = 0 then 16 else h)
+                    let meta =
+                        { Type = c.Kind; Flags = stepFlags.[index t]; Slot = c.Index; StepUsed = byte k
+                          Aux = uint16 stepParities.[index t]; RxWinGrant = grant; StepId = t; AckStepLo = ackLo
+                          CarrierWm = carrierWm.[int path]; KHist = Meta.packKHist (ReadOnlySpan kHist); ErasureQ16 = erasureQ16 }
+                    FrameMath.writeChunkHeader symbolSize frame
+                    Meta.write meta (frame.Slice(Layout.MetaOffset, Layout.MetaLength))
+                    frame.[frame.Length - 2] <- 13uy
+                    frame.[frame.Length - 1] <- 10uy
+                    if t > carrierWm.[int path] then carrierWm.[int path] <- t
+                    this.Seal(frame, path)
+                    ok <- true
+                    done' <- true
         ok
 
     /// Fill for a whole-frame hole of path (borrowed shell, spec 6.7.2): a BOOSTER when one

@@ -7,14 +7,76 @@ open System.Collections.Generic
 open Tbt.Contracts
 open Tbt.Session
 
+/// One session-level member of the client uplink RateGroup. Delivery is session
+/// custody (peer_ack), not TCP ACK: the kernel can ACK while the server decoder lags.
+type private SessionRateMember(session: Session, frameOf: unit -> int, wireOut: unit -> int64) =
+    let mutable lastAck = 0UL
+    let mutable lastNs = 0L
+    interface IRateMember with
+        member _.Inflight =
+            let fl = int64 (frameOf())
+            int (max 0L (wireOut() - int64 session.Tx.PeerAck * fl))
+        member _.Delivered = int64 session.Tx.PeerAck * int64 (frameOf())
+        member _.CopyEstimate =
+            let fl = int64 (frameOf())
+            let unique = int64 (session.Tx.Head - session.Tx.PeerAck) * fl
+            max 0L (wireOut() - int64 session.Tx.PeerAck * fl - unique)
+        member _.MinRttNs = session.Tx.MinRttNs
+        member _.LastDeliveredNs =
+            if session.Tx.PeerAck > lastAck then
+                lastAck <- session.Tx.PeerAck
+                lastNs <- session.Clock.NowNs()
+            lastNs
+
 [<Sealed>]
-type SessionCarrier(session: Session, bridge: FlowBridge) =
+type SessionCarrier(session: Session, bridge: FlowBridge, ?uplinkPace: bool, ?tupleMbit: float) =
+    let pace = defaultArg uplinkPace false
+    let tupleMbit = defaultArg tupleMbit 0.0
     let paths = List<IPath>()
     let mutable next = 0
     let mutable framesIn = 0L
     let mutable framesOut = 0L
+    /// Bytes of DATA/PARITY/BOOSTER put on the wire (not WIN_ACK/CTRL/heartbeat).
+    let mutable wireOut = 0L
+    let group = RateGroup(session.Clock)
+    let member' = SessionRateMember(session, (fun () -> session.FrameLength), (fun () -> wireOut))
+    do if pace then group.Add member'
+    let pacers = Dictionary<uint16, PathPacer>()
     /// Local slots visited by Watch and Service (RS-3: grows with armed flows, not 256).
     let mutable slotVisits = 0L
+
+    let pacerOf (pathId: uint16) =
+        if tupleMbit <= 0.0 then None
+        else
+            match pacers.TryGetValue pathId with
+            | true, p -> Some p
+            | _ ->
+                let p = PathPacer(tupleMbit)
+                pacers.[pathId] <- p
+                Some p
+
+    let pathAllows (pathId: uint16) (bytes: int) (now: int64) =
+        match pacerOf pathId with
+        | None -> true
+        | Some p ->
+            p.SetMinRtt session.Tx.MinRttNs
+            p.TryTake(bytes, now)
+
+    let chargePath (pathId: uint16) (bytes: int) =
+        match pacerOf pathId with
+        | Some p -> p.OnSent bytes
+        | None -> ()
+
+    let inflightBytes () =
+        let fl = int64 session.FrameLength
+        int (max 0L (wireOut - int64 session.Tx.PeerAck * fl))
+
+    /// Before the group has a sample, TryTake uses a zero rate and would stall after one
+    /// frame. Allow 10 frames in flight (same startup floor as TunPath) until then.
+    let groupAllows (fl: int) (repair: bool) (bulk: bool) =
+        if not group.Ready then inflightBytes () + fl <= 10 * fl
+        elif repair then group.TryTakeRepair(fl, fl)
+        else group.TryTake(fl, bulk)
 
     let prune () =
         let mutable i = paths.Count - 1
@@ -28,10 +90,15 @@ type SessionCarrier(session: Session, bridge: FlowBridge) =
     let hot = ReadySet()
 
     /// Q-3 (spec 16.3): one batch gives each path at most 4 frames, within budget. Returns frames sent.
+    /// When uplinkPace is set, WIN_ACK/CTRL/heartbeat skip the group; new data uses TryTake
+    /// (aggregate 1.25 BDP); BOOSTERs use the charged repair reserve (TryTakeRepair / OnRepair)
+    /// and are skipped when that reserve is dry so new data can still go.
     let writeBatch (budget0: int) =
         let mutable budget = budget0
         let mutable progress = true
         let mutable passes = 0
+        let fl = session.FrameLength
+        let now = session.Clock.NowNs()
         while progress && passes < 4 && budget > 0 && paths.Count > 0 && session.WantsToSend do
             progress <- false
             passes <- passes + 1
@@ -40,11 +107,33 @@ type SessionCarrier(session: Session, bridge: FlowBridge) =
             while j < n && budget > 0 do
                 let link = paths.[(next + j) % n]
                 let mutable frame = Span<byte>.Empty
-                if link.TryBeginFrame(&frame) && session.TryProduce(link.PathId, frame) then
-                    link.CommitFrame()
-                    framesOut <- framesOut + 1L
-                    budget <- budget - 1
-                    progress <- true
+                if link.TryBeginFrame(&frame) then
+                    let mutable allowRepair = true
+                    let mutable charge = 0
+                    let mutable attempt = false
+                    if not pace || session.ControlWaiting then
+                        attempt <- true
+                    elif session.RepairWaiting && groupAllows fl true (session.Tx.Queued > 0) && pathAllows link.PathId fl now then
+                        attempt <- true
+                        charge <- 1
+                    elif groupAllows fl false (session.Tx.Queued > 0) && pathAllows link.PathId fl now then
+                        // allowRepair=false: a dry repair reserve must not block new data.
+                        attempt <- true
+                        allowRepair <- false
+                        charge <- 2
+                    if attempt && session.TryProduce(link.PathId, frame, allowRepair) then
+                        link.CommitFrame()
+                        framesOut <- framesOut + 1L
+                        budget <- budget - 1
+                        progress <- true
+                        if charge = 1 then
+                            wireOut <- wireOut + int64 fl
+                            group.OnRepair fl
+                            chargePath link.PathId fl
+                        elif charge = 2 then
+                            wireOut <- wireOut + int64 fl
+                            group.OnSent fl
+                            chargePath link.PathId fl
                 j <- j + 1
             next <- (next + 1) % n
         budget0 - budget
@@ -88,6 +177,17 @@ type SessionCarrier(session: Session, bridge: FlowBridge) =
     /// One Q-3 batch (tests): at most 4 frames per path.
     member _.WriteBatch(budget: int) = writeBatch budget
     member _.Alive = paths.Count > 0 && not session.Faulted && not session.Closed
+    member _.UplinkPace = pace
+    member _.TupleMbit = tupleMbit
+    /// Poller wait when the uplink group is token-limited: a 5 s wait would stall the pipe.
+    member _.WaitMs() =
+        if not pace then 5000
+        elif session.ControlWaiting || not session.WantsToSend then 5000
+        else
+            let fl = session.FrameLength
+            group.Service(session.Clock.NowNs())
+            if groupAllows fl false false || groupAllows fl true false then 5000
+            else 2
 
     /// One line of counters for the log.
     member _.Describe() =
@@ -107,6 +207,12 @@ type SessionCarrier(session: Session, bridge: FlowBridge) =
         + " stale=" + string session.Flows.Counters.StaleSources
         + " flow_state=" + string session.FlowStatesSent + "/" + string session.FlowStatesRejected
         + " fills=" + string tx.FillsSent
+        + (if not pace then ""
+           else
+            " pace_bw_mbit=" + (group.Bandwidth * 8000.0).ToString("F1")
+            + " pace_inflight=" + string (max 0L (wireOut - int64 tx.PeerAck * int64 session.FrameLength))
+            + " pace_phase=" + (if group.InStartup then "startup" else "probe" + string group.Cycle)
+            + " pace_repair_kib=" + string (group.RepairBytes / 1024L))
 
     /// Add a path whose bootstrap is done; frames it already holds come in at once.
     member this.AddPath(link: IPath) =
@@ -120,11 +226,20 @@ type SessionCarrier(session: Session, bridge: FlowBridge) =
     member _.RemovePath(pathId: uint16) =
         let i = paths.FindIndex(fun p -> p.PathId = pathId)
         if i >= 0 then
+            let id = paths.[i].PathId
             paths.[i].Close()
             paths.RemoveAt i
+            pacers.Remove id |> ignore
 
     member _.Watch(poller: Poller) =
-        let sending = session.WantsToSend
+        let sending =
+            if not pace then session.WantsToSend
+            elif session.ControlWaiting then true
+            elif not session.WantsToSend then false
+            else
+                let fl = session.FrameLength
+                group.Service(session.Clock.NowNs())
+                groupAllows fl false false || groupAllows fl true false
         for link in paths do link.Watch(poller, sending)
         let fill = session.CanFill
         let fillInteractive = session.CanFillInteractive
@@ -165,6 +280,7 @@ type SessionCarrier(session: Session, bridge: FlowBridge) =
         readPass poller false
         session.Flush()
         session.Tick()
+        if pace then group.Service(session.Clock.NowNs())
         writeRound ()
         prune ()
 

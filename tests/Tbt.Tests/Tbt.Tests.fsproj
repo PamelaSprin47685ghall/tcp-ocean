@@ -15,6 +15,7 @@
     <Compile Include="JoinTests.fs" />
     <Compile Include="BootstrapTests.fs" />
     <Compile Include="TunTests.fs" />
+    <Compile Include="PaceTests.fs" />
     <Compile Include="FuzzTests.fs" />
     <Compile Include="PollerTests.fs" />
     <Compile Include="ControlTests.fs" />

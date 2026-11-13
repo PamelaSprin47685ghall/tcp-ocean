@@ -295,6 +295,8 @@ type Session(role: Role, p: SessionParams, port: IFlowPort, clock: IClock, confi
     member _.Keys = keys
     member _.Caps = p.Caps
     member _.Tx = tx
+    member _.Clock = clock
+    member _.NowNs() = clock.NowNs()
     member _.Rx = rx
     member _.Flows = flows
     member _.InteractiveSources = interactiveSources
@@ -346,11 +348,21 @@ type Session(role: Role, p: SessionParams, port: IFlowPort, clock: IClock, confi
         ackDue || flowStateDue || (ctrl.Pending > 0 && ctrl.IsDue(clock.NowNs(), int64 tx.SrttNs)) || tx.HasCandidate
         || (peerSeen && tx.HeartbeatDue)
 
+    /// WIN_ACK, CTRL, FLOW_STATE, or heartbeat: not paced by the uplink group.
+    member _.ControlWaiting =
+        ackDue || flowStateDue || (ctrl.Pending > 0 && ctrl.IsDue(clock.NowNs(), int64 tx.SrttNs))
+        || (peerSeen && tx.HeartbeatDue)
+
+    /// A BOOSTER is at the front of the send queue (no control cell waits).
+    member this.RepairWaiting = not this.ControlWaiting && tx.RepairWaiting
+
     member _.FlowStatesSent = flowStatesSent
     member _.FlowStatesRejected = flowStatesRejected
 
     /// Render and seal the next cell for path. False when nothing waits.
-    member _.TryProduce(path: uint16, frame: Span<byte>) =
+    /// `allowRepair` false skips BOOSTERs so a dry recovery reserve can still send new data.
+    member this.TryProduce(path: uint16, frame: Span<byte>) = this.TryProduce(path, frame, true)
+    member _.TryProduce(path: uint16, frame: Span<byte>, allowRepair: bool) =
         let now = clock.NowNs()
         if ackDue && peerSeen then
             renderWinAck frame path now
@@ -362,7 +374,7 @@ type Session(role: Role, p: SessionParams, port: IFlowPort, clock: IClock, confi
             lastFlowStateNs <- now
             flowStateDue <- snapshotPending ()
             true
-        elif tx.TryRenderNext(frame, path, rx.AckStepLo, rx.Grant, rx.ErasureQ16) then
+        elif tx.TryRenderNext(frame, path, rx.AckStepLo, rx.Grant, rx.ErasureQ16, allowRepair) then
             noteAckSent now
             true
         elif peerSeen && tx.HeartbeatDue then

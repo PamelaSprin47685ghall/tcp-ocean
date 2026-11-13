@@ -78,7 +78,8 @@ let run (o: Options) =
         let bridge = FlowBridge ValueNone
         let session = Session(Role.Client, p, bridge, SystemClock(), config)
         bridge.Attach session
-        let carrier = SessionCarrier(session, bridge)
+        let tupleMbit = max 0.0 (o.Float("tuple-mbit", 0.0))
+        let carrier = SessionCarrier(session, bridge, uplinkPace=true, tupleMbit=tupleMbit)
         carrier.AddPath link0
         let maxPaths = int hello.MaxPaths
         // Forward as soon as path 0 is up; remaining JOINs run with bounded
@@ -139,7 +140,7 @@ let run (o: Options) =
                 Tbt.Contracts.Trace.flush ()
             poller.WatchRead listener
             carrier.Watch poller
-            poller.Wait 5000
+            poller.Wait(carrier.WaitMs())
             if poller.IsReadable listener then
                 let mutable go = true
                 while go do

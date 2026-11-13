@@ -246,3 +246,41 @@ type RateGroup(clock: IClock) =
         + " goodput_mbit=" + (goodput * 8000.0).ToString("F1") + " copy_est_kib=" + string (copyEstimate () / 1024L)
         + " inflight=" + string (inflight ()) + " repair_kib=" + string (repairBytes / 1024L) + " phase="
         + (if startup then "startup" elif draining then "drain" else "probe" + string cycle)
+
+/// Optional per-5-tuple pacer for the client uplink (e.g. PROFILE=rtt400 at 4 Mbit).
+/// Off when rateMbit <= 0 so the 20 ms / 200 Mbit matrix is not capped per path.
+/// Paces at 1.25× the configured rate; burst depth is about 1.25 BDP, or 4 frames
+/// before a min-RTT sample exists.
+[<Sealed>]
+type PathPacer(rateMbit: float) =
+    let bytesPerNs = rateMbit / 8000.0
+    let pace = 1.25 * bytesPerNs
+    let mutable tokens = 0.0
+    let mutable tokensNs = 0L
+    let mutable minRttNs = Int64.MaxValue
+
+    member _.RateMbit = rateMbit
+
+    member _.SetMinRtt(ns: int64) =
+        if ns > 0L && ns < minRttNs then minRttNs <- ns
+
+    /// True when one more frame of `bytes` may go now. Does not charge; call OnSent after a send.
+    /// The bucket starts at 4 frames (not a full BDP) so a late min-RTT does not grant every
+    /// path 1.25 BDP at once; refill dt is capped so a long pause is not a burst.
+    member _.TryTake(bytes: int, now: int64) =
+        if rateMbit <= 0.0 then true
+        else
+            let depth =
+                if minRttNs = Int64.MaxValue then 4.0 * float bytes
+                else max (4.0 * float bytes) (1.25 * bytesPerNs * float minRttNs)
+            if tokensNs = 0L then
+                tokens <- 4.0 * float bytes
+                tokensNs <- now
+            else
+                let dt = min 20_000_000L (max 0L (now - tokensNs))
+                tokens <- min depth (tokens + pace * float dt)
+                tokensNs <- now
+            tokens >= float bytes
+
+    member _.OnSent(bytes: int) = tokens <- tokens - float bytes
+

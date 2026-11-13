@@ -36,6 +36,10 @@ fi
 window=${WINDOW:-1024}
 window_clamp=${WINDOW_CLAMP:-600000}
 max_paths=${MAX_PATHS:-64}
+# Per-5-tuple cap on the client uplink pacer (0 = off; rtt400 uses 4). Do not set this
+# on the 20 ms / 200 Mbit matrix: a default 4 Mbit/path cap would destroy it.
+tuple_mbit=${TUPLE_MBIT:-0}
+if [[ $profile == rtt400 && $tuple_mbit == 0 ]]; then tuple_mbit=4; fi
 seed=${SEED:-7}
 ping_count=${PING_COUNT:-200}
 handshake_s=${HANDSHAKE_S:-10}
@@ -146,7 +150,7 @@ python3 -c 'import os; print(os.urandom(32).hex())' > "$work/psk"
 printf 'owd_ms=%s\nrate_mbit=%s\nloss=%s\nseed=%s\n' "$owd" "$rate" "$loss" "$seed" > "$work/wanem.conf"
 if [ -n "${WANEM_EXTRA:-}" ]; then printf "%b\n" "$WANEM_EXTRA" >> "$work/wanem.conf"; fi   # e.g. WANEM_EXTRA="outage_ms=300\noutage_every_s=3"
 sudo TBTUN_NETNS_LOCK_HELD=1 "$here/netns.sh" up "$work"
-echo "link: owd ${owd} ms each way, ${rate} Mbit/s, segment loss ${loss}; paths ${paths}; window ${window}; window_clamp ${window_clamp}; seed ${seed}; server_max_paths ${max_paths}; server carrier ${carrier}"
+echo "link: owd ${owd} ms each way, ${rate} Mbit/s, segment loss ${loss}; paths ${paths}; window ${window}; window_clamp ${window_clamp}; seed ${seed}; server_max_paths ${max_paths}; server carrier ${carrier}; tuple_mbit ${tuple_mbit}"
 
 in_ns far python3 "$work/echo.py" serve 7000 &
 in_ns far iperf3 -s -p 5201 >/dev/null 2>&1 &
@@ -159,9 +163,11 @@ tunnel() {
         --window "$window" --window-clamp "$window_clamp" --max-paths "$max_paths" \
         2>"$work/server-$name.log" &
     sleep 0.5
-    in_ns near "$work/jit/tbtun" client --server "$server_at" --listen 127.0.0.1:1080 --psk-file "$work/psk" --stats-s 1 \
-        --paths "$paths" --window "$window" --window-clamp "$window_clamp" --stats-s 1 \
-        ${JOIN_CONCURRENCY:+--join-concurrency "$JOIN_CONCURRENCY"} 2>"$work/client-$name.log" &
+    local client_args=(--server "$server_at" --listen 127.0.0.1:1080 --psk-file "$work/psk" --stats-s 1
+        --paths "$paths" --window "$window" --window-clamp "$window_clamp")
+    if [[ $tuple_mbit != 0 ]]; then client_args+=(--tuple-mbit "$tuple_mbit"); fi
+    if [[ -n ${JOIN_CONCURRENCY:-} ]]; then client_args+=(--join-concurrency "$JOIN_CONCURRENCY"); fi
+    in_ns near "$work/jit/tbtun" client "${client_args[@]}" 2>"$work/client-$name.log" &
     # session up is logged once path 0 is forwarding; paths ready after the
     # remaining JOINs (bounded concurrency). Raise HANDSHAKE_S for many paths
     # under loss. If the client has been seen and then exited, waiting the
