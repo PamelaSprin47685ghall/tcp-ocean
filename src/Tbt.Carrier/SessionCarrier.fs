@@ -229,6 +229,7 @@ type SessionCarrier(session: Session, bridge: FlowBridge, ?uplinkPace: bool, ?tu
         + " queued=" + string tx.Queued + " srtt_ms=" + string (int (tx.SrttNs / 1e6))
         + " minrtt_ms=" + (if tx.MinRttNs = Int64.MaxValue then "-" else string (tx.MinRttNs / 1_000_000L))
         + " rtt_skipped=" + string tx.RttSkipped + " boosters=" + string tx.BoostersSent + " repair_repeats=" + string tx.RepairRepeats
+        + " spurious_repairs=" + string tx.SpuriousRepairs
         + " ctrl=" + string session.CtrlSent + "/" + string session.CtrlExecuted + "/" + string session.CtrlRejected
         + " close=" + string (int session.CloseState) + " rx_ack=" + string rx.AckStepLo + " rx_base=" + string rx.Decoder.BaseStep
         + " recovered=" + string rx.Counters.Recovered + " interactive=" + string session.InteractiveSources + "/" + string session.Tx.UrgentSteps

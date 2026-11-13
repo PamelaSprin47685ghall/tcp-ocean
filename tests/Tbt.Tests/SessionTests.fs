@@ -668,7 +668,102 @@ let ``an oversized seal-to-custody sample is clamped to three times minRTT`` () 
     // 137.5 ms after the first sample, then 137.5 + (1200-137.5)/8 = 270.3 ms.
     Assert.Equal(400_000_000L, c.Tx.MinRttNs)
     Assert.InRange(c.Tx.SrttNs, 250e6, 300e6)
-    Assert.InRange(c.Tx.RepairWaitNs, 1.05 * 400e6 - 1.0, 1.05 * 400e6 + 1.0)
+    // Deadline is clamped SRTT + 4·RTTVAR, never below minRTT or above 4×minRTT.
+    // It must not follow the 8 s sample, and must exceed 1.05×minRTT once queueing/var is known.
+    Assert.True(c.Tx.RepairWaitNs >= float c.Tx.MinRttNs, sprintf "wait %g min %d" c.Tx.RepairWaitNs c.Tx.MinRttNs)
+    Assert.True(c.Tx.RepairWaitNs <= 4.0 * float c.Tx.MinRttNs, sprintf "wait %g" c.Tx.RepairWaitNs)
+    Assert.True(c.Tx.RepairWaitNs < 2_000_000_000.0, sprintf "wait followed the 8 s sample: %g" c.Tx.RepairWaitNs)
+
+
+[<Fact>]
+let ``repair wait is minRTT plus measured queueing and variance, not 1.05 times minRTT alone`` () =
+    let config = { SessionConfig.defaults with Credit = { CreditPolicy.defaults with Enabled = false } }
+    let pair = Pair(config, 1, 0.0, 4)
+    let c = pair.Client
+    let clock = pair.Clock
+    c.Tx.InitialGrant 10_000UL
+    let mutable slot = -1
+    Assert.True(c.TryOpenFlow(&slot))
+    let chunk = Array.create 65536 7uy
+    let sealUntil (n: uint64) =
+        let mutable guard = 64
+        while c.Tx.Head < n && guard > 0 do
+            let took = pair.Feed(c, slot, ReadOnlySpan chunk, false)
+            c.Tx.Flush()
+            guard <- guard - 1
+            if took = 0 && c.Tx.Head < n then failwith (sprintf "feed stuck at head %d" c.Tx.Head)
+        Assert.True(c.Tx.Head >= n, sprintf "head %d want %d" c.Tx.Head n)
+    sealUntil 1UL
+    clock.Now <- clock.Now + 400_000_000L
+    c.Tx.OnPeerAck(c.Tx.Head, 100us)
+    Assert.Equal(400_000_000L, c.Tx.MinRttNs)
+    // A standing queue of 80 ms (20 % of minRTT) on later samples.
+    let head0 = c.Tx.Head
+    sealUntil (head0 + 3UL)
+    clock.Now <- clock.Now + 480_000_000L
+    c.Tx.OnPeerAck(c.Tx.Head, 100us)
+    // 1.05 × minRTT is 420 ms and would fire inside the queueing delay.
+    Assert.True(c.Tx.RepairWaitNs > 1.05 * 400e6 + 1.0, sprintf "wait %g still 1.05×minRTT" c.Tx.RepairWaitNs)
+    Assert.True(c.Tx.RepairWaitNs <= 4.0 * 400e6, sprintf "wait %g" c.Tx.RepairWaitNs)
+
+[<Fact>]
+let ``a NACK does not enqueue repairs until the original's delivery deadline has passed`` () =
+    let config = { SessionConfig.defaults with Credit = { CreditPolicy.defaults with Enabled = false } }
+    let pair = Pair(config, 1, 0.0, 4)
+    let c = pair.Client
+    let clock = pair.Clock
+    c.Tx.InitialGrant 10_000UL
+    let mutable slot = -1
+    Assert.True(c.TryOpenFlow(&slot))
+    let chunk = Array.create 65536 7uy
+    let mutable guard = 64
+    while c.Tx.Head < 2UL && guard > 0 do
+        pair.Feed(c, slot, ReadOnlySpan chunk, false) |> ignore
+        c.Tx.Flush()
+        guard <- guard - 1
+    let sealedAt = clock.Now
+    clock.Now <- clock.Now + 400_000_000L
+    c.Tx.OnPeerAck(1UL, 100us)
+    Assert.True(c.Tx.MinRttNs <> Int64.MaxValue)
+    // A just-sealed step is NACKed immediately (as a 20 ms / +66 decoder NACK would).
+    let tLo = 1UL
+    Assert.True(c.Tx.Head > tLo)
+    let wait = c.Tx.RepairWaitNs
+    clock.Now <- sealedAt + 20_000_000L
+    c.Tx.OnNack(tLo, 1, 4)
+    Assert.False(c.Tx.RepairWaiting, "originals are still in flight; no BOOSTER yet")
+    clock.Now <- sealedAt + int64 wait
+    c.Tx.OnNack(tLo, 1, 4)
+    Assert.True(c.Tx.RepairWaiting, "deadline passed; a repair round is due")
+
+[<Fact>]
+let ``an ack that arrives sooner than minRTT after a BOOSTER counts as a spurious repair`` () =
+    let config = { SessionConfig.defaults with Credit = { CreditPolicy.defaults with Enabled = false } }
+    let pair = Pair(config, 1, 0.0, 4)
+    let c = pair.Client
+    let clock = pair.Clock
+    c.Tx.InitialGrant 10_000UL
+    let mutable slot = -1
+    Assert.True(c.TryOpenFlow(&slot))
+    let chunk = Array.create 65536 7uy
+    let mutable guard = 64
+    while c.Tx.Head < 2UL && guard > 0 do
+        pair.Feed(c, slot, ReadOnlySpan chunk, false) |> ignore
+        c.Tx.Flush()
+        guard <- guard - 1
+    let sealedAt = clock.Now
+    clock.Now <- sealedAt + 400_000_000L
+    c.Tx.OnPeerAck(1UL, 100us)
+    let tLo = 1UL
+    clock.Now <- sealedAt + int64 c.Tx.RepairWaitNs
+    c.Tx.OnNack(tLo, 1, 4)
+    Assert.True(c.Tx.RepairWaiting)
+    let frame = Array.zeroCreate<byte> c.FrameLength
+    Assert.True(c.Tx.TryRenderNext(Span frame, 0us, 1UL, 100us, 0us, true))
+    Assert.True(c.Tx.BoostersSent >= 1L)
+    // Custody of the original arrives immediately: the BOOSTER has not had a minRTT on the path.
+    c.Tx.OnPeerAck(c.Tx.Head, 100us)
+    Assert.True(c.Tx.SpuriousRepairs >= 1L, sprintf "spurious %d boosters %d" c.Tx.SpuriousRepairs c.Tx.BoostersSent)
 
 [<Fact>]
 let ``the grant limit is each report's own ack plus its grant: late, duplicate and reordered reports never amplify it`` () =

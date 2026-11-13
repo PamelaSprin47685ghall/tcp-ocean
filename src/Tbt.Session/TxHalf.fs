@@ -87,12 +87,18 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
     /// Steps sealAt as interactive (for the opt-in latency trace).
     let traced: bool[] = Array.zeroCreate capacity
     let mutable srttNs = 100_000_000.0
+    /// Jacobson/Karels EWMA of |sample − SRTT|; used with SRTT for the repair deadline.
+    let mutable rttvarNs = 0.0
     /// Windowed minimum of clean RTT samples: the min of this and the last 10 s bucket.
     let mutable minCurNs = Int64.MaxValue
     let mutable minPrevNs = Int64.MaxValue
     let mutable minSinceNs = 0L
     let mutable rttSkipped = 0L
     let mutable repairRepeats = 0L
+    /// BOOSTERs sent for a step whose first copy later arrived (ack sooner than minRTT after the repair).
+    let mutable spuriousRepairs = 0L
+    /// When a BOOSTER for this step was sealed (0: none in this generation).
+    let boostSentNs: int64[] = Array.zeroCreate encoder.Capacity
     let mutable lastSourceNs = 0L
     let mutable lastHeartbeatNs = 0L
 
@@ -205,6 +211,17 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
                 let now = clock.NowNs()
                 let sealAt = sealNs.[int ((ack - 1UL) % uint64 sealNs.Length)]
                 let sample = now - sealAt
+                // A BOOSTER cannot complete a minRTT after it was sent: an earlier
+                // ack is the original first copy arriving — the repair was spurious.
+                let minRtt = min minCurNs minPrevNs
+                let mutable tSp = peerAck
+                while tSp < ack do
+                    let bi = int (tSp % uint64 boostSentNs.Length)
+                    let sentAt = boostSentNs.[bi]
+                    if sentAt > 0L && minRtt <> Int64.MaxValue && now - sentAt < minRtt then
+                        spuriousRepairs <- spuriousRepairs + 1L
+                    boostSentNs.[bi] <- 0L
+                    tSp <- tSp + 1UL
                 if repairLo < ack && repairNs >= sealAt then rttSkipped <- rttSkipped + 1L
                 elif sample > 0L then
                     // Clamp to k × minRTT so one long custody delay cannot
@@ -213,6 +230,10 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
                     let used =
                         if m = Int64.MaxValue then sample
                         else min sample (3L * m)
+                    // RFC 6298: RTTVAR first from the pre-update SRTT, then SRTT.
+                    let err = float used - srttNs
+                    if rttvarNs = 0.0 then rttvarNs <- abs err / 2.0
+                    else rttvarNs <- rttvarNs + (abs err - rttvarNs) / 4.0
                     srttNs <- srttNs + (float used - srttNs) / 8.0
                     if now - minSinceNs >= 10_000_000_000L then
                         minPrevNs <- minCurNs
@@ -243,13 +264,20 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
     member _.RttSkipped = rttSkipped
     /// Repair rounds repeated for the same range because the wait ran out.
     member _.RepairRepeats = repairRepeats
-    /// Wait between repair rounds for one range: 1.05 × path minRTT once a
-    /// min sample exists, else 1.05 × session SRTT. Session SRTT (seal-to-custody)
-    /// is not used for this timer once the path has been measured.
+    /// Repair deadline: minRTT + measured queueing and variance
+    /// (clamped SRTT + 4·RTTVAR), floored at minRTT and capped at 4×minRTT.
+    /// 1.05×minRTT alone fires on any standing queue above 5% of minRTT
+    /// (894194e), which turns paced bulk into a spurious BOOSTER storm.
+    /// Before a min sample, 1.05 × session SRTT.
     member _.RepairWaitNs =
         let m = min minCurNs minPrevNs
-        if m = Int64.MaxValue then 1.05 * srttNs else 1.05 * float m
+        if m = Int64.MaxValue then 1.05 * srttNs
+        else
+            let wait = max srttNs (float m) + 4.0 * rttvarNs
+            min (max wait (float m)) (4.0 * float m)
     member _.BoostersSent = boostersSent
+    member _.SpuriousRepairs = spuriousRepairs
+    member _.RttVarNs = rttvarNs
 
     /// A NACK from the peer's WIN_ACK (spec 5.8): steps [tLo, tLo + span) lack deficit ranks.
     /// One round sends n = ceil((deficit + 2) / (1 - eps)) BOOSTERs; rounds for the same
@@ -259,31 +287,39 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
         let now = clock.NowNs()
         let span = int (min (uint64 (min span CodeGraph.MaxBoosterSpan)) (encoder.Head - min tLo encoder.Head))
         if tLo >= peerAck && span >= 1 && deficit >= 1 && encoder.StepUsed tLo > 0 then
-            let same = tLo = repairLo && span = repairSpan
-            if not same || deficit > repairDeficit || float (now - repairNs) >= this.RepairWaitNs then
-                if same && deficit <= repairDeficit then repairRepeats <- repairRepeats + 1L
-                if not same then
-                    repairLo <- tLo
-                    repairSpan <- span
-                    repairSeq <- 0
-                repairDeficit <- deficit
-                repairNs <- now
-                // Bound the pending repair queue: a decoder lag looks like loss and would
-                // otherwise enqueue an unbounded BOOSTER storm (uplink collapse).
-                let room = max 0 (256 - repairs.Count)
-                let n = min room (min 64 (int (ceil (float (deficit + 2) / (1.0 - min 0.9 erasure)))))
-                if room = 0 then ()
-                elif repairSeq + n <= 256 then
-                    for i in 0 .. n - 1 do
-                        repairs.Enqueue { Kind = CellType.Booster; Step = tLo; Index = byte (repairSeq + i)
-                                          Span = byte span; Round = byte n }
-                    repairSeq <- repairSeq + n
-                else
-                    for j in 0 .. span - 1 do
-                        let t = tLo + uint64 j
-                        for s in 0 .. encoder.StepUsed t - 1 do
-                            if repairs.Count < 256 then
-                                repairs.Enqueue { Kind = CellType.Data; Step = t; Index = byte s; Span = 0uy; Round = 0uy }
+            // Per-step expected delivery: do not repair until the original
+            // first copy has been allowed its deadline. A NACK for in-flight
+            // steps (decoder lag, 20 ms / +66-step rule) would otherwise
+            // enqueue a BOOSTER storm whose originals later arrive.
+            let sealAt = sealNs.[int (tLo % uint64 sealNs.Length)]
+            let originalDue = float (now - sealAt) >= this.RepairWaitNs
+            if not originalDue then ()
+            else
+                let same = tLo = repairLo && span = repairSpan
+                if not same || deficit > repairDeficit || float (now - repairNs) >= this.RepairWaitNs then
+                    if same && deficit <= repairDeficit then repairRepeats <- repairRepeats + 1L
+                    if not same then
+                        repairLo <- tLo
+                        repairSpan <- span
+                        repairSeq <- 0
+                    repairDeficit <- deficit
+                    repairNs <- now
+                    // Bound the pending repair queue: a decoder lag looks like loss and would
+                    // otherwise enqueue an unbounded BOOSTER storm (uplink collapse).
+                    let room = max 0 (256 - repairs.Count)
+                    let n = min room (min 64 (int (ceil (float (deficit + 2) / (1.0 - min 0.9 erasure)))))
+                    if room = 0 then ()
+                    elif repairSeq + n <= 256 then
+                        for i in 0 .. n - 1 do
+                            repairs.Enqueue { Kind = CellType.Booster; Step = tLo; Index = byte (repairSeq + i)
+                                              Span = byte span; Round = byte n }
+                        repairSeq <- repairSeq + n
+                    else
+                        for j in 0 .. span - 1 do
+                            let t = tLo + uint64 j
+                            for s in 0 .. encoder.StepUsed t - 1 do
+                                if repairs.Count < 256 then
+                                    repairs.Enqueue { Kind = CellType.Data; Step = t; Index = byte s; Span = 0uy; Round = 0uy }
 
     /// Tail rule (spec 5.8): input paused for 50 ms and the peer lacks steps: a HEARTBEAT
     /// every 50 ms carries tx_head_step.
@@ -364,6 +400,9 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
                     frame.[frame.Length - 1] <- 10uy
                     this.Seal(frame, path)
                     boostersSent <- boostersSent + 1L
+                    let nowB = clock.NowNs()
+                    for j in 0 .. int c.Span - 1 do
+                        boostSentNs.[int ((t + uint64 j) % uint64 boostSentNs.Length)] <- nowB
                     ok <- true
                     done' <- true
                 elif rendered then
@@ -402,6 +441,9 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
                           Aux = uint16 c.Round; RxWinGrant = grant; StepId = c.Step; AckStepLo = ackLo
                           CarrierWm = carrierWm.[int path]; KHist = 0u; ErasureQ16 = erasureQ16 }
                 boostersSent <- boostersSent + 1L
+                let nowB = clock.NowNs()
+                for j in 0 .. int c.Span - 1 do
+                    boostSentNs.[int ((c.Step + uint64 j) % uint64 boostSentNs.Length)] <- nowB
                 found <- true
         // Parity: the oldest steps first; a few steps, then PAD.
         let mutable t = max peerAck encoder.Tail
