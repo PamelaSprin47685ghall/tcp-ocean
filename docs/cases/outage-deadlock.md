@@ -45,3 +45,13 @@ sent 108 segments after the blackout and made no progress for 2.2 s, and srtt in
   behind it waited for the hole, so they give no sample.
 Test: `a peer without SACK still gets every hole re-sent after a blackout (RTO fallback)`
 fails on main and passes with the fix (srtt < 200 ms).
+
+### RTO fallback: netns sanity (one run each, 4 paths, 20 ms OWD, 200 Mbit, 5 % loss, tun carrier)
+
+| scenario | bulk up | bulk down | under-bulk p99 | rtos | demotions | main 447a5c2 reference |
+|---|---|---|---|---|---|---|
+| steady 5 % | 142.2 | 136.0 / 134.6 | 111.7 ms | 3 | 0 | up 126-151, down ~133, p99 ~110-160 |
+| 300 ms outage every 3 s | 108.6 | 106.1 / 112.8 | 536.8 ms | 69 | 0 | up 101-130, down 111-114, p99 496-535 |
+
+No timeouts, clock_jumps=0. With SACK peers the fallback fires rarely (3 times in steady loss) and the
+outage case stays within the main range.
