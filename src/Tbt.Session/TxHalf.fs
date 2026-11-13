@@ -113,6 +113,9 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
     let mutable spuriousRepairs = 0L
     /// Extra reorder window beyond minRTT/4, grown when a repair was spurious.
     let mutable reoExtraNs = 0L
+    /// When true (server downlink), mid-window holes use RACK evidence (t_hi).
+    /// The client leaves this off until arrival-based delivery samples are in.
+    let mutable evidenceRepair = false
     /// When a BOOSTER for this step was sealed (0: none in this generation).
     let boostSentNs: int64[] = Array.zeroCreate encoder.Capacity
     let mutable lastSourceNs = 0L
@@ -326,6 +329,9 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
         if m = Int64.MaxValue then 0L
         else min m (m / 4L + reoExtraNs)
     member _.PeerSeenHi = peerSeenHi
+    member _.EvidenceRepair
+        with get () = evidenceRepair
+        and set v = evidenceRepair <- v
     member _.BoostersSent = boostersSent
     member _.SpuriousRepairs = spuriousRepairs
     member _.RttVarNs = rttvarNs
@@ -348,7 +354,7 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
         let tail = int64 this.RepairWaitNs
         let later = peerSeenHi
         let first =
-            if later > t && later < encoder.Head then
+            if evidenceRepair && later > t && later < encoder.Head then
                 let li = int (later % uint64 sealNs.Length)
                 let laterSeal = sealNs.[li]
                 if laterSeal > 0L then laterSeal + minRtt + this.ReoWndNs

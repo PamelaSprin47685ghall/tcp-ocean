@@ -79,8 +79,9 @@ let run (o: Options) =
         let clock = CachedClock(SystemClock())
         let session = Session(Role.Client, p, bridge, clock, config)
         bridge.Attach session
-        let tupleMbit = max 0.0 (o.Float("tuple-mbit", 0.0))
-        let carrier = SessionCarrier(session, bridge, uplinkPace=true, tupleMbit=tupleMbit)
+        let pace = o.Int("uplink-pace", 0) <> 0
+        let tupleMbit = if pace then max 0.0 (o.Float("tuple-mbit", 0.0)) else 0.0
+        let carrier = SessionCarrier(session, bridge, uplinkPace=pace, tupleMbit=tupleMbit)
         carrier.AddPath link0
         let maxPaths = int hello.MaxPaths
         // Forward as soon as path 0 is up; remaining JOINs run with bounded

@@ -39,7 +39,10 @@ max_paths=${MAX_PATHS:-64}
 # Per-5-tuple cap on the client uplink pacer (0 = off; rtt400 uses 4). Do not set this
 # on the 20 ms / 200 Mbit matrix: a default 4 Mbit/path cap would destroy it.
 tuple_mbit=${TUPLE_MBIT:-0}
-if [[ $profile == rtt400 && $tuple_mbit == 0 ]]; then tuple_mbit=4; fi
+# Client uplink RateGroup is off unless UPLINK_PACE=1. The rtt400 4 Mbit/path
+# cap only applies when that pacer is on.
+uplink_pace=${UPLINK_PACE:-0}
+if [[ $uplink_pace != 0 && $profile == rtt400 && $tuple_mbit == 0 ]]; then tuple_mbit=4; fi
 seed=${SEED:-7}
 ping_count=${PING_COUNT:-200}
 handshake_s=${HANDSHAKE_S:-10}
@@ -165,6 +168,7 @@ tunnel() {
     sleep 0.5
     local client_args=(--server "$server_at" --listen 127.0.0.1:1080 --psk-file "$work/psk" --stats-s 1
         --paths "$paths" --window "$window" --window-clamp "$window_clamp")
+    if [[ $uplink_pace != 0 ]]; then client_args+=(--uplink-pace 1); fi
     if [[ $tuple_mbit != 0 ]]; then client_args+=(--tuple-mbit "$tuple_mbit"); fi
     if [[ -n ${JOIN_CONCURRENCY:-} ]]; then client_args+=(--join-concurrency "$JOIN_CONCURRENCY"); fi
     in_ns near "$work/jit/tbtun" client "${client_args[@]}" 2>"$work/client-$name.log" &

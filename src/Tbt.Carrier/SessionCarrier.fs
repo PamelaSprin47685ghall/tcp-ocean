@@ -146,14 +146,6 @@ type SessionCarrier(session: Session, bridge: FlowBridge, ?uplinkPace: bool, ?tu
                     elif session.RepairWaiting && groupAllows fl true (session.Tx.Queued > 0) && pathAllows link.PathId fl now then
                         attempt <- true
                         charge <- 1
-                    elif session.Tx.InteractiveWaiting && pathAllows link.PathId fl now then
-                        // Interactive cells, including those spilled to the bulk queue
-                        // when the 64-cell reserve is full, do not wait on the bulk
-                        // 1.25 BDP cap (20/200 0% 64-flow echo fell to 14–21 Mbit when
-                        // a low post-echo bw estimate capped inflight at ~0.4 MiB).
-                        attempt <- true
-                        allowRepair <- false
-                        charge <- 2
                     elif groupAllows fl false (session.Tx.Queued > 0) && pathAllows link.PathId fl now then
                         // allowRepair=false: a dry repair reserve must not block new data.
                         attempt <- true

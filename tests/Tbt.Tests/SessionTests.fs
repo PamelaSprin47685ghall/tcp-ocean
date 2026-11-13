@@ -743,6 +743,7 @@ let ``a step is presumed lost only after a later-sealed step is seen and the reo
     let c = pair.Client
     let clock = pair.Clock
     c.Tx.InitialGrant 10_000UL
+    c.Tx.EvidenceRepair <- true
     let mutable slot = -1
     Assert.True(c.TryOpenFlow(&slot))
     let chunk = Array.create 65536 7uy
@@ -879,6 +880,7 @@ let ``seeing a later step does not make a not-yet-due hole eligible`` () =
     let c = pair.Client
     let clock = pair.Clock
     c.Tx.InitialGrant 10_000UL
+    c.Tx.EvidenceRepair <- true
     let mutable slot = -1
     Assert.True(c.TryOpenFlow(&slot))
     let chunk = Array.create 65536 7uy
@@ -989,6 +991,7 @@ let ``a spurious repair widens the reorder window`` () =
     let c = pair.Client
     let clock = pair.Clock
     c.Tx.InitialGrant 10_000UL
+    c.Tx.EvidenceRepair <- true
     let mutable slot = -1
     Assert.True(c.TryOpenFlow(&slot))
     let chunk = Array.create 65536 7uy

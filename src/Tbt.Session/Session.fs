@@ -79,6 +79,10 @@ type Session(role: Role, p: SessionParams, port: IFlowPort, clock: IClock, confi
     let encoder = Encoder((if client then keys.GraphSeedUp else keys.GraphSeedDown), s, config.WindowSteps)
     let decoder = Decoder((if client then keys.GraphSeedDown else keys.GraphSeedUp), s, config.WindowSteps, config.MaxRows)
     let tx = TxHalf(txDir, s, fieldOf txDir, encoder, sealer, config.Rho, config.MaxPaths, config.TxQueueCells, clock)
+    do
+        // Evidence-driven (RACK) repair is the server's downlink default. Client
+        // uplink keeps the per-step tail timer until delivery samples use t_hi.
+        if not client then tx.EvidenceRepair <- true
     let rx = RxHalf(s, fieldOf rxDir, decoder, opener, config.WindowSteps, config.MaxPaths)
     let both = Caps.FlowState ||| Caps.FlowState2
     let credit = { config.Credit with Enabled = config.Credit.Enabled && p.Caps &&& both = both }
