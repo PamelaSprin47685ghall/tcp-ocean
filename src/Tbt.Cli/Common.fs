@@ -44,6 +44,10 @@ type Options(args: string[]) =
         match values.TryGetValue name with
         | true, v -> Int32.Parse v
         | _ -> fallback
+    member _.Float(name: string, fallback: float) =
+        match values.TryGetValue name with
+        | true, v -> Double.Parse(v, Globalization.CultureInfo.InvariantCulture)
+        | _ -> fallback
     member _.Has(name: string) = values.ContainsKey name
 
 /// host:port; a host name resolves to its first address.

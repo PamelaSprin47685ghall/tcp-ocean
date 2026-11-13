@@ -13,6 +13,7 @@
     <Compile Include="CryptoTests.fs" />
     <Compile Include="SessionTests.fs" />
     <Compile Include="JoinTests.fs" />
+    <Compile Include="BootstrapTests.fs" />
     <Compile Include="TunTests.fs" />
     <Compile Include="FuzzTests.fs" />
     <Compile Include="PollerTests.fs" />

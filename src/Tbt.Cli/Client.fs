@@ -6,6 +6,7 @@ open System
 open System.Net
 open System.Net.Sockets
 open System.Runtime.InteropServices
+open System.Threading
 open Tbt.Contracts
 open Tbt.Session
 open Tbt.Session.Handshake
@@ -13,26 +14,34 @@ open Tbt.Carrier
 open Tbt.Cli.Common
 
 /// Connect, send head and bootstrap frame, wait for the reply head and bootstrap frame.
-let private bootstrap (server: IPEndPoint) (host: string) (boot: byte[]) (windowClamp: int) =
+/// `timeoutMs` is used for Connect, Send, and Receive so TCP can retransmit a JOIN
+/// inside one attempt. The socket is disposed if this throws.
+let private bootstrap (server: IPEndPoint) (host: string) (boot: byte[]) (windowClamp: int) (timeoutMs: int) =
     let socket = new Socket(server.AddressFamily, SocketType.Stream, ProtocolType.Tcp)
-    SocketTuning.path(socket, windowClamp)
-    socket.ReceiveTimeout <- 10_000
-    socket.SendTimeout <- 10_000
-    socket.Connect server
-    let link = PathLink(socket, SocketTuning.probe ())
-    link.Queue(ReadOnlySpan(requestHead host))
-    link.Queue(ReadOnlySpan boot)
-    while not link.TxIdle do
-        if link.Send() <> IoResult.Progress then failwith "path closed during bootstrap"
-    let mutable failed = false
-    let mutable reply = Span<byte>.Empty
-    let mutable result: byte[] | null = null
-    while isNull result do
-        if link.Receive() <> IoResult.Progress then failwith "path closed during bootstrap"
-        if link.TryTakeHead(&failed) && link.TryTakeFrame(&reply) then result <- reply.ToArray()
-        elif failed then failwith "bad reply head"
-    socket.Blocking <- false
-    struct (link, nonNull result)
+    try
+        SocketTuning.path(socket, windowClamp)
+        socket.ReceiveTimeout <- timeoutMs
+        socket.SendTimeout <- timeoutMs
+        let connect = socket.ConnectAsync server
+        if not (connect.Wait timeoutMs) then failwith "connect timed out"
+        connect.GetAwaiter().GetResult()
+        let link = PathLink(socket, SocketTuning.probe ())
+        link.Queue(ReadOnlySpan(requestHead host))
+        link.Queue(ReadOnlySpan boot)
+        while not link.TxIdle do
+            if link.Send() <> IoResult.Progress then failwith "path closed during bootstrap"
+        let mutable failed = false
+        let mutable reply = Span<byte>.Empty
+        let mutable result: byte[] | null = null
+        while isNull result do
+            if link.Receive() <> IoResult.Progress then failwith "path closed during bootstrap"
+            if link.TryTakeHead(&failed) && link.TryTakeFrame(&reply) then result <- reply.ToArray()
+            elif failed then failwith "bad reply head"
+        socket.Blocking <- false
+        struct (link, nonNull result)
+    with _ ->
+        socket.Dispose()
+        reraise()
 
 let run (o: Options) =
     let server = endpoint (o.Text "server")
@@ -44,31 +53,49 @@ let run (o: Options) =
     let windowClamp = o.Int("window-clamp", SocketTuning.WindowClamp)
     let config = { SessionConfig.defaults with WindowSteps = o.Int("window", 1024) }
     let entropy = SystemEntropy()
-    let offer = ClientOffer(psk, Guid.NewGuid(), entropy, uint64 (unixMs ()), mss, max 1 pathCount)
-    let struct (link0, reply) = bootstrap server host offer.Frame windowClamp
-    match offer.TryAccept(ReadOnlySpan reply) with
-    | ValueNone ->
-        log "handshake failed"
+    let rttMs = max 1 (o.Int("rtt-ms", JoinBootstrap.DefaultRttMs))
+    let loss = min 0.9 (max 0.0 (o.Float("loss", JoinBootstrap.DefaultLoss)))
+    let timeoutMs = JoinBootstrap.socketTimeoutMs rttMs loss
+    let attempts = JoinBootstrap.maxAttempts loss
+    let backoff = JoinBootstrap.backoffMs rttMs
+    // Fresh ClientOffer on each attempt: a nonce the server already accepted is a replay.
+    let mutable accepted = ValueNone
+    match JoinBootstrap.tryRepeated attempts backoff Thread.Sleep (fun _ ->
+        let offer = ClientOffer(psk, Guid.NewGuid(), entropy, uint64 (unixMs ()), mss, max 1 pathCount)
+        let struct (link0, reply) = bootstrap server host offer.Frame windowClamp timeoutMs
+        match offer.TryAccept(ReadOnlySpan reply) with
+        | ValueNone ->
+            link0.Close()
+            failwith "handshake failed"
+        | ValueSome(struct (p, hello)) -> accepted <- ValueSome(struct (link0, p, hello))) with
+    | JoinBootstrap.GaveUp msg ->
+        log ("handshake failed: " + msg)
         1
-    | ValueSome(struct (p, hello)) ->
+    | JoinBootstrap.Joined ->
+        let struct (link0, p, hello) = accepted.Value
         let bridge = FlowBridge ValueNone
         let session = Session(Role.Client, p, bridge, SystemClock(), config)
         bridge.Attach session
         let carrier = SessionCarrier(session, bridge)
         carrier.AddPath link0
         let maxPaths = int hello.MaxPaths
+        // A retry of the same path id must bump the incarnation; a new nonce at
+        // an equal incarnation is closed by admission. Failures after the budget
+        // are logged and skipped — they must not kill the process.
         for id in 1 .. min pathCount maxPaths - 1 do
-            let join = JoinOffer(p.Keys.PathKey, entropy, p.Keys.SessionId, p.Symbol, p.Caps, maxPaths, uint16 id, 1u, mss)
-            try
-                let struct (link, ack) = bootstrap server host join.Frame windowClamp
+            match JoinBootstrap.tryRepeated attempts backoff Thread.Sleep (fun i ->
+                let inc = uint32 (i + 1)
+                let join = JoinOffer(p.Keys.PathKey, entropy, p.Keys.SessionId, p.Symbol, p.Caps, maxPaths, uint16 id, inc, mss)
+                let struct (link, ack) = bootstrap server host join.Frame windowClamp timeoutMs
                 if (join.TryAccept(ReadOnlySpan ack)).IsSome then
                     link.PathId <- uint16 id
-                    link.Incarnation <- 1u
+                    link.Incarnation <- inc
                     carrier.AddPath link
                 else
-                    log ("path " + string id + ": join refused")
                     link.Close()
-            with :? SocketException as e -> log ("path " + string id + ": " + e.Message)
+                    failwith "join refused") with
+            | JoinBootstrap.Joined -> ()
+            | JoinBootstrap.GaveUp msg -> log ("path " + string id + ": " + msg)
         log ("session up: S=" + string p.Symbol + " paths=" + string carrier.Paths.Count + " window_clamp=" + string windowClamp)
         let listener = new Socket(listenAt.AddressFamily, SocketType.Stream, ProtocolType.Tcp)
         listener.Bind listenAt

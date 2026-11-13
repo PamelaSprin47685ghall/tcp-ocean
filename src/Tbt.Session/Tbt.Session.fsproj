@@ -7,6 +7,7 @@
     <Compile Include="RxHalf.fs" />
     <Compile Include="Session.fs" />
     <Compile Include="Handshake.fs" />
+    <Compile Include="JoinBootstrap.fs" />
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="../Tbt.Contracts/Tbt.Contracts.fsproj" />
