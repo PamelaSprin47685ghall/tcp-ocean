@@ -94,32 +94,14 @@ type SessionCarrier(session: Session, bridge: FlowBridge, ?uplinkPace: bool, ?tu
 
     /// 64 unique frames is enough to finish several encoder steps and get a
     /// real RTT sample, but far below a many-path flood. Once the group has a
-    /// healthy rate, unique inflight is capped at 1.25 BDP (RateGroup.Cwnd is
-    /// 2.885 BDP in startup, which dumped 8 MB into 256 paths and overflowed
-    /// the server decoder).
+    /// healthy cwnd, TryTake is the cap (1.25 BDP).
     let startupCap (fl: int) = 64 * fl
-
-    let cruiseCwnd (fl: int) =
-        let rtt =
-            let m = session.Tx.MinRttNs
-            if m <> Int64.MaxValue then m else max 1L (int64 session.Tx.SrttNs)
-        let measured = RateGroup.CwndGain * group.Bandwidth * float rtt
-        // A low first sample (kzA11U: ~7 Mbit) made a pure 1.25 BDP cap
-        // self-fulfilling (bulk up 12.4 vs 21.4). When --tuple-mbit is set,
-        // also allow 1.25 BDP of min(paths×tuple, 40 Mbit) so short echos
-        // and an 8 s bulk can probe up. Off when tupleMbit=0 so the
-        // 20 ms / 200 Mbit matrix is not given a 2.5 MiB floor (~1 Gbit
-        // at 20 ms). At 400 ms that floor is 2.5 MiB, below the 8 MiB
-        // UWOx4h startup dump.
-        let floorBw = if tupleMbit > 0.0 then min (tupleMbit * float (max 1 paths.Count)) 40.0 else 0.0
-        let floor = RateGroup.CwndGain * (floorBw / 8000.0) * float rtt
-        int (max measured floor) + 4 * fl
 
     let groupAllows (fl: int) (repair: bool) (bulk: bool) =
         if repair then
             if group.Ready && group.TryTakeRepair(fl, fl) then true
             else not group.Ready && uniqueInflight fl <= startupCap fl
-        elif group.Ready && uniqueInflight fl + fl <= cruiseCwnd fl && group.TryTake(fl, bulk) then true
+        elif group.Ready && group.TryTake(fl, bulk) then true
         else uniqueInflight fl + fl <= startupCap fl
 
     let prune () =
