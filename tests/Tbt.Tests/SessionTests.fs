@@ -96,6 +96,7 @@ type Pair(config: SessionConfig, paths: int, loss: float, seed: int) =
                 dst.OnFrame(p, Span f) |> ignore
             else go <- false
 
+    member _.Clock = clock
     member _.Client = client
     member _.Server = server
     member _.ClientPort = clientPort
@@ -606,6 +607,68 @@ let ``Karn skips samples held behind a repair but keeps clean ones`` () =
     let m = c.Tx.MinRttNs
     Assert.True(m >= 40_000_000L && m < 60_000_000L, sprintf "min rtt %d" m)
     Assert.True(c.Tx.RepairWaitNs <= 4.0 * float m)
+
+[<Fact>]
+let ``a jump in peer ack samples only the newest sealed step, not the oldest`` () =
+    let config = { SessionConfig.defaults with Credit = { CreditPolicy.defaults with Enabled = false } }
+    let pair = Pair(config, 1, 0.0, 4)
+    let c = pair.Client
+    let clock = pair.Clock
+    c.Tx.InitialGrant 10_000UL
+    let mutable slot = -1
+    Assert.True(c.TryOpenFlow(&slot))
+    let chunk = Array.create 65536 7uy
+    let sealUntil (n: uint64) =
+        let mutable guard = 64
+        while c.Tx.Head < n && guard > 0 do
+            let took = pair.Feed(c, slot, ReadOnlySpan chunk, false)
+            c.Tx.Flush()
+            guard <- guard - 1
+            if took = 0 && c.Tx.Head < n then failwith (sprintf "feed stuck at head %d" c.Tx.Head)
+        Assert.True(c.Tx.Head >= n, sprintf "head %d want %d" c.Tx.Head n)
+    sealUntil 2UL
+    Assert.Equal(0UL, c.Tx.PeerAck)
+    // The first steps age 8 s, then two more seal, then an ack covers all after 400 ms.
+    clock.Now <- clock.Now + 8_000_000_000L
+    let afterGap = c.Tx.Head
+    sealUntil (afterGap + 2UL)
+    clock.Now <- clock.Now + 400_000_000L
+    c.Tx.OnPeerAck(c.Tx.Head, 100us)
+    // Newest step: 400 ms → SRTT 100 + (400-100)/8 = 137.5 ms. The 8 s gap would
+    // have pushed SRTT above a second if the oldest step in the jump were used.
+    Assert.InRange(c.Tx.SrttNs, 130e6, 150e6)
+
+[<Fact>]
+let ``an oversized seal-to-custody sample is clamped to three times minRTT`` () =
+    let config = { SessionConfig.defaults with Credit = { CreditPolicy.defaults with Enabled = false } }
+    let pair = Pair(config, 1, 0.0, 4)
+    let c = pair.Client
+    let clock = pair.Clock
+    c.Tx.InitialGrant 10_000UL
+    let mutable slot = -1
+    Assert.True(c.TryOpenFlow(&slot))
+    let chunk = Array.create 65536 7uy
+    let sealUntil (n: uint64) =
+        let mutable guard = 64
+        while c.Tx.Head < n && guard > 0 do
+            let took = pair.Feed(c, slot, ReadOnlySpan chunk, false)
+            c.Tx.Flush()
+            guard <- guard - 1
+            if took = 0 && c.Tx.Head < n then failwith (sprintf "feed stuck at head %d" c.Tx.Head)
+        Assert.True(c.Tx.Head >= n, sprintf "head %d want %d" c.Tx.Head n)
+    sealUntil 1UL
+    clock.Now <- clock.Now + 400_000_000L
+    c.Tx.OnPeerAck(c.Tx.Head, 100us)
+    Assert.Equal(400_000_000L, c.Tx.MinRttNs)
+    let head0 = c.Tx.Head
+    sealUntil (head0 + 1UL)
+    clock.Now <- clock.Now + 8_000_000_000L
+    c.Tx.OnPeerAck(c.Tx.Head, 100us)
+    // minRTT stays 400 ms; the 8 s sample is used as 1.2 s. SRTT starts at
+    // 137.5 ms after the first sample, then 137.5 + (1200-137.5)/8 = 270.3 ms.
+    Assert.Equal(400_000_000L, c.Tx.MinRttNs)
+    Assert.InRange(c.Tx.SrttNs, 250e6, 300e6)
+    Assert.InRange(c.Tx.RepairWaitNs, 1.05 * 400e6 - 1.0, 1.05 * 400e6 + 1.0)
 
 [<Fact>]
 let ``the grant limit is each report's own ack plus its grant: late, duplicate and reordered reports never amplify it`` () =

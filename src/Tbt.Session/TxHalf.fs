@@ -188,12 +188,20 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
                 // Karn: a step held behind a repair round started after its seal measures the
                 // repair wait, not the path; such samples would raise SRTT, which spaces repair
                 // rounds further apart, which holds steps longer (runaway).
+                // Only the newest covered step (ack - 1): a jump must not
+                // feed seal-to-custody of older steps in the gap into SRTT.
                 let now = clock.NowNs()
                 let sealAt = sealNs.[int ((ack - 1UL) % uint64 sealNs.Length)]
                 let sample = now - sealAt
                 if repairLo < ack && repairNs >= sealAt then rttSkipped <- rttSkipped + 1L
                 elif sample > 0L then
-                    srttNs <- srttNs + (float sample - srttNs) / 8.0
+                    // Clamp to k × minRTT so one long custody delay cannot
+                    // drag the session SRTT (minRTT itself stays raw).
+                    let m = min minCurNs minPrevNs
+                    let used =
+                        if m = Int64.MaxValue then sample
+                        else min sample (3L * m)
+                    srttNs <- srttNs + (float used - srttNs) / 8.0
                     if now - minSinceNs >= 10_000_000_000L then
                         minPrevNs <- minCurNs
                         minCurNs <- Int64.MaxValue
@@ -223,11 +231,12 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
     member _.RttSkipped = rttSkipped
     /// Repair rounds repeated for the same range because the wait ran out.
     member _.RepairRepeats = repairRepeats
-    /// Wait between repair rounds for one range: 1.05 SRTT, kept within [1.05, 4] min RTT.
+    /// Wait between repair rounds for one range: 1.05 × path minRTT once a
+    /// min sample exists, else 1.05 × session SRTT. Session SRTT (seal-to-custody)
+    /// is not used for this timer once the path has been measured.
     member _.RepairWaitNs =
         let m = min minCurNs minPrevNs
-        let w = 1.05 * srttNs
-        if m = Int64.MaxValue then w else min (max w (1.05 * float m)) (4.0 * float m)
+        if m = Int64.MaxValue then 1.05 * srttNs else 1.05 * float m
     member _.BoostersSent = boostersSent
 
     /// A NACK from the peer's WIN_ACK (spec 5.8): steps [tLo, tLo + span) lack deficit ranks.
