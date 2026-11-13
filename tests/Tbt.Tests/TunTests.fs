@@ -717,9 +717,9 @@ let sackBlocksOf (p: byte[]) =
     List.ofSeq blocks
 
 [<Fact>]
-let ``uplink: a segment re-sent after its hole was swallowed is reported as a D-SACK`` () =
-    // The kernel sender undoes its cwnd cut on a D-SACK (RFC 2883): a swallowed hole or an
-    // outage that only lost ACKs must not leave the client's window collapsed.
+let ``uplink: the first late copy of a swallowed segment is no duplicate; a second copy is a D-SACK`` () =
+    // Receive history, not the cumulative ACK, decides: swallowed bytes were acked but never
+    // received, so their first arrival is new (RFC 2883 reports only real duplicates).
     let f = Fixture 10
     f.Open()
     let send i =
@@ -732,20 +732,29 @@ let ``uplink: a segment re-sent after its hole was swallowed is reported as a D-
     let top = f.Data0 + uint32 f.Stream.Length
     Assert.Equal(top, (parse f.Out.Packets.[f.Out.Packets.Count - 1]).AckNo)
     Assert.Empty(sackBlocksOf f.Out.Packets.[f.Out.Packets.Count - 1])
-    // The kernel's retransmission of the swallowed segment 1.
+    Assert.Equal(1L, f.Path.Counters.VirtualAcks)
+    // The kernel's retransmission of the swallowed segment 1: its first copy here.
+    let n = f.Out.Packets.Count
     send 1
     f.Path.FlushAck()
-    let a = f.Out.Packets.[f.Out.Packets.Count - 1]
-    Assert.Equal(top, (parse a).AckNo)
-    Assert.Equal<(uint32 * uint32) list>([ f.Data0 + 1460u, f.Data0 + 2920u ], sackBlocksOf a)
-    // A plain duplicate of acked data (an ACK lost in an outage, RTO) is one too.
+    Assert.Equal(n + 1, f.Out.Packets.Count)
+    Assert.Empty(sackBlocksOf f.Out.Packets.[n])
+    Assert.Equal(top, (parse f.Out.Packets.[n]).AckNo)
+    Assert.Equal(1460L, f.Path.Counters.LateFirstBytes)
+    Assert.Equal(0L, f.Path.Counters.Dsacks)
+    // Its second copy did arrive before: a D-SACK.
+    send 1
+    f.Path.FlushAck()
+    Assert.Equal<(uint32 * uint32) list>([ f.Data0 + 1460u, f.Data0 + 2920u ], sackBlocksOf f.Out.Packets.[f.Out.Packets.Count - 1])
+    // A plain duplicate of received and acked data is one too.
     send 0
     f.Path.FlushAck()
     Assert.Equal<(uint32 * uint32) list>([ f.Data0, f.Data0 + 1460u ], sackBlocksOf f.Out.Packets.[f.Out.Packets.Count - 1])
     Assert.Equal(2L, f.Path.Counters.Dsacks)
+    Assert.Equal(1460L, f.Path.Counters.LateFirstBytes)
 
 [<Fact>]
-let ``uplink: during a hole's grace only a lone D-SACK goes out, never interval blocks`` () =
+let ``uplink: a duplicate above the cumulative ACK waits out the grace, then goes as a D-SACK`` () =
     let f = Fixture 10
     f.Open()
     let send i =
@@ -757,16 +766,44 @@ let ``uplink: during a hole's grace only a lone D-SACK goes out, never interval 
     send 4
     f.Path.FlushAck()
     Assert.Equal(n, f.Out.Packets.Count)
-    // Segment 4 again, inside the held interval: a duplicate.
+    // Segment 4 again, inside the held interval: a duplicate, above the cumulative ACK. Its
+    // RFC 2883 form names the holding SACK block, which would show the hole: nothing yet.
     send 4
+    f.Path.FlushAck()
+    Assert.Equal(n, f.Out.Packets.Count)
+    // The grace ends, the gap is swallowed: now the duplicate is below the ACK, a lone D-SACK.
+    f.Clock.Now <- f.Clock.Now + 16_000_000L
+    f.Path.Service f.Clock.Now
     f.Path.FlushAck()
     Assert.Equal(n + 1, f.Out.Packets.Count)
     let a = f.Out.Packets.[n]
-    Assert.Equal(f.Data0 + 1460u, (parse a).AckNo)
+    Assert.Equal(f.Data0 + 5u * 1460u, (parse a).AckNo)
     Assert.Equal<(uint32 * uint32) list>([ f.Data0 + 4u * 1460u, f.Data0 + 5u * 1460u ], sackBlocksOf a)
-    // The gap's own ACK still waits for the grace.
+    Assert.Equal(1L, f.Path.Counters.Dsacks)
+
+[<Fact>]
+let ``uplink: outside the lease an above-ACK duplicate uses the RFC 2883 two-block form`` () =
+    // The peer's FIN is seen (out of order, after segment 6): the lease ends (spec 6.8.2),
+    // so holes are reported by SACK at once.
+    let f = Fixture 10
+    f.Open()
+    let send i =
+        f.Send(f.Data0 + uint32 (i * 1460), ReadOnlySpan(f.Stream, i * 1460, min 1460 (f.Stream.Length - i * 1460)), [||])
+    send 0
+    send 2
+    send 5
+    let struct (fs, fp) = clientSegment (f.Data0 + uint32 (6 * 1460)) 1001u (Packet.Ack ||| Packet.Fin) [||] (ReadOnlySpan(f.Stream, 6 * 1460, 1460))
+    f.Path.OnSegment(fs, Span fp, f.Clock.Now)
+    f.Path.FlushAck()
+    let n = f.Out.Packets.Count
+    // Segment 6 again: D-SACK [6, 7), then its block [5, 7), then the other block [2, 3).
+    send 6
     f.Path.FlushAck()
     Assert.Equal(n + 1, f.Out.Packets.Count)
+    let b = sackBlocksOf f.Out.Packets.[n]
+    let at k = f.Data0 + uint32 (k * 1460)
+    Assert.Equal<(uint32 * uint32) list>([ (at 6, at 7); (at 5, at 7); (at 2, at 3) ], b)
+    Assert.Equal(at 1, (parse f.Out.Packets.[n]).AckNo)
 
 [<Fact>]
 let ``uplink: no D-SACK to a peer that did not negotiate SACK`` () =
@@ -953,3 +990,26 @@ let ``a demoted path's repairs are charged to the group and counted, one probe p
     Assert.InRange(probes, 1L, 4L)
     // Each probe is charged to the group: 2..4 copies of one frame.
     Assert.True(group.RepairBytes - bytes0 >= probes * 2L * int64 L)
+
+[<Fact>]
+let ``uplink: the swallowed-range record is bounded; a forgotten range's late copy counts as a duplicate`` () =
+    let f = Fixture 200
+    f.Open()
+    let send i =
+        f.Send(f.Data0 + uint32 (i * 1460), ReadOnlySpan(f.Stream, i * 1460, 1460), [||])
+    // 70 holes, one at a time: segment 2k is lost, 2k + 1 arrives, the gap is swallowed.
+    for k in 0 .. 69 do
+        send (2 * k + 1)
+        f.Clock.Now <- f.Clock.Now + 16_000_000L
+        f.Path.Service f.Clock.Now
+        f.Path.FlushAck()
+    Assert.Equal(70L, f.Path.Counters.VirtualAcks)
+    Assert.Equal(6L, f.Path.Counters.SwallowedForgotten)
+    // A recent hole's first copy: new. The oldest hole's (forgotten): taken for a duplicate.
+    send 138
+    f.Path.FlushAck()
+    Assert.Equal(1460L, f.Path.Counters.LateFirstBytes)
+    Assert.Equal(0L, f.Path.Counters.Dsacks)
+    send 0
+    f.Path.FlushAck()
+    Assert.Equal(1L, f.Path.Counters.Dsacks)

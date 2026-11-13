@@ -41,6 +41,11 @@ type TunCounters() =
     member val Faults = 0L with get, set
     /// Gaps between two calls longer than the stall limit, cut from the timeline.
     member val ClockJumps = 0L with get, set
+    /// Swallowed (virtually acked) bytes whose first copy arrived later: not duplicates.
+    member val LateFirstBytes = 0L with get, set
+    /// Swallowed ranges forgotten because the record was full (a later first arrival of
+    /// their bytes is then taken for a duplicate).
+    member val SwallowedForgotten = 0L with get, set
     /// Repairs requested by RACK, the tail timer or the RTO fallback (each sent once paced).
     member val RepairRequests = 0L with get, set
     /// Times a waiting repair found the pacer empty and waited.
@@ -118,6 +123,12 @@ type TunPath(output: ITunOutput, counters: TunCounters, localIp: uint32, localPo
     /// outage that only lost ACKs, or a hole TBT did not need, does not shrink the kernel window.
     let mutable dsackLo = 0UL
     let mutable dsackHi = 0UL
+    /// Receive history: ranges below rcvNxt that were swallowed (virtually acked), not
+    /// received. Bytes below rcvNxt outside them really arrived. Bounded; oldest forgotten.
+    static let swallowedMax = 64
+    let swStart = Array.zeroCreate<uint64> (swallowedMax + 1)
+    let swEnd = Array.zeroCreate<uint64> (swallowedMax + 1)
+    let mutable swCount = 0
     // Head phase: in-order bytes only, until the bootstrap frame is whole.
     let mutable head: byte[] = Array.zeroCreate headCap
     let mutable headLen = 0
@@ -310,10 +321,69 @@ type TunPath(output: ITunOutput, counters: TunCounters, localIp: uint32, localPo
     /// not closing, no FIN seen. The advance never passes the observed right edge.
     let leaseValid () = dataPhase && attached && not closing && peerFinAt = UInt64.MaxValue
 
+    let removeSwallowed (i: int) =
+        for j in i .. swCount - 2 do
+            swStart.[j] <- swStart.[j + 1]
+            swEnd.[j] <- swEnd.[j + 1]
+        swCount <- swCount - 1
+
+    /// Record [lo, hi) as swallowed (ranges kept in order, newest last).
+    let recordSwallowed (lo: uint64) (hi: uint64) =
+        if hi > lo then
+            if swCount = swallowedMax then
+                removeSwallowed 0
+                counters.SwallowedForgotten <- counters.SwallowedForgotten + 1L
+            swStart.[swCount] <- lo
+            swEnd.[swCount] <- hi
+            swCount <- swCount + 1
+
+    /// [a, b) arrived below rcvNxt: the parts inside swallowed ranges are first arrivals (cut
+    /// out of the record); returns the first contiguous run of really duplicate bytes, or
+    /// (0, 0).
+    let lateArrival (a: uint64) (b: uint64) =
+        let mutable dupLo = 0UL
+        let mutable dupHi = 0UL
+        let mutable pos = a
+        let mutable i = 0
+        while pos < b do
+            // The first swallowed range that ends after pos.
+            while i < swCount && swEnd.[i] <= pos do i <- i + 1
+            if i < swCount && swStart.[i] <= pos then
+                let e = min b swEnd.[i]
+                counters.LateFirstBytes <- counters.LateFirstBytes + int64 (e - pos)
+                // Cut [pos, e) out of range i.
+                let s0 = swStart.[i]
+                let e0 = swEnd.[i]
+                if s0 = pos && e0 = e then removeSwallowed i
+                elif s0 = pos then swStart.[i] <- e
+                elif e0 = e then swEnd.[i] <- pos
+                else
+                    // Split: [s0, pos) and [e, e0).
+                    if swCount = swallowedMax then
+                        removeSwallowed 0
+                        counters.SwallowedForgotten <- counters.SwallowedForgotten + 1L
+                        i <- i - 1
+                    for j in swCount - 1 .. -1 .. i + 1 do
+                        swStart.[j + 1] <- swStart.[j]
+                        swEnd.[j + 1] <- swEnd.[j]
+                    swCount <- swCount + 1
+                    swEnd.[i] <- pos
+                    swStart.[i + 1] <- e
+                    swEnd.[i + 1] <- e0
+                pos <- e
+            else
+                let e = if i < swCount then min b swStart.[i] else b
+                if dupHi = dupLo then
+                    dupLo <- pos
+                    dupHi <- e
+                pos <- e
+        struct (dupLo, dupHi)
+
     /// Swallow the gap in front of interval 0.
     let swallow (fast: bool) =
         let lo = rcvNxt
         let hi = ivStart.[0]
+        recordSwallowed lo hi
         dropSlotsIn lo hi
         rcvNxt <- ivEnd.[0]
         removeInterval 0
@@ -370,8 +440,11 @@ type TunPath(output: ITunOutput, counters: TunCounters, localIp: uint32, localPo
         let mutable a = seq64
         let mutable d = data
         if a < rcvNxt && d.Length > 0 then
-            dsackLo <- a
-            dsackHi <- min (a + uint64 d.Length) rcvNxt
+            // From the receive history: a first arrival of swallowed bytes is no duplicate.
+            let struct (lo, hi) = lateArrival a (min (a + uint64 d.Length) rcvNxt)
+            if hi > lo then
+                dsackLo <- lo
+                dsackHi <- hi
         elif d.Length > 0 && dataPhase then
             // Wholly inside a held interval: a duplicate too.
             let e = a + uint64 d.Length
@@ -845,9 +918,17 @@ type TunPath(output: ITunOutput, counters: TunCounters, localIp: uint32, localPo
         if ackDue && state <> TunState.Closed then
             let dsack = sackOk && dsackHi > dsackLo
             let grace = ivCount > 0 && leaseValid ()
-            // In the grace only a D-SACK may go out, alone: interval blocks would be duplicate
-            // ACKs; a D-SACK block does not count as one (it covers no new data).
-            if not grace || dsack then
+            // A duplicate above the cumulative ACK is reported in the RFC 2883 two-block form
+            // (the D-SACK, then the SACK block holding it), which shows the hole: in the grace
+            // it waits until the gap is filled or swallowed.
+            let above = dsack && dsackLo >= rcvNxt
+            let mutable c = -1
+            if above then
+                for i in 0 .. ivCount - 1 do
+                    if ivStart.[i] <= dsackLo && dsackHi <= ivEnd.[i] then c <- i
+            // In the grace only a D-SACK below the cumulative ACK may go out, alone: interval
+            // blocks would be duplicate ACKs; such a D-SACK block covers no new data.
+            if not grace || (dsack && not above) then
                 let blocks = if grace || not sackOk then 0 else min (if dsack then 3 else 4) ivCount
                 let d = if dsack then 1 else 0
                 if blocks + d > 0 then
@@ -860,9 +941,11 @@ type TunPath(output: ITunOutput, counters: TunCounters, localIp: uint32, localPo
                         BinaryPrimitives.WriteUInt32BigEndian(o.Slice 4, uint32 dsackLo)
                         BinaryPrimitives.WriteUInt32BigEndian(o.Slice 8, uint32 dsackHi)
                         counters.Dsacks <- counters.Dsacks + 1L
-                    for i in 0 .. blocks - 1 do
-                        BinaryPrimitives.WriteUInt32BigEndian(o.Slice(4 + 8 * (i + d)), uint32 ivStart.[i])
-                        BinaryPrimitives.WriteUInt32BigEndian(o.Slice(8 + 8 * (i + d)), uint32 ivEnd.[i])
+                    // Interval order, the one holding an above-ACK duplicate first.
+                    for k in 0 .. blocks - 1 do
+                        let i = if c < 0 then k elif k = 0 then c elif k - 1 < c then k - 1 else k
+                        BinaryPrimitives.WriteUInt32BigEndian(o.Slice(4 + 8 * (k + d)), uint32 ivStart.[i])
+                        BinaryPrimitives.WriteUInt32BigEndian(o.Slice(8 + 8 * (k + d)), uint32 ivEnd.[i])
                     send Packet.Ack sndNxt (Span<byte>.op_Implicit o) 0
                 else send Packet.Ack sndNxt ReadOnlySpan.Empty 0
                 dsackLo <- 0UL
