@@ -346,6 +346,7 @@ type private FakeMember() =
         member m.Inflight = m.Inflight
         member m.Delivered = m.Delivered
         member _.MinRttNs = 40_000_000L
+        member _.LastDeliveredNs = 0L
 
 [<Fact>]
 let ``rate group: after startup the in-flight cap is 1.25 BDP, not 2`` () =
@@ -516,3 +517,139 @@ let ``rate group: the 0.75 phase ends once in flight is down to one BDP`` () =
     // In flight falls to one BDP: the phase ends at once, not after a round (40 ms).
     tick 990_000
     Assert.Equal(2, g.Cycle)
+
+let blackoutRun (paths: int) (lossP: float) (seed: int) (lost: int64 -> bool) (ms: int) =
+    // netns (5 % loss + 300 ms outage every 3 s): all paths stalled together, all were demoted,
+    // no segment was sent again and the downlink stayed dead for minutes.
+    // Two paths in one group; a model receiver per path (20 ms one way, cumulative ACKs).
+    // Every packet in [500 ms, 1800 ms) is lost.
+    let clock = ManualClock()
+    let group = RateGroup(clock)
+    let fs = [| for k in 0 .. paths - 1 -> Fixture(1, clock, group, uint16 (40000 + k)) |]
+    let rnd = Random(seed)
+    clock.Now <- clock.Now + 40_000_000L
+    let t0 = clock.Now
+    for f in fs do
+        f.Open()
+        group.Add(f.Path :> IRateMember)
+        (f.Path :> IPath).Backlog <- 100
+    let seen = [| for _ in fs -> fs.[0].Out.Packets.Count |]
+    for i in 0 .. fs.Length - 1 do seen.[i] <- fs.[i].Out.Packets.Count
+    let got = [| for _ in fs -> Dictionary<uint32, int>() |]
+    let cum = Array.zeroCreate<uint32> paths
+    let acks = [| for _ in fs -> Queue<struct (int64 * uint32 * byte[])>() |]
+    let be (v: uint32) = [| byte (v >>> 24); byte (v >>> 16); byte (v >>> 8); byte v |]
+    // SACK blocks as Linux sends them: up to 3 received ranges above the cumulative ACK.
+    let sackOf (k: int) =
+        let ranges = List<struct (uint32 * uint32)>()
+        for kv in got.[k] |> Seq.filter (fun kv -> kv.Key > cum.[k]) |> Seq.sortBy (fun kv -> kv.Key) do
+            if ranges.Count > 0 && (let struct (_, r) = ranges.[ranges.Count - 1] in r = kv.Key) then
+                let struct (l, _) = ranges.[ranges.Count - 1]
+                ranges.[ranges.Count - 1] <- struct (l, kv.Key + uint32 kv.Value)
+            else ranges.Add(struct (kv.Key, kv.Key + uint32 kv.Value))
+        let top = ranges |> Seq.rev |> Seq.truncate 3 |> Seq.toArray
+        if top.Length = 0 then [||]
+        else Array.concat [ yield [| 1uy; 1uy; 5uy; byte (2 + 8 * top.Length) |]
+                            for struct (l, r) in top do yield be l; yield be r ]
+    let lost (t: int64) = lost (t - t0)
+    let sentIn = Array.zeroCreate<int> paths
+    let resentIn = Array.zeroCreate<int> paths
+    let sentAfter = Array.zeroCreate<int> paths
+    let cumAtBlack = Array.zeroCreate<uint32> paths
+    let starts = [| for _ in fs -> HashSet<uint32>() |]
+    let lastProgress = Array.zeroCreate<int64> paths
+    for _ in 1 .. ms do
+        clock.Now <- clock.Now + 1_000_000L
+        let now = clock.Now
+        for k in 0 .. paths - 1 do
+            let f = fs.[k]
+            // Packets the server wrote since the last round reach the client 20 ms later.
+            for i in seen.[k] .. f.Out.Packets.Count - 1 do
+                let q = parse f.Out.Packets.[i]
+                if q.PayloadLength > 0 then
+                    if cum.[k] = 0u then cum.[k] <- q.Seq
+                    let fresh = starts.[k].Add q.Seq
+                    if lost now then (if fresh then sentIn.[k] <- sentIn.[k] + 1 else resentIn.[k] <- resentIn.[k] + 1)
+                    elif now - t0 >= 1_800_000_000L then sentAfter.[k] <- sentAfter.[k] + 1
+                    if not (lost now) && rnd.NextDouble() >= lossP then
+                        got.[k].[q.Seq] <- q.PayloadLength
+                        let mutable l = 0
+                        while got.[k].TryGetValue(cum.[k], &l) do
+                            cum.[k] <- cum.[k] + uint32 l
+                            lastProgress.[k] <- now - t0
+                        acks.[k].Enqueue(struct (now + 40_000_000L, cum.[k], sackOf k))
+            seen.[k] <- f.Out.Packets.Count
+            if now - t0 = 500_000_000L then cumAtBlack.[k] <- cum.[k]
+            // ACKs come back 20 ms later (40 ms after the send); those in the blackout are lost.
+            let mutable a = Unchecked.defaultof<struct (int64 * uint32 * byte[])>
+            while acks.[k].TryPeek(&a) && (let struct (due, _, _) = a in due <= now) do
+                let struct (due, c, sk) = acks.[k].Dequeue()
+                if not (lost (due - 20_000_000L)) && rnd.NextDouble() >= lossP then
+                    let struct (s, p) = clientSegment f.Data0 c Packet.Ack sk ReadOnlySpan.Empty
+                    f.Path.OnSegment(s, Span p, now)
+            let ip = f.Path :> IPath
+            let mutable frame = Span<byte>.Empty
+            let mutable n = 0
+            while n < 4 && ip.TryBeginFrame(&frame) do
+                frame.Fill 0x66uy
+                ip.CommitFrame()
+                n <- n + 1
+            f.Path.Service now
+        group.Service now
+    [ for k in 0 .. paths - 1 ->
+        sprintf "path %d: re-sent in blackout %d, sent after %d, last progress %d ms, cum %d; %s" k resentIn.[k] sentAfter.[k] (lastProgress.[k] / 1_000_000L) (int (cum.[k] - cumAtBlack.[k])) (fs.[k].Path.Describe()), lastProgress.[k], fs.[k].Path.Counters.Demotions ]
+
+[<Fact>]
+let ``a blackout on every path does not leave them demoted and dead`` () =
+    let r = blackoutRun 2 0.0 1 (fun t -> t >= 500_000_000L && t < 1_800_000_000L) 4000
+    for msg, last, demotions in r do
+        Assert.True(last > 3_500_000_000L, msg)
+        // All paths stalled at once: an outage, not a dead path.
+        Assert.Equal(0L, demotions)
+        Assert.DoesNotContain("demoted", msg)
+
+[<Fact>]
+let ``segments sent before a delivered repair are still re-sent when an outage silences every ACK`` () =
+    // netns deadlock (demotions=4, no segment ever sent again): a repaired low segment was
+    // delivered, so rackSentNs moved to its repair time. Higher segments sent before that
+    // repair were neither below the highest SACK (RACK) nor sent after rackSentNs (tail
+    // timer), and the outage left no later ACK to cover them: no repair, ever.
+    let clock = ManualClock()
+    let group = RateGroup(clock)
+    let f = Fixture(1, clock, group, 40000us)
+    clock.Now <- clock.Now + 40_000_000L
+    f.Open()
+    group.Add(f.Path :> IRateMember)
+    let ip = f.Path :> IPath
+    ip.Backlog <- 100
+    let starts = List<uint32>()
+    let mutable frame = Span<byte>.Empty
+    for _ in 1 .. 10 do
+        clock.Now <- clock.Now + 1_000_000L
+        while starts.Count < 10 && ip.TryBeginFrame(&frame) do
+            frame.Fill 0x55uy
+            ip.CommitFrame()
+            starts.Add (parse f.Out.Packets.[f.Out.Packets.Count - 1]).Seq
+    Assert.True(starts.Count >= 6, sprintf "%d frames" starts.Count)
+    let h = starts.Count / 2
+    let l = uint32 L
+    let be (v: uint32) = [| byte (v >>> 24); byte (v >>> 16); byte (v >>> 8); byte v |]
+    let ack (cum: uint32) (sack: byte[]) =
+        let struct (s, p) = clientSegment f.Data0 cum Packet.Ack sack ReadOnlySpan.Empty
+        f.Path.OnSegment(s, Span p, clock.Now)
+    // 40 ms: the first half but 0 SACKed: RACK repairs 0.
+    clock.Now <- clock.Now + 30_000_000L
+    ack starts.[0] (Array.concat [ [| 1uy; 1uy; 5uy; 10uy |]; be starts.[1]; be (starts.[h - 1] + l) ])
+    // 80 ms: the repair of 0 arrives, the first half acked; the rest was lost and the outage begins.
+    clock.Now <- clock.Now + 40_000_000L
+    ack (starts.[h - 1] + l) [||]
+    let before = f.Out.Packets.Count
+    for _ in 1 .. 2000 do
+        clock.Now <- clock.Now + 1_000_000L
+        f.Path.Service clock.Now
+        group.Service clock.Now
+    let resent = HashSet<uint32>()
+    for i in before .. f.Out.Packets.Count - 1 do
+        let q = parse f.Out.Packets.[i]
+        if q.PayloadLength > 0 then resent.Add q.Seq |> ignore
+    Assert.True(resent.Contains starts.[h], sprintf "re-sent %A; %s" (Seq.toList resent) (f.Path.Describe()))

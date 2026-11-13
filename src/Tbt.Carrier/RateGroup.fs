@@ -14,6 +14,8 @@ type IRateMember =
     abstract Inflight: int
     abstract Delivered: int64
     abstract MinRttNs: int64
+    /// Last time the member delivered anything (cumulative ACK or SACK).
+    abstract LastDeliveredNs: int64
 
 [<Sealed>]
 type RateGroup(clock: IClock) =
@@ -78,6 +80,14 @@ type RateGroup(clock: IClock) =
         sampleDelivered <- delivered ()
         sampleSent <- sentBytes
         lastSendRate <- Double.MaxValue
+
+    /// True when some member delivered at or after t: a stall on every path at once is an
+    /// outage, not one dead path, and must not demote them all.
+    member _.AnyDeliveredSince(t: int64) =
+        let mutable any = false
+        for i in 0 .. members.Count - 1 do
+            if members.[i].LastDeliveredNs >= t then any <- true
+        any
 
     member _.Add(m: IRateMember) =
         members.Add m
