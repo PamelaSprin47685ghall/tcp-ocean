@@ -543,7 +543,7 @@ type TunPath(output: ITunOutput, counters: TunCounters, localIp: uint32, localPo
         deliveredNs <- now
         lastDeliveredSentNs <- s.SentNs
         if s.Retx > 0 then heldBehindRepair <- true
-        if s.Retx = 0 && not heldBehindRepair then
+        if s.Retx = 0 && not heldBehindRepair && now > s.SentNs then
             let rtt = float (now - s.SentNs)
             srttNs <- if srttNs = 0.0 then rtt else 0.875 * srttNs + 0.125 * rtt
             let r = now - s.SentNs
@@ -819,6 +819,7 @@ type TunPath(output: ITunOutput, counters: TunCounters, localIp: uint32, localPo
         let mss = peerMss
         let mutable at' = 0
         let now = clock.NowNs()
+        catchUp now
         while at' < data.Length do
             let n = min mss (data.Length - at')
             data.Slice(at', n).CopyTo(Span(output.Scratch, Packet.DataOffset, n))
@@ -1006,6 +1007,10 @@ type TunPath(output: ITunOutput, counters: TunCounters, localIp: uint32, localPo
         member _.Receive(_) = ()
 
         member _.TryBeginFrame(frame) =
+            // A send stamps the ring with now, so the stall shift must happen first: a frame
+            // sent after a pause and shifted later would carry a future send time, give a
+            // negative RTT and, through the group's min RTT, a negative cwnd (no sends ever).
+            catchUp (clock.NowNs())
             if state <> TunState.Established || not attached || frameLength > peerMss then false
             // Waiting repairs go before new frames.
             elif repairQ.Count > 0 && (drainRepairs (clock.NowNs()); repairQ.Count > 0) then false

@@ -64,7 +64,8 @@ type RateGroup(clock: IClock) =
 
     let minRtt () =
         let mutable r = Int64.MaxValue
-        for m in members do r <- min r m.MinRttNs
+        // A member without a valid sample (0 or less) must not drive the group's cwnd to 0.
+        for m in members do if m.MinRttNs > 0L then r <- min r m.MinRttNs
         r
 
     let inflight () =
