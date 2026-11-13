@@ -34,6 +34,12 @@ module SocketTuning =
     [<Literal>]
     let NotSentLimit = 16384
 
+    /// Per-path receive window (spec ch. 9: TCP_WINDOW_CLAMP 600 000 B, 3 x BDP of the planning
+    /// path). It also bounds what the peer may have in flight on one path, so a queue at the
+    /// bottleneck cannot grow past it.
+    [<Literal>]
+    let WindowClamp = 600000
+
     let probe () : INotSentProbe =
         if OperatingSystem.IsLinux() then LinuxNotSentProbe() else NoNotSentProbe()
 
@@ -42,6 +48,9 @@ module SocketTuning =
         socket.NoDelay <- true
         if OperatingSystem.IsLinux() then
             try socket.SetRawSocketOption(6, 25, ReadOnlySpan(BitConverter.GetBytes NotSentLimit))
+            with :? SocketException -> ()
+            // TCP_WINDOW_CLAMP; autotuning stays on (no SO_RCVBUF, spec 3.6).
+            try socket.SetRawSocketOption(6, 10, ReadOnlySpan(BitConverter.GetBytes WindowClamp))
             with :? SocketException -> ()
 
     /// Settings for a local flow socket.
