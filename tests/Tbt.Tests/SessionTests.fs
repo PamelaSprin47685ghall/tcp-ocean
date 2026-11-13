@@ -737,6 +737,53 @@ let ``a NACK does not enqueue repairs until the original's delivery deadline has
     Assert.True(c.Tx.RepairWaiting, "deadline passed; a repair round is due")
 
 [<Fact>]
+let ``a NACK repairs only the prefix of the range whose originals are due`` () =
+    let config = { SessionConfig.defaults with Credit = { CreditPolicy.defaults with Enabled = false } }
+    let pair = Pair(config, 1, 0.0, 4)
+    let c = pair.Client
+    let clock = pair.Clock
+    c.Tx.InitialGrant 10_000UL
+    let mutable slot = -1
+    Assert.True(c.TryOpenFlow(&slot))
+    let chunk = Array.create 65536 7uy
+    let sealUntil (n: uint64) =
+        let mutable guard = 64
+        while c.Tx.Head < n && guard > 0 do
+            pair.Feed(c, slot, ReadOnlySpan chunk, false) |> ignore
+            c.Tx.Flush()
+            guard <- guard - 1
+        Assert.True(c.Tx.Head >= n, sprintf "head %d want %d" c.Tx.Head n)
+    sealUntil 2UL
+    let earlySealed = clock.Now
+    clock.Now <- earlySealed + 400_000_000L
+    // One early step left outstanding so the NACK range starts at a due
+    // frontier; a first flush may already have sealed many steps.
+    let tLo = c.Tx.Head - 1UL
+    c.Tx.OnPeerAck(tLo, 100us)
+    Assert.True(c.Tx.MinRttNs <> Int64.MaxValue)
+    let wait = c.Tx.RepairWaitNs
+    // Seal the tail 1 ms before the frontier's deadline so only tLo is due.
+    clock.Now <- earlySealed + int64 wait - 1_000_000L
+    sealUntil (c.Tx.Head + 4UL)
+    let span = int (c.Tx.Head - tLo)
+    Assert.True(span >= 4, sprintf "span %d" span)
+    clock.Now <- earlySealed + int64 wait
+    c.Tx.OnNack(tLo, span, 30)
+    Assert.True(c.Tx.RepairWaiting, "due prefix should repair")
+    let frame = Array.zeroCreate<byte> c.FrameLength
+    let before = c.Tx.BoostersSent
+    let mutable n = 0
+    while c.Tx.RepairWaiting && n < 64 do
+        Assert.True(c.Tx.TryRenderNext(Span frame, 0us, 1UL, 100us, 0us, true))
+        n <- n + 1
+    let sent = c.Tx.BoostersSent - before
+    // Full-span, full-deficit would enqueue ceil((30+2)/(1-0.05)) ≈ 34 BOOSTERs.
+    // A due prefix of one (or a few) early steps gets a scaled deficit and a
+    // much smaller batch.
+    Assert.True(sent >= 1L && sent <= 16L, sprintf "boosters %d span %d wait %g" sent span wait)
+    Assert.False(c.Tx.RepairWaiting)
+
+[<Fact>]
 let ``an ack that arrives sooner than minRTT after a BOOSTER counts as a spurious repair`` () =
     let config = { SessionConfig.defaults with Credit = { CreditPolicy.defaults with Enabled = false } }
     let pair = Pair(config, 1, 0.0, 4)

@@ -287,35 +287,45 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
         let now = clock.NowNs()
         let span = int (min (uint64 (min span CodeGraph.MaxBoosterSpan)) (encoder.Head - min tLo encoder.Head))
         if tLo >= peerAck && span >= 1 && deficit >= 1 && encoder.StepUsed tLo > 0 then
-            // Per-step expected delivery: do not repair until the original
-            // first copy has been allowed its deadline. A NACK for in-flight
-            // steps (decoder lag, 20 ms / +66-step rule) would otherwise
-            // enqueue a BOOSTER storm whose originals later arrive.
-            let sealAt = sealNs.[int (tLo % uint64 sealNs.Length)]
-            let originalDue = float (now - sealAt) >= this.RepairWaitNs
-            if not originalDue then ()
+            // Only the prefix of the NACK range whose first copy has been
+            // allowed its deadline is eligible. Gating on tLo alone and then
+            // repairing the whole span treats just-sealed steps of a startup
+            // burst as due (0% first-down: 59→1293 BOOSTERs in 4 s, unique
+            // send stalled). A 20 ms / +66 decoder NACK starts at the
+            // frontier and routinely covers those fresh steps.
+            let wait = this.RepairWaitNs
+            let mutable dueSpan = 0
+            let mutable blocked = false
+            while dueSpan < span && not blocked do
+                let sealAt = sealNs.[int ((tLo + uint64 dueSpan) % uint64 sealNs.Length)]
+                if sealAt <= 0L || float (now - sealAt) < wait then blocked <- true
+                else dueSpan <- dueSpan + 1
+            if dueSpan < 1 then ()
             else
-                let same = tLo = repairLo && span = repairSpan
-                if not same || deficit > repairDeficit || float (now - repairNs) >= this.RepairWaitNs then
-                    if same && deficit <= repairDeficit then repairRepeats <- repairRepeats + 1L
-                    if not same then
+                let dueDeficit = max 1 (int (ceil (float deficit * float dueSpan / float span)))
+                let same = tLo = repairLo && dueSpan = repairSpan
+                if not same || dueDeficit > repairDeficit || float (now - repairNs) >= wait then
+                    if same && dueDeficit <= repairDeficit then repairRepeats <- repairRepeats + 1L
+                    if tLo <> repairLo then
                         repairLo <- tLo
-                        repairSpan <- span
+                        repairSpan <- dueSpan
                         repairSeq <- 0
-                    repairDeficit <- deficit
+                    elif dueSpan > repairSpan then
+                        repairSpan <- dueSpan
+                    repairDeficit <- dueDeficit
                     repairNs <- now
                     // Bound the pending repair queue: a decoder lag looks like loss and would
                     // otherwise enqueue an unbounded BOOSTER storm (uplink collapse).
                     let room = max 0 (256 - repairs.Count)
-                    let n = min room (min 64 (int (ceil (float (deficit + 2) / (1.0 - min 0.9 erasure)))))
+                    let n = min room (min 64 (int (ceil (float (dueDeficit + 2) / (1.0 - min 0.9 erasure)))))
                     if room = 0 then ()
                     elif repairSeq + n <= 256 then
                         for i in 0 .. n - 1 do
                             repairs.Enqueue { Kind = CellType.Booster; Step = tLo; Index = byte (repairSeq + i)
-                                              Span = byte span; Round = byte n }
+                                              Span = byte dueSpan; Round = byte n }
                         repairSeq <- repairSeq + n
                     else
-                        for j in 0 .. span - 1 do
+                        for j in 0 .. dueSpan - 1 do
                             let t = tLo + uint64 j
                             for s in 0 .. encoder.StepUsed t - 1 do
                                 if repairs.Count < 256 then
