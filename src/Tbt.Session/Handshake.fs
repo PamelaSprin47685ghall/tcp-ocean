@@ -143,6 +143,10 @@ type JoinOffer(kPath: byte[], entropy: IEntropy, sessionId: Guid, symbol: int, c
     member _.Frame = wire
     member _.PathId = pathId
 
+    /// Open a JOIN_ACK for this request whatever its status (ValueNone: not ours or broken).
+    member _.TryOpen(frame: ReadOnlySpan<byte>) =
+        Join.tryOpenAck (ReadOnlySpan kPath) (ReadOnlySpan nonce) (ReadOnlySpan jth) frame
+
     /// Check JOIN_ACK field by field (spec 6.5.7.3). ValueNone closes the new path.
     member _.TryAccept(frame: ReadOnlySpan<byte>) =
         match Join.tryOpenAck (ReadOnlySpan kPath) (ReadOnlySpan nonce) (ReadOnlySpan jth) frame with
@@ -168,3 +172,111 @@ let joinAck (kPath: byte[]) (entropy: IEntropy) (sessionId: Guid) (symbol: int) 
           Caps = caps; MssClient = r.MssClient; MssServer = uint16 mssServer }
     Join.buildAck (ReadOnlySpan kPath) (Bootstrap.content(joinFrame).Slice(0, 16)) (ReadOnlySpan(Join.transcriptHash joinFrame))
                   ack (ReadOnlySpan(random entropy 968))
+
+/// What the server does with one authenticated JOIN (spec 6.5.7.4).
+type JoinVerdict =
+    /// Close the new connection; no bytes.
+    | Close = 0
+    /// New decision ACCEPT: send Ack, then register the path (replacing its old incarnation).
+    | Accept = 1
+    /// New decision with a refusal status: send Ack, then close the new connection.
+    | Reject = 2
+    /// The same request again: send the frozen Ack bytes of its decision, then close; never activate.
+    | Replay = 3
+
+[<Struct>]
+type JoinDecision =
+    { Verdict: JoinVerdict
+      /// The frozen JOIN_ACK frame (empty for Close).
+      Ack: byte[]
+      Request: Join.JoinRequest }
+
+/// Server admission of path joins for one session (spec 6.5.7.4); single owner (the server loop).
+/// Per path: highest_seen and active incarnation until the session ends. Each decision is
+/// recorded with its JTH and nonce and its JOIN_ACK is rendered exactly once; a repeat of the
+/// same request only replays those bytes (a re-render would put new padding under the same key
+/// and zero nonce: AEAD nonce reuse). Bounded: 1024 decision digests, 288 frozen ACKs kept for
+/// FrozenNs (a proxy for the ACK's TCP delivery); when no slot is free, new admissions are refused without any state change, and
+/// nothing that still holds a frozen ACK is forgotten.
+[<Sealed>]
+type JoinAdmission(kPath: byte[], entropy: IEntropy, clock: IClock, sessionId: Guid, symbol: int, caps: uint16,
+                   maxPaths: int, mssServer: int, idLimit: int) =
+    static let pathLimit = 288
+    static let recordLimit = 1024
+    static let frozenLimit = 288
+    let highest = Array.zeroCreate<uint32> pathLimit
+    let active = Array.zeroCreate<uint32> pathLimit
+    let records = Collections.Generic.Dictionary<string, struct (int64 * byte[])>()
+    let nonces = Collections.Generic.Dictionary<string, string>()
+    let order = Collections.Generic.Queue<struct (string * string)>()
+    let mutable frozen = 0
+    let mutable refused = 0L
+
+    /// How long a frozen JOIN_ACK is kept for replay (bounds the original TCP delivery).
+    static member FrozenNs = 30_000_000_000L
+
+    member _.Highest(path: uint16) = highest.[int path]
+    member _.Active(path: uint16) = active.[int path]
+    /// New admissions refused because the decision cache had no free slot.
+    member _.Refused = refused
+    member _.FrozenCount = frozen
+    member _.Records = records.Count
+
+    member private _.Expire(now: int64) =
+        // Frozen bytes past their time keep only the digest (spec 6.5.7.4 rule 8).
+        if frozen > 0 then
+            for struct (jth, _) in order do
+                match records.TryGetValue jth with
+                | true, struct (at, ack) when ack.Length > 0 && now - at >= JoinAdmission.FrozenNs ->
+                    records.[jth] <- struct (at, Array.Empty<byte>())
+                    frozen <- frozen - 1
+                | _ -> ()
+
+    /// Decide on an authenticated JOIN frame with request r. activePaths: paths the session
+    /// serves now; pathAlive: whether r's path id is among them; closing: the session closes.
+    member this.Decide(frame: ReadOnlySpan<byte>, r: Join.JoinRequest, activePaths: int, pathAlive: bool, closing: bool) =
+        let close = { Verdict = JoinVerdict.Close; Ack = Array.Empty<byte>(); Request = r }
+        let p = int r.PathId
+        if p >= pathLimit then close
+        else
+            let now = clock.NowNs()
+            this.Expire now
+            let jthBytes = Join.transcriptHash frame
+            let jth = Convert.ToHexString jthBytes
+            let nonce = Convert.ToHexString(Bootstrap.content(frame).Slice(0, 16))
+            match records.TryGetValue jth with
+            | true, struct (_, ack) ->
+                if ack.Length = 0 then close else { Verdict = JoinVerdict.Replay; Ack = ack; Request = r }
+            | _ ->
+                if nonces.ContainsKey nonce || r.Incarnation = 0u || r.Incarnation <= highest.[p] then close
+                else
+                    // Reserve a frozen-ACK buffer and a digest slot first (rule 3).
+                    let mutable room = frozen < frozenLimit
+                    while room && records.Count >= recordLimit do
+                        let struct (oldJth, oldNonce) = order.Peek()
+                        let struct (_, ack) = records.[oldJth]
+                        if ack.Length = 0 then
+                            order.Dequeue() |> ignore
+                            records.Remove oldJth |> ignore
+                            nonces.Remove oldNonce |> ignore
+                        else room <- false
+                    if not room then
+                        refused <- refused + 1L
+                        close
+                    else
+                        let status =
+                            // No LANE support: role 1 is invalid. idLimit: path ids this
+                            // session's tables hold (SessionConfig.MaxPaths).
+                            if r.Role <> Join.JoinRole.Bulk || p >= 256 || p >= idLimit then Join.JoinStatus.InvalidRequest
+                            elif closing then Join.JoinStatus.SessionClosing
+                            elif not pathAlive && activePaths >= maxPaths then Join.JoinStatus.Capacity
+                            else Join.JoinStatus.Accept
+                        highest.[p] <- r.Incarnation
+                        if status = Join.JoinStatus.Accept then active.[p] <- r.Incarnation
+                        let ack = joinAck kPath entropy sessionId symbol caps maxPaths frame r status mssServer
+                        records.[jth] <- struct (now, ack)
+                        nonces.[nonce] <- jth
+                        order.Enqueue(struct (jth, nonce))
+                        frozen <- frozen + 1
+                        { Verdict = (if status = Join.JoinStatus.Accept then JoinVerdict.Accept else JoinVerdict.Reject)
+                          Ack = ack; Request = r }

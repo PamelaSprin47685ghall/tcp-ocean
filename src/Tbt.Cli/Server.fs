@@ -21,9 +21,10 @@ type private Pending(link: PathLink, since: int64) =
     member val Silent = false with get, set
 
 [<Sealed>]
-type private Entry(carrier: SessionCarrier, maxPaths: int) =
+type private Entry(carrier: SessionCarrier, maxPaths: int, admission: JoinAdmission) =
     member _.Carrier = carrier
     member _.MaxPaths = maxPaths
+    member _.Admission = admission
 
 let run (o: Options) =
     let listenAt = if o.Has "listen" then ValueSome(endpoint (o.Text "listen")) else ValueNone
@@ -87,13 +88,20 @@ let run (o: Options) =
             match tryJoin s.Keys.PathKey (ReadOnlySpan frame) with
             | ValueSome r ->
                 done' <- true
-                if int r.PathId < e.MaxPaths && not (e.Carrier.HasPath r.PathId) then
-                    let ack = joinAck s.Keys.PathKey entropy s.Keys.SessionId s.SymbolSize s.Caps e.MaxPaths (ReadOnlySpan frame) r
-                                      Tbt.Crypto.Join.JoinStatus.Accept mss
+                let c = e.Carrier
+                let d = e.Admission.Decide(ReadOnlySpan frame, r, c.Paths.Count, c.HasPath r.PathId, s.CloseState <> CloseState.Open)
+                match d.Verdict with
+                | JoinVerdict.Accept ->
                     link.PathId <- r.PathId
-                    reply link ack
-                    e.Carrier.AddPath link
-                else link.Close()
+                    reply link d.Ack
+                    // A higher incarnation replaces the path (spec 6.5.7.4 rule 6).
+                    if c.HasPath r.PathId then c.RemovePath r.PathId
+                    c.AddPath link
+                | JoinVerdict.Reject
+                | JoinVerdict.Replay ->
+                    reply link d.Ack
+                    link.Close()
+                | _ -> link.Close()
             | ValueNone -> ()
             i <- i + 1
         done'
@@ -109,7 +117,11 @@ let run (o: Options) =
             link.PathId <- 0us
             reply link a.Reply
             carrier.AddPath link
-            sessions.Add(Entry(carrier, min maxPaths (int a.Hello.MaxPaths)))
+            let paths = min maxPaths (int a.Hello.MaxPaths)
+            let admission =
+                JoinAdmission(a.Params.Keys.PathKey, entropy, clock, a.Params.Keys.SessionId, a.Params.Symbol, a.Params.Caps,
+                              paths, mss, config.MaxPaths)
+            sessions.Add(Entry(carrier, paths, admission))
             log ("session " + a.Params.Keys.SessionId.ToString() + " up, S=" + string a.Params.Symbol)
             true
         | ValueNone -> tryJoinAny link frame
