@@ -6,7 +6,6 @@
 namespace Tbt.Carrier
 
 open System
-open System.Collections.Generic
 open Tbt.Contracts
 
 /// What the group reads from one member path.
@@ -24,7 +23,10 @@ type IRateMember =
 
 [<Sealed>]
 type RateGroup(clock: IClock) =
-    let members = List<IRateMember>()
+    // Compact array, scanned by index: a F#/List enumerator was 10% of 256-path CPU
+    // (MoveNext) on top of the walk itself. Service stays one O(n) pass per round.
+    let mutable members = Array.zeroCreate<IRateMember> 16
+    let mutable memberCount = 0
     let filter = Array.zeroCreate<float> 10
     let mutable slot = 0
     let mutable bw = 0.0
@@ -81,7 +83,8 @@ type RateGroup(clock: IClock) =
         let mutable d = 0L
         let mutable c = 0L
         let mutable last = Int64.MinValue / 2L
-        for m in members do
+        for i in 0 .. memberCount - 1 do
+            let m = members.[i]
             // A negative member value (only a clock-jump artefact) must not drive the group cwnd below 0.
             if m.MinRttNs >= 0L then r <- min r m.MinRttNs
             n <- n + m.Inflight
@@ -128,12 +131,23 @@ type RateGroup(clock: IClock) =
     member _.LastOutageNs = outageNs
 
     member _.Add(m: IRateMember) =
-        members.Add m
+        if memberCount = members.Length then
+            let grown = Array.zeroCreate (members.Length * 2)
+            Array.Copy(members, grown, memberCount)
+            members <- grown
+        members.[memberCount] <- m
+        memberCount <- memberCount + 1
         scan ()
         restartSample (clock.NowNs())
 
     member _.Remove(m: IRateMember) =
-        members.Remove m |> ignore
+        let mutable i = 0
+        while i < memberCount && not (LanguagePrimitives.PhysicalEquality members.[i] m) do
+            i <- i + 1
+        if i < memberCount then
+            members.[i] <- members.[memberCount - 1]
+            members.[memberCount - 1] <- Unchecked.defaultof<_>
+            memberCount <- memberCount - 1
         scan ()
         restartSample (clock.NowNs())
 
@@ -141,7 +155,7 @@ type RateGroup(clock: IClock) =
         with get () = protectRecovery
         and set v = protectRecovery <- v
 
-    member _.Count = members.Count
+    member _.Count = memberCount
     /// Bytes per ns; 0 before the first sample.
     member _.Bandwidth = bw
     member _.Ready = bw > 0.0 && minRtt () <> Int64.MaxValue
@@ -211,7 +225,7 @@ type RateGroup(clock: IClock) =
         if cycle = 1 && not startup && not draining && rtt <> Int64.MaxValue
            && inflight () <= int (bw * float rtt) then
             cycle <- 2
-        if rtt <> Int64.MaxValue && members.Count > 0 then
+        if rtt <> Int64.MaxValue && memberCount > 0 then
             if sampleNs = 0L then restartSample now
             elif now - sampleNs >= max rtt 5_000_000L && delivered () = sampleDelivered then
                 // Nothing delivered on any path for a whole round: an outage, not a rate. A zero
@@ -224,8 +238,9 @@ type RateGroup(clock: IClock) =
                 // Shared only when the paths that wait are more than one (or the only one): a
                 // single dead path while the others have nothing in flight is not an outage.
                 let mutable waiting = 0
-                for m in members do if m.Inflight > 0 then waiting <- waiting + 1
-                if waiting >= min 2 members.Count then outageNs <- now
+                for i in 0 .. memberCount - 1 do
+                    if members.[i].Inflight > 0 then waiting <- waiting + 1
+                if waiting >= min 2 memberCount then outageNs <- now
             elif now - sampleNs >= max rtt 5_000_000L then
                 let d = delivered ()
                 let cp = copyEstimate ()
@@ -277,7 +292,7 @@ type RateGroup(clock: IClock) =
                     sampleCopies <- cp
 
     member _.Describe() =
-        "group paths=" + string members.Count + " bw_mbit=" + (bw * 8000.0).ToString("F1")
+        "group paths=" + string memberCount + " bw_mbit=" + (bw * 8000.0).ToString("F1")
         + " goodput_mbit=" + (goodput * 8000.0).ToString("F1") + " copy_est_kib=" + string (copyEstimate () / 1024L)
         + " inflight=" + string (inflight ()) + " repair_kib=" + string (repairBytes / 1024L) + " phase="
         + (if startup then "startup" elif draining then "drain" else "probe" + string cycle)
