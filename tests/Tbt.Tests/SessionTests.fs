@@ -1256,3 +1256,38 @@ let ``allowRepair false sends unsent originals while a BOOSTER waits`` () =
     // the primitive writeBatch uses for an admitted unpaced or paced repair slot.
     Assert.True(c.Tx.TryRenderNext(Span frame, 0us, 1UL, 100us, 0us, allowRepair=true))
     Assert.True(c.Tx.BoostersSent > boost0)
+
+
+[<Fact>]
+let ``UniqueArrived counts cells of a seen-but-unacked later step`` () =
+    let config = { SessionConfig.defaults with Credit = { CreditPolicy.defaults with Enabled = false } }
+    let pair = Pair(config, 1, 0.0, 4)
+    let c = pair.Client
+    c.Tx.InitialGrant 10_000UL
+    let mutable slot = -1
+    Assert.True(c.TryOpenFlow(&slot))
+    let chunk = Array.create 65536 7uy
+    let mutable guard = 64
+    while c.Tx.Head < 5UL && guard > 0 do
+        pair.Feed(c, slot, ReadOnlySpan chunk, false) |> ignore
+        c.Tx.Flush()
+        guard <- guard - 1
+    Assert.True(c.Tx.Head >= 5UL, sprintf "head %d" c.Tx.Head)
+    // Drain some originals so uniqueCells of the later steps are those already sealed.
+    let frame = Array.zeroCreate<byte> c.FrameLength
+    let mutable n = 0
+    while c.Tx.Queued > 0 && n < 4096 do
+        Assert.True(c.Tx.TryRenderNext(Span frame, 0us, 1UL, 100us, 0us, allowRepair=false))
+        n <- n + 1
+    Assert.Equal(0L, c.Tx.UniqueAcked)
+    Assert.Equal(0L, c.Tx.UniqueArrived)
+    c.Tx.OnPeerAck(1UL, 100us)
+    let afterAck = c.Tx.UniqueAcked
+    Assert.True(afterAck > 0L, "custody of step 0 should count")
+    Assert.Equal(afterAck, c.Tx.UniqueArrived)
+    let seen = c.Tx.Head - 1UL
+    Assert.True(seen > 1UL, sprintf "seen %d" seen)
+    c.Tx.OnPeerSeen seen
+    Assert.True(c.Tx.UniqueArrived > afterAck,
+        sprintf "t_hi %d must add arrival cells ahead of peer_ack; arrived %d acked %d" seen c.Tx.UniqueArrived afterAck)
+    Assert.Equal(afterAck, c.Tx.UniqueAcked)

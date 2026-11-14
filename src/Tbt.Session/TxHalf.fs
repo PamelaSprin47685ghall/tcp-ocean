@@ -69,6 +69,9 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
     let uniqueCells: int[] = Array.zeroCreate capacity
     /// Cumulative first-copy cells the peer has in custody (sum of uniqueCells over acked steps).
     let mutable uniqueAcked = 0L
+    /// Unique cells in custody plus those of steps the peer has reported seeing (t_hi)
+    /// that are still ahead of peer_ack. Client uplink rate samples use this.
+    let mutable uniqueArrived = 0L
     /// Repair (spec 5.8): BOOSTER cells go before all other cells.
     let repairs = Queue<Candidate>(256)
     /// Interactive steps (spec 16.3 CR-1): one small session-level reserve, sent before the
@@ -132,6 +135,17 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
 
     let index (t: uint64) = int (t &&& uint64 (capacity - 1))
 
+    let refreshUniqueArrived () =
+        let mutable n = uniqueAcked
+        if peerSeenHi >= peerAck && encoder.Head > 0UL then
+            let last = min peerSeenHi (encoder.Head - 1UL)
+            let mutable step = peerAck
+            while step <= last do
+                n <- n + int64 uniqueCells.[index step]
+                step <- step + 1UL
+        uniqueArrived <- n
+
+
     let seal (k: int) (small: bool) =
         let target = if fillingUrgent then urgent else queue
         let wasUrgent = fillingUrgent
@@ -189,6 +203,12 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
     member _.CellsSent = cellsSent
     /// First-copy DATA/PARITY cells the peer has in custody.
     member _.UniqueAcked = uniqueAcked
+    /// Custody cells plus first-copy cells of steps the peer has reported seeing
+    /// (WIN_ACK t_hi) even if a hole still sits at the frontier. An in-order
+    /// high-water: steps between peer_ack and t_hi are counted as arrived.
+    /// Client uplink RateGroup samples use this so pace_bw can track the
+    /// bottleneck before cumulative peer_ack catches up.
+    member _.UniqueArrived = uniqueArrived
     member _.Erasure = erasure
 
     /// True when a new bulk source can go into the current step now (window and peer grant).
@@ -315,6 +335,7 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
                         if sample < minCurNs then minCurNs <- sample
                 peerAck <- ack
                 if ack > 0UL then peerSeenHi <- max peerSeenHi (ack - 1UL)
+                refreshUniqueArrived ()
                 if ack > CodeGraph.HistorySpan then encoder.Release(ack - CodeGraph.HistorySpan)
             // The grant is relative to THIS report's own ack: a late (reordered) report with an
             // older ack must not be applied to a newer peerAck (that would amplify the grant).
@@ -368,7 +389,9 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
     /// peer_ack alone cannot show that a later step arrived while a hole sits
     /// at the frontier.
     member _.OnPeerSeen(thi: uint64) =
-        if thi > peerSeenHi then peerSeenHi <- thi
+        if thi > peerSeenHi then
+            peerSeenHi <- thi
+            refreshUniqueArrived ()
 
     /// Deadline for step t: if a later-sealed step has been seen, wait until
     /// that step's seal + minRTT + reo_wnd (it has already been acknowledged,

@@ -7,10 +7,15 @@ open System.Collections.Generic
 open Tbt.Contracts
 open Tbt.Session
 
-/// One session-level member of the client uplink RateGroup. Delivery is session
-/// custody (peer_ack), not TCP ACK: the kernel can ACK while the server decoder lags.
+/// One session-level member of the client uplink RateGroup. Delivery for rate
+/// samples is arrival evidence (WIN_ACK t_hi / UniqueArrived), not only
+/// cumulative peer_ack: a later-seen step means the bottleneck already carried
+/// those cells even if a hole still sits at the frontier. Inflight stays
+/// custody-based so a hole cannot shrink the 1.25 BDP cap. Not kernel TCP ACK:
+/// the kernel can ACK while the server decoder lags.
 type private SessionRateMember(session: Session, frameOf: unit -> int, uniqueOut: unit -> int64, wireOut: unit -> int64) =
     let mutable lastAck = 0UL
+    let mutable lastSeen = 0UL
     let mutable lastNs = 0L
     interface IRateMember with
         // Unique payload still awaiting custody, not every BOOSTER copy: counting copies
@@ -18,7 +23,7 @@ type private SessionRateMember(session: Session, frameOf: unit -> int, uniqueOut
         member _.Inflight =
             let fl = int64 (frameOf())
             int (max 0L (uniqueOut() - session.Tx.UniqueAcked * fl))
-        member _.Delivered = session.Tx.UniqueAcked * int64 (frameOf())
+        member _.Delivered = session.Tx.UniqueArrived * int64 (frameOf())
         member _.CopyEstimate = max 0L (wireOut() - uniqueOut())
         // RateGroup.Service will not take a bw sample while minRTT is unknown.
         // Karn can skip every seal-to-custody sample when BOOSTERs start before
@@ -28,8 +33,9 @@ type private SessionRateMember(session: Session, frameOf: unit -> int, uniqueOut
             let m = session.Tx.MinRttNs
             if m <> System.Int64.MaxValue then m else max 1L (int64 session.Tx.SrttNs)
         member _.LastDeliveredNs =
-            if session.Tx.PeerAck > lastAck then
+            if session.Tx.PeerAck > lastAck || session.Tx.PeerSeenHi > lastSeen then
                 lastAck <- session.Tx.PeerAck
+                lastSeen <- session.Tx.PeerSeenHi
                 lastNs <- session.Clock.NowNs()
             lastNs
 
