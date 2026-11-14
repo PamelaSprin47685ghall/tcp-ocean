@@ -13,6 +13,14 @@
 #   SKIP_REF=1 (skip plain-TCP iperf/ping baselines), PING_COUNT (default 200),
 #   HANDSHAKE_S (default 10; raise for large path counts at long RTT),
 #   JOIN_CONCURRENCY (client --join-concurrency; default: the client's own),
+#   UPLINK_PACE=1 (client shared uplink RateGroup; default off). Independent of TUPLE_MBIT
+#   (client --tuple-mbit; default 0=off) and of the wanem per-tuple shaper (PROFILE=rtt400
+#   sets wanem tuple_mbit=4 in WANEM_EXTRA; that is the network model, not the client pacer).
+#   WANEM_TUPLE_MODE=shaper|policer (default shaper), WANEM_LOSS_POINT=before|after (default
+#   before). Either key in WANEM_EXTRA wins over these env defaults.
+#   HOST_PAUSE_DISCARD=1 marks a run invalid when dmesg shows a host VM fork or virtio_balloon
+#   "Out of puff" during the run window (count and evidence are always kept in host-pause.txt).
+#   Default is 0: record only. Event-loop stall alone is never a discard reason.
 #   PAUSE=stop_s/every_s (e.g. 5/12: SIGSTOP server and client together for stop_s every every_s
 #   while a session is up, like a suspended machine; both clocks jump. Log: pause.log.
 #   docs/cases/clock-jump-cwnd.md).
@@ -36,15 +44,19 @@ fi
 window=${WINDOW:-1024}
 window_clamp=${WINDOW_CLAMP:-600000}
 max_paths=${MAX_PATHS:-64}
-# Per-5-tuple cap on the client uplink pacer (0 = off; rtt400 uses 4). Do not set this
-# on the 20 ms / 200 Mbit matrix: a default 4 Mbit/path cap would destroy it.
+# Per-5-tuple cap on the *client* uplink pacer (0 = off). Independent of UPLINK_PACE
+# and of wanem's own tuple_mbit (the network model). Do not set this on the 20 ms /
+# 200 Mbit matrix: a default 4 Mbit/path cap would destroy it.
 tuple_mbit=${TUPLE_MBIT:-0}
-# Client uplink RateGroup is off unless UPLINK_PACE=1. The rtt400 4 Mbit/path
-# cap only applies when that pacer is on.
+# Client shared uplink RateGroup is off unless UPLINK_PACE=1. This does not turn on
+# the client's --tuple-mbit, even under PROFILE=rtt400.
 uplink_pace=${UPLINK_PACE:-0}
 # New per-step / evidence repair scheduler (default off = main OnNack). Both sides.
 new_repair=${NEW_REPAIR:-0}
-if [[ $uplink_pace != 0 && $profile == rtt400 && $tuple_mbit == 0 ]]; then tuple_mbit=4; fi
+# wanem tuple discipline and where iid/GE/outage is applied. WANEM_EXTRA keys win.
+wanem_tuple_mode=${WANEM_TUPLE_MODE:-shaper}
+wanem_loss_point=${WANEM_LOSS_POINT:-before}
+host_pause_discard=${HOST_PAUSE_DISCARD:-0}
 seed=${SEED:-7}
 ping_count=${PING_COUNT:-200}
 handshake_s=${HANDSHAKE_S:-10}
@@ -109,7 +121,12 @@ commit=$(git -C "$repo" rev-parse --short HEAD)
 [[ -n $(git -C "$repo" status --porcelain) ]] && commit="$commit-dirty"
 work=$(mktemp -d /tmp/tbtun-e2e.XXXXXX)
 stamp() { echo "$*" | tee -a "$work/stamp.txt"; }
-stamp "stamp: commit=$commit owd_ms=$owd rate_mbit=$rate loss=$loss paths=$paths window=$window window_clamp=$window_clamp seed=$seed server_max_paths=$max_paths seconds=$seconds carrier=$carrier profile=${profile:-none}"
+run_started_s=$(date +%s)
+run_started_iso=$(date --iso-8601=seconds)
+# Host dmesg snapshot at the start of the window (best-effort; never fatal).
+{ dmesg -T 2>/dev/null || sudo dmesg -T 2>/dev/null || true; } > "$work/dmesg-start.txt" || true
+stamp "stamp: script_commit=$commit owd_ms=$owd rate_mbit=$rate loss=$loss paths=$paths window=$window window_clamp=$window_clamp seed=$seed server_max_paths=$max_paths seconds=$seconds carrier=$carrier profile=${profile:-none}"
+stamp "run_window_start: unix=$run_started_s iso=$run_started_iso tz=$(date +%Z) host_pause_discard=$host_pause_discard (discard only on pre-declared host fork/balloon; never on event-loop stall alone)"
 if (( paths > max_paths )); then
     echo "warning: requested paths=$paths exceeds server --max-paths=$max_paths (default 64); handshake will negotiate at most $max_paths, and the run will fail the negotiated==requested check. Set MAX_PATHS."
 fi
@@ -135,27 +152,92 @@ stop_pause() {
     for exe in "$work/aot/tbtun" "$work/jit/tbtun"; do pids_of "$exe" | xargs -r sudo kill -CONT 2>/dev/null || true; done
 }
 cleanup() {
+    local rc=$?
     stop_pause
     for exe in "$work/aot/tbtun" "$work/jit/tbtun"; do pids_of "$exe" | xargs -r sudo kill 2>/dev/null || true; done
     # Do not kill by the fixed namespace names. netns.sh down verifies ownership, then
     # signals leftover processes in the recorded namespaces only, then deletes them.
-    sudo TBTUN_NETNS_LOCK_HELD=1 "$here/netns.sh" down "$work"
+    # wanem is SIGTERM'd here (and waits), so wanem.stats is the final write-accounting flush.
+    if [[ -n ${work:-} && -d $work ]]; then
+        sudo TBTUN_NETNS_LOCK_HELD=1 "$here/netns.sh" down "$work" || true
+        finalize_stamp "$rc"
+    fi
+}
+# After wanem has flushed, record host-pause evidence, conservation, and the closing stamp.
+# Event-loop stall is never a discard reason. A pre-declared host-pause discard upgrades
+# a passing run to exit 3 (invalid), without erasing the logs.
+finalize_stamp() {
+    local rc=${1:-0}
+    [[ -n ${work:-} && -d $work ]] || return 0
+    [[ -f $work/stamp-finalized ]] && return 0
+    { dmesg -T 2>/dev/null || sudo dmesg -T 2>/dev/null || true; } > "$work/dmesg-end.txt" || true
+    if [[ -f $work/wanem.stats ]]; then
+        echo "wanem: $(tr '\n' ' ' < "$work/wanem.stats")"
+    fi
+    python3 "$here/stamp_end.py" "$work" "${run_started_s:-0}" "${host_pause_discard:-0}" | tee -a "$work/stamp.txt"
+    : "${status:=$rc}"
+    # A bare "exit 1" or set -e failure must not be stamped or re-exited as success.
+    if (( rc != 0 && status == 0 )); then status=$rc; fi
+    if [[ -f $work/run-invalid ]]; then
+        stamp "run_valid=no discarded=host_pause (pre-declared HOST_PAUSE_DISCARD=1; evidence in host-pause.txt)"
+        if (( status == 0 )); then status=3; fi
+    fi
+    stamp "stamp: script_commit=$commit owd_ms=$owd rate_mbit=$rate loss=$loss paths=$paths window=$window window_clamp=$window_clamp seed=$seed server_max_paths=$max_paths seconds=$seconds carrier=$carrier profile=${profile:-none} ping_count=$ping_count handshake_s=$handshake_s pause=${PAUSE:-none} join_concurrency=${JOIN_CONCURRENCY:-default} uplink_pace=$uplink_pace client_tuple_mbit=$tuple_mbit new_repair=$new_repair wanem_tuple_mode=${wanem_eff_mode:-?} wanem_loss_point=${wanem_eff_loss:-?} host_pause_discard=$host_pause_discard status=$status"
+    echo "logs: $work"
+    date +%s > "$work/stamp-finalized"
+    if (( status != rc )); then exit "$status"; fi
 }
 trap cleanup EXIT
 
 if [[ -n ${TBT_BIN:-} ]]; then
     ln -s "$(cd "$TBT_BIN/aot" && pwd)" "$work/aot"
     ln -s "$(cd "$TBT_BIN/jit" && pwd)" "$work/jit"
+    stamp "bins_from: TBT_BIN=$TBT_BIN (script_commit may differ from binary build_commit)"
 else
     dotnet publish "$repo/src/Tbt.Cli" -c Release -r linux-x64 -o "$work/aot" >"$work/publish.log"
     dotnet build "$repo/src/Tbt.Cli" -c Release -o "$work/jit" >"$work/build.log"
+    git -C "$repo" rev-parse HEAD > "$work/aot/build-commit"
+    git -C "$repo" rev-parse HEAD > "$work/jit/build-commit"
+    if [[ -n $(git -C "$repo" status --porcelain) ]]; then
+        echo dirty >> "$work/aot/build-commit"
+        echo dirty >> "$work/jit/build-commit"
+    fi
+    stamp "bins_from: built in $work from repo $repo @$commit"
 fi
+stamp_bin() {
+    local label=$1 path=$2
+    if [[ ! -e $path ]]; then
+        stamp "$label: missing path=$path sha256=missing build_commit=unknown"
+        return 0
+    fi
+    local real hash sidecar bc=unknown
+    real=$(readlink -f "$path")
+    hash=$(sha256sum "$real" | awk '{print $1}')
+    sidecar="$(dirname "$real")/build-commit"
+    if [[ -f $sidecar ]]; then
+        bc=$(tr '\n' ' ' < "$sidecar" | sed 's/[[:space:]]\+/ /g; s/[[:space:]]$//')
+    fi
+    stamp "$label: path=$real sha256=$hash build_commit=$bc"
+}
+stamp_bin server_bin "$work/aot/tbtun"
+# JIT: the assembly is tbtun.dll; the launcher (tbtun) is a host script / apphost.
+stamp_bin client_bin "$work/jit/tbtun.dll"
+stamp_bin client_apphost "$work/jit/tbtun"
 cp "$here/echo.py" "$work/echo.py"
 python3 -c 'import os; print(os.urandom(32).hex())' > "$work/psk"
 printf 'owd_ms=%s\nrate_mbit=%s\nloss=%s\nseed=%s\n' "$owd" "$rate" "$loss" "$seed" > "$work/wanem.conf"
 if [ -n "${WANEM_EXTRA:-}" ]; then printf "%b\n" "$WANEM_EXTRA" >> "$work/wanem.conf"; fi   # e.g. WANEM_EXTRA="outage_ms=300\noutage_every_s=3"
+# Defaults, only if WANEM_EXTRA did not already set the key.
+grep -q '^tuple_mode=' "$work/wanem.conf" || echo "tuple_mode=$wanem_tuple_mode" >> "$work/wanem.conf"
+grep -q '^loss_point=' "$work/wanem.conf" || echo "loss_point=$wanem_loss_point" >> "$work/wanem.conf"
+# Effective flags after composing the config (WANEM_EXTRA wins).
+wanem_eff_mode=$(awk -F= '$1=="tuple_mode"{v=$2} END{print v}' "$work/wanem.conf")
+wanem_eff_loss=$(awk -F= '$1=="loss_point"{v=$2} END{print v}' "$work/wanem.conf")
+wanem_eff_tuple=$(awk -F= '$1=="tuple_mbit"{v=$2} END{print v}' "$work/wanem.conf")
+wanem_eff_bucket=$(awk -F= '$1=="tuple_bucket_bytes"{v=$2} END{print v}' "$work/wanem.conf")
+stamp "flags: uplink_pace=$uplink_pace client_tuple_mbit=$tuple_mbit new_repair=$new_repair join_concurrency=${JOIN_CONCURRENCY:-default} window=$window window_clamp=$window_clamp max_paths=$max_paths carrier=$carrier profile=${profile:-none} wanem_tuple_mbit=${wanem_eff_tuple:-0} wanem_tuple_bucket=${wanem_eff_bucket:-default} wanem_tuple_mode=$wanem_eff_mode wanem_loss_point=$wanem_eff_loss wanem_seed=$seed wanem_version=2 host_pause_discard=$host_pause_discard skip_echo=${SKIP_ECHO:-0} skip_iperf=${SKIP_IPERF:-0} skip_ref=${SKIP_REF:-0} ping_count=$ping_count handshake_s=$handshake_s pause=${PAUSE:-none}"
 sudo TBTUN_NETNS_LOCK_HELD=1 "$here/netns.sh" up "$work"
-echo "link: owd ${owd} ms each way, ${rate} Mbit/s, segment loss ${loss}; paths ${paths}; window ${window}; window_clamp ${window_clamp}; seed ${seed}; server_max_paths ${max_paths}; server carrier ${carrier}; tuple_mbit ${tuple_mbit}"
+echo "link: owd ${owd} ms each way, ${rate} Mbit/s, segment loss ${loss}; paths ${paths}; window ${window}; window_clamp ${window_clamp}; seed ${seed}; server_max_paths ${max_paths}; server carrier ${carrier}; client_tuple_mbit ${tuple_mbit}; uplink_pace ${uplink_pace}; wanem_tuple_mode ${wanem_eff_mode}; wanem_loss_point ${wanem_eff_loss}"
 
 in_ns far python3 "$work/echo.py" serve 7000 &
 in_ns far iperf3 -s -p 5201 >/dev/null 2>&1 &
@@ -315,7 +397,7 @@ done
 report bulk; stop bulk
 fi
 
-echo "wanem: $(tr '\n' ' ' < "$work/wanem.stats")"
+# wanem.stats is printed after SIGTERM flush in finalize_stamp (via the EXIT trap).
 # Kernel TCP counters from both namespaces, while they still exist.
 if ip netns list | grep -q '^tbe_near'; then
     sudo ip netns exec tbe_near nstat -az > "$work/nstat-near.txt" 2>/dev/null || true
@@ -367,6 +449,6 @@ ss_retrans(work / "ss-near.txt", "near")
 ss_retrans(work / "ss-far.txt", "far")
 PY
 fi
-stamp "stamp: commit=$commit owd_ms=$owd rate_mbit=$rate loss=$loss paths=$paths window=$window window_clamp=$window_clamp seed=$seed server_max_paths=$max_paths seconds=$seconds carrier=$carrier profile=${profile:-none} ping_count=$ping_count handshake_s=$handshake_s pause=${PAUSE:-none} join_concurrency=${JOIN_CONCURRENCY:-default} status=$status"
-echo "logs: $work"
+# finalize_stamp (host-pause, conservation, closing stamp) runs from the EXIT trap
+# after wanem has been SIGTERM'd and has flushed write_ok / queue depth.
 exit $status

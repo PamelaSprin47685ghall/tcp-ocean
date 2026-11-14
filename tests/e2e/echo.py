@@ -10,8 +10,11 @@ for N seconds (N=0 means until the client closes).
   echo.py bulk HOST PORT up|down SECONDS   one connection, prints goodput
   echo.py pingbulk HOST PORT COUNT         ping while one bulk download runs until every
                                            probe has finished (success, timeout, or fail).
-                                           p99 is reported only over probes fully inside load.
-Exit status 0 only when every check matched, and for pingbulk when every probe succeeded."""
+                                           verdict is the on-time success rate of ALL planned
+                                           probes under proven load; P99 is secondary and uses
+                                           only those successful in-load samples.
+Exit status 0 only when every check matched, and for ping/pingbulk when every planned
+probe succeeded on time under proven load (zero in-load samples is a failure)."""
 import os, socket, struct, sys, threading, time
 
 def serve(port):
@@ -115,8 +118,15 @@ class BulkWatch:
             return self.active
 
     def add_bytes(self, n):
+        """Count transferred bytes. The first n>0 is what proves load is actually flowing."""
         with self._lock:
-            self.bytes += n
+            if n > 0:
+                self.bytes += n
+                if not self.active:
+                    now = time.perf_counter()
+                    self.active = True
+                    if self.t_start is None:
+                        self.t_start = now
 
 def ping(host, port, count, label="ping", watch=None, probe_timeout=2.0):
     """COUNT probes, 20 ms apart. If watch is set, each probe records whether bulk
@@ -171,17 +181,23 @@ def _report_ping(label, count, records):
     timeouts = sum(1 for r in records if r["status"] == "timeout")
     fails = sum(1 for r in records if r["status"] not in ("ok", "timeout"))
     loaded = [r for r in records if r["status"] == "ok" and r["inside_load"]]
+    ontime_in_load = len(loaded)
+    planned = count
+    rate = (ontime_in_load / planned) if planned else 0.0
     rtts = sorted(r["rtt_ms"] for r in loaded)
     parts = [f"{label} n={count} ok={ok} timeout={timeouts} fail={fails} denom={count}",
-             f"under_load={len(loaded)}"]
+             f"under_load={ontime_in_load}",
+             f"ontime_in_load={ontime_in_load}",
+             f"planned={planned}",
+             f"ontime_rate={rate:.3f}"]
     if rtts:
         parts.append(f"p50_ms={_pct(rtts, 0.5):.1f}")
         parts.append(f"p95_ms={_pct(rtts, 0.95):.1f}")
         parts.append(f"p99_ms={_pct(rtts, 0.99):.1f}")
         parts.append(f"max_ms={rtts[-1]:.1f}")
-        parts.append("(p99 over probes fully inside load)")
+        parts.append("(p99 secondary, over successful in-load samples)")
     else:
-        parts.append("p99_ms=na (no probe fully inside load)")
+        parts.append("p99_ms=na (no successful in-load sample)")
     print(" ".join(parts))
     log_path = os.environ.get("ECHO_PROBE_LOG")
     if log_path:
@@ -190,15 +206,15 @@ def _report_ping(label, count, records):
             for r in records:
                 f.write(f"{r['i']} {r['status']} {r['rtt_ms']:.3f} "
                         f"{int(r['bulk_at_send'])} {int(r['bulk_at_recv'])} {int(r['inside_load'])}\n")
-    return 0 if ok == count else 1
+    # Primary verdict: on-time success of every planned probe under proven load.
+    # Zero in-load samples is a failure even if every idle probe succeeded.
+    return 0 if planned and ontime_in_load == planned else 1
 
 def bulk(host, port, direction, seconds, out=None, stop=None, watch=None):
     """Transfer for `seconds`. seconds=0, or a stop event, runs until stop is set
     (or the peer closes). watch, if given, is a BulkWatch updated around the transfer."""
     with socket.create_connection((host, port), timeout=60) as c:
         t0 = time.time()
-        if watch is not None:
-            watch.set_active(True)
         try:
             if direction == "up":
                 c.sendall(b"S")
@@ -213,6 +229,8 @@ def bulk(host, port, direction, seconds, out=None, stop=None, watch=None):
                         c.sendall(block)
                     except socket.timeout:
                         continue
+                    if watch is not None:
+                        watch.add_bytes(len(block))
                 c.shutdown(socket.SHUT_WR)
                 c.settimeout(60)
                 n = struct.unpack("<Q", recv_exact(c, 8))[0]
@@ -246,7 +264,8 @@ def bulk(host, port, direction, seconds, out=None, stop=None, watch=None):
 def pingbulk(host, port, count, _seconds=None):
     """Run a downlink bulk transfer until every probe has finished. `_seconds` is
     accepted for old call sites but no longer caps the transfer: probes decide when
-    bulk stops. p99 uses only probes whose send and recv both fell inside load."""
+    bulk stops. Load is proven only after real bulk bytes flow, not at connect.
+    The verdict is the on-time success rate of every planned probe under that load."""
     stop = threading.Event()
     watch = BulkWatch()
     out = []

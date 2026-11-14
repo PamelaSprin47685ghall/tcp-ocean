@@ -66,7 +66,9 @@ class EchoChecks(unittest.TestCase):
         self.assertIn("ok=30", out)
         self.assertIn("denom=30", out)
         self.assertIn("under_load=30", out)
-        self.assertIn("(p99 over probes fully inside load)", out)
+        self.assertIn("(p99 secondary, over successful in-load samples)", out)
+        self.assertIn("ontime_in_load=30", out)
+        self.assertIn("ontime_rate=1.000", out)
         self.assertIn("bulk down", out)
 
     def test_timeout_counted_in_denominator(self):
@@ -88,16 +90,36 @@ class EchoChecks(unittest.TestCase):
         self.assertIn("fail=1", line)
         self.assertIn("denom=5", line)
         self.assertIn("under_load=2", line)
+        self.assertIn("ontime_in_load=2", line)
+        self.assertIn("planned=5", line)
         self.assertIn("p99_ms=12.0", line)
         self.assertNotIn("2000", line)
 
     def test_p99_na_when_no_in_load_sample(self):
+        # All probes can succeed off-load and still fail: no proven-load sample.
         records = [{"status": "ok", "inside_load": False, "rtt_ms": 10.0}]
         buf = io.StringIO()
         with redirect_stdout(buf):
             rc = echo._report_ping("ping-under-bulk", 1, records)
-        self.assertEqual(rc, 0)
-        self.assertIn("p99_ms=na", buf.getvalue())
+        self.assertEqual(rc, 1)
+        line = buf.getvalue()
+        self.assertIn("p99_ms=na", line)
+        self.assertIn("ontime_in_load=0", line)
+        self.assertIn("ontime_rate=0.000", line)
+
+    def test_bulk_watch_active_only_after_bytes(self):
+        w = echo.BulkWatch()
+        self.assertFalse(w.active)
+        w.add_bytes(0)
+        self.assertFalse(w.active)
+        self.assertEqual(w.bytes, 0)
+        w.add_bytes(16)
+        self.assertTrue(w.active)
+        self.assertEqual(w.bytes, 16)
+        w.set_active(False)
+        self.assertFalse(w.active)
+        self.assertIsNotNone(w.t_start)
+        self.assertIsNotNone(w.t_stop)
 
 
 if __name__ == "__main__":
