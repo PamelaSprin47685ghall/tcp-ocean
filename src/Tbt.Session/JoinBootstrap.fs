@@ -75,13 +75,15 @@ let tryRepeated (attempts: int) (backoffMs: int -> int) (sleepMs: int -> unit) (
     loop 0
 
 [<Literal>]
-let DefaultConcurrency = 8
+let DefaultConcurrency = 32
 
-/// In-flight JOIN cap used by the client (at least 1, at most 16).
-/// Default is 8: 16 concurrent JOINs to the TUN server left JOIN_ACKs
-/// unreceived until the client ReceiveTimeout (group paths oscillated 17↔1
-/// every 31 s). 8 in flight was verified on rtt400.
-let clampConcurrency (n: int) = min 16 (max 1 n)
+/// In-flight JOIN cap used by the client (at least 1, at most 64).
+/// Default is 32: at 256 paths this is about 8 waves and first 8-echo was
+/// 8.1 s, versus 27.5 s when 256 JOINs were launched unbounded (or very
+/// high). The old cap of 16 and default of 8, and the comment that blamed
+/// the TUN server for lost JOIN_ACKs at 16, were stale — this is a client
+/// scheduling limit, not a server one.
+let clampConcurrency (n: int) = min 64 (max 1 n)
 
 /// Waves needed to join `remaining` paths at this concurrency.
 let waves (remaining: int) (concurrency: int) =

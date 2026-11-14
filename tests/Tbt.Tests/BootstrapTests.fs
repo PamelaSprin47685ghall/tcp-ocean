@@ -66,15 +66,18 @@ let ``a non-path-0 exhaustion is a GaveUp value, not an exception the caller mus
     | Joined -> failwith "expected exhaustion"
 
 [<Fact>]
-let ``join waves for 256 paths at concurrency 16 is 16, and concurrency is clamped`` () =
-    Assert.Equal(8, DefaultConcurrency)
-    Assert.Equal(16, clampConcurrency 99)
+let ``join waves for 256 paths at concurrency 32 is 8, and concurrency is clamped to 64`` () =
+    Assert.Equal(32, DefaultConcurrency)
+    Assert.Equal(64, clampConcurrency 99)
+    Assert.Equal(64, clampConcurrency 64)
     Assert.Equal(1, clampConcurrency 0)
-    Assert.Equal(32, waves 255 DefaultConcurrency)
+    Assert.Equal(8, waves 255 DefaultConcurrency)
     Assert.Equal(16, waves 255 16)
+    Assert.Equal(4, waves 256 64)
     Assert.Equal(1, waves 7 16)
     Assert.Equal(0, waves 0 8)
     Assert.Equal(8, waves 64 8)
+    Assert.Equal(2, waves 64 32)
 
 [<Fact>]
 let ``runBounded never exceeds concurrency and finishes every item`` () =
