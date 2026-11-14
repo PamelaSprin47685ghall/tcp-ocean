@@ -30,6 +30,8 @@ type TunCounters() =
     member val CellsSpanning = 0L with get, set
     member val CellsReceived = 0L with get, set
     member val CellsDropped = 0L with get, set
+    /// Payload bytes whose cumulative ACK advanced over a hole (grace or frontier swallow).
+    member val BytesSwallowed = 0L with get, set
     /// Times the fragment-slot table grew (memory budget = advertised window).
     member val ReasmGrows = 0L with get, set
     /// Times a fragment was not stored: rcvNxt / interval merge stopped (backpressure, not a drop).
@@ -118,6 +120,9 @@ type TunPath(output: ITunOutput, counters: TunCounters, localIp: uint32, localPo
 
     // ---- receive -----------------------------------------------------------------------
     let mutable rcvNxt = 0UL
+    let mutable bytesAccepted = 0L
+    let mutable swallowedBytes = 0L
+    let mutable lateFirstLocal = 0L
     let mutable peerFinAt = UInt64.MaxValue
     // OFO intervals (spec 6.8.3 early_retire used a fixed 16). Sized from the same
     // advertised-window budget as fragment slots. Overflow must not swallow: a new
@@ -335,7 +340,7 @@ type TunPath(output: ITunOutput, counters: TunCounters, localIp: uint32, localPo
             let start = data0 + uint64 index * l
             if off = 0 && n = frameLength then
                 deliver (rest.Slice(0, n)) start
-                pos <- pos + uint64 n
+                pos <- pos + uint64 n; bytesAccepted <- bytesAccepted + int64 n
                 rest <- rest.Slice n
             else
                 let s = findSlot index
@@ -348,7 +353,7 @@ type TunPath(output: ITunOutput, counters: TunCounters, localIp: uint32, localPo
                         let index' = slotFrame.[s]
                         dropSlot s
                         deliver (Span(slotBuf.[s], 0, frameLength)) (data0 + uint64 index' * l)
-                    pos <- pos + uint64 n
+                    pos <- pos + uint64 n; bytesAccepted <- bytesAccepted + int64 n
                     rest <- rest.Slice n
         int (pos - a)
 
@@ -409,7 +414,9 @@ type TunPath(output: ITunOutput, counters: TunCounters, localIp: uint32, localPo
             while i < swCount && swEnd.[i] <= pos do i <- i + 1
             if i < swCount && swStart.[i] <= pos then
                 let e = min b swEnd.[i]
-                counters.LateFirstBytes <- counters.LateFirstBytes + int64 (e - pos)
+                let n = int64 (e - pos)
+                counters.LateFirstBytes <- counters.LateFirstBytes + n
+                lateFirstLocal <- lateFirstLocal + n
                 // Cut [pos, e) out of range i.
                 let s0 = swStart.[i]
                 let e0 = swEnd.[i]
@@ -444,6 +451,9 @@ type TunPath(output: ITunOutput, counters: TunCounters, localIp: uint32, localPo
         let hi = ivStart.[0]
         recordSwallowed lo hi
         dropSlotsIn lo hi
+        let hole = int64 (hi - lo)
+        counters.BytesSwallowed <- counters.BytesSwallowed + hole
+        swallowedBytes <- swallowedBytes + hole
         rcvNxt <- ivEnd.[0]
         removeInterval 0
         advance ()
@@ -828,12 +838,22 @@ type TunPath(output: ITunOutput, counters: TunCounters, localIp: uint32, localPo
     member _.CopyEstimate = copyEstimate
     /// Payload bytes put on the wire, every copy included.
     member _.WireSentBytes = wireSent
+    /// TCP payload bytes accepted into reassembly (in-order or stored out-of-order).
+    member _.BytesAccepted = bytesAccepted
+    /// Payload bytes this path virtually ACKed (holes swallowed, never given to the frame reader).
+    member _.BytesSwallowed = swallowedBytes
+    /// Cumulative ACK minus the start of the data phase (0 before it). Comparable to acc_b + sw_b.
+    member _.BytesCumAcked = if dataPhase then int64 (rcvNxt - data0) else 0L
+    member _.LateFirstBytes = lateFirstLocal
     member _.Describe() =
         "bw_mbit=" + (btlBw * 8000.0).ToString("F1") + " srtt_ms=" + (srttNs / 1e6).ToString("F1")
         + " min_rtt_ms=" + (if minRttNs = Int64.MaxValue then "-" else (float minRttNs / 1e6).ToString("F1"))
         + " cwnd=" + string (cwnd ()) + " inflight=" + string inflight + " peer_wnd=" + string peerWnd
         + " phase=" + (if startup then "startup" elif draining then "drain" else "probe" + string cycle)
         + " rq=" + string repairQ.Count + " req=" + string counters.RepairRequests + " defer=" + string counters.RepairsDeferred
+        + " acc_b=" + string bytesAccepted + " sw_b=" + string swallowedBytes
+        + " ack_b=" + string (if dataPhase then int64 (rcvNxt - data0) else 0L)
+        + " late_b=" + string lateFirstLocal
         + (if demoted then " demoted" else "")
     /// The HTTP head and bootstrap frame are whole: BootFrame holds the frame. -2: bad head.
     member _.BootState = if bootAt = -2 then -2 elif bootAt >= 0 && headLen >= bootAt + Layout.BootFrameLength then 1 else 0

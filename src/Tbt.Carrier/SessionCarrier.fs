@@ -249,6 +249,23 @@ type SessionCarrier(session: Session, bridge: FlowBridge, ?uplinkPace: bool, ?tu
     member _.Describe() =
         let tx = session.Tx
         let rx = session.Rx
+        let mutable consTx = 0L
+        let mutable consAck = 0L
+        let mutable ackKnown = true
+        let mutable i = 0
+        let pathTx = System.Text.StringBuilder()
+        while i < paths.Count do
+            match paths.[i] with
+            | :? PathLink as pl ->
+                consTx <- consTx + pl.BytesWritten
+                let acked = pl.BytesAcked
+                if acked < 0L then ackKnown <- false
+                else consAck <- consAck + acked
+                if pathTx.Length > 0 then pathTx.Append(',') |> ignore
+                pathTx.Append(int pl.PathId).Append(':').Append(pl.BytesWritten) |> ignore
+                if acked >= 0L then pathTx.Append('/').Append(acked) |> ignore
+            | _ -> ()
+            i <- i + 1
         "paths=" + string paths.Count + " frames_in=" + string framesIn + " frames_out=" + string framesOut
         + " tx_head=" + string tx.Head + " peer_ack=" + string tx.PeerAck + " grant_limit=" + string tx.GrantLimit
         + " queued=" + string tx.Queued + " srtt_ms=" + string (int (tx.SrttNs / 1e6))
@@ -264,6 +281,8 @@ type SessionCarrier(session: Session, bridge: FlowBridge, ?uplinkPace: bool, ?tu
         + " stale=" + string session.Flows.Counters.StaleSources
         + " flow_state=" + string session.FlowStatesSent + "/" + string session.FlowStatesRejected
         + " fills=" + string tx.FillsSent
+        + " cons_tx_b=" + string consTx + " cons_ack_b=" + (if ackKnown then string consAck else "-")
+        + " path_tx=" + pathTx.ToString()
         + (if not pace then ""
            else
             " pace_bw_mbit=" + (group.Bandwidth * 8000.0).ToString("F1")

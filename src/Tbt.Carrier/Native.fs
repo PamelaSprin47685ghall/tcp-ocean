@@ -46,6 +46,9 @@ extern int sysPoll(nativeint fds, unativeint count, int timeoutMs)
 [<DllImport("libc", EntryPoint = "close", SetLastError = true)>]
 extern int sysClose(int fd)
 
+[<DllImport("libc", EntryPoint = "socket", SetLastError = true)>]
+extern int sysSocket(int domain, int typ, int protocol)
+
 let read (fd: int) (buffer: Span<byte>) =
     use p = fixed &MemoryMarshal.GetReference buffer
     int (sysRead(fd, NativePtr.toNativeInt p, unativeint buffer.Length))
@@ -113,3 +116,50 @@ let openTun (name: string) =
             sysClose fd |> ignore
             -1
         else fd
+
+let SIOCGIFTXQLEN = 0x8942un
+let SIOCSIFTXQLEN = 0x8943un
+/// TUNSETSNDBUF: _IOW('T', 212, int). The owner of the TUN fd can set this
+/// without CAP_NET_ADMIN; SIOCSIFTXQLEN often cannot.
+let TUNSETSNDBUF = 0x400454d4un
+
+let private ifreq (name: string) =
+    let ifr = Array.zeroCreate<byte> 40
+    Text.Encoding.ASCII.GetBytes(name, 0, min 15 name.Length, ifr, 0) |> ignore
+    ifr
+
+/// Get or set a network device's txqueuelen (SIOCG/SIOCSIFTXQLEN) via a datagram socket.
+/// Returns (ok, qlen, errno). CAP_NET_ADMIN is typically required to set.
+let tryTxQueueLen (name: string) (setTo: int option) =
+    let fd = sysSocket(2, 2, 0) // AF_INET, SOCK_DGRAM
+    if fd < 0 then struct (false, 0, lastError ())
+    else
+        try
+            let ifr = ifreq name
+            match setTo with
+            | Some q ->
+                BitConverter.TryWriteBytes(Span(ifr, 16, 4), q) |> ignore
+                use ip = fixed &ifr.[0]
+                if sysIoctl(fd, SIOCSIFTXQLEN, NativePtr.toNativeInt ip) < 0 then
+                    struct (false, q, lastError ())
+                else
+                    // Read back the value the kernel kept.
+                    use ig = fixed &ifr.[0]
+                    if sysIoctl(fd, SIOCGIFTXQLEN, NativePtr.toNativeInt ig) < 0 then
+                        struct (true, q, 0)
+                    else struct (true, BitConverter.ToInt32(ifr, 16), 0)
+            | None ->
+                use ig = fixed &ifr.[0]
+                if sysIoctl(fd, SIOCGIFTXQLEN, NativePtr.toNativeInt ig) < 0 then
+                    struct (false, 0, lastError ())
+                else struct (true, BitConverter.ToInt32(ifr, 16), 0)
+        finally
+            sysClose fd |> ignore
+
+let trySetTunSndBuf (tunFd: int) (bytes: int) =
+    let buf = Array.zeroCreate<byte> 4
+    BitConverter.TryWriteBytes(Span buf, bytes) |> ignore
+    use p = fixed &buf.[0]
+    if sysIoctl(tunFd, TUNSETSNDBUF, NativePtr.toNativeInt p) < 0 then
+        struct (false, bytes, lastError ())
+    else struct (true, bytes, 0)

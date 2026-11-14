@@ -57,11 +57,19 @@ let run (o: Options) =
     let tun: TunStack | null =
         if o.Has "tun" then
             let at = endpoint (o.Text "tun-listen")
-            match TunStack.Open(o.Text "tun", at, clock, entropy, maxPaths * 64, windowClamp) with
+            let qlen = o.Int("tun-txqueuelen", SocketTuning.TunTxQueueLen)
+            match TunStack.Open(o.Text "tun", at, clock, entropy, maxPaths * 64, windowClamp, qlen) with
             | null -> failwith ("cannot open TUN device " + o.Text "tun")
             | t ->
+                let qmsg =
+                    if qlen <= 0 then "txqueuelen=left-default"
+                    elif t.TxQueueOk then "txqueuelen=" + string t.TxQueueLen
+                    else "txqueuelen=" + string qlen + " failed errno=" + string t.TxQueueErrno + " (need CAP_NET_ADMIN; continuing)"
+                let bmsg =
+                    if t.SndBufOk then "tun_sndbuf=" + string t.SndBuf
+                    else "tun_sndbuf=" + string t.SndBuf + " failed errno=" + string t.SndBufErrno
                 log ("server on " + at.ToString() + " (user-space TCP on " + o.Text "tun" + ") -> " + target.ToString()
-                     + " window_clamp=" + string windowClamp)
+                     + " window_clamp=" + string windowClamp + " " + qmsg + " " + bmsg)
                 t
         else null
     if isNull listener && isNull tun then failwith "need --listen or --tun with --tun-listen"
@@ -195,7 +203,9 @@ let run (o: Options) =
         match tun with
         | null -> ()
         | t ->
-            if poller.IsFdReadable t.Fd then t.Receive()
+            // Always drain (non-blocking). Waiting only when the poller says readable
+            // used to leave a burst sitting in tbt0 while this loop was in decode.
+            t.Receive() |> ignore
             // Bootstrap frames whole on TUN paths: classify (a bad head stays silent).
             for c in t.Fresh do
                 if c.BootState = 1 then classify c (c.BootFrame.ToArray()) |> ignore
@@ -221,7 +231,14 @@ let run (o: Options) =
             i <- i - 1
         match tun with
         | null -> ()
-        | t -> t.Service()
+        | t ->
+            t.Service()
+            // Decode / send in Service may have taken tens of ms; drain again so
+            // the kernel TUN queue does not overflow and become a swallowed hole.
+            t.Receive() |> ignore
+            for c in t.Fresh do
+                if c.BootState = 1 then classify c (c.BootFrame.ToArray()) |> ignore
+            t.Fresh.Clear()
         if statsMs > 0L && now - lastStats >= statsMs then
             lastStats <- now
             let mutable fin = 0L

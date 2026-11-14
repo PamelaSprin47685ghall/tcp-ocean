@@ -26,6 +26,18 @@ type TunStack(fd: int, local: IPEndPoint, clock: IClock, entropy: IEntropy, maxC
     let mutable packetsIn = 0L
     let mutable packetsOut = 0L
     let mutable writeFailures = 0L
+    let mutable parseFail = 0L
+    let mutable wrongDst = 0L
+    let mutable rstNoConn = 0L
+    let mutable recvCapped = 0L
+    /// Safety cap on one Receive drain (non-blocking, should hit EAGAIN first).
+    let recvBudgetMax = 1_000_000
+    let mutable txqLen = -1
+    let mutable txqOk = false
+    let mutable txqErrno = 0
+    let mutable sndBuf = -1
+    let mutable sndBufOk = false
+    let mutable sndBufErrno = 0
     let isn () =
         let b = Array.zeroCreate<byte> 4
         entropy.Fill(Span b)
@@ -42,6 +54,7 @@ type TunStack(fd: int, local: IPEndPoint, clock: IClock, entropy: IEntropy, maxC
 
     /// RST for a segment that has no connection (RFC 793 reset generation).
     let reset (seg: Packet.Segment) =
+        rstNoConn <- rstNoConn + 1L
         if seg.Flags &&& Packet.Rst = 0uy then
             let ackFlag = seg.Flags &&& Packet.Ack <> 0uy
             let seq = if ackFlag then seg.AckNo else 0u
@@ -51,24 +64,43 @@ type TunStack(fd: int, local: IPEndPoint, clock: IClock, entropy: IEntropy, maxC
             output.Write(ReadOnlySpan(scratch, 0, n))
 
     member _.Fd = fd
+    /// txqueuelen after the startup ioctl, or -1 if it was not attempted.
+    member _.TxQueueLen = txqLen
+    member _.TxQueueOk = txqOk
+    member _.TxQueueErrno = txqErrno
+    member _.SndBuf = sndBuf
+    member _.SndBufOk = sndBufOk
+    member _.SndBufErrno = sndBufErrno
+
+    /// SIOCSIFTXQLEN on the named device (typically needs CAP_NET_ADMIN).
+    static member TrySetTxQueueLen(name: string, qlen: int) = Native.tryTxQueueLen name (Some qlen)
+    static member TryGetTxQueueLen(name: string) = Native.tryTxQueueLen name None
     member _.Counters = counters
     member _.Connections = conns.Count
     /// Connections whose bootstrap frame is whole and that wait for classification.
     member _.Fresh = fresh
 
-    /// Read every packet the device holds now (at most 4096) and hand them over.
+    /// Read every packet the device holds now (until EAGAIN) and hand them over.
+    /// Returns how many packets were read. A small cap used to leave a burst in the
+    /// TUN queue; during a decode stall that overflowed tbt0 and became a swallowed hole.
     member _.Receive() =
         let mutable go = true
-        let mutable budget = 4096
+        let mutable budget = recvBudgetMax
+        let mutable read = 0
         while go && budget > 0 do
             let n = Native.read fd (Span rx)
             if n <= 0 then go <- false
             else
                 budget <- budget - 1
+                read <- read + 1
                 packetsIn <- packetsIn + 1L
                 let mutable seg = Unchecked.defaultof<Packet.Segment>
                 let packet = Span(rx, 0, n)
-                if Packet.tryParse (Span<byte>.op_Implicit packet) &seg && seg.DstIp = localIp && seg.DstPort = localPort then
+                if not (Packet.tryParse (Span<byte>.op_Implicit packet) &seg) then
+                    parseFail <- parseFail + 1L
+                elif seg.DstIp <> localIp || seg.DstPort <> localPort then
+                    wrongDst <- wrongDst + 1L
+                else
                     let k = key seg.SrcIp seg.SrcPort
                     let now = clock.NowNs()
                     match conns.TryGetValue k with
@@ -93,6 +125,8 @@ type TunStack(fd: int, local: IPEndPoint, clock: IClock, entropy: IEntropy, maxC
                             c.OnSyn(seg.Seq, Span<byte>.op_Implicit (packet.Slice(seg.OptionsAt, seg.OptionsLength)),
                                     1460, now)
                         else reset seg
+        if budget = 0 && go then recvCapped <- recvCapped + 1L
+        read
 
     /// Timers and pending ACKs of every connection; closed ones leave the table.
     member _.Service() =
@@ -129,12 +163,32 @@ type TunStack(fd: int, local: IPEndPoint, clock: IClock, entropy: IEntropy, maxC
         + " clock_jumps=" + string counters.ClockJumps + " up_holes=" + string counters.UpHoles
         + " virtual_ack=" + string counters.VirtualAcks + " fast_swallow=" + string counters.FastSwallows
         + " cells_rx=" + string counters.CellsReceived + " cells_spanning=" + string counters.CellsSpanning
-        + " cells_dropped=" + string counters.CellsDropped + " reasm_grows=" + string counters.ReasmGrows + " reasm_pressure=" + string counters.ReasmPressure + " gap_grows=" + string counters.GapGrows + " gap_pressure=" + string counters.GapPressure
+        + " cells_dropped=" + string counters.CellsDropped + " swallow_b=" + string counters.BytesSwallowed + " late_first_b=" + string counters.LateFirstBytes
+        + " parse_fail=" + string parseFail + " wrong_dst=" + string wrongDst + " rst_no_conn=" + string rstNoConn + " recv_capped=" + string recvCapped
+        + " reasm_grows=" + string counters.ReasmGrows + " reasm_pressure=" + string counters.ReasmPressure + " gap_grows=" + string counters.GapGrows + " gap_pressure=" + string counters.GapPressure
         + String.Join("", groups.Values |> Seq.map (fun g -> "\n  " + g.Describe()))
         + String.Join("", conns.Values |> Seq.map (fun c -> "\n  path " + string (c :> IPath).PathId + " " + c.Describe()))
 
-    /// Open the TUN device name; null when it fails.
+    /// Open the TUN device name; null when it fails. Sizes the TUN qdisc
+    /// (SIOCSIFTXQLEN, default TunTxQueueLen) and the tun-fd send buffer so a
+    /// 64-path burst is not dropped while this process is in decode.
     static member Open(name: string, local: IPEndPoint, clock: IClock, entropy: IEntropy, maxConnections: int,
-                       ?windowClamp: int) : TunStack | null =
+                       ?windowClamp: int, ?txQueueLen: int) : TunStack | null =
         let fd = Native.openTun name
-        if fd < 0 then null else TunStack(fd, local, clock, entropy, maxConnections, ?windowClamp=windowClamp)
+        if fd < 0 then null
+        else
+            let t = TunStack(fd, local, clock, entropy, maxConnections, ?windowClamp=windowClamp)
+            let qlen = defaultArg txQueueLen SocketTuning.TunTxQueueLen
+            if qlen > 0 then
+                let struct (ok, got, errno) = Native.tryTxQueueLen name (Some qlen)
+                t.RecordTxQueue(ok, got, errno)
+            // Owner of the fd can set this without CAP_NET_ADMIN.
+            let buf = max 8_000_000 (qlen * 1500)
+            let struct (ok, got, errno) = Native.trySetTunSndBuf fd buf
+            t.RecordSndBuf(ok, got, errno)
+            t
+
+    member private _.RecordTxQueue(ok, got, errno) =
+        txqOk <- ok; txqLen <- got; txqErrno <- errno
+    member private _.RecordSndBuf(ok, got, errno) =
+        sndBufOk <- ok; sndBuf <- got; sndBufErrno <- errno

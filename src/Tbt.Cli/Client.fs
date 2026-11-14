@@ -21,6 +21,10 @@ open Tbt.Cli.Common
 let private bootstrap (server: IPEndPoint) (host: string) (boot: byte[]) (windowClamp: int) (timeoutMs: int) =
     let socket = new Socket(server.AddressFamily, SocketType.Stream, ProtocolType.Tcp)
     try
+        // The client carrier is kernel TCP, not a TUN: there is no tbt0-style qdisc
+        // this process owns. Write gating (TCP_NOTSENT_LOWAT) keeps unsent bytes
+        // small; a queue overflow, if any, is on the host path and shows up as
+        // kernel retranmissions, not as a userspace virtual ACK.
         SocketTuning.path(socket, windowClamp)
         socket.ReceiveTimeout <- timeoutMs
         socket.SendTimeout <- timeoutMs

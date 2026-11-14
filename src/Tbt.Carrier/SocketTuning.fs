@@ -40,6 +40,12 @@ module SocketTuning =
     [<Literal>]
     let WindowClamp = 600000
 
+    /// Default txqueuelen on the server TUN (SIOCSIFTXQLEN). Sized so a 64-path
+    /// burst can sit in the qdisc while userspace is in decode (~20k × ~1.5 KiB).
+    /// The server sets this itself at startup; the testbed script is only a backup.
+    [<Literal>]
+    let TunTxQueueLen = 20000
+
     let probe () : INotSentProbe =
         if OperatingSystem.IsLinux() then LinuxNotSentProbe() else NoNotSentProbe()
 
@@ -56,3 +62,14 @@ module SocketTuning =
 
     /// Settings for a local flow socket.
     let local (socket: Socket) = socket.NoDelay <- true
+
+    /// Linux TCP_INFO.tcpi_bytes_acked (offset 120), or -1 when unavailable.
+    /// RFC 4898 thru octets acked: payload the peer has cumulatively ACKed.
+    let tryBytesAcked (socket: Socket) =
+        if not (OperatingSystem.IsLinux()) then -1L
+        else
+            try
+                let buf = Array.zeroCreate<byte> 256
+                let n = socket.GetRawSocketOption(6, 11, Span buf) // SOL_TCP, TCP_INFO
+                if n >= 128 then BitConverter.ToInt64(buf, 120) else -1L
+            with :? SocketException -> -1L

@@ -754,6 +754,44 @@ let ``uplink: the first late copy of a swallowed segment is no duplicate; a seco
     Assert.Equal(1460L, f.Path.Counters.LateFirstBytes)
 
 [<Fact>]
+let ``uplink: a swallowed hole is ACKed but never delivered, even when the original arrives late`` () =
+    // Reproduces the 64-path mux-uplink conservation gap (~27% frames_out never
+    // frames_in on 133e946 s7): after the 15 ms grace, the cumulative ACK jumps
+    // over the hole (the client kernel would count those bytes in tcpi_bytes_acked)
+    // but they are not in BytesAccepted and never reach OnFrame. A late first copy
+    // is LateFirstBytes only — TunPath does not hand it to the frame reader
+    // (spec 6.8: recovery is the source-retention lease / BOOSTER, not the original).
+    let f = Fixture 10
+    f.Open()
+    let send i =
+        f.Send(f.Data0 + uint32 (i * 1460), ReadOnlySpan(f.Stream, i * 1460, min 1460 (f.Stream.Length - i * 1460)), [||])
+    send 0
+    for i in 2 .. (f.Stream.Length - 1) / 1460 do send i
+    let acceptedBefore = f.Path.BytesAccepted
+    let framesBefore = f.Owner.Frames.Count
+    f.Clock.Now <- f.Clock.Now + 16_000_000L
+    f.Path.Service f.Clock.Now
+    f.Path.FlushAck()
+    let ack = parse f.Out.Packets.[f.Out.Packets.Count - 1]
+    Assert.Equal(f.Data0 + uint32 f.Stream.Length, ack.AckNo)
+    Assert.Equal(1L, f.Path.Counters.VirtualAcks)
+    Assert.Equal(1460L, f.Path.Counters.BytesSwallowed)
+    Assert.Equal(1460L, f.Path.BytesSwallowed)
+    Assert.Equal(int64 f.Stream.Length, f.Path.BytesCumAcked)
+    Assert.Equal(int64 f.Stream.Length - 1460L, f.Path.BytesAccepted)
+    Assert.Equal(acceptedBefore, f.Path.BytesAccepted)
+    // Frames that overlap the hole never arrive.
+    let lostLo, lostHi = 1460, 2920
+    let expected = [ for k in 0 .. 9 do if k * L >= lostHi || (k + 1) * L <= lostLo then yield k ]
+    let got = [ for fr in f.Owner.Frames -> int fr.[0] - 1 ] |> List.sort
+    Assert.Equal<int list>(expected, got)
+    // The original segment later: counted, still not delivered.
+    send 1
+    Assert.Equal(1460L, f.Path.Counters.LateFirstBytes)
+    Assert.Equal(framesBefore, f.Owner.Frames.Count)
+    Assert.Equal(int64 f.Stream.Length - 1460L, f.Path.BytesAccepted)
+
+[<Fact>]
 let ``uplink: a duplicate above the cumulative ACK waits out the grace, then goes as a D-SACK`` () =
     let f = Fixture 10
     f.Open()
@@ -1140,3 +1178,10 @@ let ``uplink: more than 16 OFO gaps are kept instead of early-retired`` () =
     Assert.Equal(dropped0, f.Path.Counters.CellsDropped)
     Assert.Equal(acks0, f.Path.Counters.VirtualAcks)
     Assert.Equal(0L, f.Path.Counters.GapPressure)
+
+[<Fact>]
+let ``server TUN txqueuelen helper fails cleanly on a missing device`` () =
+    Assert.Equal(20000, SocketTuning.TunTxQueueLen)
+    let struct (ok, _, errno) = TunStack.TrySetTxQueueLen("tbtun-no-such-dev", SocketTuning.TunTxQueueLen)
+    Assert.False(ok)
+    Assert.True(errno > 0)

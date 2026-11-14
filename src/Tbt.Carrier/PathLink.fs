@@ -32,6 +32,10 @@ type PathLink(socket: Socket, probe: INotSentProbe) =
     member val FrameLength = Layout.BootFrameLength with get, set
     member _.Buffered = rxEnd - rxStart
     member _.TxIdle = txStart = txEnd
+    /// Bytes actually handed to the kernel on this path (partial Send counts).
+    member val BytesWritten = 0L with get, set
+    /// Peer cumulative ACK of this socket's payload (tcpi_bytes_acked), or -1.
+    member _.BytesAcked = SocketTuning.tryBytesAcked socket
 
     /// Read what the kernel holds into the buffer.
     member _.Receive() =
@@ -82,7 +86,7 @@ type PathLink(socket: Socket, probe: INotSentProbe) =
         txEnd <- txEnd + data.Length
 
     /// Hand queued bytes to the kernel.
-    member _.Send() =
+    member this.Send() =
         if txStart = txEnd then IoResult.Progress
         else
             let mutable err = SocketError.Success
@@ -91,6 +95,7 @@ type PathLink(socket: Socket, probe: INotSentProbe) =
             elif err <> SocketError.Success then IoResult.Closed
             else
                 txStart <- txStart + n
+                this.BytesWritten <- this.BytesWritten + int64 n
                 IoResult.Progress
 
     member _.Close() =
