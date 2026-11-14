@@ -55,6 +55,8 @@ type SessionCarrier(session: Session, bridge: FlowBridge, ?uplinkPace: bool, ?tu
     let pacers = Dictionary<uint16, PathPacer>()
     /// Local slots visited by Watch and Service (RS-3: grows with armed flows, not 256).
     let mutable slotVisits = 0L
+    /// Unpaced writeBatch: originals sent since the last admitted repair.
+    let mutable originalsSinceRepair = 0
 
     let pacerOf (pathId: uint16) =
         if tupleMbit <= 0.0 then None
@@ -122,6 +124,11 @@ type SessionCarrier(session: Session, bridge: FlowBridge, ?uplinkPace: bool, ?tu
     /// When uplinkPace is set, WIN_ACK/CTRL/heartbeat skip the group; new data uses TryTake
     /// (aggregate 1.25 BDP); BOOSTERs use the charged repair reserve (TryTakeRepair / OnRepair)
     /// and are skipped when that reserve is dry so new data can still go.
+    /// When unpaced (server downlink, or client with pacing off), unsent originals go first.
+    /// A repair is admitted only if the original queue is empty, or after every
+    /// RepairSendOrder.OriginalsBeforeRepair originals, so a BOOSTER storm cannot
+    /// freeze tx_head. TryRenderNext still prefers a BOOSTER when allowRepair is set
+    /// (a paced repair slot, or an unpaced shared slot).
     let writeBatch (budget0: int) =
         let mutable budget = budget0
         let mutable progress = true
@@ -141,8 +148,18 @@ type SessionCarrier(session: Session, bridge: FlowBridge, ?uplinkPace: bool, ?tu
                     let mutable allowRepair = true
                     let mutable charge = 0
                     let mutable attempt = false
-                    if not pace || session.ControlWaiting then
+                    let mutable unpacedRepair = false
+                    let mutable unpacedData = false
+                    if session.ControlWaiting then
                         attempt <- true
+                    elif not pace then
+                        if RepairSendOrder.canSendRepair session.Tx.Queued session.RepairWaiting originalsSinceRepair then
+                            attempt <- true
+                            unpacedRepair <- true
+                        elif session.WantsToSend then
+                            attempt <- true
+                            allowRepair <- false
+                            unpacedData <- true
                     elif session.RepairWaiting && groupAllows fl true (session.Tx.Queued > 0) && pathAllows link.PathId fl now then
                         attempt <- true
                         charge <- 1
@@ -156,6 +173,8 @@ type SessionCarrier(session: Session, bridge: FlowBridge, ?uplinkPace: bool, ?tu
                         framesOut <- framesOut + 1L
                         budget <- budget - 1
                         progress <- true
+                        if unpacedRepair then originalsSinceRepair <- 0
+                        elif unpacedData then originalsSinceRepair <- originalsSinceRepair + 1
                         if charge = 1 then
                             wireOut <- wireOut + int64 fl
                             group.OnRepair fl

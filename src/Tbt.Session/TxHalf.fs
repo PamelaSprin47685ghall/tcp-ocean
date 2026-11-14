@@ -662,3 +662,17 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
 
     /// carrier_wm of path (largest DATA/PARITY step sent on it).
     member _.CarrierWm(path: uint16) = carrierWm.[int path]
+
+/// Unpaced send order (server downlink, or client with UPLINK_PACE off).
+/// Repairs must not preempt unsent originals: a BOOSTER-first storm can freeze
+/// tx_head and starve new data (20/200 0% 64-flow echo with --new-repair).
+/// When both wait, admit one repair after every OriginalsBeforeRepair originals
+/// so 5% loss recovery is not starved by a continuous source queue.
+module RepairSendOrder =
+    /// Originals sent before one shared repair slot when both queues wait.
+    [<Literal>]
+    let OriginalsBeforeRepair = 3
+
+    /// True when this unpaced slot may carry a BOOSTER.
+    let canSendRepair (originalsWaiting: int) (repairWaiting: bool) (originalsSinceRepair: int) =
+        repairWaiting && (originalsWaiting = 0 || originalsSinceRepair >= OriginalsBeforeRepair)

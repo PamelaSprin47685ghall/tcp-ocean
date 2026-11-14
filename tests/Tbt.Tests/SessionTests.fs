@@ -1207,3 +1207,52 @@ let ``256 flows opened one after another with readers that take nothing stay wit
         pair.Round() |> ignore
         check ()
     Assert.True(s.Flows.PoolUsed <= usedBefore, sprintf "%d -> %d" usedBefore s.Flows.PoolUsed)
+
+
+[<Fact>]
+let ``unpaced repair slots do not preempt unsent originals, except a 1-in-4 share`` () =
+    // Empty original queue: a waiting repair may go at once.
+    Assert.True(RepairSendOrder.canSendRepair 0 true 0)
+    Assert.True(RepairSendOrder.canSendRepair 0 true RepairSendOrder.OriginalsBeforeRepair)
+    // Originals waiting: no repair until the share is due.
+    Assert.False(RepairSendOrder.canSendRepair 10 true 0)
+    Assert.False(RepairSendOrder.canSendRepair 10 true (RepairSendOrder.OriginalsBeforeRepair - 1))
+    Assert.True(RepairSendOrder.canSendRepair 10 true RepairSendOrder.OriginalsBeforeRepair)
+    // No repair waiting: never a repair slot, even if the streak is due.
+    Assert.False(RepairSendOrder.canSendRepair 0 false 0)
+    Assert.False(RepairSendOrder.canSendRepair 10 false RepairSendOrder.OriginalsBeforeRepair)
+
+
+[<Fact>]
+let ``allowRepair false sends unsent originals while a BOOSTER waits`` () =
+    let config = { SessionConfig.defaults with NewRepair = true; Credit = { CreditPolicy.defaults with Enabled = false } }
+    let pair = Pair(config, 1, 0.0, 4)
+    let c = pair.Client
+    let clock = pair.Clock
+    c.Tx.InitialGrant 10_000UL
+    let mutable slot = -1
+    Assert.True(c.TryOpenFlow(&slot))
+    let chunk = Array.create 65536 7uy
+    let mutable guard = 64
+    while c.Tx.Head < 2UL && guard > 0 do
+        pair.Feed(c, slot, ReadOnlySpan chunk, false) |> ignore
+        c.Tx.Flush()
+        guard <- guard - 1
+    let sealedAt = clock.Now
+    clock.Now <- sealedAt + 400_000_000L
+    c.Tx.OnPeerAck(1UL, 100us)
+    clock.Now <- sealedAt + int64 c.Tx.RepairWaitNs
+    c.Tx.OnNack(1UL, 1, 4)
+    Assert.True(c.Tx.RepairWaiting)
+    Assert.True(c.Tx.Queued > 0, "originals must still be waiting")
+    let queued0 = c.Tx.Queued
+    let boost0 = c.Tx.BoostersSent
+    let frame = Array.zeroCreate<byte> c.FrameLength
+    Assert.True(c.Tx.TryRenderNext(Span frame, 0us, 1UL, 100us, 0us, allowRepair=false))
+    Assert.Equal(boost0, c.Tx.BoostersSent)
+    Assert.True(c.Tx.Queued < queued0, sprintf "queued %d -> %d" queued0 c.Tx.Queued)
+    Assert.True(c.Tx.RepairWaiting, "the BOOSTER must stay queued")
+    // A repair slot (allowRepair=true) may still take the BOOSTER first; that is
+    // the primitive writeBatch uses for an admitted unpaced or paced repair slot.
+    Assert.True(c.Tx.TryRenderNext(Span frame, 0us, 1UL, 100us, 0us, allowRepair=true))
+    Assert.True(c.Tx.BoostersSent > boost0)
