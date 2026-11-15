@@ -156,7 +156,7 @@ let run (o: Options) =
             link.PathId <- 0us
             reply link a.Reply
             carrier.AddPath link
-            let paths = min maxPaths (int a.Hello.MaxPaths)
+            let paths = min maxPaths (min (int a.Hello.MaxPaths) (MemTier.maxBulkPaths (MemTier.ofCaps a.Params.Caps)))
             let admission =
                 JoinAdmission(a.Params.Keys.PathKey, entropy, clock, a.Params.Keys.SessionId, a.Params.Symbol, a.Params.Caps,
                               paths, mss, config.MaxPaths)

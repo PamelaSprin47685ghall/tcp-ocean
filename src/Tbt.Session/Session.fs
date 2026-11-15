@@ -108,6 +108,7 @@ type Session(role: Role, p: SessionParams, port: IFlowPort, clock: IClock, confi
     let mutable beganInteractive = false
     let mutable interactiveSources = 0L
     let flows = FlowTable(port, DecoderStore decoder, Action<uint64, int>(fun t d -> rx.StepUndelivered(t, d)), credit)
+    let governor = MemoryGovernor(MemTier.budgetBytes (MemTier.ofCaps p.Caps))
     let flowStatePeriodNs = 10_000_000L
     let snapshotPeriodNs = 1_000_000_000L
     let mutable stateSeq = 0u
@@ -488,6 +489,8 @@ type Session(role: Role, p: SessionParams, port: IFlowPort, clock: IClock, confi
     member _.NowNs() = clock.NowNs()
     member _.Rx = rx
     member _.Flows = flows
+    member _.Governor = governor
+    member _.MemTier = MemTier.ofCaps p.Caps
     member _.InteractiveSources = interactiveSources
     member _.WinAcksSent = winAcksSent
     member _.Opener = opener
@@ -641,7 +644,8 @@ type Session(role: Role, p: SessionParams, port: IFlowPort, clock: IClock, confi
     // ---- local flows ------------------------------------------------------------------
 
     /// Client: a new local connection. False when all 256 slots are busy.
-    member _.TryOpenFlow(slot: byref<int>) = flows.TryAllocate(&slot)
+    member _.TryOpenFlow(slot: byref<int>) =
+        if governor.Order.RejectNewFlows then false else flows.TryAllocate(&slot)
 
     /// Bytes slot may still send under the peer's flow limit.
     member _.FlowRoom(slot: int) = flows.TxRoom slot
@@ -668,7 +672,8 @@ type Session(role: Role, p: SessionParams, port: IFlowPort, clock: IClock, confi
     member _.TryBeginSource(app: byref<Span<byte>>) =
         let mutable symbol = Span<byte>.Empty
         beganInteractive <- false
-        if tx.TryBeginSource(&symbol) then
+        if governor.Order.StopIntake then false
+        elif tx.TryBeginSource(&symbol) then
             app <- symbol.Slice Layout.EnvelopeLength
             true
         else false
@@ -691,7 +696,8 @@ type Session(role: Role, p: SessionParams, port: IFlowPort, clock: IClock, confi
         let interactive =
             this.IsInteractive slot && (tx.CanFillUrgent || (tx.NoteUrgentFull(); false))
         let mutable symbol = Span<byte>.Empty
-        if tx.TryBeginSource(&symbol, interactive) then
+        if governor.Order.StopIntake && not interactive then false
+        elif tx.TryBeginSource(&symbol, interactive) then
             beganInteractive <- interactive
             app <- symbol.Slice Layout.EnvelopeLength
             true

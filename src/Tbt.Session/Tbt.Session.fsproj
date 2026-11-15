@@ -5,6 +5,7 @@
     <Compile Include="TxHalf.fs" />
     <Compile Include="ParityHold.fs" />
     <Compile Include="RxHalf.fs" />
+    <Compile Include="MemoryGovernor.fs" />
     <Compile Include="Session.fs" />
     <Compile Include="Handshake.fs" />
     <Compile Include="JoinBootstrap.fs" />

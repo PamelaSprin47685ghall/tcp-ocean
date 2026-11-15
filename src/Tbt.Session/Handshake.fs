@@ -10,7 +10,10 @@ open Tbt.Crypto.Bootstrap
 open Tbt.Wire
 
 /// Capabilities this implementation offers (D4: suite 0x02 only; D5: FLOWSTATE only with FLOWSTATE2; no LANE).
+/// Advertised default: mem_tier = 0 (1024 MiB). Bits 4–5 are a field, not a feature flag, so
+/// SupportedCaps leaves them clear; AllowedCaps accepts a known tier in those bits.
 let SupportedCaps = Caps.HpMask ||| Caps.StraddleOk ||| Caps.JoinAck2 ||| Caps.FlowState ||| Caps.FlowState2
+let AllowedCaps = SupportedCaps ||| Caps.MemTierMask
 
 /// FLOWSTATE counts only together with FLOWSTATE2 (DECISIONS.md D5).
 let private flowStatePair (caps: uint16) =
@@ -35,10 +38,13 @@ let private random (entropy: IEntropy) (n: int) =
 
 /// Client side of the main handshake on path 0. The CLIENT_INIT is rendered once (frozen).
 [<Sealed>]
-type ClientOffer(psk: byte[], clientId: Guid, entropy: IEntropy, unixTimeMs: uint64, mssClient: int, maxPaths: int) =
+type ClientOffer(psk: byte[], clientId: Guid, entropy: IEntropy, unixTimeMs: uint64, mssClient: int, maxPaths: int,
+                 ?memTier: uint16) =
+    let tier = defaultArg memTier MemTier.Ti1024
+    do if not (MemTier.isKnown tier) then invalidArg "memTier" "unknown mem_tier"
     let clientNonce = random entropy 32
     let hello =
-        { Version = 2uy; Suites = Suite.ChaCha20Poly1305Bit; Caps = SupportedCaps; ClientId = clientId
+        { Version = 2uy; Suites = Suite.ChaCha20Poly1305Bit; Caps = MemTier.set SupportedCaps tier; ClientId = clientId
           UnixTimeMs = unixTimeMs; MssClient = uint16 mssClient; MaxPaths = uint16 maxPaths }
     let content =
         ClientInit.build (ReadOnlySpan psk) (ReadOnlySpan clientNonce) hello ReadOnlySpan<byte>.Empty
@@ -54,7 +60,8 @@ type ClientOffer(psk: byte[], clientId: Guid, entropy: IEntropy, unixTimeMs: uin
         else
             match ServerInit.tryOpen (ReadOnlySpan psk) (ReadOnlySpan clientNonce) si with
             | ValueSome h when h.Status = ServerStatus.Ok && h.Suite = Suite.ChaCha20Poly1305 && h.PathId = 0us
-                               && Layout.isLegalSymbol (int h.Symbol) && h.Caps &&& ~~~SupportedCaps = 0us
+                               && Layout.isLegalSymbol (int h.Symbol) && h.Caps &&& ~~~AllowedCaps = 0us
+                               && MemTier.isKnown (MemTier.ofCaps h.Caps)
                                && h.Caps &&& Caps.JoinAck2 <> 0us ->
                 let keys =
                     SessionKeys(psk, clientNonce, si.Slice(0, 32).ToArray(), h.SessionId, clientId, h.Suite,
@@ -110,13 +117,15 @@ type ServerOffer(psks: byte[][], entropy: IEntropy, grant0: uint16, maxPaths: in
                     | ValueSome(h, _) when abs (int64 h.UnixTimeMs - unixTimeMs) <= 120_000L
                                            && h.Suites &&& Suite.ChaCha20Poly1305Bit <> 0uy
                                            && h.Caps &&& Caps.JoinAck2 <> 0us && h.MssClient > 0us
+                                           && MemTier.isKnown (MemTier.ofCaps h.Caps)
                                            && caches.[i].TryAdd(cn, unixTimeMs) ->
                         let symbol = FrameMath.symbolForMss (min (int h.MssClient) mssServer)
-                        let caps = flowStatePair (h.Caps &&& SupportedCaps)
+                        let caps = flowStatePair (h.Caps &&& AllowedCaps)
+                        let paths = min maxPaths (min (int h.MaxPaths) (MemTier.maxBulkPaths (MemTier.ofCaps caps)))
                         let sid = Guid(ReadOnlySpan(random entropy 16), true)
                         let sh =
                             { Status = ServerStatus.Ok; Suite = Suite.ChaCha20Poly1305; Caps = caps; SessionId = sid
-                              Symbol = uint16 symbol; PathId = 0us; MaxPaths = uint16 (min maxPaths (int h.MaxPaths))
+                              Symbol = uint16 symbol; PathId = 0us; MaxPaths = uint16 paths
                               RxWinGrant0 = grant0; EchoTimeMs = h.UnixTimeMs; Cookie = UInt128.Zero }
                         let sn = random entropy 32
                         let si = ServerInit.build (ReadOnlySpan psk) cn (ReadOnlySpan sn) sh ReadOnlySpan<byte>.Empty

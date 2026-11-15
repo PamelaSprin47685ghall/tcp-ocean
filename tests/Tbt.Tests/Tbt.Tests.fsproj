@@ -18,6 +18,7 @@
     <Compile Include="PaceTests.fs" />
     <Compile Include="FuzzTests.fs" />
     <Compile Include="PollerTests.fs" />
+    <Compile Include="GovernorTests.fs" />
     <Compile Include="ControlTests.fs" />
     <Compile Include="BridgeTests.fs" />
   </ItemGroup>
