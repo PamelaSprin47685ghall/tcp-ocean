@@ -12,7 +12,8 @@
  *        tuple_mode=shaper (default): a packet that exceeds the bucket waits.
  *        tuple_mode=policer: a packet that exceeds the bucket is dropped (drop_tuple).
  *     2. Packets whose per-flow ready time has been reached compete for the shared directional link
- *        (serialisation at rate_mbit). A packet that is not yet flow-ready does not reserve the link
+ *        (serialisation at rate_to_far_mbit / rate_to_near_mbit, each falling back to rate_mbit).
+ *        A packet that is not yet flow-ready does not reserve the link
  *        and cannot block other ready flows. Then + OWD + jitter.
  *
  *   loss_point=before (default): iid / Gilbert-Elliott / outage applied at ingress, before either stage
@@ -58,6 +59,8 @@ typedef struct {
     int tuple_mode;   /* MODE_SHAPER or MODE_POLICER */
     int loss_point;   /* LOSS_BEFORE or LOSS_AFTER */
     long write_queue; /* pending-write cap (EAGAIN) */
+    /* 0 = use rate_mbit. to_far is uplink (not 10.200.1.0/24); to_near is downlink. */
+    double rate_to_far_mbit, rate_to_near_mbit;
 } cfg_t;
 
 typedef struct {
@@ -239,11 +242,17 @@ static int lost(dir_t *d, uint64_t t) {
 /* Assign a shared-link slot to a flow-ready packet. Does not advance the link for
  * packets that are not yet ready: the caller only hands over packets with ready <= now
  * (or, in the offline test, ready <= the virtual 'now'). */
-static uint64_t link_assign(dir_t *d, uint64_t ready, int n, uint64_t now) {
+static double dir_rate_mbit(int di) {
+    double r = di ? C.rate_to_near_mbit : C.rate_to_far_mbit;
+    return (r > 0.0) ? r : C.rate_mbit;
+}
+
+static uint64_t link_assign(dir_t *d, uint64_t ready, int n, uint64_t now, int di) {
     uint64_t start = ready;
     if (d->tx_free_ns > (double)start) start = (uint64_t)d->tx_free_ns;
     if (start < now) start = now;
-    double ser = (C.rate_mbit > 0) ? (n * 8.0 / (C.rate_mbit * 1e6) * 1e9) : 0;
+    double rate = dir_rate_mbit(di);
+    double ser = (rate > 0) ? (n * 8.0 / (rate * 1e6) * 1e9) : 0;
     d->tx_free_ns = (double)start + ser;
     return (uint64_t)d->tx_free_ns;
 }
@@ -261,7 +270,7 @@ static void promote_ready(uint64_t now) {
         pkt_t p = hpop(&wait_h);
         int di = (int)(p.seq >> 31);
         dir_t *d = &D[di];
-        uint64_t depart = link_assign(d, p.t_ns, (int)p.len, now);
+        uint64_t depart = link_assign(d, p.t_ns, (int)p.len, now, di);
         if ((p.flags & 1) || (C.loss_point == LOSS_AFTER && lost(d, now))) {
             if (p.flags & 1) d->drop_loss++;
             free(p.buf);
@@ -395,7 +404,7 @@ static void write_stats(const char *path) {
 }
 
 static void load(const char *path) {
-    cfg_t c = { 200, 0, 1000, 0, 0, 0, 0, 0, 0, 0, 100000, 1, 0, 0, 32000, MODE_SHAPER, LOSS_BEFORE, 4096 };
+    cfg_t c = { 200, 0, 1000, 0, 0, 0, 0, 0, 0, 0, 100000, 1, 0, 0, 32000, MODE_SHAPER, LOSS_BEFORE, 4096, 0, 0 };
     FILE *f = fopen(path, "r"); char line[256], k[64], val[128];
     if (f) {
         while (fgets(line, sizeof line, f)) {
@@ -412,6 +421,8 @@ static void load(const char *path) {
                 if (!strcmp(k, "owd_ms")) c.owd_ms = v;
                 else if (!strcmp(k, "jitter_ms")) c.jitter_ms = v;
                 else if (!strcmp(k, "rate_mbit")) c.rate_mbit = v;
+                else if (!strcmp(k, "rate_to_far_mbit")) c.rate_to_far_mbit = v;
+                else if (!strcmp(k, "rate_to_near_mbit")) c.rate_to_near_mbit = v;
                 else if (!strcmp(k, "loss")) c.loss = v;
                 else if (!strcmp(k, "ge_p")) c.ge_p = v;
                 else if (!strcmp(k, "ge_r")) c.ge_r = v;
@@ -431,10 +442,11 @@ static void load(const char *path) {
     }
     if (c.write_queue > WQ_MAX) c.write_queue = WQ_MAX;
     C = c; rng = c.seed * 0x2545F4914F6CDD1DULL;
-    fprintf(stderr, "wanem %s: owd %.1f ms jitter %.1f rate %.0f Mbit loss %.4f ge(%.3f,%.3f,%.3f,%.3f) "
+    fprintf(stderr, "wanem %s: owd %.1f ms jitter %.1f rate %.0f Mbit (to_far %.0f to_near %.0f) loss %.4f ge(%.3f,%.3f,%.3f,%.3f) "
                     "outage %.0f ms/%.1f s limit %ld seed %llu tuple %.3f Mbit bucket %ld B "
                     "tuple_mode %s loss_point %s write_queue %ld\n",
-            WANEM_VERSION, C.owd_ms, C.jitter_ms, C.rate_mbit, C.loss, C.ge_p, C.ge_r, C.ge_1h, C.ge_1k,
+            WANEM_VERSION, C.owd_ms, C.jitter_ms, C.rate_mbit, dir_rate_mbit(0), dir_rate_mbit(1),
+            C.loss, C.ge_p, C.ge_r, C.ge_1h, C.ge_1k,
             C.out_ms, C.out_every_s, C.limit, (unsigned long long)C.seed,
             C.tuple_mbit, C.tuple_bucket_bytes,
             C.tuple_mode == MODE_POLICER ? "policer" : "shaper",
@@ -579,6 +591,26 @@ int main(void) {
     promote_ready(t_idle);
     expect("policer drops the over-bucket packet", D[0].drop_tuple == 1 && wait_h.n == 0 && due_h.n == 21);
     C.tuple_mode = MODE_SHAPER;
+
+    /* Asymmetric shared-link rates: to_far 20 Mbit, to_near 200 Mbit.
+     * One 1500 B packet each way at t=0; no per-tuple shaper. The unused
+     * rate_mbit=1000 must not be applied (that would be 12 us both ways). */
+    reset_sched();
+    C.tuple_mbit = 0;
+    C.rate_mbit = 1000;
+    C.rate_to_far_mbit = 20;
+    C.rate_to_near_mbit = 200;
+    ingest(0, 1500, 0, 0);
+    ingest(1, 1500, 0, 1);
+    uint64_t asym[8]; int na = collect_due(0, asym, 8);
+    expect("asym: both directions due", na == 2);
+    uint64_t tmin = asym[0] < asym[1] ? asym[0] : asym[1];
+    uint64_t tmax = asym[0] > asym[1] ? asym[0] : asym[1];
+    expect("asym: near serialises in 60 us", tmin == 60000ULL);
+    expect("asym: far serialises in 600 us", tmax == 600000ULL);
+    C.tuple_mbit = 4;
+    C.rate_to_far_mbit = 0;
+    C.rate_to_near_mbit = 0;
 
     if (failures) { fprintf(stderr, "%d wanem schedule test(s) failed\n", failures); return 1; }
     fprintf(stderr, "all wanem schedule tests passed\n");

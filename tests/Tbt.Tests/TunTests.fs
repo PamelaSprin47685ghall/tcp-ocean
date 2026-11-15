@@ -586,6 +586,69 @@ let ``rate group: startup full-pipe check ignores app-limited idle and sub-BDP r
     Assert.False(g.InStartup, "full pipe still ends startup: " + g.Describe())
     Assert.True(n >= 3 * 40 && n <= 5 * 40, sprintf "exited after %d ms, expected about 3 rounds (120 ms)" n)
 
+[<Fact>]
+let ``rate group: uplink and downlink keep separate estimates after idle`` () =
+    // Dedicated lines are asymmetric and come in more than one bandwidth:
+    // the client uplink RateGroup and the server downlink RateGroup each
+    // learn their own pipe. An idle / direction switch must not copy one
+    // estimate onto the other, and must not depend on a hard-coded rate.
+    let clock = ManualClock()
+    let up = RateGroup(clock)
+    let down = RateGroup(clock)
+    let um = FakeMember()
+    let dm = FakeMember()
+    up.Add um
+    down.Add dm
+    let feed (g: RateGroup) (m: FakeMember) inflight bulk sent burn =
+        g.OnSent sent
+        m.Delivered <- m.Delivered + int64 sent
+        m.Inflight <- inflight
+        if burn > 0 then g.OnSent burn
+        g.TryTake(L, bulk) |> ignore
+        g.Service clock.Now
+    let step () = clock.Now <- clock.Now + 1_000_000L
+    // 40 ms minRTT. Up 20 Mbit/s = 2500 B/ms (2 BDP = 200 kB).
+    // Down 200 Mbit/s = 25 000 B/ms (2 BDP = 2 MB).
+    for _ in 1 .. 120 do
+        step ()
+        feed up um 300_000 true 2_500 0
+    Assert.True(up.InStartup, up.Describe())
+    Assert.InRange(up.Bandwidth, 0.0024, 0.0026)
+    for _ in 1 .. 120 do
+        step ()
+        feed down dm 3_000_000 true 25_000 0
+    Assert.True(down.InStartup, down.Describe())
+    Assert.InRange(down.Bandwidth, 0.024, 0.026)
+    // App-limited idle on both (the opposite direction has the bulk).
+    for _ in 1 .. 400 do
+        step ()
+        feed up um 0 false 20 0
+        feed down dm 0 false 100 0
+    Assert.True(up.InStartup, "up stays in startup: " + up.Describe())
+    Assert.True(down.InStartup, "down stays in startup: " + down.Describe())
+    Assert.InRange(up.Bandwidth, 0.0024, 0.0026)
+    Assert.InRange(down.Bandwidth, 0.024, 0.026)
+    Assert.True(down.Bandwidth > up.Bandwidth * 5.0, "estimates must stay an order of magnitude apart")
+    // Downlink bulk resumes below 2 BDP: must not exit, must not fall to the 20 Mbit estimate.
+    for _ in 1 .. 200 do
+        step ()
+        feed down dm 400_000 true 25_000 1_000_000
+        feed up um 0 false 20 0
+    Assert.True(down.InStartup, "down sub-BDP must not end startup: " + down.Describe())
+    Assert.InRange(down.Bandwidth, 0.024, 0.026)
+    Assert.InRange(up.Bandwidth, 0.0024, 0.0026)
+    // A loaded downlink pipe still ends startup; the uplink estimate is untouched.
+    let mutable n = 0
+    while down.InStartup && n < 200 do
+        step ()
+        feed down dm 3_000_000 true 25_000 0
+        feed up um 0 false 20 0
+        n <- n + 1
+    Assert.False(down.InStartup, "down full pipe still ends startup: " + down.Describe())
+    Assert.True(up.InStartup, "up must not follow the downlink exit: " + up.Describe())
+    Assert.InRange(up.Bandwidth, 0.0024, 0.0026)
+    Assert.InRange(down.Bandwidth, 0.024, 0.026)
+
 let blackoutRunWith (sack: bool) (paths: int) (lossP: float) (seed: int) (lost: int64 -> bool) (ms: int) =
     // netns (5 % loss + 300 ms outage every 3 s): all paths stalled together, all were demoted,
     // no segment was sent again and the downlink stayed dead for minutes.

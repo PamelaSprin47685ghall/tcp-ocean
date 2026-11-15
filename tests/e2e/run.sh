@@ -16,6 +16,10 @@
 #   UPLINK_PACE=1 (client shared uplink RateGroup; default off). Independent of TUPLE_MBIT
 #   (client --tuple-mbit; default 0=off) and of the wanem per-tuple shaper (PROFILE=rtt400
 #   sets wanem tuple_mbit=4 in WANEM_EXTRA; that is the network model, not the client pacer).
+#   PROFILE=asym20_200: wanem rate_to_far_mbit=20 (uplink) and rate_to_near_mbit=200
+#   (downlink); owd still comes from the argv (default 20 ms). rate_mbit remains the
+#   fallback if a per-direction key is omitted. The symmetric 20/200 and rtt400
+#   matrices are unchanged.
 #   WANEM_TUPLE_MODE=shaper|policer (default shaper), WANEM_LOSS_POINT=before|after (default
 #   before). Either key in WANEM_EXTRA wins over these env defaults.
 #   HOST_PAUSE_DISCARD=1 marks a run invalid when dmesg shows a host VM fork or virtio_balloon
@@ -37,6 +41,11 @@ if [[ $profile == rtt400 ]]; then
     owd=${1:-200} rate=${2:-1000} loss=${3:-0} paths=${4:-4} seconds=${5:-10}
     if [[ -z ${WANEM_EXTRA:-} ]]; then
         WANEM_EXTRA="tuple_mbit=4\ntuple_bucket_bytes=32000"
+    fi
+elif [[ $profile == asym20_200 ]]; then
+    owd=${1:-20} rate=${2:-200} loss=${3:-0} paths=${4:-4} seconds=${5:-10}
+    if [[ -z ${WANEM_EXTRA:-} ]]; then
+        WANEM_EXTRA="rate_to_far_mbit=20\nrate_to_near_mbit=200"
     fi
 else
     owd=${1:-20} rate=${2:-200} loss=${3:-0} paths=${4:-4} seconds=${5:-10}
@@ -235,9 +244,15 @@ wanem_eff_mode=$(awk -F= '$1=="tuple_mode"{v=$2} END{print v}' "$work/wanem.conf
 wanem_eff_loss=$(awk -F= '$1=="loss_point"{v=$2} END{print v}' "$work/wanem.conf")
 wanem_eff_tuple=$(awk -F= '$1=="tuple_mbit"{v=$2} END{print v}' "$work/wanem.conf")
 wanem_eff_bucket=$(awk -F= '$1=="tuple_bucket_bytes"{v=$2} END{print v}' "$work/wanem.conf")
-stamp "flags: uplink_pace=$uplink_pace client_tuple_mbit=$tuple_mbit new_repair=$new_repair join_concurrency=${JOIN_CONCURRENCY:-default} window=$window window_clamp=$window_clamp max_paths=$max_paths carrier=$carrier profile=${profile:-none} wanem_tuple_mbit=${wanem_eff_tuple:-0} wanem_tuple_bucket=${wanem_eff_bucket:-default} wanem_tuple_mode=$wanem_eff_mode wanem_loss_point=$wanem_eff_loss wanem_seed=$seed wanem_version=2 host_pause_discard=$host_pause_discard skip_echo=${SKIP_ECHO:-0} skip_iperf=${SKIP_IPERF:-0} skip_ref=${SKIP_REF:-0} ping_count=$ping_count handshake_s=$handshake_s pause=${PAUSE:-none}"
+wanem_eff_to_far=$(awk -F= '$1=="rate_to_far_mbit"{v=$2} END{print v}' "$work/wanem.conf")
+wanem_eff_to_near=$(awk -F= '$1=="rate_to_near_mbit"{v=$2} END{print v}' "$work/wanem.conf")
+stamp "flags: uplink_pace=$uplink_pace client_tuple_mbit=$tuple_mbit new_repair=$new_repair join_concurrency=${JOIN_CONCURRENCY:-default} window=$window window_clamp=$window_clamp max_paths=$max_paths carrier=$carrier profile=${profile:-none} wanem_tuple_mbit=${wanem_eff_tuple:-0} wanem_tuple_bucket=${wanem_eff_bucket:-default} wanem_rate_to_far=${wanem_eff_to_far:-} wanem_rate_to_near=${wanem_eff_to_near:-} wanem_tuple_mode=$wanem_eff_mode wanem_loss_point=$wanem_eff_loss wanem_seed=$seed wanem_version=2 host_pause_discard=$host_pause_discard skip_echo=${SKIP_ECHO:-0} skip_iperf=${SKIP_IPERF:-0} skip_ref=${SKIP_REF:-0} ping_count=$ping_count handshake_s=$handshake_s pause=${PAUSE:-none}"
 sudo TBTUN_NETNS_LOCK_HELD=1 "$here/netns.sh" up "$work"
-echo "link: owd ${owd} ms each way, ${rate} Mbit/s, segment loss ${loss}; paths ${paths}; window ${window}; window_clamp ${window_clamp}; seed ${seed}; server_max_paths ${max_paths}; server carrier ${carrier}; client_tuple_mbit ${tuple_mbit}; uplink_pace ${uplink_pace}; wanem_tuple_mode ${wanem_eff_mode}; wanem_loss_point ${wanem_eff_loss}"
+if [[ -n ${wanem_eff_to_far:-} || -n ${wanem_eff_to_near:-} ]]; then
+    echo "link: owd ${owd} ms each way, ${rate} Mbit/s fallback, to_far ${wanem_eff_to_far:-$rate} / to_near ${wanem_eff_to_near:-$rate} Mbit/s, segment loss ${loss}; paths ${paths}; window ${window}; window_clamp ${window_clamp}; seed ${seed}; server_max_paths ${max_paths}; server carrier ${carrier}; client_tuple_mbit ${tuple_mbit}; uplink_pace ${uplink_pace}; wanem_tuple_mode ${wanem_eff_mode}; wanem_loss_point ${wanem_eff_loss}"
+else
+    echo "link: owd ${owd} ms each way, ${rate} Mbit/s, segment loss ${loss}; paths ${paths}; window ${window}; window_clamp ${window_clamp}; seed ${seed}; server_max_paths ${max_paths}; server carrier ${carrier}; client_tuple_mbit ${tuple_mbit}; uplink_pace ${uplink_pace}; wanem_tuple_mode ${wanem_eff_mode}; wanem_loss_point ${wanem_eff_loss}"
+fi
 
 in_ns far python3 "$work/echo.py" serve 7000 &
 in_ns far iperf3 -s -p 5201 >/dev/null 2>&1 &
