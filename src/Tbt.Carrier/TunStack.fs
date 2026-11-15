@@ -91,10 +91,11 @@ type TunStack(fd: int, local: IPEndPoint, clock: IClock, entropy: IEntropy, maxC
     /// Connections whose bootstrap frame is whole and that wait for classification.
     member _.Fresh = fresh
 
-    /// True when a connection has a TCP ACK waiting to be flushed.
+    /// True when Service can flush an ACK or close a gap now.
     member _.AckDue =
+        let now = clock.NowNs()
         let mutable d = false
-        for c in conns.Values do if c.AckPending then d <- true
+        for c in conns.Values do if c.AckNeedsService now then d <- true
         d
 
     /// TUNSETSNDBUF; bytes <= 0 leaves the kernel default (no ioctl).

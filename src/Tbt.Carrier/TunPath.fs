@@ -385,6 +385,21 @@ type TunPath(output: ITunOutput, counters: TunCounters, localIp: uint32, localPo
     /// not closing, no FIN seen. The advance never passes the observed right edge.
     let leaseValid () = dataPhase && attached && not closing && peerFinAt = UInt64.MaxValue
 
+    /// An ACK can leave now, or its gap still needs the lease grace.
+    let canFlushAck () =
+        if not ackDue || state = TunState.Closed then false
+        else
+            let grace = ivCount > 0 && leaseValid ()
+            let below = sackOk && dsackHi > dsackLo && dsackLo < rcvNxt
+            not grace || below
+
+    /// Read the first gap without changing its timer or the receive frontier.
+    let firstGapAction (now: int64) =
+        if state <> TunState.Established || ivCount = 0 || not (leaseValid ()) then struct (false, false)
+        else
+            let fast = ivWm.[0] <> UInt64.MaxValue && owner.Frontier > ivWm.[0]
+            struct (fast || now - ivSince.[0] >= graceNs, fast)
+
     let removeSwallowed (i: int) =
         for j in i .. swCount - 2 do
             swStart.[j] <- swStart.[j + 1]
@@ -860,6 +875,13 @@ type TunPath(output: ITunOutput, counters: TunCounters, localIp: uint32, localPo
     member _.BootFrame = ReadOnlySpan(head, bootAt, Layout.BootFrameLength)
     /// True while timers or sending may need a short wait.
     member _.AckPending = ackDue && state <> TunState.Closed
+    /// Yield the receive loop only when Service can act on the pending ACK or gap.
+    /// The query does not move timers; Service still applies clock-jump handling.
+    member _.AckNeedsService(now: int64) =
+        if canFlushAck () then true
+        else
+            let struct (ready, _) = firstGapAction now
+            ready
     member _.Busy = ringCount > 0 || ivCount > 0 || ackDue
     member _.Closed = state = TunState.Closed
 
@@ -963,12 +985,11 @@ type TunPath(output: ITunOutput, counters: TunCounters, localIp: uint32, localPo
         catchUp now
         isDemoted now |> ignore
         if state = TunState.Established then
-            if leaseValid () then
-                let mutable go = true
-                while go && ivCount > 0 do
-                    let fast = ivWm.[0] <> UInt64.MaxValue && owner.Frontier > ivWm.[0]
-                    if fast || now - ivSince.[0] >= graceNs then swallow fast
-                    else go <- false
+            let mutable go = true
+            while go && ivCount > 0 do
+                let struct (ready, fast) = firstGapAction now
+                if ready then swallow fast
+                else go <- false
             // Fragments that can no longer complete.
             if dataPhase then
                 let l = uint64 frameLength
@@ -1036,7 +1057,7 @@ type TunPath(output: ITunOutput, counters: TunCounters, localIp: uint32, localPo
     /// Send the pending ACK, unless a gap is in its grace (spec 6.8.2: no duplicate ACK and
     /// no SACK while the lease covers it).
     member _.FlushAck() =
-        if ackDue && state <> TunState.Closed then
+        if canFlushAck () then
             let dsack = sackOk && dsackHi > dsackLo
             let grace = ivCount > 0 && leaseValid ()
             // A duplicate above the cumulative ACK is reported in the RFC 2883 two-block form
@@ -1049,30 +1070,29 @@ type TunPath(output: ITunOutput, counters: TunCounters, localIp: uint32, localPo
                     if ivStart.[i] <= dsackLo && dsackHi <= ivEnd.[i] then c <- i
             // In the grace only a D-SACK below the cumulative ACK may go out, alone: interval
             // blocks would be duplicate ACKs; such a D-SACK block covers no new data.
-            if not grace || (dsack && not above) then
-                let blocks = if grace || not sackOk then 0 else min (if dsack then 3 else 4) ivCount
-                let d = if dsack then 1 else 0
-                if blocks + d > 0 then
-                    let o = Span<byte>(sackOption, 0, 4 + 8 * (blocks + d))
-                    o.[0] <- 1uy
-                    o.[1] <- 1uy
-                    o.[2] <- 5uy
-                    o.[3] <- byte (2 + 8 * (blocks + d))
-                    if dsack then
-                        BinaryPrimitives.WriteUInt32BigEndian(o.Slice 4, uint32 dsackLo)
-                        BinaryPrimitives.WriteUInt32BigEndian(o.Slice 8, uint32 dsackHi)
-                        counters.Dsacks <- counters.Dsacks + 1L
-                    // Interval order, the one holding an above-ACK duplicate first.
-                    for k in 0 .. blocks - 1 do
-                        let i = if c < 0 then k elif k = 0 then c elif k - 1 < c then k - 1 else k
-                        BinaryPrimitives.WriteUInt32BigEndian(o.Slice(4 + 8 * (k + d)), uint32 ivStart.[i])
-                        BinaryPrimitives.WriteUInt32BigEndian(o.Slice(8 + 8 * (k + d)), uint32 ivEnd.[i])
-                    send Packet.Ack sndNxt (Span<byte>.op_Implicit o) 0
-                else send Packet.Ack sndNxt ReadOnlySpan.Empty 0
-                dsackLo <- 0UL
-                dsackHi <- 0UL
-                // A grace-time D-SACK leaves the gap's ACK for later.
-                ackDue <- grace
+            let blocks = if grace || not sackOk then 0 else min (if dsack then 3 else 4) ivCount
+            let d = if dsack then 1 else 0
+            if blocks + d > 0 then
+                let o = Span<byte>(sackOption, 0, 4 + 8 * (blocks + d))
+                o.[0] <- 1uy
+                o.[1] <- 1uy
+                o.[2] <- 5uy
+                o.[3] <- byte (2 + 8 * (blocks + d))
+                if dsack then
+                    BinaryPrimitives.WriteUInt32BigEndian(o.Slice 4, uint32 dsackLo)
+                    BinaryPrimitives.WriteUInt32BigEndian(o.Slice 8, uint32 dsackHi)
+                    counters.Dsacks <- counters.Dsacks + 1L
+                // Interval order, the one holding an above-ACK duplicate first.
+                for k in 0 .. blocks - 1 do
+                    let i = if c < 0 then k elif k = 0 then c elif k - 1 < c then k - 1 else k
+                    BinaryPrimitives.WriteUInt32BigEndian(o.Slice(4 + 8 * (k + d)), uint32 ivStart.[i])
+                    BinaryPrimitives.WriteUInt32BigEndian(o.Slice(8 + 8 * (k + d)), uint32 ivEnd.[i])
+                send Packet.Ack sndNxt (Span<byte>.op_Implicit o) 0
+            else send Packet.Ack sndNxt ReadOnlySpan.Empty 0
+            dsackLo <- 0UL
+            dsackHi <- 0UL
+            // A grace-time D-SACK leaves the gap's ACK for later.
+            ackDue <- grace
 
     /// Last resort (the causes are fixed where found): an exception from this path or its
     /// owner fails only that owner (one session) and resets this connection.
