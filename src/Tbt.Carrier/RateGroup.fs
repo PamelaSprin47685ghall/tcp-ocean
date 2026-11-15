@@ -45,6 +45,12 @@ type RateGroup(clock: IClock) =
     /// as a full pipe. A source that keeps up with the network (an echo, a handshake
     /// trickle) never sets it, and its rounds say nothing about the pipe.
     let mutable backlogged = false
+    /// Group-wide delivery state for per-ACK rate samples (BBR delivery rate estimation:
+    /// tp->delivered, delivered_mstamp, first_tx_mstamp), summed over the member paths.
+    let mutable ackDelivered = 0L
+    let mutable ackDeliveredNs = clock.NowNs()
+    let mutable ackFirstSentNs = clock.NowNs()
+    let mutable ackSamples = 0L
     /// Startup rounds are counted by delivery, not by time: a round ends once one BDP of
     /// the current estimate (bw x min RTT) has been delivered since the last one. While
     /// the pipe delivers at its estimate this is one round per sample interval, as
@@ -218,6 +224,39 @@ type RateGroup(clock: IClock) =
         let reserve = this.Refill l
         repairTokens >= float bytes && tokens - float bytes >= -reserve
 
+    /// Group delivery state to stamp on a frame at send time.
+    member _.DeliveredBytes = ackDelivered
+    member _.DeliveredNs = ackDeliveredNs
+    member _.FirstSentNs = ackFirstSentNs
+    /// A send with nothing of the group in flight starts a new delivery interval (BBR).
+    member _.OnSendStart(now: int64) =
+        ackDeliveredNs <- now
+        ackFirstSentNs <- now
+
+    /// One frame delivered (cumulative ACK or SACK), with the group state stamped when it was
+    /// sent. In startup the per-ACK delivery rate (delivered since that send over the longer
+    /// of the send and ACK spans, never shorter than min RTT) raises the estimate at once.
+    /// The interval sampler only sees a rate one sample after it was delivered and is applied
+    /// one sample later still, so startup grew 2.885x per two min RTTs: from a seed of a few
+    /// Mbit (an ACK-only direction before a switch) the 400 ms lines took ~3 s to fill.
+    /// Samples only raise the estimate here; the interval sampler keeps every other rule.
+    member _.OnDelivered(bytes: int, sentDelivered: int64, sentDeliveredNs: int64, firstSentNs: int64,
+                         sentNs: int64, now: int64) =
+        ackDelivered <- ackDelivered + int64 bytes
+        let interval = max (now - sentDeliveredNs) (sentNs - firstSentNs)
+        ackDeliveredNs <- now
+        ackFirstSentNs <- sentNs
+        if startup && not draining then
+            let rtt = cachedMinRtt
+            if rtt <> Int64.MaxValue && rtt > 0L && interval >= rtt then
+                let rate = float (ackDelivered - sentDelivered) / float interval
+                if rate > bw then
+                    bw <- rate
+                    if rate > filter.[slot] then filter.[slot] <- rate
+                    ackSamples <- ackSamples + 1L
+
+    member _.AckRaises = ackSamples
+
     /// The session has at least BacklogFrames frames queued (called once per write round).
     member _.NoteBacklog() = backlogged <- true
 
@@ -383,7 +422,7 @@ type RateGroup(clock: IClock) =
         + " inflight=" + string (inflight ()) + " repair_kib=" + string (repairBytes / 1024L) + " phase="
         + phase ()
         + " full_rounds=" + string fullCount + " app_rounds=" + string appLimited
-        + " rounds=" + string deliveryRounds
+        + " rounds=" + string deliveryRounds + " ack_raises=" + string ackSamples
         + " pacing_mbit=" + (gain () * bw * 8000.0).ToString("F1")
         + " send_mbit=" + (measuredSendRate * 8000.0).ToString("F1")
         + " sample_mbit=" + (sampleRate * 8000.0).ToString("F1")

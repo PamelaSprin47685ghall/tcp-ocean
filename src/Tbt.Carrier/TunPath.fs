@@ -75,6 +75,11 @@ type SentSegment =
       mutable Delivered: int64
       mutable DeliveredNs: int64
       mutable FirstSentNs: int64
+      /// The group's delivery state when this copy was sent (BBR per-ACK rate sample of the
+      /// whole group, not only this path).
+      mutable GroupDelivered: int64
+      mutable GroupDeliveredNs: int64
+      mutable GroupFirstSentNs: int64
       /// Repair copies beyond the first, in bytes (HOLE-2 duplicates on the wire).
       mutable Duplicates: int
       /// A repair is requested and waits for the pacer.
@@ -663,6 +668,7 @@ type TunPath(output: ITunOutput, counters: TunCounters, localIp: uint32, localPo
         let interval = max ackElapsed sendElapsed
         deliveredNs <- now
         lastDeliveredSentNs <- s.SentNs
+        group.OnDelivered(s.Length, s.GroupDelivered, s.GroupDeliveredNs, s.GroupFirstSentNs, s.SentNs, now)
         if s.Retx > 0 then heldBehindRepair <- true
         if s.Retx = 0 && not heldBehindRepair && now >= s.SentNs then
             let rtt = float (now - s.SentNs)
@@ -738,6 +744,9 @@ type TunPath(output: ITunOutput, counters: TunCounters, localIp: uint32, localPo
             s.Delivered <- delivered
             s.DeliveredNs <- deliveredNs
             s.FirstSentNs <- lastDeliveredSentNs
+            s.GroupDelivered <- group.DeliveredBytes
+            s.GroupDeliveredNs <- group.DeliveredNs
+            s.GroupFirstSentNs <- group.FirstSentNs
             ackDue <- false
 
     /// Index of the segment that starts at seq, or -1.
@@ -973,7 +982,8 @@ type TunPath(output: ITunOutput, counters: TunCounters, localIp: uint32, localPo
                 ringHead <- 0
             if ringCount = 0 then unaNs <- now
             ring.[at ringCount] <- { Seq = sndNxt; Length = n; Kind = 0uy; Sacked = false; Retx = 0; SentNs = now; Duplicates = 0; Due = false
-                                     Delivered = delivered; DeliveredNs = deliveredNs; FirstSentNs = lastDeliveredSentNs }
+                                     Delivered = delivered; DeliveredNs = deliveredNs; FirstSentNs = lastDeliveredSentNs
+                                     GroupDelivered = group.DeliveredBytes; GroupDeliveredNs = group.DeliveredNs; GroupFirstSentNs = group.FirstSentNs }
             ringCount <- ringCount + 1
             inflight <- inflight + n
             send (Packet.Ack ||| Packet.Psh) sndNxt ReadOnlySpan.Empty n
@@ -1204,9 +1214,11 @@ type TunPath(output: ITunOutput, counters: TunCounters, localIp: uint32, localPo
             if inflight = 0 then
                 deliveredNs <- now
                 lastDeliveredSentNs <- now
+            if group.Inflight = 0 then group.OnSendStart now
             if ringCount = 0 then unaNs <- now
             ring.[at ringCount] <- { Seq = sndNxt; Length = l; Kind = 1uy; Sacked = false; Retx = 0; SentNs = now; Duplicates = 0; Due = false
-                                     Delivered = delivered; DeliveredNs = deliveredNs; FirstSentNs = lastDeliveredSentNs }
+                                     Delivered = delivered; DeliveredNs = deliveredNs; FirstSentNs = lastDeliveredSentNs
+                                     GroupDelivered = group.DeliveredBytes; GroupDeliveredNs = group.DeliveredNs; GroupFirstSentNs = group.FirstSentNs }
             ringCount <- ringCount + 1
             inflight <- inflight + l
             let p = output.Scratch

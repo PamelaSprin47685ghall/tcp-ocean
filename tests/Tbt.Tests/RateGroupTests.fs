@@ -230,3 +230,73 @@ let ``a trickle on one direction does not end startup or move the other directio
     Assert.Equal("drain", down.Group.Phase)
     near up.Rate up.Group.Bandwidth
     near down.Rate down.Group.Bandwidth
+
+/// A one-bottleneck link fed by the real controller: frames leave at the group's pace and
+/// cwnd, queue at a bottleneck of capacity bytes/ns, and are ACKed one RTT after they leave
+/// it. Before the bulk, `trickle` frames per RTT (ACK-only feedback) seed the estimate.
+/// perAck: the paths report each delivered frame to the group (TunPath does). Returns the
+/// time from bulk start until 100 ms of delivery reach 90 % of capacity, in ms.
+let private rampMs (capacityMbit: float) (rttMs: int) (trickle: int) (perAck: bool) =
+    let clock = Clock()
+    let rtt = int64 rttMs * 1_000_000L
+    let g = RateGroup(clock)
+    let m = Member(rtt)
+    g.Add m
+    let cap = capacityMbit / 8000.0
+    let L = 1344
+    let flight = System.Collections.Generic.Queue<struct (int64 * int64 * int64 * int64 * int64)>()
+    let mutable linkFree = 0L
+    let send () =
+        if g.Inflight = 0 && flight.Count = 0 then g.OnSendStart clock.Now
+        let depart = max clock.Now linkFree + int64 (float L / cap)
+        linkFree <- depart
+        flight.Enqueue(struct (depart + rtt, g.DeliveredBytes, g.DeliveredNs, g.FirstSentNs, clock.Now))
+        g.OnSent L
+        m.Inflight <- m.Inflight + L
+    let deliver () =
+        let mutable n = 0
+        while flight.Count > 0 && (let struct (at, _, _, _, _) = flight.Peek() in at <= clock.Now) do
+            let struct (_, d, dn, fs, sn) = flight.Dequeue()
+            m.Delivered <- m.Delivered + int64 L
+            m.Inflight <- m.Inflight - L
+            m.LastDelivered <- clock.Now
+            if perAck then g.OnDelivered(L, d, dn, fs, sn, clock.Now)
+            n <- n + L
+        n
+    // Feedback-only phase: a few frames per RTT for 4 s.
+    for t in 1 .. 4000 do
+        clock.Now <- clock.Now + 1_000_000L
+        deliver () |> ignore
+        if t % rttMs < trickle then send ()
+        g.Service clock.Now
+    let window = Array.zeroCreate<int> 100
+    let mutable sum = 0
+    let mutable result = -1
+    let mutable t = 0
+    while result < 0 && t < 20_000 do
+        t <- t + 1
+        clock.Now <- clock.Now + 1_000_000L
+        let n = deliver ()
+        sum <- sum + n - window.[t % 100]
+        window.[t % 100] <- n
+        g.NoteBacklog()
+        while g.TryTake(L, true) do send ()
+        g.Service clock.Now
+        if t >= 100 && float sum >= 0.9 * cap * 100_000_000.0 then result <- t
+        if System.Environment.GetEnvironmentVariable "RAMP_TRACE" = "1" && t % 100 = 0 then
+            printfn "  t=%d perAck=%b win=%.1f Mbit %s" t perAck (float sum * 8.0 / 100_000.0) (g.Describe())
+    result
+
+[<Theory>]
+[<InlineData(145.0, 400, 112)>]
+[<InlineData(145.0, 400, 60)>]
+[<InlineData(145.0, 400, 8)>]
+[<InlineData(32.0, 400, 60)>]
+[<InlineData(200.0, 40, 1)>]
+let ``after an ACK-only direction, per-ACK samples fill the pipe sooner than interval samples`` capMbit rttMs trickle =
+    let fast = rampMs capMbit rttMs trickle true
+    let slow = rampMs capMbit rttMs trickle false
+    printfn "ramp %g Mbit %d ms trickle %d: per-ACK %d ms, interval only %d ms" capMbit rttMs trickle fast slow
+    Assert.True(fast > 0 && slow > 0)
+    // The interval sampler applies a rate one sample late; per-ACK samples (BBR) at once.
+    Assert.True(float fast <= 0.9 * float slow, sprintf "per-ACK %d ms vs interval %d ms" fast slow)
