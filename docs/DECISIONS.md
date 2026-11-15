@@ -113,6 +113,6 @@ JOIN / JOIN_ACK 的引导 AEAD 仍是 ChaCha20-Poly1305；ACK 里的 suite 字�
 以及客户端与服务端在 X25519 / 0x03 / 两者同时开启时的互通。
 
 X25519 使用 5×51-bit limb 的恒定时间 Montgomery ladder（cswap、固定指令序列、ladder 与求逆不分配）。
-每 cell 的 AEAD 零分配：ChaCha 在 AVX2 上走 8-block Vector256 核，否则 Vector128；Poly1305 是 44-bit limb 的托管实现。
+每 cell 的 AEAD 零分配：ChaCha 在 AVX2 上走 8-block Vector256 核，否则 Vector128；Poly1305 是 donna-64（UInt128 乘法，预计算 r²..r⁴，一次吸收 4 块）。
 套件 0x02 也可与平台 `ChaCha20Poly1305`（Linux 上为 OpenSSL）交叉验证。TryDecrypt 不抛异常，伪造帧也不分配。
 

@@ -9,8 +9,8 @@ open System
 open System.Security.Cryptography
 
 /// Poly1305 one-time authenticator (RFC 8439 section 2.5). The arithmetic is
-/// the 44/44/42-bit limb core in Tbt.Kernels; one instance is reused, no
-/// allocation per Update/Finish.
+/// the donna-64 limb core in Tbt.Kernels (UInt128 products, r²..r⁴); one
+/// instance is reused, no allocation per Update/Finish.
 [<Sealed>]
 type Poly1305() =
     let mutable core = Kernels.Poly1305()
@@ -20,8 +20,9 @@ type Poly1305() =
     member _.Finish(tag: Span<byte>) = core.Finish tag
 
 [<Sealed>]
-type ChaCha20Poly1305Aead(key: ReadOnlySpan<byte>, ?doubleRounds: int) =
+type ChaCha20Poly1305Aead(key: ReadOnlySpan<byte>, ?doubleRounds: int, ?platform: bool) =
     let rounds = defaultArg doubleRounds 10
+    let wantPlatform = defaultArg platform true
     let words = ChaCha20.keyWords key
     let mac = Poly1305()
     let polyKey: byte[] = Array.zeroCreate 32
@@ -31,7 +32,7 @@ type ChaCha20Poly1305Aead(key: ReadOnlySpan<byte>, ?doubleRounds: int) =
     // is available. TryDecrypt stays on the managed path so a bad tag never
     // throws or allocates.
     let native: ChaCha20Poly1305 | null =
-        if rounds = 10 && ChaCha20Poly1305.IsSupported then new ChaCha20Poly1305(key) else null
+        if wantPlatform && rounds = 10 && ChaCha20Poly1305.IsSupported then new ChaCha20Poly1305(key) else null
 
     member private _.Authenticate(nonce: ReadOnlySpan<byte>, aad: ReadOnlySpan<byte>, cipher: ReadOnlySpan<byte>, tag: Span<byte>) =
         ChaCha20.blockRounds rounds words 0u nonce (Span polyKey)

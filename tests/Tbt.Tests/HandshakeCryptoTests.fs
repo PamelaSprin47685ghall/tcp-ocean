@@ -240,8 +240,12 @@ let ``microbench: ChaCha8 vs ChaCha20 AEAD on a data-cell body`` () =
     let aad = Array.init 18 (fun i -> byte (i + 3))
     // 40-byte meta + 1344-byte symbol, the plaintext of one S=1344 cell.
     let plain = Array.init 1384 (fun i -> byte i)
-    let run (rounds: int) (iters: int) (warm: int) =
-        let aead = ChaCha20Poly1305Aead(ReadOnlySpan key, rounds)
+    let median (xs: float[]) =
+        let a = Array.copy xs
+        Array.sortInPlace a
+        a.[a.Length / 2]
+    let run (rounds: int) (platform: bool) (iters: int) (warm: int) (samples: int) =
+        let aead = ChaCha20Poly1305Aead(ReadOnlySpan key, rounds, platform)
         let cipher = Array.zeroCreate plain.Length
         let tag = Array.zeroCreate 16
         let back = Array.zeroCreate plain.Length
@@ -250,17 +254,22 @@ let ``microbench: ChaCha8 vs ChaCha20 AEAD on a data-cell body`` () =
             if not (aead.TryDecrypt(ReadOnlySpan nonce, ReadOnlySpan cipher, ReadOnlySpan tag, Span back, ReadOnlySpan aad)) then
                 failwith "bench decrypt failed"
         for _ in 1 .. warm do once ()
-        GC.Collect()
-        GC.WaitForPendingFinalizers()
-        let before = GC.GetAllocatedBytesForCurrentThread()
-        let sw = Stopwatch.StartNew()
-        for _ in 1 .. iters do once ()
-        sw.Stop()
-        let alloc = GC.GetAllocatedBytesForCurrentThread() - before
-        sw.Elapsed.TotalNanoseconds / float iters, alloc
-    let ns20, a20 = run 10 20000 4000
-    let ns8, a8 = run 4 20000 4000
-    Assert.True(ns8 > 0.0 && ns20 > 0.0)
-    // Per-cell AEAD itself must not allocate (see CryptoTests); this print is for the report.
-    eprintfn "cell AEAD ns/op ChaCha20=%.0f ChaCha8=%.0f ratio=%.2f alloc/op 20=%.3f 8=%.3f"
-        ns20 ns8 (ns20 / ns8) (float a20 / 20000.0) (float a8 / 20000.0)
+        let ns = Array.zeroCreate samples
+        let mutable allocTotal = 0L
+        for s in 0 .. samples - 1 do
+            GC.Collect()
+            GC.WaitForPendingFinalizers()
+            let before = GC.GetAllocatedBytesForCurrentThread()
+            let sw = Stopwatch.StartNew()
+            for _ in 1 .. iters do once ()
+            sw.Stop()
+            allocTotal <- allocTotal + (GC.GetAllocatedBytesForCurrentThread() - before)
+            ns.[s] <- sw.Elapsed.TotalNanoseconds / float iters
+        median ns, float allocTotal / float (iters * samples)
+    // Managed Enc+Dec (platform=false) is what this Poly1305 change moves; 5 warmed samples, median.
+    let ns20, a20 = run 10 false 20000 8000 5
+    let ns8, a8 = run 4 false 20000 8000 5
+    let ns20p, a20p = run 10 true 20000 8000 5
+    Assert.True(ns8 > 0.0 && ns20 > 0.0 && ns20p > 0.0)
+    eprintfn "cell AEAD median-of-5 ns/op managed20=%.0f managed8=%.0f prod20=%.0f alloc/op 20=%.3f 8=%.3f prod20=%.3f"
+        ns20 ns8 ns20p a20 a8 a20p

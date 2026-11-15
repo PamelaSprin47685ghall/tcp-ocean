@@ -237,12 +237,14 @@ let private rfcAeadPlain =
 
 [<Fact>]
 let ``AEAD matches RFC 8439 section 2.8.2`` () =
-    let aead = ChaCha20Poly1305Aead(ReadOnlySpan(hex "808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f"))
+    let key = hex "808182838485868788898a8b8c8d8e8f909192939495969798999a9b9c9d9e9f"
     let nonce = hex "070000004041424344454647"
     let aad = hex "50515253c0c1c2c3c4c5c6c7"
     let plain = Text.Encoding.ASCII.GetBytes rfcAeadPlain
     let cipher = Array.zeroCreate<byte> plain.Length
     let tag = Array.zeroCreate<byte> 16
+    // Managed core (not the platform AEAD) must match the RFC vector itself.
+    let aead = ChaCha20Poly1305Aead(ReadOnlySpan key, platform = false)
     aead.Encrypt(ReadOnlySpan nonce, ReadOnlySpan plain, Span cipher, Span tag, ReadOnlySpan aad)
     Assert.StartsWith("d31a8d34648e60db7b86afbc53ef7ec2a4aded51296e08fea9e2b5a736ee62d6", toHex (ReadOnlySpan cipher))
     Assert.EndsWith("6116", toHex (ReadOnlySpan cipher))
@@ -270,13 +272,44 @@ let ``AEAD agrees with the platform implementation on random inputs`` () =
             rng.NextBytes aad
             let c1 = Array.zeroCreate<byte> plain.Length
             let t1 = Array.zeroCreate<byte> 16
-            ChaCha20Poly1305Aead(ReadOnlySpan key).Encrypt(ReadOnlySpan nonce, ReadOnlySpan plain, Span c1, Span t1, ReadOnlySpan aad)
+            ChaCha20Poly1305Aead(ReadOnlySpan key, platform = false).Encrypt(ReadOnlySpan nonce, ReadOnlySpan plain, Span c1, Span t1, ReadOnlySpan aad)
             let c2 = Array.zeroCreate<byte> plain.Length
             let t2 = Array.zeroCreate<byte> 16
             use bcl = new Security.Cryptography.ChaCha20Poly1305(key)
             bcl.Encrypt(nonce, plain, c2, t2, aad)
             Assert.Equal(toHex (ReadOnlySpan c2), toHex (ReadOnlySpan c1))
             Assert.Equal(toHex (ReadOnlySpan t2), toHex (ReadOnlySpan t1))
+
+[<Fact>]
+let ``managed AEAD agrees with the platform on edge and random lengths`` () =
+    if Security.Cryptography.ChaCha20Poly1305.IsSupported then
+        let edges = [| 0; 1; 15; 16; 17; 31; 32; 33; 63; 64; 65; 127; 128; 255; 256; 1024; 1384; 1385; 2048; 3000 |]
+        let aadLens = [| 0; 1; 15; 16; 17; 18; 32; 40; 64 |]
+        let rng = Random 11
+        let trial (plainLen: int) (aadLen: int) (seed: int) =
+            let rng = Random seed
+            let key, nonce = Array.zeroCreate<byte> 32, Array.zeroCreate<byte> 12
+            rng.NextBytes key
+            rng.NextBytes nonce
+            let plain = Array.zeroCreate<byte> plainLen
+            let aad = Array.zeroCreate<byte> aadLen
+            rng.NextBytes plain
+            rng.NextBytes aad
+            let c1, t1 = Array.zeroCreate<byte> plainLen, Array.zeroCreate 16
+            let c2, t2 = Array.zeroCreate<byte> plainLen, Array.zeroCreate 16
+            ChaCha20Poly1305Aead(ReadOnlySpan key, platform = false).Encrypt(ReadOnlySpan nonce, ReadOnlySpan plain, Span c1, Span t1, ReadOnlySpan aad)
+            use bcl = new Security.Cryptography.ChaCha20Poly1305(key)
+            bcl.Encrypt(nonce, plain, c2, t2, aad)
+            Assert.Equal(toHex (ReadOnlySpan c2), toHex (ReadOnlySpan c1))
+            Assert.Equal(toHex (ReadOnlySpan t2), toHex (ReadOnlySpan t1))
+            let back = Array.zeroCreate<byte> plainLen
+            Assert.True(ChaCha20Poly1305Aead(ReadOnlySpan key, platform = false).TryDecrypt(ReadOnlySpan nonce, ReadOnlySpan c2, ReadOnlySpan t2, Span back, ReadOnlySpan aad))
+            Assert.Equal<byte[]>(plain, back)
+        for p in edges do
+            for a in aadLens do
+                trial p a (p * 131 + a * 17 + 3)
+        for i in 0 .. 199 do
+            trial (rng.Next(0, 4000)) (rng.Next(0, 80)) (1000 + i)
 
 [<Fact>]
 let ``a forged frame costs no exception and no allocation`` () =
