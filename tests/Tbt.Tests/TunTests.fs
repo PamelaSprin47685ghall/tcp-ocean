@@ -563,7 +563,7 @@ let ``rate group: startup full-pipe check ignores app-limited idle and sub-BDP r
         if burn > 0 then g.OnSent burn
         g.TryTake(L, bulk) |> ignore
         g.Service clock.Now
-    // Learn 200 Mbit/s in startup (40 ms minRTT, 2 BDP = 2 MB). Three loaded
+    // Learn 200 Mbit/s in startup (40 ms minRTT, 1 BDP = 1 MB). Three loaded
     // no-growth samples set leftover fullCount = 2 without exiting (4th would).
     for _ in 1 .. 120 do
         tick 3_000_000 true 25_000 0
@@ -574,11 +574,11 @@ let ``rate group: startup full-pipe check ignores app-limited idle and sub-BDP r
         tick 0 false 100 0
     Assert.True(g.InStartup, "idle must keep startup: " + g.Describe())
     Assert.InRange(g.Bandwidth, 0.024, 0.026)
-    // Bulk resumes: pacer/cwnd limited but inflight well below 2 BDP (400 kB).
+    // Bulk resumes: pacer/cwnd limited but inflight well below 1 BDP (400 kB).
     for _ in 1 .. 200 do
         tick 400_000 true 25_000 1_000_000
     Assert.True(g.InStartup, "sub-BDP limited rounds must not end startup: " + g.Describe())
-    // A loaded pipe (3 MB > 2 BDP) with no 25 % growth: three rounds end startup.
+    // A loaded pipe (3 MB > 1 BDP) with no 25 % growth: three rounds end startup.
     let mutable n = 0
     while g.InStartup && n < 200 do
         tick 3_000_000 true 25_000 0
@@ -607,8 +607,8 @@ let ``rate group: uplink and downlink keep separate estimates after idle`` () =
         g.TryTake(L, bulk) |> ignore
         g.Service clock.Now
     let step () = clock.Now <- clock.Now + 1_000_000L
-    // 40 ms minRTT. Up 20 Mbit/s = 2500 B/ms (2 BDP = 200 kB).
-    // Down 200 Mbit/s = 25 000 B/ms (2 BDP = 2 MB).
+    // 40 ms minRTT. Up 20 Mbit/s = 2500 B/ms (1 BDP = 100 kB).
+    // Down 200 Mbit/s = 25 000 B/ms (1 BDP = 1 MB).
     for _ in 1 .. 120 do
         step ()
         feed up um 300_000 true 2_500 0
@@ -629,7 +629,7 @@ let ``rate group: uplink and downlink keep separate estimates after idle`` () =
     Assert.InRange(up.Bandwidth, 0.0024, 0.0026)
     Assert.InRange(down.Bandwidth, 0.024, 0.026)
     Assert.True(down.Bandwidth > up.Bandwidth * 5.0, "estimates must stay an order of magnitude apart")
-    // Downlink bulk resumes below 2 BDP: must not exit, must not fall to the 20 Mbit estimate.
+    // Downlink bulk resumes below 1 BDP: must not exit, must not fall to the 20 Mbit estimate.
     for _ in 1 .. 200 do
         step ()
         feed down dm 400_000 true 25_000 1_000_000
@@ -648,6 +648,38 @@ let ``rate group: uplink and downlink keep separate estimates after idle`` () =
     Assert.True(up.InStartup, "up must not follow the downlink exit: " + up.Describe())
     Assert.InRange(up.Bandwidth, 0.0024, 0.0026)
     Assert.InRange(down.Bandwidth, 0.024, 0.026)
+
+[<Fact>]
+let ``rate group: leftover high bw still leaves startup once one BDP is in flight`` () =
+    // 20/200 5 %: leftover group bw is already at/above the pipe. Startup must
+    // end after 3 no-growth limited rounds with inflight >= 1 BDP, otherwise
+    // 2.885 x pacing overshoots for the whole 10 s down1 window.
+    let clock = ManualClock()
+    let g = RateGroup(clock)
+    let a = FakeMember()
+    g.Add a
+    let tick inflight bulk sent =
+        clock.Now <- clock.Now + 1_000_000L
+        g.OnSent sent
+        a.Delivered <- a.Delivered + int64 sent
+        a.Inflight <- inflight
+        g.TryTake(L, bulk) |> ignore
+        g.Service clock.Now
+    for _ in 1 .. 120 do
+        tick 3_000_000 true 25_000
+    Assert.True(g.InStartup, g.Describe())
+    Assert.InRange(g.Bandwidth, 0.024, 0.026)
+    for _ in 1 .. 200 do
+        tick 0 false 100
+    Assert.True(g.InStartup, g.Describe())
+    // ~1.2 BDP (1.2 MB) is loaded but would have been below a 2 BDP bar.
+    let mutable n = 0
+    while g.InStartup && n < 200 do
+        tick 1_200_000 true 25_000
+        n <- n + 1
+    Assert.False(g.InStartup, "1.2 BDP no-growth must end startup: " + g.Describe())
+    Assert.True(n >= 40 && n <= 200, sprintf "exited after %d ms" n)
+    Assert.InRange(g.Bandwidth, 0.024, 0.026)
 
 let blackoutRunWith (sack: bool) (paths: int) (lossP: float) (seed: int) (lost: int64 -> bool) (ms: int) =
     // netns (5 % loss + 300 ms outage every 3 s): all paths stalled together, all were demoted,

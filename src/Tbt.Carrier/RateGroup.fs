@@ -216,7 +216,7 @@ type RateGroup(clock: IClock) =
 
     /// One sample per round (min RTT, at least 5 ms): max filter over 10 rounds, startup,
     /// drain, 8-phase gain cycle. App-limited rounds keep the estimate and do not advance
-    /// the startup full-pipe check (nor do limited rounds with inflight below 2 BDP).
+    /// the startup full-pipe check (nor do limited rounds with inflight below 1 BDP).
     member _.Service(now: int64) =
         scan ()
         let rtt = minRtt ()
@@ -269,15 +269,19 @@ type RateGroup(clock: IClock) =
                     bw <- Array.max filter
                     if limited then appLimited <- 0 else appLimited <- appLimited + 1
                     if startup then
-                        // Full-pipe only when this group is actually loaded (2 BDP: startup
-                        // cwnd is 2.885 BDP). After idle, TryTake hits the 2 ms pacer
-                        // (limited=true) with inflight still a few hundred kB; those rounds
-                        // and leftover fullCount from a previous burst on THIS group (echo,
-                        // then this direction going app-limited during the opposite bulk)
-                        // must not end startup at a stale leftover bw. The check is a
-                        // ratio of this group's estimate, not a hard-coded rate. Uplink and
-                        // downlink are separate RateGroups and never copy a bw across.
-                        let filled = bw > 0.0 && inflight () >= int (2.0 * bw * float rtt)
+                        // Full-pipe only when this group has at least one BDP in flight.
+                        // After idle, TryTake hits the 2 ms pacer (limited=true) with
+                        // inflight still a few hundred kB; those rounds and leftover
+                        // fullCount from a previous burst on THIS group must not end
+                        // startup at a stale leftover bw. Requiring 2 BDP (startup cwnd
+                        // is 2.885 BDP) kept 20/200 5 % loss in startup for the whole
+                        // 10 s down1: leftover bw was already at/above the pipe, inflight
+                        // oscillated around 2 BDP, and the estimate even grew, so
+                        // fullCount never stuck. One BDP is enough to say the pipe is
+                        // loaded, and still ignores post-idle pacer hits. The check is a
+                        // ratio of this group's estimate, not a hard-coded rate. Uplink
+                        // and downlink are separate RateGroups and never copy a bw across.
+                        let filled = bw > 0.0 && inflight () >= int (bw * float rtt)
                         if limited && filled then
                             if bw >= fullBw * 1.25 then
                                 fullBw <- bw
