@@ -252,6 +252,11 @@ type FlowTable(port: IFlowPort, store: ISourceStore, stepUndelivered: Action<uin
             if f.RxOpened then rxActive <- rxActive - 1
             release f
             f.Gen <- 0u
+            // reportsDue counts marked flows, not remaining repeat transmissions.
+            // Retire this generation's mark before reuse or the Close callback.
+            if f.ReportsDue > 0 then
+                f.ReportsDue <- 0
+                reportsDue <- reportsDue - 1
             counters.Closed <- counters.Closed + 1L
             port.Close f.Index
             true

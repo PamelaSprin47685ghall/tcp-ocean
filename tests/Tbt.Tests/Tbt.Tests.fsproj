@@ -28,6 +28,7 @@
     <Compile Include="ControlTests.fs" />
     <Compile Include="CliTests.fs" />
     <Compile Include="BridgeTests.fs" />
+    <Compile Include="FlowReportLifecycleTests.fs" />
   </ItemGroup>
   <ItemGroup>
     <None Include="../vectors/*.json" CopyToOutputDirectory="PreserveNewest" LinkBase="vectors" />
