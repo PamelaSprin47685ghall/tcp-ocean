@@ -445,6 +445,7 @@ type Session(role: Role, p: SessionParams, port: IFlowPort, clock: IClock, confi
 
     member _.CanFill = tx.CanFill
     member _.CanFillInteractive = tx.CanFillUrgent
+    member _.CanFillClose = tx.CanFillClose
 
     /// Heavy-hitter filter (spec 16.1, HHF): a flow is interactive while it sent at most
     /// InteractiveBytes in the current and in the last 100 ms window.
@@ -462,6 +463,17 @@ type Session(role: Role, p: SessionParams, port: IFlowPort, clock: IClock, confi
         let mutable symbol = Span<byte>.Empty
         beganInteractive <- false
         if tx.TryBeginSource(&symbol) then
+            app <- symbol.Slice Layout.EnvelopeLength
+            true
+        else false
+
+    /// A FIN or RST source: uses the close reserve (spec 6.10b.4) and an interactive step
+    /// (spec 16.3) so a full bulk queue cannot hold up the end of a flow.
+    member this.TryBeginSourceClose(app: byref<Span<byte>>) =
+        let mutable symbol = Span<byte>.Empty
+        beganInteractive <- false
+        if tx.TryBeginSource(&symbol, true, true) then
+            beganInteractive <- true
             app <- symbol.Slice Layout.EnvelopeLength
             true
         else false
@@ -507,9 +519,11 @@ type Session(role: Role, p: SessionParams, port: IFlowPort, clock: IClock, confi
         rx.Release()
 
     /// End of an input round: send pending RSTs, then seal a partly filled step.
+    /// RST uses the close reserve, not the bulk fill path: a full data queue must not
+    /// delay the end (spec 6.10b.4).
     member this.Flush() =
         let mutable app = Span<byte>.Empty
-        while resets.Count > 0 && this.TryBeginSource(&app) do
+        while resets.Count > 0 && this.TryBeginSourceClose(&app) do
             let slot = resets.Dequeue()
             if flows.ResetPending slot then this.CommitSource(slot, 0, false)
         tx.Flush()

@@ -392,6 +392,36 @@ let ``an interactive flow goes before a full bulk queue`` () =
     Assert.Equal<byte[]>(message, pair.ServerPort.Data.[chat].ToArray())
     Assert.True(c.Tx.Queued > 200)
 
+[<Fact>]
+let ``a local RST is sent while the bulk queue is full`` () =
+    // Spec 6.10b.4: FIN/RST uses the close reserve; a full data queue must not block the end.
+    // This is the pingbulk leftover: the client aborts a flow while new echo data already
+    // fills TxQueueCells, and the RST must still reach the server in the next round.
+    let config = { SessionConfig.defaults with Credit = { CreditPolicy.defaults with Enabled = false } }
+    let pair = Pair(config, 1, 0.0, 17)
+    let c = pair.Client
+    let mutable bulk = -1
+    let mutable victim = -1
+    Assert.True(c.TryOpenFlow(&bulk))
+    Assert.True(c.TryOpenFlow(&victim))
+    Assert.Equal(3, pair.Feed(c, victim, ReadOnlySpan [| 1uy; 2uy; 3uy |], false))
+    pair.Round() |> ignore
+    Assert.Equal(3L, pair.ServerPort.Stream(victim).Length)
+    let payload = Array.init (1000 * 1328) byte
+    let sent = pair.Feed(c, bulk, ReadOnlySpan payload, false)
+    Assert.True(sent < payload.Length)
+    Assert.False(c.CanFill)
+    Assert.True(c.CanFillClose)
+    Assert.True(c.Tx.Queued >= SessionConfig.defaults.TxQueueCells)
+    c.FailFlow victim
+    Assert.True(c.Flows.ResetPending victim)
+    c.Flush()
+    Assert.False(c.Flows.ResetPending victim)
+    Assert.True(c.Flows.[victim].TxEndSent)
+    Assert.False(c.CanFill)
+    pair.Round() |> ignore
+    Assert.Contains(victim, pair.ServerPort.Resets)
+
 /// Send src bytes of slot as interactive-or-bulk sources (as the carrier does); bytes taken.
 let feedFor (s: Session) (slot: int) (data: ReadOnlySpan<byte>) (fin: bool) =
     let mutable at = 0

@@ -223,12 +223,26 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
     member _.CanFillUrgent =
         filled > 0 || (encoder.Head < grantLimit && encoder.HeldSteps < encoder.Capacity && urgent.Count < urgentLimit)
 
+    /// True when a FIN/RST source can go out now. Spec 6.10b.4: the close reserve is
+    /// independent of ordinary data credit, and a full bulk (or urgent) cell queue must not
+    /// block the end. Only the peer's step grant and encoder capacity may wait. A close
+    /// source always starts (or joins) an interactive step, so it is sent before bulk cells.
+    member _.CanFillClose =
+        (filled > 0 && fillingUrgent)
+        || (encoder.Head < grantLimit && encoder.HeldSteps < encoder.Capacity)
+
     /// The symbol of the next source slot. The caller writes user bytes from offset 16 on.
-    /// An interactive source puts its step into the interactive queue.
-    member this.TryBeginSource(symbol: byref<Span<byte>>, interactive: bool) =
-        // Bulk sources do not ride in an interactive step: close it first.
-        if not interactive && fillingUrgent && filled > 0 then seal filled true |> ignore
-        if not (if interactive then this.CanFillUrgent else this.CanFill) then false
+    /// An interactive source puts its step into the interactive queue. forClose seals a
+    /// partial bulk step first so the end is not stuck behind queueLimit bulk cells.
+    member this.TryBeginSource(symbol: byref<Span<byte>>, interactive: bool, ?forClose: bool) =
+        let close = defaultArg forClose false
+        if close && filled > 0 && not fillingUrgent then seal filled true |> ignore
+        elif not interactive && not close && fillingUrgent && filled > 0 then seal filled true |> ignore
+        let can =
+            if close then this.CanFillClose
+            elif interactive then this.CanFillUrgent
+            else this.CanFill
+        if not can then false
         else encoder.TryGetFillSlot(filled, &symbol)
 
     member this.TryBeginSource(symbol: byref<Span<byte>>) = this.TryBeginSource(&symbol, false)

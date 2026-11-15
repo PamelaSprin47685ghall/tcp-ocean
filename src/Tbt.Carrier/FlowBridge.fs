@@ -27,6 +27,7 @@ type FlowBridge(target: EndPoint voption) =
     /// runs out of credit leaves and comes back on the Credit event (RS-2).
     let armed = ReadySet()
     let failures = ReadySet()
+    let peekBuf = Array.zeroCreate 1
 
     let wantsRead (slot: int) =
         not (isNull locals.[slot]) && not connecting.[slot] && session.FlowSending slot
@@ -49,6 +50,22 @@ type FlowBridge(target: EndPoint voption) =
         opened.Remove slot
         writers.Remove slot
         armed.Remove slot
+
+    /// True when the write half is already dead: a full close or RST, not a SHUT_WR.
+    let writeSideDead (socket: Socket) =
+        try
+            let code = socket.GetSocketOption(SocketOptionLevel.Socket, SocketOptionName.Error) :?> int
+            if code <> 0 then true
+            else socket.Poll(0, SelectMode.SelectError)
+        with :? SocketException -> true
+
+    /// Local read hit EOF or a hard error: RST if the socket is fully dead, else FIN on the
+    /// close reserve so a full bulk queue cannot hold up the end (spec 6.10b.4).
+    let localReadClosed (slot: int) (socket: Socket) =
+        if writeSideDead socket then session.FailFlow slot
+        else
+            let mutable app = Span<byte>.Empty
+            if session.TryBeginSourceClose(&app) then session.CommitSource(slot, 0, true)
 
     /// Start a non-blocking connect; return its first result.
     static member private Connect(socket: Socket, ep: EndPoint) =
@@ -93,21 +110,31 @@ type FlowBridge(target: EndPoint voption) =
         | socket ->
             let mutable budget = 16
             let mutable app = Span<byte>.Empty
-            // The peer's flow limit bounds each read; at zero only this flow waits.
-            while budget > 0 && session.FlowSending slot && session.FlowRoom slot > 0 && session.TryBeginSourceFor(slot, &app) do
-                let mutable err = SocketError.Success
-                let room = session.FlowRoom slot
-                let n = socket.Receive((if room < app.Length then app.Slice(0, room) else app), SocketFlags.None, &err)
-                if err = SocketError.WouldBlock then budget <- 0
-                elif err <> SocketError.Success then
-                    session.FailFlow slot
-                    budget <- 0
-                elif n = 0 then
-                    session.CommitSource(slot, 0, true)
-                    budget <- 0
+            let mutable go = true
+            while go && budget > 0 && session.FlowSending slot do
+                if session.FlowRoom slot > 0 && session.TryBeginSourceFor(slot, &app) then
+                    let mutable err = SocketError.Success
+                    let room = session.FlowRoom slot
+                    let n = socket.Receive((if room < app.Length then app.Slice(0, room) else app), SocketFlags.None, &err)
+                    if err = SocketError.WouldBlock then go <- false
+                    elif err <> SocketError.Success then
+                        session.FailFlow slot
+                        go <- false
+                    elif n = 0 then
+                        // Do not commit FIN into a bulk source behind a full queue.
+                        localReadClosed slot socket
+                        go <- false
+                    else
+                        session.CommitSource(slot, n, false)
+                        budget <- budget - 1
                 else
-                    session.CommitSource(slot, n, false)
-                    budget <- budget - 1
+                    // Credit or the bulk queue is full: still observe a local close.
+                    go <- false
+                    let mutable err = SocketError.Success
+                    let n = socket.Receive(Span peekBuf, SocketFlags.Peek, &err)
+                    if err = SocketError.WouldBlock then ()
+                    elif err <> SocketError.Success then session.FailFlow slot
+                    elif n = 0 then localReadClosed slot socket
             rearm slot
 
     /// The local socket of slot is writable: finish a connect, then deliver again.
