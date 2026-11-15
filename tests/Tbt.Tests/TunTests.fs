@@ -658,24 +658,26 @@ let ``rate group: leftover high bw still leaves startup once one BDP is in fligh
     let g = RateGroup(clock)
     let a = FakeMember()
     g.Add a
-    let tick inflight bulk sent =
+    let tick inflight bulk sent burn =
         clock.Now <- clock.Now + 1_000_000L
         g.OnSent sent
         a.Delivered <- a.Delivered + int64 sent
         a.Inflight <- inflight
+        if burn > 0 then g.OnSent burn
         g.TryTake(L, bulk) |> ignore
         g.Service clock.Now
     for _ in 1 .. 120 do
-        tick 3_000_000 true 25_000
+        tick 3_000_000 true 25_000 0
     Assert.True(g.InStartup, g.Describe())
     Assert.InRange(g.Bandwidth, 0.024, 0.026)
     for _ in 1 .. 200 do
-        tick 0 false 100
+        tick 0 false 100 0
     Assert.True(g.InStartup, g.Describe())
-    // ~1.2 BDP (1.2 MB) is loaded but would have been below a 2 BDP bar.
+    // ~1.2 BDP (1.2 MB) is loaded but below startup cwnd; burn the pacer so
+    // the round is limited (as a backlogged sender hitting the 2 ms bucket).
     let mutable n = 0
     while g.InStartup && n < 200 do
-        tick 1_200_000 true 25_000
+        tick 1_200_000 true 25_000 1_000_000
         n <- n + 1
     Assert.False(g.InStartup, "1.2 BDP no-growth must end startup: " + g.Describe())
     Assert.True(n >= 40 && n <= 200, sprintf "exited after %d ms" n)
