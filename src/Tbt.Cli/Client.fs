@@ -58,6 +58,7 @@ let run (o: Options) =
     let windowClamp = o.Int("window-clamp", SocketTuning.WindowClamp)
     let config = { SessionConfig.defaults with WindowSteps = o.Int("window", 1024); NewRepair = o.Int("new-repair", 0) <> 0 }
     let entropy = SystemEntropy()
+    let struct (offerAegis, offerChaCha8, offerChaCha20, offerX25519) = offerFromOptions o
     let rttMs = max 1 (o.Int("rtt-ms", JoinBootstrap.DefaultRttMs))
     let loss = min 0.9 (max 0.0 (o.Float("loss", JoinBootstrap.DefaultLoss)))
     let timeoutMs = JoinBootstrap.socketTimeoutMs rttMs loss
@@ -66,7 +67,9 @@ let run (o: Options) =
     // Fresh ClientOffer on each attempt: a nonce the server already accepted is a replay.
     let mutable accepted = ValueNone
     match JoinBootstrap.tryRepeated attempts backoff Thread.Sleep (fun _ ->
-        let offer = ClientOffer(psk, Guid.NewGuid(), entropy, uint64 (unixMs ()), mss, max 1 pathCount)
+        let offer = ClientOffer(psk, Guid.NewGuid(), entropy, uint64 (unixMs ()), mss, max 1 pathCount,
+                                  offerX25519 = offerX25519, offerChaCha8 = offerChaCha8,
+                                  offerAegis = offerAegis, offerChaCha20 = offerChaCha20)
         let struct (link0, reply) = bootstrap server host offer.Frame windowClamp timeoutMs
         match offer.TryAccept(ReadOnlySpan reply) with
         | ValueNone ->
@@ -89,7 +92,8 @@ let run (o: Options) =
         let maxPaths = int hello.MaxPaths
         // Forward as soon as path 0 is up; remaining JOINs run with bounded
         // concurrency and are attached on this thread via `pending`.
-        log ("session up: S=" + string p.Symbol + " paths=" + string carrier.Paths.Count + " window_clamp=" + string windowClamp)
+        log ("session up: S=" + string p.Symbol + " paths=" + string carrier.Paths.Count
+             + " window_clamp=" + string windowClamp + " " + describeOffer p.Keys.Suite p.Caps)
         let concurrency = JoinBootstrap.clampConcurrency (o.Int("join-concurrency", JoinBootstrap.DefaultConcurrency))
         let pending = ConcurrentQueue<PathLink>()
         let mutable readyLogged = false

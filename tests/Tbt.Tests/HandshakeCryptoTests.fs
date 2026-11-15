@@ -355,24 +355,45 @@ let ``AEGIS-128L forged tag is rejected with no allocation and a cleared plainte
 
 [<Fact>]
 let ``default handshake still does not advertise or select AEGIS-128L`` () =
-    Assert.Equal(Suite.ChaCha20Poly1305Bit, Suite.advertisedBits false false)
+    Assert.Equal(Suite.ChaCha20Poly1305Bit, Suite.advertisedBits false false true)
     if Suite.hardwareAes then
-        Assert.Equal(Suite.ChaCha20Poly1305Bit ||| Suite.ChaCha8Poly1305Bit ||| Suite.Aegis128LBit, Suite.advertisedBits true true)
+        Assert.Equal(Suite.ChaCha20Poly1305Bit ||| Suite.ChaCha8Poly1305Bit ||| Suite.Aegis128LBit, Suite.advertisedBits true true true)
     else
-        Assert.Equal(Suite.ChaCha20Poly1305Bit ||| Suite.ChaCha8Poly1305Bit, Suite.advertisedBits true true)
+        Assert.Equal(Suite.ChaCha20Poly1305Bit ||| Suite.ChaCha8Poly1305Bit, Suite.advertisedBits true true true)
     // bit0 is set only when offerAegis and hardware AES are both present.
     if Suite.hardwareAes then
-        Assert.Equal(Suite.ChaCha20Poly1305Bit ||| Suite.Aegis128LBit, Suite.advertisedBits false true)
-        Assert.Equal(Suite.Aegis128L, Suite.select (Suite.Aegis128LBit ||| Suite.ChaCha20Poly1305Bit) true false)
+        Assert.Equal(Suite.ChaCha20Poly1305Bit ||| Suite.Aegis128LBit, Suite.advertisedBits false true true)
+        Assert.Equal(Suite.Aegis128L, Suite.select (Suite.Aegis128LBit ||| Suite.ChaCha20Poly1305Bit) true false true)
     else
-        Assert.Equal(Suite.ChaCha20Poly1305Bit, Suite.advertisedBits false true)
-        Assert.Equal(Suite.ChaCha20Poly1305, Suite.select (Suite.Aegis128LBit ||| Suite.ChaCha20Poly1305Bit) true false)
+        Assert.Equal(Suite.ChaCha20Poly1305Bit, Suite.advertisedBits false true true)
+        Assert.Equal(Suite.ChaCha20Poly1305, Suite.select (Suite.Aegis128LBit ||| Suite.ChaCha20Poly1305Bit) true false true)
     let struct (c, s, sh) = handshake false false false 101 202
     Assert.Equal(Suite.ChaCha20Poly1305, c.Keys.Suite)
     Assert.NotEqual<byte>(Suite.Aegis128L, sh.Suite)
     Assert.Equal(32, c.Keys.UpKey(0u).Length)
     Assert.Equal(32, c.Keys.HpUp.Length)
     ignore s
+
+[<Fact>]
+let ``--suites names parse and advertisedBits can omit 0x02`` () =
+    Assert.Equal(struct (false, false, true), Suite.parseOfferList "")
+    Assert.Equal(struct (false, false, true), Suite.parseOfferList "chacha20")
+    Assert.Equal(struct (true, true, true), Suite.parseOfferList "aegis,chacha8,chacha20")
+    Assert.Equal(struct (true, false, false), Suite.parseOfferList "AEGIS-128L")
+    Assert.Equal(struct (false, true, false), Suite.parseOfferList "0x03")
+    Assert.Equal("aegis", Suite.name Suite.Aegis128L)
+    Assert.Equal("chacha20", Suite.name Suite.ChaCha20Poly1305)
+    Assert.Equal("chacha8", Suite.name Suite.ChaCha8Poly1305)
+    Assert.Throws<ArgumentException>(fun () -> Suite.parseOfferList "rc4" |> ignore) |> ignore
+    Assert.Throws<ArgumentException>(fun () -> Suite.parseOfferList "  ,  " |> ignore) |> ignore
+    // Explicitly omitting 0x02 does not change the two-argument default.
+    Assert.Equal(Suite.ChaCha20Poly1305Bit, Suite.advertisedBits false false true)
+    if Suite.hardwareAes then
+        Assert.Equal(Suite.Aegis128LBit, Suite.advertisedBits false true false)
+        Assert.Equal(Suite.Aegis128L, Suite.select Suite.Aegis128LBit true false false)
+        Assert.Equal(0uy, Suite.select Suite.ChaCha20Poly1305Bit false false false)
+    else
+        Assert.Equal(0uy, Suite.advertisedBits false true false)
 
 [<Fact>]
 let ``AEGIS-128L is selected when both ends offer it, keys are 16 bytes, and a 0x02 sealer cannot open the cell`` () =

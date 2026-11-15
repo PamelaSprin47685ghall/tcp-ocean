@@ -40,11 +40,12 @@ let private random (entropy: IEntropy) (n: int) =
 /// Client side of the main handshake on path 0. The CLIENT_INIT is rendered once (frozen).
 [<Sealed>]
 type ClientOffer(psk: byte[], clientId: Guid, entropy: IEntropy, unixTimeMs: uint64, mssClient: int, maxPaths: int,
-                 ?memTier: uint16, ?offerX25519: bool, ?offerChaCha8: bool, ?offerAegis: bool) =
+                 ?memTier: uint16, ?offerX25519: bool, ?offerChaCha8: bool, ?offerAegis: bool, ?offerChaCha20: bool) =
     let tier = defaultArg memTier MemTier.Ti1024
     let wantDh = defaultArg offerX25519 false
     let wantChaCha8 = defaultArg offerChaCha8 false
     let wantAegis = defaultArg offerAegis false
+    let wantChaCha20 = defaultArg offerChaCha20 true
     do if not (MemTier.isKnown tier) then invalidArg "memTier" "unknown mem_tier"
     let clientNonce = random entropy 32
     let dhSecret, dhPublic =
@@ -57,7 +58,7 @@ type ClientOffer(psk: byte[], clientId: Guid, entropy: IEntropy, unixTimeMs: uin
     let advertised = SupportedCaps ||| (if wantDh then Caps.X25519 else 0us)
     let allowed = AllowedCaps &&& (if wantDh then ~~~0us else ~~~Caps.X25519)
     let hello =
-        { Version = 2uy; Suites = Suite.advertisedBits wantChaCha8 wantAegis; Caps = MemTier.set advertised tier; ClientId = clientId
+        { Version = 2uy; Suites = Suite.advertisedBits wantChaCha8 wantAegis wantChaCha20; Caps = MemTier.set advertised tier; ClientId = clientId
           UnixTimeMs = unixTimeMs; MssClient = uint16 mssClient; MaxPaths = uint16 maxPaths }
     let content =
         ClientInit.build (ReadOnlySpan psk) (ReadOnlySpan clientNonce) hello (ReadOnlySpan dhPublic)
@@ -125,10 +126,11 @@ type ServerAccept =
 /// Server side of the main handshake. psks: the configured client keys.
 [<Sealed>]
 type ServerOffer(psks: byte[][], entropy: IEntropy, grant0: uint16, maxPaths: int,
-                 ?offerX25519: bool, ?offerChaCha8: bool, ?offerAegis: bool) =
+                 ?offerX25519: bool, ?offerChaCha8: bool, ?offerAegis: bool, ?offerChaCha20: bool) =
     let wantDh = defaultArg offerX25519 false
     let wantChaCha8 = defaultArg offerChaCha8 false
     let wantAegis = defaultArg offerAegis false
+    let wantChaCha20 = defaultArg offerChaCha20 true
     let allowed = AllowedCaps &&& (if wantDh then ~~~0us else ~~~Caps.X25519)
     let caches = Array.init psks.Length (fun _ -> ReplayCache())
 
@@ -146,14 +148,14 @@ type ServerOffer(psks: byte[][], entropy: IEntropy, grant0: uint16, maxPaths: in
                 if (ReadOnlySpan(keyHint (ReadOnlySpan psk) cn)).SequenceEqual(ClientInit.hint ci) then
                     match ClientInit.tryOpen (ReadOnlySpan psk) ci with
                     | ValueSome(h, clientPub) when abs (int64 h.UnixTimeMs - unixTimeMs) <= 120_000L
-                                           && Suite.select h.Suites wantAegis wantChaCha8 <> 0uy
+                                           && Suite.select h.Suites wantAegis wantChaCha8 wantChaCha20 <> 0uy
                                            && h.Caps &&& Caps.JoinAck2 <> 0us && h.MssClient > 0us
                                            && MemTier.isKnown (MemTier.ofCaps h.Caps)
                                            && caches.[i].TryAdd(cn, unixTimeMs) ->
                         let symbol = FrameMath.symbolForMss (min (int h.MssClient) mssServer)
                         let caps = flowStatePair (h.Caps &&& allowed)
                         let useDh = wantDh && (caps &&& Caps.X25519) <> 0us
-                        let suite = Suite.select h.Suites wantAegis wantChaCha8
+                        let suite = Suite.select h.Suites wantAegis wantChaCha8 wantChaCha20
                         let mutable ikm = psks.[i]
                         let serverPub = Array.zeroCreate X25519.KeyLength
                         let ok =

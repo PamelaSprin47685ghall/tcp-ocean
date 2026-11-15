@@ -139,6 +139,12 @@ ChaCha20-Poly1305；0x01 只用于套件选定之后的数据帧 AEAD 和头部�
 测试：RFC 附录与 JSON 参考向量、伪造标签零分配、客户端与服务端在 `offerAegis` 时的互通，
 以及只一方通告时仍落在 0x02。
 
+## D12a CLI 套件与 X25519 通告
+
+`tbtun client` / `tbtun server` 增加 `--suites`（逗号分隔：`aegis`、`chacha8`、`chacha20`，亦接受 `0x01`/`0x02`/`0x03`）
+和 `--x25519`（布尔旗标，或 `--x25519 0` 显式关闭）。省略时行为与原先完全一致：只通告并选择套件 0x02，不通告 X25519。
+双方都列 `aegis` 且本机有 AES 硬件时，服务端按 D12 优先选 0x01。选定的套件与是否启用 X25519 写在 `session up` 日志里。
+
 ## D13 客户端可移植性与 Android TUN fd 注入
 
 规范要的是高兼容 JIT 客户端，并单独列出 Android。服务端仍是 Linux NativeAOT，其 epoll、

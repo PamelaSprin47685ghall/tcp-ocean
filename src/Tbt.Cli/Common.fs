@@ -8,6 +8,7 @@ open System.IO
 open System.Net
 open System.Security.Cryptography
 open Tbt.Contracts
+open Tbt.Crypto.Bootstrap
 
 [<Sealed>]
 type SystemClock() =
@@ -34,9 +35,15 @@ type Options(args: string[]) =
         let mutable i = 0
         while i < args.Length do
             let a = args.[i]
-            if not (a.StartsWith "--") || i + 1 >= args.Length then failwith ("bad option: " + a)
-            values.[a.Substring 2] <- args.[i + 1]
-            i <- i + 2
+            if not (a.StartsWith "--") || a.Length < 3 then failwith ("bad option: " + a)
+            let name = a.Substring 2
+            // A bare flag is allowed when it is last, or the next token is another --option.
+            if i + 1 < args.Length && not (args.[i + 1].StartsWith "--") then
+                values.[name] <- args.[i + 1]
+                i <- i + 2
+            else
+                values.[name] <- "1"
+                i <- i + 1
     member _.Text(name: string) =
         match values.TryGetValue name with
         | true, v -> v
@@ -54,6 +61,25 @@ type Options(args: string[]) =
         | true, v -> Double.Parse(v, Globalization.CultureInfo.InvariantCulture)
         | _ -> fallback
     member _.Has(name: string) = values.ContainsKey name
+
+/// CLI offer flags. Default (no --suites / --x25519): suite 0x02 only, no X25519.
+/// --suites is a comma-separated list (aegis, chacha8, chacha20). --x25519 is a
+/// bare flag, or --x25519 0 to turn it off explicitly.
+let offerFromOptions (o: Options) =
+    let struct (aegis, chacha8, chacha20) =
+        if o.Has "suites" then Suite.parseOfferList (o.TextOr("suites", ""))
+        else struct (false, false, true)
+    let x25519 =
+        if not (o.Has "x25519") then false
+        else
+            match o.TextOr("x25519", "1").Trim().ToLowerInvariant() with
+            | "0" | "false" | "no" | "off" -> false
+            | _ -> true
+    struct (aegis, chacha8, chacha20, x25519)
+
+let describeOffer (suite: byte) (caps: uint16) =
+    let dh = if (caps &&& Caps.X25519) <> 0us then "1" else "0"
+    "suite=0x" + suite.ToString("x2") + "(" + Suite.name suite + ") x25519=" + dh
 
 /// host:port; a host name resolves to its first address.
 let endpoint (text: string) : IPEndPoint =

@@ -112,20 +112,55 @@ module Suite =
         elif s = ChaCha8Poly1305 then bitmap &&& ChaCha8Poly1305Bit <> 0uy
         else false
 
-    /// Advertise 0x02 always; 0x03 when offerChaCha8 is set; 0x01 only when
-    /// offerAegis is set and hardware AES is present (default is still 0x02 only).
-    let advertisedBits (offerChaCha8: bool) (offerAegis: bool) =
-        let mutable b = ChaCha20Poly1305Bit
+    let name (s: byte) =
+        if s = Aegis128L then "aegis"
+        elif s = ChaCha20Poly1305 then "chacha20"
+        elif s = ChaCha8Poly1305 then "chacha8"
+        else "0x" + s.ToString("x2")
+
+    let tryParseName (text: string) : ValueOption<byte> =
+        match text.Trim().ToLowerInvariant() with
+        | "aegis" | "aegis-128l" | "0x01" | "1" -> ValueSome Aegis128L
+        | "chacha20" | "chacha20-poly1305" | "0x02" | "2" -> ValueSome ChaCha20Poly1305
+        | "chacha8" | "chacha8-poly1305" | "0x03" | "3" -> ValueSome ChaCha8Poly1305
+        | _ -> ValueNone
+
+    /// Parse a comma-separated offer list (CLI --suites). Empty is the default: 0x02 only.
+    /// Returns offerAegis, offerChaCha8, offerChaCha20. Unknown names fail.
+    let parseOfferList (text: string) =
+        let t = text.Trim()
+        if t.Length = 0 then struct (false, false, true)
+        else
+            let mutable aegis, chacha8, chacha20 = false, false, false
+            for part in t.Split ',' do
+                let p = part.Trim()
+                if p.Length > 0 then
+                    match tryParseName p with
+                    | ValueSome s when s = Aegis128L -> aegis <- true
+                    | ValueSome s when s = ChaCha8Poly1305 -> chacha8 <- true
+                    | ValueSome s when s = ChaCha20Poly1305 -> chacha20 <- true
+                    | _ -> invalidArg "suites" ("unknown suite: " + p)
+            if not aegis && not chacha8 && not chacha20 then
+                invalidArg "suites" "at least one suite is required"
+            struct (aegis, chacha8, chacha20)
+
+    /// Advertise 0x02 by default; 0x03 when offerChaCha8 is set; 0x01 only when
+    /// offerAegis is set and hardware AES is present. Pass offerChaCha20=false
+    /// to omit 0x02. Pass true for the historical default that always offers 0x02.
+    let advertisedBits (offerChaCha8: bool) (offerAegis: bool) (offerChaCha20: bool) =
+        let mutable b = 0uy
+        if offerChaCha20 then b <- b ||| ChaCha20Poly1305Bit
         if offerChaCha8 then b <- b ||| ChaCha8Poly1305Bit
         if offerAegis && hardwareAes then b <- b ||| Aegis128LBit
         b
 
     /// Prefer 0x01 when both offered it and hardware AES is present, then 0x03
-    /// if preferChaCha8, else 0x02; 0 if the intersection is empty (see D12).
-    let select (bitmap: byte) (preferAegis: bool) (preferChaCha8: bool) =
+    /// if preferChaCha8, else 0x02 when the server still offers it (default);
+    /// 0 if the intersection is empty (see D12).
+    let select (bitmap: byte) (preferAegis: bool) (preferChaCha8: bool) (offerChaCha20: bool) =
         if preferAegis && hardwareAes && offers bitmap Aegis128L then Aegis128L
         elif preferChaCha8 && offers bitmap ChaCha8Poly1305 then ChaCha8Poly1305
-        elif offers bitmap ChaCha20Poly1305 then ChaCha20Poly1305
+        elif offerChaCha20 && offers bitmap ChaCha20Poly1305 then ChaCha20Poly1305
         else 0uy
 
     let keyLength (s: byte) = if s = Aegis128L then 16 else 32

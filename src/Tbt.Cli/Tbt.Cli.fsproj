@@ -17,6 +17,7 @@
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="../Tbt.Contracts/Tbt.Contracts.fsproj" />
+    <ProjectReference Include="../Tbt.Crypto/Tbt.Crypto.fsproj" />
     <ProjectReference Include="../Tbt.Session/Tbt.Session.fsproj" />
     <ProjectReference Include="../Tbt.Carrier/Tbt.Carrier.fsproj" />
   </ItemGroup>

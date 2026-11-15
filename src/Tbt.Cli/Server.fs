@@ -61,7 +61,10 @@ let run (o: Options) =
     let entropy = SystemEntropy()
     let clock = CachedClock(SystemClock())
     let probe = SocketTuning.probe ()
-    let offer = ServerOffer(psks, entropy, uint16 config.WindowSteps, maxPaths)
+    let struct (offerAegis, offerChaCha8, offerChaCha20, offerX25519) = offerFromOptions o
+    let offer = ServerOffer(psks, entropy, uint16 config.WindowSteps, maxPaths,
+                            offerX25519 = offerX25519, offerChaCha8 = offerChaCha8,
+                            offerAegis = offerAegis, offerChaCha20 = offerChaCha20)
     let pending = List<Pending>()
     let sessions = List<Entry>()
     // Kernel TCP listener for paths (the baseline carrier); optional when a TUN is used.
@@ -169,7 +172,8 @@ let run (o: Options) =
                     let n = SocketTuning.tunSndBufFor(windowClamp, paths)
                     t.SetSndBuf n
                     log ("tun_sndbuf=auto " + string n + " (window_clamp x paths=" + string paths + ")")
-            log ("session " + a.Params.Keys.SessionId.ToString() + " up, S=" + string a.Params.Symbol)
+            log ("session " + a.Params.Keys.SessionId.ToString() + " up, S=" + string a.Params.Symbol
+                 + " " + describeOffer a.Params.Keys.Suite a.Params.Caps)
             true
         | ValueNone -> tryJoinAny link frame
 

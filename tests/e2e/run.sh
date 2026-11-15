@@ -159,7 +159,7 @@ names = """PROFILE WINDOW WINDOW_CLAMP MAX_PATHS TBT_BIN SEED CARRIER ALLOW_DIRT
 SKIP_ECHO SKIP_IPERF SKIP_REF PING_COUNT HANDSHAKE_S JOIN_CONCURRENCY UPLINK_PACE
 TUPLE_MBIT NEW_REPAIR WANEM_EXTRA WANEM_TUPLE_MODE WANEM_LOSS_POINT
 HOST_PAUSE_DISCARD HOST_QUIET_S HOST_MIN_MEM_MIB HOST_QUIET_BYPASS STATS_GAP_S
-PAUSE TBT_SERVER_EXTRA TBT_TRACE PING_TRACE ECHO_PROBE_LOG""".split()
+PAUSE TBT_SERVER_EXTRA TBT_CLIENT_EXTRA TBT_TRACE PING_TRACE ECHO_PROBE_LOG""".split()
 Path(sys.argv[1]).write_text(json.dumps({name: os.environ.get(name) for name in names}, indent=2) + "\n")
 PY
 stamp() { echo "$*" | tee -a "$work/stamp.txt"; }
@@ -300,6 +300,7 @@ validate_loss "$wanem_eff_loss_rate"
 stamp "flags: uplink_pace=$uplink_pace client_tuple_mbit=$tuple_mbit new_repair=$new_repair join_concurrency=${JOIN_CONCURRENCY:-default} window=$window window_clamp=$window_clamp max_paths=$max_paths carrier=$carrier profile=${profile:-none} wanem_tuple_mbit=${wanem_eff_tuple:-0} wanem_tuple_bucket=${wanem_eff_bucket:-default} wanem_rate_to_far=${wanem_eff_to_far:-} wanem_rate_to_near=${wanem_eff_to_near:-} wanem_tuple_mode=$wanem_eff_mode wanem_loss_point=$wanem_eff_loss wanem_seed=$seed wanem_version=2 host_pause_discard=$host_pause_discard skip_echo=${SKIP_ECHO:-0} skip_iperf=${SKIP_IPERF:-0} skip_ref=${SKIP_REF:-0} ping_count=$ping_count handshake_s=$handshake_s pause=${PAUSE:-none}"
 stamp "flags: wanem_seed=$wanem_eff_seed wanem_loss=$wanem_eff_loss_rate host_quiet_s=$host_quiet_s host_min_mem_mib=$host_min_mem_mib host_quiet_bypass=$host_quiet_bypass stats_gap_s=$stats_gap_s"
 printf 'server_extra=%q\n' "${TBT_SERVER_EXTRA:-}" | tee -a "$work/stamp.txt"
+printf 'client_extra=%q\n' "${TBT_CLIENT_EXTRA:-}" | tee -a "$work/stamp.txt"
 { LC_ALL=C dmesg -T 2>/dev/null || sudo env LC_ALL=C dmesg -T 2>/dev/null || true; } > "$work/dmesg-preflight.txt" || true
 python3 "$here/host_noise.py" "$work" "$host_quiet_s" "$host_min_mem_mib" "$host_quiet_bypass" | tee -a "$work/stamp.txt"
 sudo TBTUN_NETNS_LOCK_HELD=1 "$here/netns.sh" up "$work"
@@ -333,6 +334,10 @@ tunnel() {
     if [[ $tuple_mbit != 0 ]]; then client_args+=(--tuple-mbit "$tuple_mbit"); fi
     if [[ $new_repair != 0 ]]; then client_args+=(--new-repair 1); fi
     if [[ -n ${JOIN_CONCURRENCY:-} ]]; then client_args+=(--join-concurrency "$JOIN_CONCURRENCY"); fi
+    if [[ -n ${TBT_CLIENT_EXTRA:-} ]]; then
+        # shellcheck disable=SC2206
+        client_args+=($TBT_CLIENT_EXTRA)
+    fi
     in_ns near "$work/jit/tbtun" client "${client_args[@]}" 2>"$work/client-$name.log" &
     # session up is logged once path 0 is forwarding; paths ready after the
     # remaining JOINs (bounded concurrency). Raise HANDSHAKE_S for many paths

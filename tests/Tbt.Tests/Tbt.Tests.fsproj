@@ -26,6 +26,7 @@
     <Compile Include="PlatformTests.fs" />
     <Compile Include="GovernorTests.fs" />
     <Compile Include="ControlTests.fs" />
+    <Compile Include="CliTests.fs" />
     <Compile Include="BridgeTests.fs" />
   </ItemGroup>
   <ItemGroup>
@@ -41,5 +42,6 @@
     <ProjectReference Include="../../src/Tbt.Crypto/Tbt.Crypto.fsproj" />
     <ProjectReference Include="../../src/Tbt.Session/Tbt.Session.fsproj" />
     <ProjectReference Include="../../src/Tbt.Carrier/Tbt.Carrier.fsproj" />
+    <ProjectReference Include="../../src/Tbt.Cli/Tbt.Cli.fsproj" />
   </ItemGroup>
 </Project>
