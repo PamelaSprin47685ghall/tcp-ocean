@@ -215,7 +215,8 @@ type RateGroup(clock: IClock) =
     static member CwndGain = cwndGain
 
     /// One sample per round (min RTT, at least 5 ms): max filter over 10 rounds, startup,
-    /// drain, 8-phase gain cycle. App-limited rounds keep the estimate.
+    /// drain, 8-phase gain cycle. App-limited rounds keep the estimate and do not advance
+    /// the startup full-pipe check (nor do limited rounds with inflight below 2 BDP).
     member _.Service(now: int64) =
         scan ()
         let rtt = minRtt ()
@@ -267,15 +268,25 @@ type RateGroup(clock: IClock) =
                     filter.[slot] <- if limited || rate > bw then rate else bw
                     bw <- Array.max filter
                     if limited then appLimited <- 0 else appLimited <- appLimited + 1
-                    if startup && limited then
-                        if bw >= fullBw * 1.25 then
-                            fullBw <- bw
-                            fullCount <- 0
+                    if startup then
+                        // Full-pipe only when the group is actually loaded (2 BDP: startup
+                        // cwnd is 2.885 BDP). After idle, TryTake hits the 2 ms pacer
+                        // (limited=true) with inflight still a few hundred kB; those rounds
+                        // and leftover fullCount from a previous burst (echo, then ping /
+                        // uplink idle, then down1) must not end startup at a stale leftover
+                        // bw, or the 10 s down1 window crawls at 1.25 x that bw.
+                        let filled = bw > 0.0 && inflight () >= int (2.0 * bw * float rtt)
+                        if limited && filled then
+                            if bw >= fullBw * 1.25 then
+                                fullBw <- bw
+                                fullCount <- 0
+                            else
+                                fullCount <- fullCount + 1
+                                if fullCount >= 3 then
+                                    startup <- false
+                                    draining <- true
                         else
-                            fullCount <- fullCount + 1
-                            if fullCount >= 3 then
-                                startup <- false
-                                draining <- true
+                            fullCount <- 0
                     elif draining then
                         if inflight () <= int (bw * float rtt) then
                             draining <- false

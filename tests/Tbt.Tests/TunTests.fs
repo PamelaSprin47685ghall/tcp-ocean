@@ -544,6 +544,48 @@ let ``rate group: the 0.75 phase ends once in flight is down to one BDP`` () =
     tick 990_000
     Assert.Equal(2, g.Cycle)
 
+[<Fact>]
+let ``rate group: startup full-pipe check ignores app-limited idle and sub-BDP rounds`` () =
+    // Dedicated line: after a short burst leaves fullCount nearly full, a long
+    // app-limited idle (echo -> ping/uplink) must not let the next bulk exit
+    // startup on pacer-limited rounds with almost nothing in flight. Otherwise
+    // drain ends at once (inflight still below 1 BDP) and down1 crawls at
+    // 1.25 x the leftover bw (64-path 96 vs 133 Mbit in 10 s).
+    let clock = ManualClock()
+    let g = RateGroup(clock)
+    let a = FakeMember()
+    g.Add a
+    let tick (inflight: int) (bulk: bool) (sent: int) (burn: int) =
+        clock.Now <- clock.Now + 1_000_000L
+        g.OnSent sent
+        a.Delivered <- a.Delivered + int64 sent
+        a.Inflight <- inflight
+        if burn > 0 then g.OnSent burn
+        g.TryTake(L, bulk) |> ignore
+        g.Service clock.Now
+    // Learn 200 Mbit/s in startup (40 ms minRTT, 2 BDP = 2 MB). Three loaded
+    // no-growth samples set leftover fullCount = 2 without exiting (4th would).
+    for _ in 1 .. 120 do
+        tick 3_000_000 true 25_000 0
+    Assert.True(g.InStartup, g.Describe())
+    Assert.InRange(g.Bandwidth, 0.024, 0.026)
+    // App-limited idle (nothing in flight, low send).
+    for _ in 1 .. 400 do
+        tick 0 false 100 0
+    Assert.True(g.InStartup, "idle must keep startup: " + g.Describe())
+    Assert.InRange(g.Bandwidth, 0.024, 0.026)
+    // Bulk resumes: pacer/cwnd limited but inflight well below 2 BDP (400 kB).
+    for _ in 1 .. 200 do
+        tick 400_000 true 25_000 1_000_000
+    Assert.True(g.InStartup, "sub-BDP limited rounds must not end startup: " + g.Describe())
+    // A loaded pipe (3 MB > 2 BDP) with no 25 % growth: three rounds end startup.
+    let mutable n = 0
+    while g.InStartup && n < 200 do
+        tick 3_000_000 true 25_000 0
+        n <- n + 1
+    Assert.False(g.InStartup, "full pipe still ends startup: " + g.Describe())
+    Assert.True(n >= 3 * 40 && n <= 5 * 40, sprintf "exited after %d ms, expected about 3 rounds (120 ms)" n)
+
 let blackoutRunWith (sack: bool) (paths: int) (lossP: float) (seed: int) (lost: int64 -> bool) (ms: int) =
     // netns (5 % loss + 300 ms outage every 3 s): all paths stalled together, all were demoted,
     // no segment was sent again and the downlink stayed dead for minutes.
