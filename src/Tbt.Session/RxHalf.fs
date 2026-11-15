@@ -23,6 +23,7 @@ type RxCounters() =
 
 [<Sealed>]
 type RxHalf(symbolSize: int, field: CodeField, decoder: Decoder, opener: CellOpener, capacitySteps: int, maxPaths: int) =
+    let mutable arrivalCounter: ArrivalAccounting.Counter | null = null
     let counters = RxCounters()
     let hold = ParityHold(symbolSize, 2 * capacitySteps)
     /// Per path: highest step of a DATA or PARITY cell seen, and when the path last gave one.
@@ -163,7 +164,18 @@ type RxHalf(symbolSize: int, field: CodeField, decoder: Decoder, opener: CellOpe
                     ValueNone
                 else
                     counters.Cells <- counters.Cells + 1L
+                    match arrivalCounter with
+                    | null -> ()
+                    | counter when m.Type = CellType.Data || m.Type = CellType.Parity || m.Type = CellType.Booster -> counter.AddFrame()
+                    | _ -> ()
                     ValueSome m
+
+    member _.EnableArrivalEvidence() =
+        if isNull arrivalCounter then arrivalCounter <- ArrivalAccounting.Counter(Layout.frameLength symbolSize)
+    member _.AcceptedCodedFrameEvidence =
+        match arrivalCounter with
+        | null -> ValueNone
+        | counter -> ValueSome counter.Evidence
 
     member _.HeldParities = hold.Count
 

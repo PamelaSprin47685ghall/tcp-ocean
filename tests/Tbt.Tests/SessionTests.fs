@@ -56,15 +56,15 @@ let psk = Array.init 32 (fun i -> byte (i * 3 + 1))
 let unixMs = 1_800_000_000_000L
 
 /// Both ends of a session joined by in-memory paths.
-type Pair(config: SessionConfig, paths: int, loss: float, seed: int, ?wrapClock: ManualClock -> IClock) =
+type Pair(config: SessionConfig, paths: int, loss: float, seed: int, ?wrapClock: ManualClock -> IClock, ?arrivalClient: bool, ?arrivalServer: bool) =
     let inner = ManualClock()
     let clock: IClock =
         match wrapClock with
         | Some f -> f inner
         | None -> inner :> IClock
     let entropy = SeededEntropy seed
-    let offer = ClientOffer(psk, Guid(Array.create 16 7uy), entropy, uint64 unixMs, 1448, 256)
-    let accepted = (ServerOffer([| psk |], entropy, uint16 config.WindowSteps, 256)).TryAccept(ReadOnlySpan offer.Frame, unixMs, 1448)
+    let offer = ClientOffer(psk, Guid(Array.create 16 7uy), entropy, uint64 unixMs, 1448, 256, ?offerArrivalEvidence=arrivalClient)
+    let accepted = (ServerOffer([| psk |], entropy, uint16 config.WindowSteps, 256, ?offerArrivalEvidence=arrivalServer)).TryAccept(ReadOnlySpan offer.Frame, unixMs, 1448)
     let serverParams = accepted.Value.Params
     let struct (clientParams, _) = offer.TryAccept(ReadOnlySpan accepted.Value.Reply).Value
     let clientPort = RecordingPort()

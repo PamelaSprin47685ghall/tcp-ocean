@@ -40,8 +40,9 @@ let private random (entropy: IEntropy) (n: int) =
 /// Client side of the main handshake on path 0. The CLIENT_INIT is rendered once (frozen).
 [<Sealed>]
 type ClientOffer(psk: byte[], clientId: Guid, entropy: IEntropy, unixTimeMs: uint64, mssClient: int, maxPaths: int,
-                 ?memTier: uint16, ?offerX25519: bool, ?offerChaCha8: bool, ?offerAegis: bool, ?offerChaCha20: bool) =
+                 ?memTier: uint16, ?offerX25519: bool, ?offerChaCha8: bool, ?offerAegis: bool, ?offerChaCha20: bool, ?offerArrivalEvidence: bool) =
     let tier = defaultArg memTier MemTier.Ti1024
+    let wantArrival = defaultArg offerArrivalEvidence false
     let wantDh = defaultArg offerX25519 false
     let wantChaCha8 = defaultArg offerChaCha8 false
     let wantAegis = defaultArg offerAegis false
@@ -55,14 +56,21 @@ type ClientOffer(psk: byte[], clientId: Guid, entropy: IEntropy, unixTimeMs: uin
             X25519.publicKey (ReadOnlySpan sk) (Span pk) |> ignore
             sk, pk
         else [||], Array.empty
-    let advertised = SupportedCaps ||| (if wantDh then Caps.X25519 else 0us)
-    let allowed = AllowedCaps &&& (if wantDh then ~~~0us else ~~~Caps.X25519)
+    let advertised = SupportedCaps ||| (if wantDh then Caps.X25519 else 0us) ||| (if wantArrival then Caps.ExperimentalArrivalEvidence else 0us)
+    let allowed = (AllowedCaps ||| (if wantArrival then Caps.ExperimentalArrivalEvidence else 0us)) &&& (if wantDh then ~~~0us else ~~~Caps.X25519)
     let hello =
         { Version = 2uy; Suites = Suite.advertisedBits wantChaCha8 wantAegis wantChaCha20; Caps = MemTier.set advertised tier; ClientId = clientId
           UnixTimeMs = unixTimeMs; MssClient = uint16 mssClient; MaxPaths = uint16 maxPaths }
     let content =
         ClientInit.build (ReadOnlySpan psk) (ReadOnlySpan clientNonce) hello (ReadOnlySpan dhPublic)
                          (ReadOnlySpan(random entropy (ClientInit.BodyLength - 64)))
+
+    // Preserve existing managed/native constructor signatures; experiments remain off.
+    new(psk, clientId, entropy, unixTimeMs, mssClient, maxPaths, memTier: uint16 option,
+        offerX25519: bool option, offerChaCha8: bool option, offerAegis: bool option, offerChaCha20: bool option) =
+        ClientOffer(psk, clientId, entropy, unixTimeMs, mssClient, maxPaths,
+                    ?memTier=memTier, ?offerX25519=offerX25519, ?offerChaCha8=offerChaCha8,
+                    ?offerAegis=offerAegis, ?offerChaCha20=offerChaCha20, offerArrivalEvidence=false)
 
     member _.Frame = Bootstrap.frame (ReadOnlySpan content)
     member _.Hello = hello
@@ -126,13 +134,20 @@ type ServerAccept =
 /// Server side of the main handshake. psks: the configured client keys.
 [<Sealed>]
 type ServerOffer(psks: byte[][], entropy: IEntropy, grant0: uint16, maxPaths: int,
-                 ?offerX25519: bool, ?offerChaCha8: bool, ?offerAegis: bool, ?offerChaCha20: bool) =
+                 ?offerX25519: bool, ?offerChaCha8: bool, ?offerAegis: bool, ?offerChaCha20: bool, ?offerArrivalEvidence: bool) =
+    let wantArrival = defaultArg offerArrivalEvidence false
     let wantDh = defaultArg offerX25519 false
     let wantChaCha8 = defaultArg offerChaCha8 false
     let wantAegis = defaultArg offerAegis false
     let wantChaCha20 = defaultArg offerChaCha20 true
-    let allowed = AllowedCaps &&& (if wantDh then ~~~0us else ~~~Caps.X25519)
+    let allowed = (AllowedCaps ||| (if wantArrival then Caps.ExperimentalArrivalEvidence else 0us)) &&& (if wantDh then ~~~0us else ~~~Caps.X25519)
     let caches = Array.init psks.Length (fun _ -> ReplayCache())
+
+    new(psks, entropy, grant0, maxPaths, offerX25519: bool option, offerChaCha8: bool option,
+        offerAegis: bool option, offerChaCha20: bool option) =
+        ServerOffer(psks, entropy, grant0, maxPaths, ?offerX25519=offerX25519,
+                    ?offerChaCha8=offerChaCha8, ?offerAegis=offerAegis,
+                    ?offerChaCha20=offerChaCha20, offerArrivalEvidence=false)
 
     /// Try the bootstrap frame as CLIENT_INIT (spec 6.5.9 step 1). ValueNone: not ours, or
     /// rejected; the caller stays silent.
