@@ -6,6 +6,7 @@
     <Project Path="src/Tbt.Contracts/Tbt.Contracts.fsproj" />
     <Project Path="src/Tbt.Crypto/Tbt.Crypto.fsproj" />
     <Project Path="src/Tbt.Kernels/Tbt.Kernels.csproj" />
+    <Project Path="src/Tbt.NativeLib/Tbt.NativeLib.csproj" />
     <Project Path="src/Tbt.Session/Tbt.Session.fsproj" />
     <Project Path="src/Tbt.Wire/Tbt.Wire.fsproj" />
   </Folder>

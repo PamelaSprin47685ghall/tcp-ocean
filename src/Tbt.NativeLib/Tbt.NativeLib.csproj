@@ -1,0 +1,31 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Library</OutputType>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <UseSystemResourceKeys>true</UseSystemResourceKeys>
+    <PublishAot>true</PublishAot>
+    <NativeLib>Shared</NativeLib>
+    <!-- loadLibrary("tbt") looks for libtbt.so; publish may emit tbt.so, renamed after. -->
+    <AssemblyName>tbt</AssemblyName>
+    <Description>TBTun NativeAOT shared library (C ABI for Android VpnService / JNI)</Description>
+    <!-- Experimental linux-bionic RIDs need these; harmless on linux-x64. -->
+    <DisableUnsupportedError>true</DisableUnsupportedError>
+    <PublishAotUsingRuntimePack Condition="$(RuntimeIdentifier.StartsWith('linux-bionic'))">true</PublishAotUsingRuntimePack>
+  </PropertyGroup>
+  <ItemGroup Condition="$(RuntimeIdentifier.StartsWith('linux-bionic'))">
+    <LinkerArg Include="-Wl,--undefined-version" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="../Tbt.Carrier/Tbt.Carrier.fsproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="tbt.h" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+  <Target Name="PrefixLibTbt" AfterTargets="Publish"
+          Condition="Exists('$(PublishDir)tbt.so')">
+    <Copy SourceFiles="$(PublishDir)tbt.so" DestinationFiles="$(PublishDir)libtbt.so"
+          SkipUnchangedFiles="true" />
+  </Target>
+</Project>
+

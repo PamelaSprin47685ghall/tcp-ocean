@@ -164,12 +164,39 @@ SIOCOUTQNSD、TUNSETIFF、TCP_NOTSENT_LOWAT、TCP_WINDOW_CLAMP、Linux TCP_INFO 
 后交给用户态 TCP 栈，本进程不执行 TUNSETIFF / SIOCSIFTXQLEN，fd 仍由宿主持有。现有 `Open(name)`
 只用于 Linux 命名设备，行为不变。当前 `tbtun client` 仍是内核 TCP 监听器，没有改默认数据路径。
 
-**关于 net10.0-android。** 核心客户端是 `net10.0` JIT，可以被未来的 `net10.0-android` 或手写 JNI 宿主引用。
-本环境没有安装 Android workload，完整 APK（VpnService、`protect(fd)`、前台通知、Doze）不在这次范围。
-规范第十四章倾向 `linux-bionic-arm64` NativeAOT 共享库 + 手写 JNI，而不是以 Mono / 实验性
-PublishAot 的 .NET for Android 应用作为产品路径。本次的结论：JIT 核心加 fd 注入足够作为宿主的
-附着点；不能声称已经在真机 APK 或 bionic AOT 上验证。
+**产品路径是 `linux-bionic-arm64` NativeAOT 共享库，而不是 `net10.0-android` / Mono。**
+新增 `src/Tbt.NativeLib`（C#，`PublishAot=true`，`NativeLib=Shared`），通过
+`UnmanagedCallersOnly` 导出 C ABI（`tbt.h`）：`tbt_start(fd, cfg)`、`tbt_stop()`、
+`tbt_stats(buf, len)`、`tbt_set_protect(fn, ctx)`。`tbt_start` 用已有的 `TunStack.Attach`
+接管宿主 fd（不关 fd、不做 TUNSETIFF），后台线程 poll/Receive/Service；`TBT_FLAG_SMOKE`
+会在一只一次性套接字上调用 protect 回调。默认 `tbtun client` / 服务端 Linux 数据路径未改，
+也没有动 RateGroup、startup、drain、ledger credit、deadline scheduling、lanes。
 
-仍待完成：Windows `SIO_TCP_INFO` 写门控；macOS/iOS `utun` 设备（不只是注入 fd）；Android
-`VpnService.protect(fd)`、前台服务与 Doze 下的单调时钟推进；`linux-bionic-arm64` 交叉与真机证据；
-把本地 VPN 捕获接到现有 `tbtun client` 会话（现在客户端只听本地 TCP，不读 TUN）。
+交叉与导出已在本环境验证（NDK r27c，`/workspace/tools/android-ndk-r27c`，clang 18.0.3，
+Pkg.Revision 27.2.12479018；`PATH` 上 NDK clang 优先，并加上 `DisableUnsupportedError`、
+`PublishAotUsingRuntimePack`、`-Wl,--undefined-version`）：
+
+- `linux-bionic-arm64`：`tbt.so` 2.6 MiB，ELF64 AArch64，`NEEDED` 为 bionic 的
+  `libdl.so` / `libm.so` / `libc.so`。`readelf`/`nm -D` 可见
+  `tbt_start` / `tbt_stop` / `tbt_stats` / `tbt_set_protect`（`@@V1.0`）。当前镜像不依赖
+  `libssl` / `libcrypto`（密码是托管实现）。发布目录另存一份 `libtbt.so`，供
+  `System.loadLibrary("tbt")` 使用。
+- `linux-x64` 宿主烟测（`tests/native/tbt_abi_smoke.c`）：同样四个导出，`socketpair`
+  充当假 TUN，`tbt_start` + 写入 64 字节 + `tbt_stats` 见到 `pkts_in=1` 且
+  `protect_calls=1`，然后 `tbt_stop`。探测结果仍是完整 Linux 快路径
+  （epoll、SIOCOUTQNSD、tcp_info_notsent 等）。
+
+`android/vpn/` 是规范第十四章的薄壳源码（不在本环境编 APK：没有 Android SDK / workload）：
+Kotlin `TbtVpnService`（`Builder.establish()`、O_NONBLOCK、`foregroundServiceType=connectedDevice`
+前台通知——通知不是存活保证）、`TbtNative`、手写 `tbt_jni.c`（`protect` thunk 在工作线程
+`AttachCurrentThread`，不跨线程缓存 `JNIEnv`）。完整会话握手、真机加载仍待做。
+
+仍待完成：
+
+- 在带 Android SDK 的机器上编出 APK，并在真机/模拟器上加载 `libtbt.so`（AndroidSpike S1 的设备证据）。
+- 把 `protect(fd)` 接到真实路径套接字的 `connect` 之前。回调和烟测已有；现有 `tbtun client`
+  仍是内核 TCP 监听器，为保持默认 Linux 行为未挂钩。
+- Doze 下的单调时钟推进与进程保活策略（前台通知本身不是 liveness）。
+- 若日后 BCL 密码路径引入 OpenSSL，APK 需随包提供 `libssl`（当前 `.so` 的 `NEEDED` 里没有）。
+- Windows `SIO_TCP_INFO` 写门控；macOS/iOS `utun` 设备（不只是注入 fd）。
+- 把本地 VPN 捕获接到现有 `tbtun client` 会话（现在客户端只听本地 TCP，不读 TUN）。
