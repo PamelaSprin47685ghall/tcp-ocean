@@ -152,51 +152,53 @@ type SessionCarrier(session: Session, bridge: FlowBridge, ?uplinkPace: bool, ?tu
             progress <- false
             passes <- passes + 1
             let n = paths.Count
-            let mutable j = 0
-            while j < n && budget > 0 do
-                let link = paths.[(next + j) % n]
-                let mutable frame = Span<byte>.Empty
-                if link.TryBeginFrame(&frame) then
-                    let mutable allowRepair = true
-                    let mutable charge = 0
-                    let mutable attempt = false
-                    let mutable unpacedRepair = false
-                    let mutable unpacedData = false
-                    if session.ControlWaiting then
-                        attempt <- true
-                    elif not pace then
-                        if RepairSendOrder.canSendRepair session.Tx.Queued session.RepairWaiting originalsSinceRepair then
+            for pass in 1 .. 2 do
+              if pass = 1 || not progress then
+                let mutable j = 0
+                while j < n && budget > 0 do
+                    let link = paths.[(next + j) % n]
+                    let mutable frame = Span<byte>.Empty
+                    if WriteGate.admits pass link.UnsentBytes && link.TryBeginFrame(&frame) then
+                        let mutable allowRepair = true
+                        let mutable charge = 0
+                        let mutable attempt = false
+                        let mutable unpacedRepair = false
+                        let mutable unpacedData = false
+                        if session.ControlWaiting then
                             attempt <- true
-                            unpacedRepair <- true
-                        elif session.WantsToSend then
+                        elif not pace then
+                            if RepairSendOrder.canSendRepair session.Tx.Queued session.RepairWaiting originalsSinceRepair then
+                                attempt <- true
+                                unpacedRepair <- true
+                            elif session.WantsToSend then
+                                attempt <- true
+                                allowRepair <- false
+                                unpacedData <- true
+                        elif session.RepairWaiting && groupAllows fl true (session.Tx.Queued > 0) && pathAllows link.PathId fl now then
+                            attempt <- true
+                            charge <- 1
+                        elif groupAllows fl false (session.Tx.Queued > 0) && pathAllows link.PathId fl now then
+                            // allowRepair=false: a dry repair reserve must not block new data.
                             attempt <- true
                             allowRepair <- false
-                            unpacedData <- true
-                    elif session.RepairWaiting && groupAllows fl true (session.Tx.Queued > 0) && pathAllows link.PathId fl now then
-                        attempt <- true
-                        charge <- 1
-                    elif groupAllows fl false (session.Tx.Queued > 0) && pathAllows link.PathId fl now then
-                        // allowRepair=false: a dry repair reserve must not block new data.
-                        attempt <- true
-                        allowRepair <- false
-                        charge <- 2
-                    if attempt && session.TryProduce(link.PathId, frame, allowRepair) then
-                        link.CommitFrame()
-                        framesOut <- framesOut + 1L
-                        budget <- budget - 1
-                        progress <- true
-                        if unpacedRepair then originalsSinceRepair <- 0
-                        elif unpacedData then originalsSinceRepair <- originalsSinceRepair + 1
-                        if charge = 1 then
-                            wireOut <- wireOut + int64 fl
-                            group.OnRepair fl
-                            chargePath link.PathId fl
-                        elif charge = 2 then
-                            wireOut <- wireOut + int64 fl
-                            uniqueOut <- uniqueOut + int64 fl
-                            group.OnSent fl
-                            chargePath link.PathId fl
-                j <- j + 1
+                            charge <- 2
+                        if attempt && session.TryProduce(link.PathId, frame, allowRepair) then
+                            link.CommitFrame()
+                            framesOut <- framesOut + 1L
+                            budget <- budget - 1
+                            progress <- true
+                            if unpacedRepair then originalsSinceRepair <- 0
+                            elif unpacedData then originalsSinceRepair <- originalsSinceRepair + 1
+                            if charge = 1 then
+                                wireOut <- wireOut + int64 fl
+                                group.OnRepair fl
+                                chargePath link.PathId fl
+                            elif charge = 2 then
+                                wireOut <- wireOut + int64 fl
+                                uniqueOut <- uniqueOut + int64 fl
+                                group.OnSent fl
+                                chargePath link.PathId fl
+                    j <- j + 1
             next <- (next + 1) % n
         budget0 - budget
 

@@ -30,6 +30,9 @@ type IPath =
     abstract Watch: poller: Poller * sending: bool -> unit
     /// Take what the last wait reported; whole frames go to the owner.
     abstract Receive: poller: Poller -> unit
+    /// Kernel unsent bytes for two-pass gating (spec 3.14): 0 = empty, -1 = unknown.
+    /// TUN paths report 0 so the first pass keeps the existing send checks.
+    abstract UnsentBytes: int
     /// The frame area of the next send, when the path takes one more frame now.
     abstract TryBeginFrame: frame: byref<Span<byte>> -> bool
     /// Send the frame begun last.

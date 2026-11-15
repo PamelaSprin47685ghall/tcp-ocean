@@ -127,10 +127,11 @@ type PathLink(socket: Socket, probe: INotSentProbe) =
                 while this.TryTakeFrame(&f) do owner.OnFrame(this.PathId, f) |> ignore
                 if r = IoResult.Closed then this.Close()
 
+        member _.UnsentBytes = probe.NotSent socket
         /// Write gating (spec 3.14): one frame at a time, and only while the kernel holds
-        /// less than NotSentLimit unsent bytes.
+        /// at most NotSentLimit unsent bytes. The carrier prefers notsent = 0 first.
         member this.TryBeginFrame(frame) =
-            if alive && this.TxIdle && probe.NotSent socket < SocketTuning.NotSentLimit then
+            if alive && this.TxIdle && WriteGate.admits 2 (probe.NotSent socket) then
                 txStart <- 0
                 txEnd <- 0
                 frame <- Span(tx, 0, this.FrameLength)

@@ -405,7 +405,8 @@ let ``path close: AddPath after PATH_CLOSED calls NotePathJoined and the id can 
             member _.Receive(_) = ()
             member _.TryBeginFrame(_) = false
             member _.CommitFrame() = ()
-            member _.Close() = () }
+            member _.Close() = ()
+            member _.UnsentBytes = 0 }
     // While the close transaction is open, the id must not be attached again.
     carrier.AddPath stub
     Assert.Equal(PathCloseState.Closing, pair.Client.PathState 1us)

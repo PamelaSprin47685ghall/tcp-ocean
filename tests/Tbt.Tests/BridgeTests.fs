@@ -137,9 +137,10 @@ let ``watch and service visit only armed and writing flows, not all 256 slots`` 
     bridge.CloseAll()
 
 /// A path that takes every frame and counts them.
-type private CountingPath(id: uint16) =
+type private CountingPath(id: uint16, ?unsent: int) =
     let buf = Array.zeroCreate<byte> 2048
     member val Frames = 0 with get, set
+    member val Unsent = defaultArg unsent 0 with get, set
     interface IPath with
         member val PathId = id with get, set
         member val FrameLength = 0 with get, set
@@ -148,6 +149,7 @@ type private CountingPath(id: uint16) =
         member _.Backlog with set (_: int) = ()
         member _.Watch(_, _) = ()
         member _.Receive(_) = ()
+        member p.UnsentBytes = p.Unsent
         member p.TryBeginFrame(frame: byref<Span<byte>>) =
             frame <- Span(buf, 0, (p :> IPath).FrameLength)
             true
@@ -201,3 +203,53 @@ let ``the trace is off by default, costs no allocation off, and writes its recor
     let line = IO.File.ReadAllLines(file) |> Array.find (fun l -> l.StartsWith "2 42 3 1 ")
     Assert.True(Int64.Parse(line.Split(' ').[4]) > 0L)
     IO.File.Delete file
+
+[<Fact>]
+let ``write gate: first pass is notsent 0, second pass is at most 16 KiB, unknown only on the second`` () =
+    Assert.True(WriteGate.admits 1 0)
+    Assert.False(WriteGate.admits 1 1)
+    Assert.False(WriteGate.admits 1 16384)
+    Assert.False(WriteGate.admits 1 -1)
+    Assert.True(WriteGate.admits 2 0)
+    Assert.True(WriteGate.admits 2 1)
+    Assert.True(WriteGate.admits 2 16384)
+    Assert.False(WriteGate.admits 2 16385)
+    Assert.True(WriteGate.admits 2 -1)
+
+[<Fact>]
+let ``write batch prefers empty paths and only then those with notsent at most 16 KiB`` () =
+    use listener = listen ()
+    let struct (session, bridge) = clientOnBridge ()
+    let struct (app, local) = loopPair listener
+    use app = app
+    Assert.True(bridge.TryAdd local)
+    let slot = bridge.Opened.NextUp -1
+    app.Send(Array.create 60000 3uy) |> ignore
+    for _ in 1 .. 200 do
+        if session.Tx.Queued < 40 then
+            bridge.Read slot
+            Thread.Sleep 1
+    Assert.True(session.Tx.Queued >= 40)
+    let carrier = SessionCarrier(session, bridge)
+    let empty = CountingPath(0us, unsent = 0)
+    let queued = CountingPath(1us, unsent = 8000)
+    let full = CountingPath(2us, unsent = 20000)
+    carrier.AddPath empty
+    carrier.AddPath queued
+    carrier.AddPath full
+    let n = carrier.WriteBatch 8
+    Assert.True(n > 0)
+    Assert.True(empty.Frames > 0)
+    Assert.Equal(0, queued.Frames)
+    Assert.Equal(0, full.Frames)
+    // No empty path: the second pass may use a path with notsent ≤ 16 KiB, never one above it.
+    let onlyQueued = SessionCarrier(session, bridge)
+    let mid = CountingPath(0us, unsent = 8000)
+    let over = CountingPath(1us, unsent = 20000)
+    onlyQueued.AddPath mid
+    onlyQueued.AddPath over
+    let n2 = onlyQueued.WriteBatch 8
+    Assert.True(n2 > 0)
+    Assert.True(mid.Frames > 0)
+    Assert.Equal(0, over.Frames)
+    bridge.CloseAll()

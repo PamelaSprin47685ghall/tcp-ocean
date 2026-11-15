@@ -93,3 +93,12 @@ module SocketTuning =
         match KernelTcpInfo.tryRead socket with
         | ValueSome info -> info.BytesAcked
         | ValueNone -> -1L
+
+/// Two-pass write gating for the client uplink (spec 3.14).
+module WriteGate =
+    /// Pass 1 admits only notsent = 0. Pass 2, used when pass 1 is empty, admits
+    /// notsent ≤ 16 KiB, and also a probe that cannot tell (-1).
+    let admits (pass: int) (notSent: int) =
+        if pass <= 1 then notSent = 0
+        elif notSent < 0 then true
+        else notSent <= SocketTuning.NotSentLimit

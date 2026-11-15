@@ -1149,6 +1149,7 @@ type TunPath(output: ITunOutput, counters: TunCounters, localIp: uint32, localPo
         member _.Backlog with set v = backlog <- v
         member _.Watch(_, _) = ()
         member _.Receive(_) = ()
+        member _.UnsentBytes = 0
 
         member _.TryBeginFrame(frame) =
             // A send stamps the ring with now, so the stall shift must happen first: a frame
