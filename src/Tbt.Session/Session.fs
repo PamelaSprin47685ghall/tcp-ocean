@@ -80,9 +80,8 @@ type Session(role: Role, p: SessionParams, port: IFlowPort, clock: IClock, confi
     let fieldOf (d: Direction) =
         if d = Direction.Up || p.Caps &&& Caps.Dl16 <> 0us then CodeField.Gf16 else CodeField.Gf2
     let mask (hp: byte[]) : IHeaderMask =
-        if p.Caps &&& Caps.HpMask <> 0us then
-            ChaChaHeaderMask(ReadOnlySpan hp, Suite.doubleRounds p.Keys.Suite)
-        else NoHeaderMask()
+        if p.Caps &&& Caps.HpMask = 0us then NoHeaderMask()
+        else HeaderMasks.Create(p.Keys.Suite, ReadOnlySpan hp)
     let txKeys = KeyTable(p.Keys.Suite)
     let rxKeys = KeyTable(p.Keys.Suite)
     do

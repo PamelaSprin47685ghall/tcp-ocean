@@ -77,10 +77,18 @@ module Caps =
 /// suites bit2 (0x04) announces 0x03; the spec reserved the number but did not
 /// assign a bitmap bit (see docs/DECISIONS.md D11).
 module Suite =
+    /// AEGIS-128L (RFC 10032). 128-bit key, 128-bit nonce, 128-bit tag (spec 6.4.1).
+    [<Literal>]
+    let Aegis128L = 0x01uy
+
+    /// CLIENT_INIT bitmap bit0 for suite 0x01.
+    [<Literal>]
+    let Aegis128LBit = 0x01uy
+
     [<Literal>]
     let ChaCha20Poly1305 = 0x02uy
 
-    /// Bitmap bit for suite 0x02. Bit 0 (AEGIS-128L) is not implemented in this build.
+    /// Bitmap bit for suite 0x02.
     [<Literal>]
     let ChaCha20Poly1305Bit = 0x02uy
 
@@ -92,22 +100,37 @@ module Suite =
     [<Literal>]
     let ChaCha8Poly1305Bit = 0x04uy
 
-    let isImplemented (s: byte) = s = ChaCha20Poly1305 || s = ChaCha8Poly1305
+    /// True when AES-NI or ARMv8 Crypto is present. AEGIS is never advertised without it.
+    let hardwareAes = Kernels.Aegis128L.IsSupported
+
+    let isImplemented (s: byte) =
+        s = ChaCha20Poly1305 || s = ChaCha8Poly1305 || (s = Aegis128L && hardwareAes)
 
     let offers (bitmap: byte) (s: byte) =
-        if s = ChaCha20Poly1305 then bitmap &&& ChaCha20Poly1305Bit <> 0uy
+        if s = Aegis128L then bitmap &&& Aegis128LBit <> 0uy
+        elif s = ChaCha20Poly1305 then bitmap &&& ChaCha20Poly1305Bit <> 0uy
         elif s = ChaCha8Poly1305 then bitmap &&& ChaCha8Poly1305Bit <> 0uy
         else false
 
-    /// Advertise 0x02 always; also 0x03 when offerChaCha8 is set.
-    let advertisedBits (offerChaCha8: bool) =
-        if offerChaCha8 then ChaCha20Poly1305Bit ||| ChaCha8Poly1305Bit else ChaCha20Poly1305Bit
+    /// Advertise 0x02 always; 0x03 when offerChaCha8 is set; 0x01 only when
+    /// offerAegis is set and hardware AES is present (default is still 0x02 only).
+    let advertisedBits (offerChaCha8: bool) (offerAegis: bool) =
+        let mutable b = ChaCha20Poly1305Bit
+        if offerChaCha8 then b <- b ||| ChaCha8Poly1305Bit
+        if offerAegis && hardwareAes then b <- b ||| Aegis128LBit
+        b
 
-    /// Prefer 0x03 only when both sides offered it; otherwise 0x02; 0 if neither is offered.
-    let select (bitmap: byte) (preferChaCha8: bool) =
-        if preferChaCha8 && offers bitmap ChaCha8Poly1305 then ChaCha8Poly1305
+    /// Prefer 0x01 when both offered it and hardware AES is present, then 0x03
+    /// if preferChaCha8, else 0x02; 0 if the intersection is empty (see D12).
+    let select (bitmap: byte) (preferAegis: bool) (preferChaCha8: bool) =
+        if preferAegis && hardwareAes && offers bitmap Aegis128L then Aegis128L
+        elif preferChaCha8 && offers bitmap ChaCha8Poly1305 then ChaCha8Poly1305
         elif offers bitmap ChaCha20Poly1305 then ChaCha20Poly1305
         else 0uy
+
+    let keyLength (s: byte) = if s = Aegis128L then 16 else 32
+
+    let nonceLength (s: byte) = if s = Aegis128L then 16 else 12
 
     let doubleRounds (s: byte) = if s = ChaCha8Poly1305 then 4 else 10
 
@@ -280,7 +303,7 @@ type SessionKeys(ikm: byte[], clientNonce: byte[], serverNonce: byte[], sessionI
         let l = Array.zeroCreate<byte> 2
         BinaryPrimitives.WriteUInt16BigEndian(Span l, uint16 frameLength)
         Array.concat [ Kdf.ascii "tbtun v2"; sid; (Kdf.sha256 (ReadOnlySpan cid)).[.. 7]; [| suite |]; l; th ]
-    let klen = 32
+    let klen = Suite.keyLength suite
 
     let be32 (g: uint32) =
         let b = Array.zeroCreate<byte> 4

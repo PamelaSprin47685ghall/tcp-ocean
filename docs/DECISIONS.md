@@ -30,7 +30,7 @@ k − 1，stride = 1, 2, 4, 16, 64, 256。即 i = 0 是 t − 1 步，在第一�
 ## D4 默认只通告套件 0x02（spec 6.4.1）
 
 默认 CLIENT_INIT 的 suites 只置 bit1，SERVER_INIT 选 0x02（ChaCha20-Poly1305）。现有握手向量与此一致。
-AEGIS-128L（bit0）仍未实现，不通告也不接受。ChaCha8（0x03）在双方显式提供时可以协商，见 D11。
+AEGIS-128L（bit0）已实现，但默认仍不通告也不选择，以免改变既有握手向量；双方显式 `offerAegis` 且本机有 AES 硬件时才协商，见 D12。ChaCha8（0x03）在双方显式提供时可以协商，见 D11。
 
 ## D5 FLOWSTATE 只与 FLOWSTATE2 一起协商（spec 6.10b.1）
 
@@ -116,3 +116,25 @@ X25519 使用 5×51-bit limb 的恒定时间 Montgomery ladder（cswap、固定�
 每 cell 的 AEAD 零分配：ChaCha 在 AVX2 上走 8-block Vector256 核，否则 Vector128；Poly1305 是 donna-64（UInt128 乘法，预计算 r²..r⁴，一次吸收 4 块）。
 套件 0x02 也可与平台 `ChaCha20Poly1305`（Linux 上为 OpenSSL）交叉验证。TryDecrypt 不抛异常，伪造帧也不分配。
 
+## D12 AEGIS-128L（spec 6.4.1、RFC 10032）
+
+套件 0x01 按规范：128 比特密钥、128 比特随机数、128 比特标签；klen=16。数据帧随机数是常用的 96 比特
+`[dir | BE16 path_id | 0 | BE64 cell_seq]` 再补 32 个零比特。头部遮蔽为 AES-128-ECB(K_hp, sample)
+的前 8 字节。CLIENT_INIT 的 suites 位图 bit0（0x01）通告本套件，与规范一致。
+
+算法遵循 RFC 10032（AEGIS v1.1 的 Finalize：长度以比特计，小端 LE64||LE64，再 Update(t,t) 七次；
+128 比特标签是 S0..S6 的异或）。测试向量取自该 RFC 附录 A.1 / A.2 以及草稿仓库 commit d3ef9984
+的 `aegis-128l-test-vectors.json` 与 `aesround-test-vector.json`。
+
+实现只用硬件 AES：x86 上 `System.Runtime.Intrinsics.X86.Aes`（AES-NI），ARM 上
+`System.Runtime.Intrinsics.Arm.Aes`（AESE+AESMC 合成与 AESENC 等价的一轮）。没有表驱动 AES，
+也没有软件 AES 回退。本机没有硬件 AES 时，`advertisedBits` 即使 `offerAegis` 也不置 bit0，
+`select` 不选 0x01，构造 `Aegis128LAead` / `AesHeaderMask` 会抛出；默认路径不受影响。
+
+规范写明两端都有 AES 硬件时用 0x01，但没有写 0x01 与 0x03 同时出现在交集里时的优先级。
+本实现在硬件 AES 可用且双方都通告 bit0 时优先选 0x01，然后再按 D11 考虑 0x03，否则 0x02。
+默认 CLIENT_INIT 仍只通告 0x02。引导帧 CLIENT_INIT / SERVER_INIT 与 JOIN / JOIN_ACK 始终是
+ChaCha20-Poly1305；0x01 只用于套件选定之后的数据帧 AEAD 和头部遮蔽。
+
+测试：RFC 附录与 JSON 参考向量、伪造标签零分配、客户端与服务端在 `offerAegis` 时的互通，
+以及只一方通告时仍落在 0x02。

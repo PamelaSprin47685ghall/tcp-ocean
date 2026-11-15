@@ -1,8 +1,9 @@
-/// Data-frame sealing and opening (spec 6.3, 6.4, 6.5.6, 6.6) for suite 0x02
-/// (ChaCha20-Poly1305) and 0x03 (TBT-ChaCha8-Poly1305), own non-throwing implementation. One instance per direction per end; single owner thread.
+/// Data-frame sealing and opening (spec 6.3, 6.4, 6.5.6, 6.6) for suite 0x01
+/// (AEGIS-128L), 0x02 (ChaCha20-Poly1305) and 0x03 (TBT-ChaCha8-Poly1305).
+/// Open never throws on a bad tag. One instance per direction per end; single owner thread.
 ///
 /// Frame: chunk_hdr(5) | masked cell_seq(8) | AEAD(meta 40 | symbol S) | tag(16) | CRLF(2).
-/// Nonce (96 bits): dir | BE16 path_id | 0 | BE64 cell_seq.
+/// Nonce: 96 bits dir | BE16 path_id | 0 | BE64 cell_seq; suite 0x01 appends 32 zero bits.
 /// AAD (18 bytes): chunk_hdr(5) | BE64 cell_seq | BE16 path_id | dir | BE16 L.
 namespace Tbt.Crypto
 
@@ -16,9 +17,10 @@ open Tbt.Contracts
 type KeyTable(?suite: byte) =
     let suite = defaultArg suite 0x02uy
     let rounds = if suite = 0x03uy then 4 else 10
+    let nonceLength = if suite = 0x01uy then 16 else 12
     let gens: uint32[] = Array.zeroCreate 2
     let starts: uint64[] = Array.zeroCreate 2
-    let aeads: ChaCha20Poly1305Aead array = Array.zeroCreate 2
+    let aeads: IAead array = Array.zeroCreate 2
     let mutable count = 0
 
     member _.Count = count
@@ -26,6 +28,7 @@ type KeyTable(?suite: byte) =
     member _.NewestGeneration = if count = 0 then invalidOp "no key" else gens.[count - 1]
     member _.OldestGeneration = if count = 0 then invalidOp "no key" else gens.[0]
     member _.NewestStart = if count = 0 then invalidOp "no key" else starts.[count - 1]
+    member _.NonceLength = nonceLength
 
     /// Install generation gen for counters >= fromCounter. The first key must be gen 0
     /// from counter 0; later keys must be the next generation with a larger start.
@@ -35,7 +38,11 @@ type KeyTable(?suite: byte) =
         if count = 1 && (gen <> gens.[0] + 1u || fromCounter <= starts.[0]) then invalidArg "gen" "next generation expected"
         gens.[count] <- gen
         starts.[count] <- fromCounter
-        aeads.[count] <- ChaCha20Poly1305Aead(key, rounds)
+        aeads.[count] <-
+            if suite = 0x01uy then
+                if not Aegis128LAead.IsSupported then invalidOp "AEGIS-128L requires hardware AES"
+                Aegis128LAead(key)
+            else ChaCha20Poly1305Aead(key, rounds)
         count <- count + 1
 
     /// Remove the older of two generations (KEY_RETIRE).
@@ -49,7 +56,7 @@ type KeyTable(?suite: byte) =
         count <- 1
 
     /// The key for counter c, or null when c is outside every interval.
-    member _.Select(c: uint64) : ChaCha20Poly1305Aead | null =
+    member _.Select(c: uint64) : IAead | null =
         if count = 2 && c >= starts.[1] then aeads.[1]
         elif count >= 1 && c >= starts.[0] then aeads.[0]
         else null
@@ -60,6 +67,7 @@ module private Frame =
         BinaryPrimitives.WriteUInt16BigEndian(nonce.Slice 1, path)
         nonce.[3] <- 0uy
         BinaryPrimitives.WriteUInt64BigEndian(nonce.Slice 4, counter)
+        if nonce.Length > 12 then nonce.Slice(12).Clear()
 
     let writeAad (frame: ReadOnlySpan<byte>) (dir: Direction) (path: uint16) (counter: uint64) (aad: Span<byte>) =
         frame.Slice(0, Layout.ChunkHeaderLength).CopyTo aad
@@ -73,7 +81,7 @@ module private Frame =
 /// Seals data frames of one direction.
 [<Sealed>]
 type CellSealer(dir: Direction, symbolSize: int, keys: KeyTable, mask: IHeaderMask) =
-    let nonce: byte[] = Array.zeroCreate 12
+    let nonce: byte[] = Array.zeroCreate 16
     let aad: byte[] = Array.zeroCreate 18
     let hp: byte[] = Array.zeroCreate 8
     let frameLength = Layout.frameLength symbolSize
@@ -90,7 +98,7 @@ type CellSealer(dir: Direction, symbolSize: int, keys: KeyTable, mask: IHeaderMa
             Frame.writeNonce dir path counter (Span nonce)
             Frame.writeAad (Frame.readOnly frame) dir path counter (Span aad)
             let body = frame.Slice(Layout.MetaOffset, Layout.MetaLength + symbolSize)
-            aead.Encrypt(ReadOnlySpan nonce, Frame.readOnly body, body,
+            aead.Encrypt(ReadOnlySpan(nonce, 0, keys.NonceLength), Frame.readOnly body, body,
                          frame.Slice(Layout.tagOffset symbolSize, Layout.TagLength), ReadOnlySpan aad)
             mask.Compute(Frame.readOnly (frame.Slice(Layout.MetaOffset, 16)), Span hp)
             let seq = frame.Slice(Layout.CellSeqOffset, Layout.CellSeqLength)
@@ -100,7 +108,7 @@ type CellSealer(dir: Direction, symbolSize: int, keys: KeyTable, mask: IHeaderMa
 /// Opens data frames of one direction; owns the replay window of that direction.
 [<Sealed>]
 type CellOpener(dir: Direction, symbolSize: int, keys: KeyTable, mask: IHeaderMask) =
-    let nonce: byte[] = Array.zeroCreate 12
+    let nonce: byte[] = Array.zeroCreate 16
     let aad: byte[] = Array.zeroCreate 18
     let hp: byte[] = Array.zeroCreate 8
     let replay = ReplayWindow()
@@ -142,7 +150,7 @@ type CellOpener(dir: Direction, symbolSize: int, keys: KeyTable, mask: IHeaderMa
                     Frame.writeAad (Frame.readOnly frame) dir path c (Span aad)
                     let body = frame.Slice(Layout.MetaOffset, Layout.MetaLength + symbolSize)
                     let tag = frame.Slice(Layout.tagOffset symbolSize, Layout.TagLength)
-                    if aead.TryDecrypt(ReadOnlySpan nonce, Frame.readOnly body, Frame.readOnly tag, body, ReadOnlySpan aad) then
+                    if aead.TryDecrypt(ReadOnlySpan(nonce, 0, keys.NonceLength), Frame.readOnly body, Frame.readOnly tag, body, ReadOnlySpan aad) then
                         replay.Commit c
                         counter <- c
                         true

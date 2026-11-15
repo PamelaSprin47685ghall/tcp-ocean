@@ -27,3 +27,21 @@ type ChaChaHeaderMask(hpKey: ReadOnlySpan<byte>, ?doubleRounds: int) =
 type NoHeaderMask() =
     interface IHeaderMask with
         member _.Compute(_, mask) = mask.Slice(0, Layout.CellSeqLength).Clear()
+
+/// HP for suite 0x01: first 8 bytes of AES-128-ECB(K_hp, sample) (spec 6.4.1).
+/// Requires hardware AES; construction throws if it is missing.
+[<Sealed>]
+type AesHeaderMask(hpKey: ReadOnlySpan<byte>) =
+    do if hpKey.Length < 16 then invalidArg "hpKey" "AEGIS HP key is 16 bytes"
+    let aes = Kernels.Aes128Ecb(hpKey.Slice(0, 16))
+
+    interface IHeaderMask with
+        member _.Compute(sample, mask) = aes.EncryptFirst8(sample, mask.Slice(0, Layout.CellSeqLength))
+
+/// Header protection for the negotiated data-frame suite (ChaCha or AES-128-ECB).
+[<AbstractClass; Sealed>]
+type HeaderMasks =
+    static member Create(suite: byte, hpKey: ReadOnlySpan<byte>) : IHeaderMask =
+        if suite = 0x01uy then AesHeaderMask(hpKey)
+        else ChaChaHeaderMask(hpKey, if suite = 0x03uy then 4 else 10)
+

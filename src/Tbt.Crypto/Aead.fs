@@ -8,6 +8,12 @@ namespace Tbt.Crypto
 open System
 open System.Security.Cryptography
 
+/// Shared AEAD surface for the key table (ChaCha suites and AEGIS-128L).
+type IAead =
+    abstract Encrypt: nonce: ReadOnlySpan<byte> * plain: ReadOnlySpan<byte> * cipher: Span<byte> * tag: Span<byte> * aad: ReadOnlySpan<byte> -> unit
+    abstract TryDecrypt: nonce: ReadOnlySpan<byte> * cipher: ReadOnlySpan<byte> * tag: ReadOnlySpan<byte> * plain: Span<byte> * aad: ReadOnlySpan<byte> -> bool
+    abstract Wipe: unit -> unit
+
 /// Poly1305 one-time authenticator (RFC 8439 section 2.5). The arithmetic is
 /// the donna-64 limb core in Tbt.Kernels (UInt128 products, r²..r⁴); one
 /// instance is reused, no allocation per Update/Finish.
@@ -68,3 +74,8 @@ type ChaCha20Poly1305Aead(key: ReadOnlySpan<byte>, ?doubleRounds: int, ?platform
                 ChaCha20.xorStreamRounds rounds words 1u nonce cipher plain (Span scratch)
                 true
             else false
+
+    interface IAead with
+        member this.Encrypt(n, p, c, tg, a) = this.Encrypt(n, p, c, tg, a)
+        member this.TryDecrypt(n, c, tg, p, a) = this.TryDecrypt(n, c, tg, p, a)
+        member this.Wipe() = this.Wipe()

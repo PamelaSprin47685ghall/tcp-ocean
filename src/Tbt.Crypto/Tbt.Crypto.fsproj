@@ -4,6 +4,7 @@
     <Compile Include="Kdf.fs" />
     <Compile Include="X25519.fs" />
     <Compile Include="Aead.fs" />
+    <Compile Include="Aegis.fs" />
     <Compile Include="HeaderMask.fs" />
     <Compile Include="ReplayWindow.fs" />
     <Compile Include="CellCrypto.fs" />

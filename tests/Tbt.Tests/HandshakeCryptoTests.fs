@@ -6,6 +6,7 @@ open Xunit
 open Tbt.Contracts
 open Tbt.Crypto
 open Tbt.Crypto.Bootstrap
+open Tbt.Crypto.Kernels
 open Tbt.Session
 open Tbt.Session.Handshake
 open Tbt.Wire
@@ -110,11 +111,12 @@ let ``ChaCha8-Poly1305 AEAD on the RFC 8439 2.8.2 inputs matches the independent
 
 let private id = Guid(Array.create 16 7uy)
 
-let private handshake (x25519: bool) (chaCha8: bool) (seedC: int) (seedS: int) =
+let private handshake (x25519: bool) (chaCha8: bool) (aegis: bool) (seedC: int) (seedS: int) =
+    let wantAegis = aegis
     let offer = ClientOffer(psk, id, SeededEntropy seedC, uint64 unixMs, 1448, 256,
-                            offerX25519 = x25519, offerChaCha8 = chaCha8)
+                            offerX25519 = x25519, offerChaCha8 = chaCha8, offerAegis = wantAegis)
     let accepted = (ServerOffer([| psk |], SeededEntropy seedS, 4096us, 256,
-                                offerX25519 = x25519, offerChaCha8 = chaCha8))
+                                offerX25519 = x25519, offerChaCha8 = chaCha8, offerAegis = wantAegis))
                        .TryAccept(ReadOnlySpan offer.Frame, unixMs, 1448)
     Assert.True(accepted.IsSome, "server rejected CLIENT_INIT")
     let struct (clientParams, sh) = offer.TryAccept(ReadOnlySpan accepted.Value.Reply).Value
@@ -128,7 +130,7 @@ let private frameRoundTrip (cp: SessionParams) (sp: SessionParams) =
     Assert.Equal<byte[]>(cp.Keys.HpUp, sp.Keys.HpUp)
     let table = KeyTable(cp.Keys.Suite)
     table.Install(0u, ReadOnlySpan(cp.Keys.UpKey 0u), 0UL)
-    let sealer = CellSealer(Direction.Up, cp.Symbol, table, ChaChaHeaderMask(ReadOnlySpan cp.Keys.HpUp, Suite.doubleRounds cp.Keys.Suite))
+    let sealer = CellSealer(Direction.Up, cp.Symbol, table, HeaderMasks.Create(cp.Keys.Suite, ReadOnlySpan cp.Keys.HpUp))
     let f = Array.zeroCreate (Layout.frameLength cp.Symbol)
     FrameMath.writeChunkHeader cp.Symbol (Span f)
     f.[f.Length - 2] <- 13uy
@@ -137,7 +139,7 @@ let private frameRoundTrip (cp: SessionParams) (sp: SessionParams) =
     sealer.Seal(Span f, 7UL, 0us)
     let rtable = KeyTable(sp.Keys.Suite)
     rtable.Install(0u, ReadOnlySpan(sp.Keys.UpKey 0u), 0UL)
-    let opener = CellOpener(Direction.Up, sp.Symbol, rtable, ChaChaHeaderMask(ReadOnlySpan sp.Keys.HpUp, Suite.doubleRounds sp.Keys.Suite))
+    let opener = CellOpener(Direction.Up, sp.Symbol, rtable, HeaderMasks.Create(sp.Keys.Suite, ReadOnlySpan sp.Keys.HpUp))
     let copy = Array.copy f
     let mutable c = 0UL
     Assert.True(opener.TryOpen(Span copy, 0us, &c))
@@ -146,7 +148,7 @@ let private frameRoundTrip (cp: SessionParams) (sp: SessionParams) =
 
 [<Fact>]
 let ``default handshake still selects suite 0x02 and does not set X25519`` () =
-    let struct (c, s, sh) = handshake false false 101 202
+    let struct (c, s, sh) = handshake false false false 101 202
     Assert.Equal(Suite.ChaCha20Poly1305, c.Keys.Suite)
     Assert.Equal(Suite.ChaCha20Poly1305, sh.Suite)
     Assert.Equal(0us, c.Caps &&& Caps.X25519)
@@ -156,7 +158,7 @@ let ``default handshake still selects suite 0x02 and does not set X25519`` () =
 
 [<Fact>]
 let ``X25519 decorator is negotiated only when both ends offer it, and the IKM changes`` () =
-    let struct (bothC, bothS, sh) = handshake true false 111 222
+    let struct (bothC, bothS, sh) = handshake true false false 111 222
     Assert.Equal(Caps.X25519, bothC.Caps &&& Caps.X25519)
     Assert.Equal(Caps.X25519, sh.Caps &&& Caps.X25519)
     Assert.Equal(Suite.ChaCha20Poly1305, bothC.Keys.Suite)
@@ -178,7 +180,7 @@ let ``X25519 decorator is negotiated only when both ends offer it, and the IKM c
 
 [<Fact>]
 let ``ChaCha8 is selected when both ends offer it, and a 0x02 sealer cannot open the cell`` () =
-    let struct (c, s, sh) = handshake false true 131 232
+    let struct (c, s, sh) = handshake false true false 131 232
     Assert.Equal(Suite.ChaCha8Poly1305, c.Keys.Suite)
     Assert.Equal(Suite.ChaCha8Poly1305, sh.Suite)
     Assert.Equal(Suite.ChaCha8Poly1305, s.Keys.Suite)
@@ -201,7 +203,7 @@ let ``ChaCha8 is selected when both ends offer it, and a 0x02 sealer cannot open
 
 [<Fact>]
 let ``X25519 and ChaCha8 together still let client and server exchange a cell`` () =
-    let struct (c, s, sh) = handshake true true 141 242
+    let struct (c, s, sh) = handshake true true false 141 242
     Assert.Equal(Suite.ChaCha8Poly1305, sh.Suite)
     Assert.Equal(Caps.X25519, c.Caps &&& Caps.X25519)
     frameRoundTrip c s
@@ -230,6 +232,220 @@ let ``a CLIENT_INIT that sets X25519 with an all-zero public key is rejected`` (
     let accepted = (ServerOffer([| psk |], SeededEntropy 9, 4096us, 256, offerX25519 = true))
                        .TryAccept(ReadOnlySpan frame, unixMs, 1448)
     Assert.True(accepted.IsNone)
+
+// ---- AEGIS-128L (RFC 10032 / spec 6.4.1) -----------------------------------
+
+let private requireAes () =
+    if not Aegis128LAead.IsSupported then failwith "AEGIS-128L tests require hardware AES"
+
+let private loadAegisVectors () =
+    let path = System.IO.Path.Combine(AppContext.BaseDirectory, "vectors", "aegis-128l-test-vectors.json")
+    System.Text.Json.JsonDocument.Parse(System.IO.File.ReadAllText path).RootElement
+
+[<Fact>]
+let ``AESRound matches the RFC 10032 appendix A.1 vector`` () =
+    requireAes ()
+    let path = System.IO.Path.Combine(AppContext.BaseDirectory, "vectors", "aesround-test-vector.json")
+    let v = System.Text.Json.JsonDocument.Parse(System.IO.File.ReadAllText path).RootElement.[0]
+    let hs (name: string) =
+        match v.GetProperty(name).GetString() with
+        | null -> failwith name
+        | s -> hex s
+    let input, rk, expected = hs "in", hs "rk", hs "out"
+    let actual = Array.zeroCreate 16
+    Aegis128L.AesRound(ReadOnlySpan input, ReadOnlySpan rk, Span actual)
+    Assert.Equal(toHex (ReadOnlySpan expected), toHex (ReadOnlySpan actual))
+
+[<Fact>]
+let ``AES-128-ECB of a NIST block matches, and is used for AEGIS header protection`` () =
+    requireAes ()
+    // FIPS-197 C.1, AES-128.
+    let key = hex "000102030405060708090a0b0c0d0e0f"
+    let pt = hex "00112233445566778899aabbccddeeff"
+    let ct = hex "69c4e0d86a7b0430d8cdb78070b4c55a"
+    let aes = Aes128Ecb(ReadOnlySpan key)
+    let out = Array.zeroCreate 16
+    aes.Encrypt(ReadOnlySpan pt, Span out)
+    Assert.Equal(toHex (ReadOnlySpan ct), toHex (ReadOnlySpan out))
+    let mask = Array.zeroCreate 8
+    let hp = AesHeaderMask(ReadOnlySpan key) :> IHeaderMask
+    hp.Compute(ReadOnlySpan pt, Span mask)
+    Assert.Equal(toHex (ReadOnlySpan(ct.[0..7])), toHex (ReadOnlySpan mask))
+
+[<Fact>]
+let ``AEGIS-128L Update matches the RFC 10032 appendix A.2.1 vector`` () =
+    requireAes ()
+    let root = loadAegisVectors ()
+    let v = root.[0]
+    let g (name: string) =
+        match v.GetProperty(name).GetString() with
+        | null -> failwith name
+        | s -> hex s
+    let state = Array.concat [ g "S0"; g "S1"; g "S2"; g "S3"; g "S4"; g "S5"; g "S6"; g "S7" ]
+    Aegis128L.ApplyUpdate(Span state, ReadOnlySpan(g "M0"), ReadOnlySpan(g "M1"))
+    let after = Array.concat [ g "S0_2"; g "S1_2"; g "S2_2"; g "S3_2"; g "S4_2"; g "S5_2"; g "S6_2"; g "S7_2" ]
+    Assert.Equal(toHex (ReadOnlySpan after), toHex (ReadOnlySpan state))
+
+[<Fact>]
+let ``AEGIS-128L AEAD matches the RFC 10032 appendix A.2 reference vectors`` () =
+    requireAes ()
+    let root = loadAegisVectors ()
+    let mutable kat = 0
+    let mutable rejected = 0
+    let hexProp (v: System.Text.Json.JsonElement) (name: string) =
+        match v.TryGetProperty(name) with
+        | true, p ->
+            match p.GetString() with
+            | null | "" -> [||]
+            | s -> hex s
+        | _ -> [||]
+    for v in root.EnumerateArray() do
+        match v.TryGetProperty("key") with
+        | false, _ -> ()
+        | true, _ ->
+            let key = hexProp v "key"
+            let nonce = hexProp v "nonce"
+            let ad = hexProp v "ad"
+            let tag = hexProp v "tag128"
+            let aead = Aegis128LAead(ReadOnlySpan key)
+            match v.TryGetProperty("error") with
+            | true, _ ->
+                let ct = hexProp v "ct"
+                let back = Array.zeroCreate ct.Length
+                Assert.False(aead.TryDecrypt(ReadOnlySpan nonce, ReadOnlySpan ct, ReadOnlySpan tag, Span back, ReadOnlySpan ad))
+                Assert.All(back, fun b -> Assert.Equal(0uy, b))
+                rejected <- rejected + 1
+            | _ ->
+                let msg = hexProp v "msg"
+                let ct = hexProp v "ct"
+                let cipher = Array.zeroCreate msg.Length
+                let got = Array.zeroCreate 16
+                aead.Encrypt(ReadOnlySpan nonce, ReadOnlySpan msg, Span cipher, Span got, ReadOnlySpan ad)
+                Assert.Equal(toHex (ReadOnlySpan ct), toHex (ReadOnlySpan cipher))
+                Assert.Equal(toHex (ReadOnlySpan tag), toHex (ReadOnlySpan got))
+                let back = Array.zeroCreate msg.Length
+                Assert.True(aead.TryDecrypt(ReadOnlySpan nonce, ReadOnlySpan cipher, ReadOnlySpan tag, Span back, ReadOnlySpan ad))
+                Assert.Equal<byte[]>(msg, back)
+                kat <- kat + 1
+    Assert.True(kat >= 5 && rejected >= 4, sprintf "expected RFC KATs and forgeries, got kat=%d rejected=%d" kat rejected)
+
+[<Fact>]
+let ``AEGIS-128L forged tag is rejected with no allocation and a cleared plaintext`` () =
+    requireAes ()
+    let key = Array.init 16 (fun i -> byte (i + 1))
+    let nonce = Array.init 16 (fun i -> byte (i * 3))
+    let aad = Array.init 18 (fun i -> byte (i + 7))
+    let plain = Array.init 1384 (fun i -> byte i)
+    let aead = Aegis128LAead(ReadOnlySpan key)
+    let cipher = Array.copy plain
+    let tag = Array.zeroCreate 16
+    aead.Encrypt(ReadOnlySpan nonce, ReadOnlySpan plain, Span cipher, Span tag, ReadOnlySpan aad)
+    tag.[15] <- tag.[15] ^^^ 0x80uy
+    let back = Array.copy cipher
+    for _ in 1 .. 8 do
+        aead.TryDecrypt(ReadOnlySpan nonce, ReadOnlySpan cipher, ReadOnlySpan tag, Span back, ReadOnlySpan aad) |> ignore
+    GC.Collect()
+    GC.WaitForPendingFinalizers()
+    let before = GC.GetAllocatedBytesForCurrentThread()
+    for _ in 1 .. 1000 do
+        Assert.False(aead.TryDecrypt(ReadOnlySpan nonce, ReadOnlySpan cipher, ReadOnlySpan tag, Span back, ReadOnlySpan aad))
+    let alloc = GC.GetAllocatedBytesForCurrentThread() - before
+    Assert.Equal(0L, alloc)
+    Assert.All(back, fun b -> Assert.Equal(0uy, b))
+
+[<Fact>]
+let ``default handshake still does not advertise or select AEGIS-128L`` () =
+    Assert.Equal(Suite.ChaCha20Poly1305Bit, Suite.advertisedBits false false)
+    if Suite.hardwareAes then
+        Assert.Equal(Suite.ChaCha20Poly1305Bit ||| Suite.ChaCha8Poly1305Bit ||| Suite.Aegis128LBit, Suite.advertisedBits true true)
+    else
+        Assert.Equal(Suite.ChaCha20Poly1305Bit ||| Suite.ChaCha8Poly1305Bit, Suite.advertisedBits true true)
+    // bit0 is set only when offerAegis and hardware AES are both present.
+    if Suite.hardwareAes then
+        Assert.Equal(Suite.ChaCha20Poly1305Bit ||| Suite.Aegis128LBit, Suite.advertisedBits false true)
+        Assert.Equal(Suite.Aegis128L, Suite.select (Suite.Aegis128LBit ||| Suite.ChaCha20Poly1305Bit) true false)
+    else
+        Assert.Equal(Suite.ChaCha20Poly1305Bit, Suite.advertisedBits false true)
+        Assert.Equal(Suite.ChaCha20Poly1305, Suite.select (Suite.Aegis128LBit ||| Suite.ChaCha20Poly1305Bit) true false)
+    let struct (c, s, sh) = handshake false false false 101 202
+    Assert.Equal(Suite.ChaCha20Poly1305, c.Keys.Suite)
+    Assert.NotEqual<byte>(Suite.Aegis128L, sh.Suite)
+    Assert.Equal(32, c.Keys.UpKey(0u).Length)
+    Assert.Equal(32, c.Keys.HpUp.Length)
+    ignore s
+
+[<Fact>]
+let ``AEGIS-128L is selected when both ends offer it, keys are 16 bytes, and a 0x02 sealer cannot open the cell`` () =
+    requireAes ()
+    let struct (c, s, sh) = handshake false false true 151 252
+    Assert.Equal(Suite.Aegis128L, c.Keys.Suite)
+    Assert.Equal(Suite.Aegis128L, sh.Suite)
+    Assert.Equal(Suite.Aegis128L, s.Keys.Suite)
+    Assert.Equal(16, c.Keys.UpKey(0u).Length)
+    Assert.Equal(16, c.Keys.DownKey(0u).Length)
+    Assert.Equal(16, c.Keys.HpUp.Length)
+    Assert.Equal(16, s.Keys.HpDown.Length)
+    frameRoundTrip c s
+    // Cross-suite: seal with 0x01, try to open with a 0x02 table (different klen, must not succeed).
+    let t20 = KeyTable(Suite.ChaCha20Poly1305)
+    // 0x02 needs a 32-byte key; pad to show the raw 16-byte material is not interchangeable.
+    let padded = Array.append (c.Keys.UpKey 0u) (Array.zeroCreate 16)
+    t20.Install(0u, ReadOnlySpan padded, 0UL)
+    let tA = KeyTable(Suite.Aegis128L)
+    tA.Install(0u, ReadOnlySpan(c.Keys.UpKey 0u), 0UL)
+    let sealer = CellSealer(Direction.Up, c.Symbol, tA, HeaderMasks.Create(Suite.Aegis128L, ReadOnlySpan c.Keys.HpUp))
+    let f = Array.zeroCreate (Layout.frameLength c.Symbol)
+    FrameMath.writeChunkHeader c.Symbol (Span f)
+    f.[f.Length - 2] <- 13uy
+    f.[f.Length - 1] <- 10uy
+    sealer.Seal(Span f, 1UL, 0us)
+    let opener = CellOpener(Direction.Up, c.Symbol, t20, ChaChaHeaderMask(ReadOnlySpan(Array.append c.Keys.HpUp (Array.zeroCreate 16)), 10))
+    let mutable ctr = 0UL
+    Assert.False(opener.TryOpen(Span(Array.copy f), 0us, &ctr))
+    Assert.True(opener.AuthFails > 0L)
+
+[<Fact>]
+let ``AEGIS-128L is not selected when only one end offers it`` () =
+    requireAes ()
+    let onlyClient = ClientOffer(psk, id, SeededEntropy 161, uint64 unixMs, 1448, 256, offerAegis = true)
+    Assert.Equal(Suite.Aegis128LBit ||| Suite.ChaCha20Poly1305Bit, onlyClient.Hello.Suites)
+    let accepted = (ServerOffer([| psk |], SeededEntropy 262, 4096us, 256, offerAegis = false))
+                       .TryAccept(ReadOnlySpan onlyClient.Frame, unixMs, 1448)
+    Assert.True(accepted.IsSome)
+    let struct (oneC, oneH) = onlyClient.TryAccept(ReadOnlySpan accepted.Value.Reply).Value
+    Assert.Equal(Suite.ChaCha20Poly1305, oneC.Keys.Suite)
+    Assert.Equal(Suite.ChaCha20Poly1305, oneH.Suite)
+    frameRoundTrip oneC accepted.Value.Params
+
+[<Fact>]
+let ``AEGIS-128L is preferred over ChaCha8 when both are offered, and a session still exchanges a cell`` () =
+    requireAes ()
+    let offer = ClientOffer(psk, id, SeededEntropy 171, uint64 unixMs, 1448, 256, offerChaCha8 = true, offerAegis = true)
+    let accepted = (ServerOffer([| psk |], SeededEntropy 272, 4096us, 256, offerChaCha8 = true, offerAegis = true))
+                       .TryAccept(ReadOnlySpan offer.Frame, unixMs, 1448)
+    Assert.True(accepted.IsSome)
+    let struct (cp, sh) = offer.TryAccept(ReadOnlySpan accepted.Value.Reply).Value
+    Assert.Equal(Suite.Aegis128L, sh.Suite)
+    Assert.Equal(Suite.Aegis128L, cp.Keys.Suite)
+    frameRoundTrip cp accepted.Value.Params
+    let clock = ManualClock()
+    let client = Session(Role.Client, cp, RecordingPort(), clock, SessionConfig.defaults)
+    let server = Session(Role.Server, accepted.Value.Params, RecordingPort(), clock, SessionConfig.defaults)
+    let frame = Array.zeroCreate client.FrameLength
+    client.Tick()
+    Assert.True(client.TryProduce(0us, Span frame))
+    Assert.NotEqual(UInt64.MaxValue, server.OnFrame(0us, Span frame))
+    server.Tick()
+    Assert.True(server.TryProduce(0us, Span frame) || not server.WantsToSend)
+
+[<Fact>]
+let ``X25519 and AEGIS-128L together still let client and server exchange a cell`` () =
+    requireAes ()
+    let struct (c, s, sh) = handshake true false true 181 282
+    Assert.Equal(Suite.Aegis128L, sh.Suite)
+    Assert.Equal(Caps.X25519, c.Caps &&& Caps.X25519)
+    Assert.Equal(16, c.Keys.UpKey(0u).Length)
+    frameRoundTrip c s
 
 // ---- Microbenchmark (hot path: per-cell AEAD) ------------------------------
 
@@ -271,5 +487,37 @@ let ``microbench: ChaCha8 vs ChaCha20 AEAD on a data-cell body`` () =
     let ns8, a8 = run 4 false 20000 8000 5
     let ns20p, a20p = run 10 true 20000 8000 5
     Assert.True(ns8 > 0.0 && ns20 > 0.0 && ns20p > 0.0)
-    eprintfn "cell AEAD median-of-5 ns/op managed20=%.0f managed8=%.0f prod20=%.0f alloc/op 20=%.3f 8=%.3f prod20=%.3f"
-        ns20 ns8 ns20p a20 a8 a20p
+    let nsA, aA =
+        if not Aegis128LAead.IsSupported then (0.0, 0.0)
+        else
+            let key16 = Array.init 16 (fun i -> byte (i * 5 + 1))
+            let nonce16 = Array.init 16 (fun i -> byte i)
+            let aead = Aegis128LAead(ReadOnlySpan key16)
+            let cipher = Array.zeroCreate plain.Length
+            let tag = Array.zeroCreate 16
+            let back = Array.zeroCreate plain.Length
+            let once () =
+                aead.Encrypt(ReadOnlySpan nonce16, ReadOnlySpan plain, Span cipher, Span tag, ReadOnlySpan aad)
+                if not (aead.TryDecrypt(ReadOnlySpan nonce16, ReadOnlySpan cipher, ReadOnlySpan tag, Span back, ReadOnlySpan aad)) then
+                    failwith "aegis bench decrypt failed"
+            let iters, warm, samples = 20000, 8000, 5
+            for _ in 1 .. warm do once ()
+            let ns = Array.zeroCreate samples
+            let mutable allocTotal = 0L
+            for s in 0 .. samples - 1 do
+                GC.Collect()
+                GC.WaitForPendingFinalizers()
+                let before = GC.GetAllocatedBytesForCurrentThread()
+                let sw = Stopwatch.StartNew()
+                for _ in 1 .. iters do once ()
+                sw.Stop()
+                allocTotal <- allocTotal + (GC.GetAllocatedBytesForCurrentThread() - before)
+                ns.[s] <- sw.Elapsed.TotalNanoseconds / float iters
+            let med =
+                let a = Array.copy ns
+                Array.sortInPlace a
+                a.[a.Length / 2]
+            med, float allocTotal / float (iters * samples)
+    if Aegis128LAead.IsSupported then Assert.True(nsA > 0.0)
+    eprintfn "cell AEAD median-of-5 ns/op managed20=%.0f managed8=%.0f prod20=%.0f aegis128l=%.0f alloc/op 20=%.3f 8=%.3f prod20=%.3f aegis=%.3f"
+        ns20 ns8 ns20p nsA a20 a8 a20p aA
