@@ -28,3 +28,27 @@ foreground notification (not a liveness guarantee), and passes the service
 instance to JNI so `VpnService.protect(fd)` runs on every path socket before
 `connect`. Doze / full session handshake / bundling `libssl` are still open
 (see docs/DECISIONS.md D13).
+
+## Host SDK / APK
+
+The box can build the debug APK once the Android SDK command-line tools, a JDK 17,
+and Gradle are on disk (this environment uses `/workspace/tools/android-sdk`,
+`/workspace/tools/jdk-17`, `/workspace/tools/gradle-8.11.1`, and NDK r27c):
+
+    export JAVA_HOME=/workspace/tools/jdk-17
+    export ANDROID_HOME=/workspace/tools/android-sdk
+    printf 'sdk.dir=%s\nndk.dir=/workspace/tools/android-ndk-r27c\n' "$ANDROID_HOME"         > android/vpn/local.properties
+    # copy the published linux-bionic-arm64 libtbt.so into jniLibs/arm64-v8a first
+    (cd android/vpn && gradle :app:assembleDebug)
+
+The APK is not a device-tested artifact. Server address and PSK are passed to
+`TbtVpnService` as intent extras (`server_ipv4`, `server_port`, `psk_hex`, `host`,
+`path_count`).
+
+## Host end-to-end (no netns)
+
+    tests/native/run-e2e.sh
+
+Starts a loopback echo, a `tbtun server --listen` (no TUN privileges), and a
+linux-x64 `libtbt.so` client on a socketpair fake TUN; injects a SYN plus data
+and checks the echo.

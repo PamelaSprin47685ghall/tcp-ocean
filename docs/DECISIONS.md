@@ -167,36 +167,42 @@ SIOCOUTQNSD、TUNSETIFF、TCP_NOTSENT_LOWAT、TCP_WINDOW_CLAMP、Linux TCP_INFO 
 **产品路径是 `linux-bionic-arm64` NativeAOT 共享库，而不是 `net10.0-android` / Mono。**
 新增 `src/Tbt.NativeLib`（C#，`PublishAot=true`，`NativeLib=Shared`），通过
 `UnmanagedCallersOnly` 导出 C ABI（`tbt.h`）：`tbt_start(fd, cfg)`、`tbt_stop()`、
-`tbt_stats(buf, len)`、`tbt_set_protect(fn, ctx)`。`tbt_start` 用已有的 `TunStack.Attach`
-接管宿主 fd（不关 fd、不做 TUNSETIFF），后台线程 poll/Receive/Service；`TBT_FLAG_SMOKE`
-会在一只一次性套接字上调用 protect 回调。默认 `tbtun client` / 服务端 Linux 数据路径未改，
-也没有动 RateGroup、startup、drain、ledger credit、deadline scheduling、lanes。
+`tbt_stats(buf, len)`、`tbt_set_protect(fn, ctx)`。配置版本 2 在提供 `server_port` 和 32
+字节 PSK 时走真正的客户端入口（`ClientHost`，仅 NativeLib 使用）：每个路径套接字在
+`connect` 之前调用 `protect(fd)`，握手后把 TUN 上捕获的 TCP 流接到现有 `Session` /
+`SessionCarrier` / `FlowBridge`。捕获栈（`CaptureStack`）在用户态终结 IPv4 TCP，再经一对
+回环 TCP socket 交给 `FlowBridge.TryAdd`，因此不必改 `FlowBridge` 或默认的 `tbtun client`
+（后者仍只在本地内核 TCP 端口上监听）。无服务器或 `TBT_FLAG_SMOKE` 时仍是原来的
+`TunStack.Attach` 烟测路径。默认 Linux 数据路径未改，也没有动 RateGroup、startup、drain、
+ledger credit、deadline scheduling、lanes。
 
 交叉与导出已在本环境验证（NDK r27c，`/workspace/tools/android-ndk-r27c`，clang 18.0.3，
 Pkg.Revision 27.2.12479018；`PATH` 上 NDK clang 优先，并加上 `DisableUnsupportedError`、
 `PublishAotUsingRuntimePack`、`-Wl,--undefined-version`）：
 
-- `linux-bionic-arm64`：`tbt.so` 2.6 MiB，ELF64 AArch64，`NEEDED` 为 bionic 的
-  `libdl.so` / `libm.so` / `libc.so`。`readelf`/`nm -D` 可见
-  `tbt_start` / `tbt_stop` / `tbt_stats` / `tbt_set_protect`（`@@V1.0`）。当前镜像不依赖
-  `libssl` / `libcrypto`（密码是托管实现）。发布目录另存一份 `libtbt.so`，供
-  `System.loadLibrary("tbt")` 使用。
-- `linux-x64` 宿主烟测（`tests/native/tbt_abi_smoke.c`）：同样四个导出，`socketpair`
-  充当假 TUN，`tbt_start` + 写入 64 字节 + `tbt_stats` 见到 `pkts_in=1` 且
-  `protect_calls=1`，然后 `tbt_stop`。探测结果仍是完整 Linux 快路径
-  （epoll、SIOCOUTQNSD、tcp_info_notsent 等）。
+- `linux-bionic-arm64`：`tbt.so` / `libtbt.so` 约 3.4 MiB，ELF64 AArch64，`NEEDED` 为 bionic 的
+  `libdl.so` / `libm.so` / `libc.so`。四个 C ABI 导出仍在（`@@V1.0`）。当前镜像不依赖
+  `libssl` / `libcrypto`。
+- `linux-x64` ABI 烟测（`tests/native/tbt_abi_smoke.c`）仍通过：`socketpair` 假 TUN，
+  `TBT_FLAG_SMOKE` 下 `pkts_in=1`、`protect_calls=1`。
+- 宿主端到端（`tests/native/tbt_e2e.c` / `run-e2e.sh`，不需要 netns 或 CAP_NET_ADMIN）：
+  本机 echo、`tbtun server --listen`（内核 TCP，egress 到 echo）、NativeLib 客户端挂在
+  `socketpair` 假 TUN 上。测试注入 SYN 与 `"hello\n"`，读回同样的数据；`protect` 在路径
+  `connect` 之前被调用一次。服务端无需 TUN 特权。
 
-`android/vpn/` 是规范第十四章的薄壳源码（不在本环境编 APK：没有 Android SDK / workload）：
-Kotlin `TbtVpnService`（`Builder.establish()`、O_NONBLOCK、`foregroundServiceType=connectedDevice`
-前台通知——通知不是存活保证）、`TbtNative`、手写 `tbt_jni.c`（`protect` thunk 在工作线程
-`AttachCurrentThread`，不跨线程缓存 `JNIEnv`）。完整会话握手、真机加载仍待做。
+`android/vpn/` 薄壳已在本环境用 Android SDK 命令行工具编出 debug APK（SDK 与 JDK/Gradle
+装在 `/workspace/tools`，NDK r27c）。APK 含 `libtbt.so`、手写 `libtbtjni.so` 和
+`libc++_shared.so`。JNI 把 server/PSK 和 `VpnService.protect` 交给 `tbt_start`。前台通知
+不是存活保证。
+
+本机 `/dev/kvm` 存在，但当前用户（`box`，仅本组成员）对设备是 Permission denied，无法
+做加速模拟器启动或 VPN 烟测；未尝试无 KVM 的模拟器（过慢且不稳定）。真机/模拟器加载仍待做。
 
 仍待完成：
 
-- 在带 Android SDK 的机器上编出 APK，并在真机/模拟器上加载 `libtbt.so`（AndroidSpike S1 的设备证据）。
-- 把 `protect(fd)` 接到真实路径套接字的 `connect` 之前。回调和烟测已有；现有 `tbtun client`
-  仍是内核 TCP 监听器，为保持默认 Linux 行为未挂钩。
+- 真机或可用 KVM 的模拟器上安装 APK，完成 VpnService.prepare 之后的启动烟测（AndroidSpike S1
+  的设备证据）。
 - Doze 下的单调时钟推进与进程保活策略（前台通知本身不是 liveness）。
 - 若日后 BCL 密码路径引入 OpenSSL，APK 需随包提供 `libssl`（当前 `.so` 的 `NEEDED` 里没有）。
 - Windows `SIO_TCP_INFO` 写门控；macOS/iOS `utun` 设备（不只是注入 fd）。
-- 把本地 VPN 捕获接到现有 `tbtun client` 会话（现在客户端只听本地 TCP，不读 TUN）。
+- 把本地 VPN 捕获接到默认 `tbtun client` CLI（有意未做：默认客户端仍只听本地 TCP）。

@@ -57,7 +57,17 @@ class TbtVpnService : VpnService() {
             Log.w(TAG, "fcntl O_NONBLOCK", e)
         }
         val fd = pfd.fd
-        val rc = TbtNative.start(fd, this)
+        val serverIpv4 = intent?.getIntExtra(EXTRA_SERVER_IPV4, 0) ?: 0
+        val serverPort = intent?.getIntExtra(EXTRA_SERVER_PORT, 0) ?: 0
+        val pskHex = intent?.getStringExtra(EXTRA_PSK_HEX)
+        val psk = pskHex?.chunked(2)?.map { it.toInt(16).toByte() }?.toByteArray()
+        val host = intent?.getStringExtra(EXTRA_HOST)
+        val pathCount = intent?.getIntExtra(EXTRA_PATH_COUNT, 1) ?: 1
+        val rc = TbtNative.start(
+            fd, this,
+            serverIpv4 = serverIpv4, serverPort = serverPort,
+            psk = psk, pathCount = pathCount, host = host,
+        )
         if (rc != 0) {
             Log.e(TAG, "tbt_start failed: $rc")
             tearDown()
@@ -117,6 +127,11 @@ class TbtVpnService : VpnService() {
 
     companion object {
         const val ACTION_STOP = "com.tbtun.vpn.STOP"
+        const val EXTRA_SERVER_IPV4 = "server_ipv4"
+        const val EXTRA_SERVER_PORT = "server_port"
+        const val EXTRA_PSK_HEX = "psk_hex"
+        const val EXTRA_HOST = "host"
+        const val EXTRA_PATH_COUNT = "path_count"
         private const val TAG = "TbtVpnService"
         private const val CHANNEL_ID = "tbtun"
         private const val NOTIF_ID = 14

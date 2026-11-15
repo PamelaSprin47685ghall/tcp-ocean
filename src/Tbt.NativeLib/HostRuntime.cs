@@ -25,6 +25,26 @@ internal struct TbtConfig
     public IntPtr ProtectCtx;
 }
 
+[StructLayout(LayoutKind.Sequential)]
+internal struct TbtConfigV2
+{
+    public int Version;
+    public int Flags;
+    public int LocalPort;
+    public uint LocalIpv4;
+    public int WindowClamp;
+    public int MaxConnections;
+    public IntPtr Protect;
+    public IntPtr ProtectCtx;
+    public uint ServerIpv4;
+    public int ServerPort;
+    public IntPtr Psk;
+    public int PskLen;
+    public int PathCount;
+    public int Mss;
+    public IntPtr Host;
+}
+
 internal static class TbtErr
 {
     public const int Ok = 0;
@@ -33,7 +53,10 @@ internal static class TbtErr
     public const int Attach = -3;
     public const int Thread = -4;
     public const int NotStarted = -5;
+    public const int Handshake = -6;
+    public const int Protect = -7;
 }
+
 
 /// <summary>Process-wide NativeAOT host. One session at a time. The TUN fd is not closed.</summary>
 internal static class HostRuntime
@@ -46,7 +69,7 @@ internal static class HostRuntime
     private const int FSetFl = 4;
     private const int ONonblock = 0x800;
 
-    private static void SetNonblock(int fd)
+    internal static void SetNonblock(int fd)
     {
         if (!Platform.current.Value.HasLibc) return;
         int fl = Fcntl(fd, FGetFl, 0);
@@ -54,14 +77,15 @@ internal static class HostRuntime
             Fcntl(fd, FSetFl, fl | ONonblock);
     }
 
-    private const int ConfigVersion = 1;
+    private const int ConfigVersion = 2;
+    private const int ConfigVersionV1 = 1;
     private const int FlagSmoke = 1;
 
     private static readonly Lock Gate = new();
-    private static int _running;
+    internal static int Running;
     private static IntPtr _protect;
     private static IntPtr _protectCtx;
-    private static int _protectCalls;
+    internal static int ProtectCalls;
     private static int _tunFd = -1;
     private static string _stats = "state=stopped";
     private static Thread? _thread;
@@ -81,69 +105,137 @@ internal static class HostRuntime
     {
         if (tunFd < 0 || cfgPtr == IntPtr.Zero)
             return TbtErr.Args;
-        TbtConfig cfg;
+        int version;
         try
         {
-            cfg = Marshal.PtrToStructure<TbtConfig>(cfgPtr);
+            version = Marshal.ReadInt32(cfgPtr);
         }
         catch (Exception)
         {
             return TbtErr.Args;
         }
-        if (cfg.Version != ConfigVersion)
+        if (version != ConfigVersion && version != ConfigVersionV1)
             return TbtErr.Args;
+
+        TbtConfig cfg;
+        TbtConfigV2 v2 = default;
+        try
+        {
+            if (version == ConfigVersion)
+                v2 = Marshal.PtrToStructure<TbtConfigV2>(cfgPtr);
+            cfg = version == ConfigVersion
+                ? new TbtConfig
+                {
+                    Version = v2.Version,
+                    Flags = v2.Flags,
+                    LocalPort = v2.LocalPort,
+                    LocalIpv4 = v2.LocalIpv4,
+                    WindowClamp = v2.WindowClamp,
+                    MaxConnections = v2.MaxConnections,
+                    Protect = v2.Protect,
+                    ProtectCtx = v2.ProtectCtx,
+                }
+                : Marshal.PtrToStructure<TbtConfig>(cfgPtr);
+        }
+        catch (Exception)
+        {
+            return TbtErr.Args;
+        }
 
         lock (Gate)
         {
-            if (_running != 0 || _thread is not null)
+            if (Running != 0 || _thread is not null)
                 return TbtErr.Busy;
             if (cfg.Protect != IntPtr.Zero)
             {
                 _protect = cfg.Protect;
                 _protectCtx = cfg.ProtectCtx;
             }
+            Running = 1;
+            _tunFd = tunFd;
+            _stats = "state=starting tun_fd=" + tunFd;
         }
+        Interlocked.Exchange(ref ProtectCalls, 0);
 
-        int port = cfg.LocalPort > 0 && cfg.LocalPort <= 65535 ? cfg.LocalPort : 8443;
-        IPAddress addr = cfg.LocalIpv4 == 0
-            ? IPAddress.Parse("10.200.3.2")
-            : new IPAddress(new byte[]
+        bool realClient = version == ConfigVersion
+            && (cfg.Flags & FlagSmoke) == 0
+            && v2.ServerPort > 0 && v2.ServerPort <= 65535
+            && v2.Psk != IntPtr.Zero && v2.PskLen == 32;
+        try
+        {
+            if (realClient)
             {
-                (byte)(cfg.LocalIpv4 >> 24),
-                (byte)(cfg.LocalIpv4 >> 16),
-                (byte)(cfg.LocalIpv4 >> 8),
-                (byte)cfg.LocalIpv4
-            });
+                var psk = new byte[32];
+                Marshal.Copy(v2.Psk, psk, 0, 32);
+                string host = v2.Host != IntPtr.Zero
+                    ? (Marshal.PtrToStringUTF8(v2.Host) ?? "")
+                    : "";
+                var server = new IPEndPoint(Ipv4(v2.ServerIpv4), v2.ServerPort);
+                if (string.IsNullOrEmpty(host))
+                    host = server.Address.ToString();
+                int clamp = cfg.WindowClamp > 0 ? cfg.WindowClamp : SocketTuning.WindowClamp;
+                var opts = new HostOptions
+                {
+                    TunFd = tunFd,
+                    WindowClamp = clamp,
+                    PathCount = v2.PathCount > 0 ? v2.PathCount : 1,
+                    Mss = v2.Mss > 0 ? v2.Mss : 1448,
+                    Server = server,
+                    Psk = psk,
+                    Host = host,
+                };
+                int rc = ClientHost.Start(opts);
+                if (rc != TbtErr.Ok)
+                    ClearReservation();
+                return rc;
+            }
+            return StartSmoke(tunFd, cfg);
+        }
+        catch (Exception)
+        {
+            ClearReservation();
+            return TbtErr.Attach;
+        }
+    }
+
+    private static IPAddress Ipv4(uint v)
+    {
+        if (v == 0)
+            return IPAddress.Parse("10.200.3.2");
+        return new IPAddress(new byte[]
+        {
+            (byte)(v >> 24), (byte)(v >> 16), (byte)(v >> 8), (byte)v
+        });
+    }
+
+    private static int StartSmoke(int tunFd, TbtConfig cfg)
+    {
+        int port = cfg.LocalPort > 0 && cfg.LocalPort <= 65535 ? cfg.LocalPort : 8443;
+        var local = new IPEndPoint(Ipv4(cfg.LocalIpv4), port);
         int clamp = cfg.WindowClamp > 0 ? cfg.WindowClamp : SocketTuning.WindowClamp;
         int maxConn = cfg.MaxConnections > 0 ? cfg.MaxConnections : 64;
-        var local = new IPEndPoint(addr, port);
-        var clock = new HostClock();
-        var entropy = new HostEntropy();
-
         TunStack? stack = TunStack.Attach(
-            tunFd, local, clock, entropy, maxConn,
+            tunFd, local, new HostClock(), new HostEntropy(), maxConn,
             FSharpOption<int>.Some(clamp),
             null);
         if (stack is null)
+        {
+            ClearReservation();
             return TbtErr.Attach;
+        }
         SetNonblock(tunFd);
-
-        Interlocked.Exchange(ref _protectCalls, 0);
         if ((cfg.Flags & FlagSmoke) != 0)
             CallProtectOnThrowawaySocket();
 
         var thread = new Thread(Worker) { IsBackground = true, Name = "tbt-host" };
         lock (Gate)
         {
-            if (_running != 0)
+            if (_thread is not null)
             {
-                // A concurrent start raced; the host keeps the fd.
+                ClearReservation();
                 return TbtErr.Busy;
             }
             _stack = stack;
-            _tunFd = tunFd;
-            _running = 1;
-            _stats = "state=starting tun_fd=" + tunFd;
             _thread = thread;
         }
         try
@@ -152,16 +244,44 @@ internal static class HostRuntime
         }
         catch (Exception)
         {
-            lock (Gate)
-            {
-                _running = 0;
-                _thread = null;
-                _stack = null;
-                _tunFd = -1;
-            }
+            ClearReservation();
             return TbtErr.Thread;
         }
         return TbtErr.Ok;
+    }
+
+    internal static bool ArmWorker(Thread thread, int tunFd)
+    {
+        lock (Gate)
+        {
+            if (_thread is not null)
+                return false;
+            _tunFd = tunFd;
+            Running = 1;
+            _thread = thread;
+            _stats = "state=starting tun_fd=" + tunFd;
+            return true;
+        }
+    }
+
+    internal static void DisarmWorker() => ClearReservation();
+
+    private static void ClearReservation()
+    {
+        lock (Gate)
+        {
+            Running = 0;
+            _thread = null;
+            _stack = null;
+            _tunFd = -1;
+            _stats = "state=stopped";
+        }
+    }
+
+    internal static void PublishStats(string text)
+    {
+        lock (Gate)
+            _stats = text;
     }
 
     public static void Stop()
@@ -169,7 +289,7 @@ internal static class HostRuntime
         Thread? thread;
         lock (Gate)
         {
-            _running = 0;
+            Running = 0;
             thread = _thread;
         }
         if (thread is not null && thread != Thread.CurrentThread)
@@ -211,7 +331,7 @@ internal static class HostRuntime
         try
         {
             using var poller = new Poller();
-            while (Volatile.Read(ref _running) != 0)
+            while (Volatile.Read(ref Running) != 0)
             {
                 poller.WatchFd(fd);
                 poller.Wait(50_000);
@@ -221,7 +341,7 @@ internal static class HostRuntime
                 string snap = "state=running tun_fd=" + fd
                     + " packets_in=" + stack.LastReceiveCount
                     + " " + stack.Describe()
-                    + " protect_calls=" + Volatile.Read(ref _protectCalls)
+                    + " protect_calls=" + Volatile.Read(ref ProtectCalls)
                     + " notsent_source=" + NotSentSource()
                     + " " + caps;
                 lock (Gate)
@@ -235,7 +355,7 @@ internal static class HostRuntime
         }
     }
 
-    private static string NotSentSource()
+    internal static string NotSentSource()
     {
         var c = Platform.current.Value;
         if (c.HasSiocoutqnsd) return "ioctl";
@@ -256,7 +376,7 @@ internal static class HostRuntime
         }
     }
 
-    private static int CallProtect(int fd)
+    internal static int CallProtect(int fd)
     {
         IntPtr fn, ctx;
         lock (Gate)
@@ -270,19 +390,19 @@ internal static class HostRuntime
         {
             var call = (delegate* unmanaged[Cdecl]<int, IntPtr, int>)fn;
             int ok = call(fd, ctx);
-            Interlocked.Increment(ref _protectCalls);
+            Interlocked.Increment(ref ProtectCalls);
             return ok;
         }
     }
 
-    private sealed class HostClock : IClock
+    internal sealed class HostClock : IClock
     {
         private static readonly double Factor = 1_000_000_000.0 / Stopwatch.Frequency;
         public long NowNs() => (long)(Stopwatch.GetTimestamp() * Factor);
         public long FreshNs() => NowNs();
     }
 
-    private sealed class HostEntropy : IEntropy
+    internal sealed class HostEntropy : IEntropy
     {
         public void Fill(Span<byte> destination) => RandomNumberGenerator.Fill(destination);
     }
