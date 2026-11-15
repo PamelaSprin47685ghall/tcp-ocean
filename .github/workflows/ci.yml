@@ -20,6 +20,10 @@ jobs:
         run: dotnet build Tbt.slnx -c Release
       - name: Unit tests
         run: dotnet test tests/Tbt.Tests -c Release --no-build
+      - name: Offline e2e script tests
+        run: |
+          python3 tests/e2e/test_tb_guard.py
+          python3 tests/e2e/test_echo.py
 
   aot-server:
     runs-on: ubuntu-latest

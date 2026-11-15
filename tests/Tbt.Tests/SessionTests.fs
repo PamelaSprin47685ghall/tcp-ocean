@@ -7,6 +7,7 @@ open Xunit
 open Tbt.Contracts
 open Tbt.Session
 open Tbt.Session.Handshake
+open Tbt.Crypto.Bootstrap
 
 [<Sealed>]
 type ManualClock() =
@@ -1321,3 +1322,15 @@ let ``UniqueArrived counts cells of a seen-but-unacked later step`` () =
     Assert.True(c.Tx.UniqueArrived > afterAck,
         sprintf "t_hi %d must add arrival cells ahead of peer_ack; arrived %d acked %d" seen c.Tx.UniqueArrived afterAck)
     Assert.Equal(afterAck, c.Tx.UniqueAcked)
+
+[<Fact>]
+let ``offered caps follow D4 and D5: FLOWSTATE only with FLOWSTATE2, no LANE`` () =
+    let c = SupportedCaps
+    Assert.Equal(0us, c &&& Caps.Lane)
+    Assert.Equal(0us, c &&& Caps.X25519)
+    Assert.Equal(0us, c &&& Caps.UserRx)
+    Assert.Equal(0us, c &&& Caps.Dl16)
+    Assert.Equal(Caps.FlowState ||| Caps.FlowState2, c &&& (Caps.FlowState ||| Caps.FlowState2))
+    Assert.True(c &&& Caps.HpMask <> 0us)
+    Assert.True(c &&& Caps.StraddleOk <> 0us)
+    Assert.True(c &&& Caps.JoinAck2 <> 0us)

@@ -9,7 +9,7 @@ open Tbt.Crypto
 open Tbt.Crypto.Bootstrap
 open Tbt.Wire
 
-/// Capabilities this implementation offers (DECISIONS.md D4, D5: no lanes, no FLOWSTATE).
+/// Capabilities this implementation offers (D4: suite 0x02 only; D5: FLOWSTATE only with FLOWSTATE2; no LANE).
 let SupportedCaps = Caps.HpMask ||| Caps.StraddleOk ||| Caps.JoinAck2 ||| Caps.FlowState ||| Caps.FlowState2
 
 /// FLOWSTATE counts only together with FLOWSTATE2 (DECISIONS.md D5).
