@@ -145,8 +145,8 @@ type Session(role: Role, p: SessionParams, port: IFlowPort, clock: IClock, confi
     // Rekey (spec 6.5.6): one outstanding PREPARE/READY/RETIRE per direction.
     let Rcut = 4096UL
     let rekeyReserve = 256UL
-    let rekeyAgeNs = 24L * 3600L * 1_000_000_000L
-    let rekeyCells = 1UL <<< 32
+    let mutable rekeyAgeNs = 24L * 3600L * 1_000_000_000L
+    let mutable rekeyCells = 1UL <<< 32
     let txKey (g: uint32) = if client then keys.UpKey g else keys.DownKey g
     let rxKey (g: uint32) = if client then keys.DownKey g else keys.UpKey g
     let mutable txCut = 0UL
@@ -437,6 +437,11 @@ type Session(role: Role, p: SessionParams, port: IFlowPort, clock: IClock, confi
     member _.PeerCloseReason = peerCloseReason
     /// Start KEY_PREPARE for this direction (spec 6.5.6). Also used by the 2^32-cell / 24 h trigger.
     member _.BeginRekey() = startRekey()
+    /// Test hook: lower the automatic rekey trigger (production is 2^32 cells or 24 h).
+    /// R_cut stays 4096. Zero or a negative age leaves that trigger disabled.
+    member _.SetRekeyTrigger(cells: uint64, ageNs: int64) =
+        if cells > 0UL then rekeyCells <- cells
+        if ageNs > 0L then rekeyAgeNs <- ageNs
     /// CutCounter of the outstanding or last started rekey, or 0.
     member _.RekeyCut = txCut
     member _.RekeyPending = txAwaitingReady

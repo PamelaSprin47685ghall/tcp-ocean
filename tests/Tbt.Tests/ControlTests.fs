@@ -334,3 +334,26 @@ let ``path close: PATH_CLOSED for a path we did not close is not executed`` () =
     Assert.Equal(PathCloseState.Idle, s.PathState 1us)
     s.OnFrame(0us, Span(ctrlCell pair.Client 1u CtrlOp.SessionClose [| 1uy |])) |> ignore
     Assert.Equal(1L, s.CtrlExecuted)
+
+[<Fact>]
+let ``rekey: a lowered cell trigger completes PREPARE, READY and RETIRE`` () =
+    let pair = Pair(SessionConfig.defaults, 1, 0.0, 48)
+    for _ in 1 .. 20 do pair.Round() |> ignore
+    // Do not call BeginRekey: the automatic Tick path must start the transaction.
+    pair.Client.SetRekeyTrigger(32UL, System.Int64.MaxValue)
+    let n, slot = pump pair 20_000 (fun () ->
+        pair.Client.TxKeyCount = 1 && pair.Client.TxGeneration = 1u
+        && pair.Server.RxKeyCount = 1 && pair.Server.RxGeneration = 1u)
+    Assert.True(n < 20_000, "auto-rekey did not finish in " + string n + " rounds")
+    Assert.True(pair.Client.Tx.NextCounter >= pair.Client.RekeyCut)
+    Assert.Equal(0u, pair.Server.TxGeneration)
+    Assert.False(pair.Client.Faulted || pair.Server.Faulted)
+    let more = Array.init 4_000 (fun i -> byte (i + 3))
+    let mutable sent = 0
+    let before = if pair.ServerPort.Data.ContainsKey slot then int pair.ServerPort.Data.[slot].Length else 0
+    for _ in 1 .. 200 do
+        sent <- sent + pair.Feed(pair.Client, slot, ReadOnlySpan(more, sent, more.Length - sent), false)
+        pair.Round() |> ignore
+    let after = if pair.ServerPort.Data.ContainsKey slot then int pair.ServerPort.Data.[slot].Length else 0
+    Assert.True(after > before, "post-auto-rekey delivery stalled")
+    Assert.Equal(0L, pair.Server.Opener.AuthFails)
