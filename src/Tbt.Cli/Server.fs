@@ -5,6 +5,7 @@ module Tbt.Cli.Server
 open System
 open System.Collections.Generic
 open System.Net
+open System.Diagnostics
 open System.Net.Sockets
 open Tbt.Contracts
 open Tbt.Session
@@ -34,6 +35,28 @@ let run (o: Options) =
     let maxPaths = o.Int("max-paths", 64)
     let windowClamp = o.Int("window-clamp", SocketTuning.WindowClamp)
     let statsMs = int64 (o.Int("stats-s", 0)) * 1000L
+    // "full" = always-read + read-after-Service, each Receive capped at
+    // TunRecvBudget so Service / downlink / ACKs interleave (virtual-ACK grace).
+    // "adaptive" = same always-read, but each Receive runs until EAGAIN and
+    // yields every TunRecvYieldUs (or when a path/session ACK is due).
+    // "main" = poller-gated Receive, 4096 cap, no post-Service read.
+    let drainMode =
+        match o.TextOr("tun-drain", "adaptive").ToLowerInvariant() with
+        | "main" -> "main"
+        | "adaptive" -> "adaptive"
+        | _ -> "full"
+    let recvBudget =
+        let fallback =
+            match drainMode with
+            | "main" -> 4096
+            | "adaptive" -> 1_000_000
+            | _ -> SocketTuning.TunRecvBudget
+        o.Int("tun-recv-budget", fallback)
+    let recvYieldUs = max 1 (o.Int("tun-recv-yield-us", SocketTuning.TunRecvYieldUs))
+    // --tun-sndbuf: 0 = leave the kernel default; -1 = window_clamp × paths
+    // (applied when the session comes up); >0 = that many bytes. Default is
+    // TunSndBuf (2 MB).
+    let sndBufMode = o.Int("tun-sndbuf", SocketTuning.TunSndBuf)
     let config = { SessionConfig.defaults with WindowSteps = o.Int("window", 1024); MaxPaths = maxPaths; NewRepair = o.Int("new-repair", 0) <> 0 }
     let entropy = SystemEntropy()
     let clock = CachedClock(SystemClock())
@@ -58,7 +81,9 @@ let run (o: Options) =
         if o.Has "tun" then
             let at = endpoint (o.Text "tun-listen")
             let qlen = o.Int("tun-txqueuelen", SocketTuning.TunTxQueueLen)
-            match TunStack.Open(o.Text "tun", at, clock, entropy, maxPaths * 64, windowClamp, qlen) with
+            let openSnd =
+                if sndBufMode <= 0 then 0 else sndBufMode
+            match TunStack.Open(o.Text "tun", at, clock, entropy, maxPaths * 64, windowClamp, qlen, openSnd) with
             | null -> failwith ("cannot open TUN device " + o.Text "tun")
             | t ->
                 let qmsg =
@@ -66,10 +91,14 @@ let run (o: Options) =
                     elif t.TxQueueOk then "txqueuelen=" + string t.TxQueueLen
                     else "txqueuelen=" + string qlen + " failed errno=" + string t.TxQueueErrno + " (need CAP_NET_ADMIN; continuing)"
                 let bmsg =
-                    if t.SndBufOk then "tun_sndbuf=" + string t.SndBuf
+                    if sndBufMode < 0 then "tun_sndbuf=auto (window_clamp x paths, at session)"
+                    elif sndBufMode = 0 then "tun_sndbuf=left-default"
+                    elif t.SndBufOk then "tun_sndbuf=" + string t.SndBuf
                     else "tun_sndbuf=" + string t.SndBuf + " failed errno=" + string t.SndBufErrno
+                let ymsg = if drainMode = "adaptive" then " recv_yield_us=" + string recvYieldUs else ""
                 log ("server on " + at.ToString() + " (user-space TCP on " + o.Text "tun" + ") -> " + target.ToString()
-                     + " window_clamp=" + string windowClamp + " " + qmsg + " " + bmsg)
+                     + " window_clamp=" + string windowClamp + " " + qmsg + " " + bmsg
+                     + " tun_drain=" + drainMode + " recv_budget=" + string recvBudget + ymsg)
                 t
         else null
     if isNull listener && isNull tun then failwith "need --listen or --tun with --tun-listen"
@@ -132,6 +161,13 @@ let run (o: Options) =
                 JoinAdmission(a.Params.Keys.PathKey, entropy, clock, a.Params.Keys.SessionId, a.Params.Symbol, a.Params.Caps,
                               paths, mss, config.MaxPaths)
             sessions.Add(Entry(carrier, paths, admission))
+            if sndBufMode < 0 then
+                match tun with
+                | null -> ()
+                | t ->
+                    let n = SocketTuning.tunSndBufFor(windowClamp, paths)
+                    t.SetSndBuf n
+                    log ("tun_sndbuf=auto " + string n + " (window_clamp x paths=" + string paths + ")")
             log ("session " + a.Params.Keys.SessionId.ToString() + " up, S=" + string a.Params.Symbol)
             true
         | ValueNone -> tryJoinAny link frame
@@ -171,6 +207,42 @@ let run (o: Options) =
     let mutable lastStats = Environment.TickCount64
     let mutable faults = 0L
     let mutable failed = 0L
+    let stamp () = Stopwatch.GetTimestamp()
+    let toUs (d: int64) = d * 1_000_000L / Stopwatch.Frequency
+    let mutable winRecvUs = 0L
+    let mutable winRecvUsMax = 0L
+    let mutable winSvcUs = 0L
+    let mutable winSvcUsMax = 0L
+    let mutable winCsvcUs = 0L
+    let mutable winIterN = 0
+    let mutable winIterUsMax = 0L
+    let mutable winSvcGapMax = 0L
+    let mutable lastSvcTs = 0L
+    let recvYieldTicks = int64 recvYieldUs * Stopwatch.Frequency / 1_000_000L
+    let ackWaiting () =
+        sessions.Exists(fun e -> e.Carrier.Session.ControlWaiting)
+    let recTimed (t: TunStack) (force: bool) =
+        if force || poller.IsFdReadable t.Fd then
+            let a = stamp ()
+            if drainMode = "adaptive" then
+                let deadline = a + recvYieldTicks
+                t.Receive(recvBudget, yieldWhen=fun () -> stamp () >= deadline || t.AckDue || ackWaiting ()) |> ignore
+            else
+                t.Receive(recvBudget) |> ignore
+            let us = toUs (stamp () - a)
+            winRecvUs <- winRecvUs + us
+            if us > winRecvUsMax then winRecvUsMax <- us
+    let svcTimed (t: TunStack) =
+        let nowTs = stamp ()
+        if lastSvcTs <> 0L then
+            let gap = toUs (nowTs - lastSvcTs)
+            if gap > winSvcGapMax then winSvcGapMax <- gap
+        lastSvcTs <- nowTs
+        let a = nowTs
+        t.Service()
+        let us = toUs (stamp () - a)
+        winSvcUs <- winSvcUs + us
+        if us > winSvcUsMax then winSvcUsMax <- us
     while true do
         match listener with
         | null -> ()
@@ -187,6 +259,7 @@ let run (o: Options) =
         let busy = tunBusy || sessions.Exists(fun e -> e.Carrier.Session.WantsToSend)
         poller.Wait(if busy then 1000 elif sessions.Count > 0 then 10_000 else 100_000)
         clock.Tick() |> ignore
+        let iterA = stamp ()
         let now = Environment.TickCount64
         match listener with
         | null -> ()
@@ -203,15 +276,15 @@ let run (o: Options) =
         match tun with
         | null -> ()
         | t ->
-            // Always drain (non-blocking). Waiting only when the poller says readable
-            // used to leave a burst sitting in tbt0 while this loop was in decode.
-            t.Receive() |> ignore
+            // full: always drain (non-blocking). main: only when the poller says readable.
+            recTimed t (drainMode = "full")
             // Bootstrap frames whole on TUN paths: classify (a bad head stays silent).
             for c in t.Fresh do
                 if c.BootState = 1 then classify c (c.BootFrame.ToArray()) |> ignore
             t.Fresh.Clear()
         servicePending poller now
         let mutable i = sessions.Count - 1
+        let csvcA = stamp ()
         while i >= 0 do
             let c = sessions.[i].Carrier
             // Last resort: an exception fails this session only (causes are fixed where found).
@@ -229,16 +302,20 @@ let run (o: Options) =
                 c.Close()
                 sessions.RemoveAt i
             i <- i - 1
+        winCsvcUs <- winCsvcUs + toUs (stamp () - csvcA)
         match tun with
         | null -> ()
         | t ->
-            t.Service()
-            // Decode / send in Service may have taken tens of ms; drain again so
-            // the kernel TUN queue does not overflow and become a swallowed hole.
-            t.Receive() |> ignore
-            for c in t.Fresh do
-                if c.BootState = 1 then classify c (c.BootFrame.ToArray()) |> ignore
-            t.Fresh.Clear()
+            svcTimed t
+            // full/adaptive: drain again after Service so a decode stall does not overflow tbt0.
+            if drainMode = "full" || drainMode = "adaptive" then
+                recTimed t true
+                for c in t.Fresh do
+                    if c.BootState = 1 then classify c (c.BootFrame.ToArray()) |> ignore
+                t.Fresh.Clear()
+        let iterUs = toUs (stamp () - iterA)
+        winIterN <- winIterN + 1
+        if iterUs > winIterUsMax then winIterUsMax <- iterUs
         if statsMs > 0L && now - lastStats >= statsMs then
             lastStats <- now
             let mutable fin = 0L
@@ -246,10 +323,22 @@ let run (o: Options) =
             for e in sessions do
                 fin <- fin + e.Carrier.FramesIn
                 fout <- fout + e.Carrier.FramesOut
+            let struct (recvCalls, recvPkts, recvMax) =
+                match tun with
+                | null -> struct (0, 0, 0)
+                | t -> t.TakeRecvWindow()
             log ("stats sessions=" + string sessions.Count + " sessions_failed=" + string failed
                  + " session_exceptions=" + string faults + " frames_in=" + string fin + " frames_out=" + string fout
                  + " rss_kib=" + string (rssKiB ()) + " alloc_kib=" + string (GC.GetTotalAllocatedBytes false / 1024L)
-                 + " gc0=" + string (GC.CollectionCount 0))
+                 + " gc0=" + string (GC.CollectionCount 0)
+                 + " recv_calls=" + string recvCalls + " recv_pkts=" + string recvPkts + " recv_max=" + string recvMax
+                 + " recv_us=" + string winRecvUs + " recv_us_max=" + string winRecvUsMax
+                 + " svc_us=" + string winSvcUs + " svc_us_max=" + string winSvcUsMax
+                 + " csvc_us=" + string winCsvcUs + " iter_n=" + string winIterN + " iter_us_max=" + string winIterUsMax
+                 + " svc_gap_us_max=" + string winSvcGapMax
+                 + " tun_drain=" + drainMode)
+            winRecvUs <- 0L; winRecvUsMax <- 0L; winSvcUs <- 0L; winSvcUsMax <- 0L
+            winCsvcUs <- 0L; winIterN <- 0; winIterUsMax <- 0L; winSvcGapMax <- 0L
             for e in sessions do log ("stats " + e.Carrier.Describe())
             match tun with
             | null -> ()

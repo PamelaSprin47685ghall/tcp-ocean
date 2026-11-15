@@ -30,8 +30,13 @@ type TunStack(fd: int, local: IPEndPoint, clock: IClock, entropy: IEntropy, maxC
     let mutable wrongDst = 0L
     let mutable rstNoConn = 0L
     let mutable recvCapped = 0L
+    let mutable recvYielded = 0L
     /// Safety cap on one Receive drain (non-blocking, should hit EAGAIN first).
     let recvBudgetMax = 1_000_000
+    let mutable winRecvCalls = 0
+    let mutable winRecvPkts = 0
+    let mutable winRecvMax = 0
+    let mutable lastReceiveCount = 0
     let mutable txqLen = -1
     let mutable txqOk = false
     let mutable txqErrno = 0
@@ -75,57 +80,89 @@ type TunStack(fd: int, local: IPEndPoint, clock: IClock, entropy: IEntropy, maxC
     /// SIOCSIFTXQLEN on the named device (typically needs CAP_NET_ADMIN).
     static member TrySetTxQueueLen(name: string, qlen: int) = Native.tryTxQueueLen name (Some qlen)
     static member TryGetTxQueueLen(name: string) = Native.tryTxQueueLen name None
+    member _.LastReceiveCount = lastReceiveCount
+    /// Per-stats-window receive counts; resets the window.
+    member _.TakeRecvWindow() =
+        let c, p, m = winRecvCalls, winRecvPkts, winRecvMax
+        winRecvCalls <- 0; winRecvPkts <- 0; winRecvMax <- 0
+        struct (c, p, m)
     member _.Counters = counters
     member _.Connections = conns.Count
     /// Connections whose bootstrap frame is whole and that wait for classification.
     member _.Fresh = fresh
 
-    /// Read every packet the device holds now (until EAGAIN) and hand them over.
-    /// Returns how many packets were read. A small cap used to leave a burst in the
-    /// TUN queue; during a decode stall that overflowed tbt0 and became a swallowed hole.
-    member _.Receive() =
+    /// True when a connection has a TCP ACK waiting to be flushed.
+    member _.AckDue =
+        let mutable d = false
+        for c in conns.Values do if c.AckPending then d <- true
+        d
+
+    /// TUNSETSNDBUF; bytes <= 0 leaves the kernel default (no ioctl).
+    member this.SetSndBuf(bytes: int) =
+        if bytes <= 0 then
+            this.RecordSndBuf(true, 0, 0)
+        else
+            let struct (ok, got, errno) = Native.trySetTunSndBuf fd bytes
+            this.RecordSndBuf(ok, got, errno)
+
+    /// Read packets the device holds now (until EAGAIN, the per-call budget, or
+    /// `yieldWhen`). Returns how many packets were read. A small cap used to leave
+    /// a burst in the TUN queue; during a decode stall that overflowed tbt0 and
+    /// became a swallowed hole. `budget` bounds one call so the server loop can
+    /// return to Service/downlink. `yieldWhen` (adaptive drain) stops after at
+    /// least one packet when Service/ACK should run, without waiting for the cap.
+    member _.Receive(?budget: int, ?yieldWhen: unit -> bool) =
         let mutable go = true
-        let mutable budget = recvBudgetMax
+        let mutable budget = min recvBudgetMax (max 1 (defaultArg budget recvBudgetMax))
         let mutable read = 0
+        let shouldYield = defaultArg yieldWhen (fun () -> false)
         while go && budget > 0 do
-            let n = Native.read fd (Span rx)
-            if n <= 0 then go <- false
+            if read > 0 && shouldYield () then
+                recvYielded <- recvYielded + 1L
+                go <- false
             else
-                budget <- budget - 1
-                read <- read + 1
-                packetsIn <- packetsIn + 1L
-                let mutable seg = Unchecked.defaultof<Packet.Segment>
-                let packet = Span(rx, 0, n)
-                if not (Packet.tryParse (Span<byte>.op_Implicit packet) &seg) then
-                    parseFail <- parseFail + 1L
-                elif seg.DstIp <> localIp || seg.DstPort <> localPort then
-                    wrongDst <- wrongDst + 1L
+                let n = Native.read fd (Span rx)
+                if n <= 0 then go <- false
                 else
-                    let k = key seg.SrcIp seg.SrcPort
-                    let now = clock.NowNs()
-                    match conns.TryGetValue k with
-                    | true, c when not c.Closed ->
-                        let before = c.BootState
-                        c.OnSegment(seg, packet, now)
-                        if before = 0 && c.BootState <> 0 && not c.Attached then fresh.Add c
-                    | _ ->
-                        if seg.Flags &&& Packet.Syn <> 0uy && seg.Flags &&& Packet.Ack = 0uy
-                           && conns.Count < maxConnections then
-                            conns.Remove k |> ignore
-                            let g =
-                                match groups.TryGetValue seg.SrcIp with
-                                | true, g -> g
-                                | _ ->
-                                    let g = RateGroup(clock)
-                                    groups.[seg.SrcIp] <- g
-                                    g
-                            let c = TunPath(output, counters, localIp, localPort, seg.SrcIp, seg.SrcPort, isn (), clock, g, windowClamp)
-                            g.Add c
-                            conns.[k] <- c
-                            c.OnSyn(seg.Seq, Span<byte>.op_Implicit (packet.Slice(seg.OptionsAt, seg.OptionsLength)),
-                                    1460, now)
-                        else reset seg
+                    budget <- budget - 1
+                    read <- read + 1
+                    packetsIn <- packetsIn + 1L
+                    let mutable seg = Unchecked.defaultof<Packet.Segment>
+                    let packet = Span(rx, 0, n)
+                    if not (Packet.tryParse (Span<byte>.op_Implicit packet) &seg) then
+                        parseFail <- parseFail + 1L
+                    elif seg.DstIp <> localIp || seg.DstPort <> localPort then
+                        wrongDst <- wrongDst + 1L
+                    else
+                        let k = key seg.SrcIp seg.SrcPort
+                        let now = clock.NowNs()
+                        match conns.TryGetValue k with
+                        | true, c when not c.Closed ->
+                            let before = c.BootState
+                            c.OnSegment(seg, packet, now)
+                            if before = 0 && c.BootState <> 0 && not c.Attached then fresh.Add c
+                        | _ ->
+                            if seg.Flags &&& Packet.Syn <> 0uy && seg.Flags &&& Packet.Ack = 0uy
+                               && conns.Count < maxConnections then
+                                conns.Remove k |> ignore
+                                let g =
+                                    match groups.TryGetValue seg.SrcIp with
+                                    | true, g -> g
+                                    | _ ->
+                                        let g = RateGroup(clock)
+                                        groups.[seg.SrcIp] <- g
+                                        g
+                                let c = TunPath(output, counters, localIp, localPort, seg.SrcIp, seg.SrcPort, isn (), clock, g, windowClamp)
+                                g.Add c
+                                conns.[k] <- c
+                                c.OnSyn(seg.Seq, Span<byte>.op_Implicit (packet.Slice(seg.OptionsAt, seg.OptionsLength)),
+                                        1460, now)
+                            else reset seg
         if budget = 0 && go then recvCapped <- recvCapped + 1L
+        lastReceiveCount <- read
+        winRecvCalls <- winRecvCalls + 1
+        winRecvPkts <- winRecvPkts + read
+        if read > winRecvMax then winRecvMax <- read
         read
 
     /// Timers and pending ACKs of every connection; closed ones leave the table.
@@ -164,16 +201,17 @@ type TunStack(fd: int, local: IPEndPoint, clock: IClock, entropy: IEntropy, maxC
         + " virtual_ack=" + string counters.VirtualAcks + " fast_swallow=" + string counters.FastSwallows
         + " cells_rx=" + string counters.CellsReceived + " cells_spanning=" + string counters.CellsSpanning
         + " cells_dropped=" + string counters.CellsDropped + " swallow_b=" + string counters.BytesSwallowed + " late_first_b=" + string counters.LateFirstBytes
-        + " parse_fail=" + string parseFail + " wrong_dst=" + string wrongDst + " rst_no_conn=" + string rstNoConn + " recv_capped=" + string recvCapped
+        + " parse_fail=" + string parseFail + " wrong_dst=" + string wrongDst + " rst_no_conn=" + string rstNoConn + " recv_capped=" + string recvCapped + " recv_yielded=" + string recvYielded
         + " reasm_grows=" + string counters.ReasmGrows + " reasm_pressure=" + string counters.ReasmPressure + " gap_grows=" + string counters.GapGrows + " gap_pressure=" + string counters.GapPressure
         + String.Join("", groups.Values |> Seq.map (fun g -> "\n  " + g.Describe()))
         + String.Join("", conns.Values |> Seq.map (fun c -> "\n  path " + string (c :> IPath).PathId + " " + c.Describe()))
 
     /// Open the TUN device name; null when it fails. Sizes the TUN qdisc
-    /// (SIOCSIFTXQLEN, default TunTxQueueLen) and the tun-fd send buffer so a
-    /// 64-path burst is not dropped while this process is in decode.
+    /// (SIOCSIFTXQLEN, default TunTxQueueLen) so a 64-path burst is not dropped
+    /// while this process is in a budgeted Receive / Service turn. sndBuf > 0
+    /// sets TUNSETSNDBUF; 0 leaves the kernel default; omitted uses TunSndBuf.
     static member Open(name: string, local: IPEndPoint, clock: IClock, entropy: IEntropy, maxConnections: int,
-                       ?windowClamp: int, ?txQueueLen: int) : TunStack | null =
+                       ?windowClamp: int, ?txQueueLen: int, ?sndBuf: int) : TunStack | null =
         let fd = Native.openTun name
         if fd < 0 then null
         else
@@ -182,10 +220,9 @@ type TunStack(fd: int, local: IPEndPoint, clock: IClock, entropy: IEntropy, maxC
             if qlen > 0 then
                 let struct (ok, got, errno) = Native.tryTxQueueLen name (Some qlen)
                 t.RecordTxQueue(ok, got, errno)
-            // Owner of the fd can set this without CAP_NET_ADMIN.
-            let buf = max 8_000_000 (qlen * 1500)
-            let struct (ok, got, errno) = Native.trySetTunSndBuf fd buf
-            t.RecordSndBuf(ok, got, errno)
+            // Owner of the fd can set this without CAP_NET_ADMIN. sndBuf <= 0
+            // means "leave the kernel default".
+            t.SetSndBuf(defaultArg sndBuf SocketTuning.TunSndBuf)
             t
 
     member private _.RecordTxQueue(ok, got, errno) =

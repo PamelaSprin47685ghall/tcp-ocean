@@ -41,6 +41,10 @@ type Options(args: string[]) =
         match values.TryGetValue name with
         | true, v -> v
         | _ -> failwith ("missing option --" + name)
+    member _.TextOr(name: string, fallback: string) =
+        match values.TryGetValue name with
+        | true, v -> v
+        | _ -> fallback
     member _.Int(name: string, fallback: int) =
         match values.TryGetValue name with
         | true, v -> Int32.Parse v

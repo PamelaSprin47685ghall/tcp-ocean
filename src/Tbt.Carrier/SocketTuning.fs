@@ -41,10 +41,34 @@ module SocketTuning =
     let WindowClamp = 600000
 
     /// Default txqueuelen on the server TUN (SIOCSIFTXQLEN). Sized so a 64-path
-    /// burst can sit in the qdisc while userspace is in decode (~20k × ~1.5 KiB).
-    /// The server sets this itself at startup; the testbed script is only a backup.
+    /// burst can sit in the qdisc while userspace is in a budgeted Receive / Service
+    /// turn (~20k × ~1.5 KiB). The server sets this itself at startup; the testbed
+    /// script is only a backup (tbt0 only — veths stay at the kernel default).
     [<Literal>]
     let TunTxQueueLen = 20000
+
+    /// Packets one Receive may drain before returning to Service. Keeps ACK /
+    /// downlink latency inside the virtual-ACK grace (~15 ms). A larger burst
+    /// stays in the TUN qdisc and is taken on later iterations.
+    [<Literal>]
+    let TunRecvBudget = 128
+
+    /// How long an adaptive Receive may run before yielding to Service / ACK.
+    [<Literal>]
+    let TunRecvYieldUs = 2000
+
+    /// TUNSETSNDBUF default. 2 MB is large enough that tun-fd writes do not
+    /// EAGAIN on the downlink, without the seconds of queueing a
+    /// txqueuelen×1500 (30 MiB) buffer would add. 0 at Open means leave the
+    /// kernel default.
+    [<Literal>]
+    let TunSndBuf = 2_000_000
+
+    /// TUN send buffer large enough for a full window on every path, or 0 to
+    /// leave the kernel default (caller passes 0 through to Open).
+    let tunSndBufFor (windowClamp: int, paths: int) =
+        if paths <= 0 || windowClamp <= 0 then 0
+        else windowClamp * paths
 
     let probe () : INotSentProbe =
         if OperatingSystem.IsLinux() then LinuxNotSentProbe() else NoNotSentProbe()

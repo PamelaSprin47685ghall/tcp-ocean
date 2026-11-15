@@ -63,11 +63,6 @@ up() {
     for pair in "$NEAR tbn" "$WAN tbwn" "$WAN tbwf" "$FAR tbf" "$NEAR lo" "$WAN lo" "$FAR lo"; do
         set -- $pair; ip -n "$1" link set "$2" up
     done
-    # Default txqueuelen (~1000) drops a 64-path burst on the veths and on tbt0
-    # while the server is in decode; those drops become swallowed holes (t13u).
-    for d in "$NEAR tbn" "$WAN tbwn" "$WAN tbwf" "$FAR tbf"; do
-        set -- $d; ip -n "$1" link set "$2" txqueuelen 20000
-    done
     ip -n $NEAR route add default via 10.200.1.1
     ip -n $FAR route add default via 10.200.2.1
     ip netns exec $WAN sysctl -qw net.ipv4.ip_forward=1
@@ -96,9 +91,10 @@ up() {
     # The device belongs to the invoking user, so the server needs no root.
     ip -n $FAR tuntap add dev tbt0 mode tun user "${SUDO_USER:-root}"
     ip -n $FAR addr add 10.200.3.1/24 dev tbt0
-    # Same reason as tbe0: userspace must be able to stall briefly without the
-    # kernel dropping segments the TunPath would then virtually ACK.
-    ip -n $FAR link set tbt0 txqueuelen 20000
+    # Backup only: the server sets tbt0 itself (SIOCSIFTXQLEN) but that ioctl
+    # needs CAP_NET_ADMIN and fails in e2e (sudo -u box, errno=1). veths and
+    # tbe0 stay exactly as this script already had them (testbed defaults).
+    ip -n $FAR link set tbt0 txqueuelen "${TBT_TBT0_TXQLEN:-20000}"
     ip -n $FAR link set tbt0 up
     ip netns exec $FAR sysctl -qw net.ipv4.ip_forward=1
     for k in all default tbf tbt0; do ip netns exec $FAR sysctl -qw "net.ipv4.conf.$k.rp_filter=0"; done

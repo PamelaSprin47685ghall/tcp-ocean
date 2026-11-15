@@ -248,6 +248,11 @@ tunnel() {
     local name=$1 target=$2
     local server_extra=()
     if [[ $new_repair != 0 ]]; then server_extra+=(--new-repair 1); fi
+    if [[ -n ${TBT_SERVER_EXTRA:-} ]]; then
+        # split on whitespace; optional override, no default behaviour change
+        # shellcheck disable=SC2206
+        server_extra+=($TBT_SERVER_EXTRA)
+    fi
     in_ns far "$work/aot/tbtun" server "${server_args[@]}" --target "$target" --psk-file "$work/psk" --stats-s 1 \
         --window "$window" --window-clamp "$window_clamp" --max-paths "$max_paths" "${server_extra[@]}" \
         2>"$work/server-$name.log" &

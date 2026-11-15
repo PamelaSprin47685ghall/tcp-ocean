@@ -859,6 +859,7 @@ type TunPath(output: ITunOutput, counters: TunCounters, localIp: uint32, localPo
     member _.BootState = if bootAt = -2 then -2 elif bootAt >= 0 && headLen >= bootAt + Layout.BootFrameLength then 1 else 0
     member _.BootFrame = ReadOnlySpan(head, bootAt, Layout.BootFrameLength)
     /// True while timers or sending may need a short wait.
+    member _.AckPending = ackDue && state <> TunState.Closed
     member _.Busy = ringCount > 0 || ivCount > 0 || ackDue
     member _.Closed = state = TunState.Closed
 
