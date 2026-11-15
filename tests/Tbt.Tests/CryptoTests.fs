@@ -63,7 +63,11 @@ let ``CLIENT_INIT and SERVER_INIT match the independent reference`` () =
     match ClientInit.tryOpen psk (ReadOnlySpan ci) with
     | ValueSome(hello, _) -> Assert.Equal(clientHello (), hello)
     | ValueNone -> failwith "CLIENT_INIT did not open"
-    Assert.Equal(ValueSome(serverHello ()), ServerInit.tryOpen psk (ReadOnlySpan cn) (ReadOnlySpan si))
+    match ServerInit.tryOpen psk (ReadOnlySpan cn) (ReadOnlySpan si) with
+    | ValueSome(hello, pub) ->
+        Assert.Equal(serverHello (), hello)
+        Assert.True(X25519.isZero (ReadOnlySpan pub))
+    | ValueNone -> failwith "SERVER_INIT did not open"
     // A wrong PSK or one flipped bit fails closed.
     Assert.True((ClientInit.tryOpen (ReadOnlySpan(Array.zeroCreate 32)) (ReadOnlySpan ci)).IsNone)
     ci.[700] <- ci.[700] ^^^ 1uy

@@ -1,5 +1,5 @@
-/// Data-frame sealing and opening (spec 6.3, 6.4, 6.5.6, 6.6) for suite 0x02,
-/// ChaCha20-Poly1305 (RFC 8439), own non-throwing implementation. One instance per direction per end; single owner thread.
+/// Data-frame sealing and opening (spec 6.3, 6.4, 6.5.6, 6.6) for suite 0x02
+/// (ChaCha20-Poly1305) and 0x03 (TBT-ChaCha8-Poly1305), own non-throwing implementation. One instance per direction per end; single owner thread.
 ///
 /// Frame: chunk_hdr(5) | masked cell_seq(8) | AEAD(meta 40 | symbol S) | tag(16) | CRLF(2).
 /// Nonce (96 bits): dir | BE16 path_id | 0 | BE64 cell_seq.
@@ -13,13 +13,16 @@ open Tbt.Contracts
 /// Counter-interval key table: at most two generations (spec 6.5.6). A counter selects
 /// exactly one key; there is no trial decryption.
 [<Sealed>]
-type KeyTable() =
+type KeyTable(?suite: byte) =
+    let suite = defaultArg suite 0x02uy
+    let rounds = if suite = 0x03uy then 4 else 10
     let gens: uint32[] = Array.zeroCreate 2
     let starts: uint64[] = Array.zeroCreate 2
     let aeads: ChaCha20Poly1305Aead array = Array.zeroCreate 2
     let mutable count = 0
 
     member _.Count = count
+    member _.Suite = suite
     member _.NewestGeneration = if count = 0 then invalidOp "no key" else gens.[count - 1]
     member _.OldestGeneration = if count = 0 then invalidOp "no key" else gens.[0]
     member _.NewestStart = if count = 0 then invalidOp "no key" else starts.[count - 1]
@@ -32,7 +35,7 @@ type KeyTable() =
         if count = 1 && (gen <> gens.[0] + 1u || fromCounter <= starts.[0]) then invalidArg "gen" "next generation expected"
         gens.[count] <- gen
         starts.[count] <- fromCounter
-        aeads.[count] <- ChaCha20Poly1305Aead key
+        aeads.[count] <- ChaCha20Poly1305Aead(key, rounds)
         count <- count + 1
 
     /// Remove the older of two generations (KEY_RETIRE).

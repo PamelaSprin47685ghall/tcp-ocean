@@ -74,6 +74,8 @@ module Caps =
     let Reserved = 0xF800us
 
 /// Suite numbers and the suite bitmap of CLIENT_INIT (spec 6.4.1).
+/// suites bit2 (0x04) announces 0x03; the spec reserved the number but did not
+/// assign a bitmap bit (see docs/DECISIONS.md D11).
 module Suite =
     [<Literal>]
     let ChaCha20Poly1305 = 0x02uy
@@ -81,6 +83,33 @@ module Suite =
     /// Bitmap bit for suite 0x02. Bit 0 (AEGIS-128L) is not implemented in this build.
     [<Literal>]
     let ChaCha20Poly1305Bit = 0x02uy
+
+    /// TBT-ChaCha8-Poly1305: RFC 8439 section 2.8 with 8 ChaCha rounds (4 double-rounds).
+    [<Literal>]
+    let ChaCha8Poly1305 = 0x03uy
+
+    /// CLIENT_INIT bitmap bit2 for suite 0x03.
+    [<Literal>]
+    let ChaCha8Poly1305Bit = 0x04uy
+
+    let isImplemented (s: byte) = s = ChaCha20Poly1305 || s = ChaCha8Poly1305
+
+    let offers (bitmap: byte) (s: byte) =
+        if s = ChaCha20Poly1305 then bitmap &&& ChaCha20Poly1305Bit <> 0uy
+        elif s = ChaCha8Poly1305 then bitmap &&& ChaCha8Poly1305Bit <> 0uy
+        else false
+
+    /// Advertise 0x02 always; also 0x03 when offerChaCha8 is set.
+    let advertisedBits (offerChaCha8: bool) =
+        if offerChaCha8 then ChaCha20Poly1305Bit ||| ChaCha8Poly1305Bit else ChaCha20Poly1305Bit
+
+    /// Prefer 0x03 only when both sides offered it; otherwise 0x02; 0 if neither is offered.
+    let select (bitmap: byte) (preferChaCha8: bool) =
+        if preferChaCha8 && offers bitmap ChaCha8Poly1305 then ChaCha8Poly1305
+        elif offers bitmap ChaCha20Poly1305 then ChaCha20Poly1305
+        else 0uy
+
+    let doubleRounds (s: byte) = if s = ChaCha8Poly1305 then 4 else 10
 
 /// Fields of the CLIENT_INIT encrypted body (spec 6.5.2). Integers are little endian.
 [<Struct>]
@@ -223,7 +252,7 @@ module ServerInit =
         | ValueNone -> ValueNone
         | ValueSome body ->
             let b = ReadOnlySpan body
-            ValueSome
+            ValueSome(
                 { Status = b.[0]
                   Suite = b.[1]
                   Caps = BinaryPrimitives.ReadUInt16LittleEndian(b.Slice 2)
@@ -233,7 +262,8 @@ module ServerInit =
                   MaxPaths = BinaryPrimitives.ReadUInt16LittleEndian(b.Slice 24)
                   RxWinGrant0 = BinaryPrimitives.ReadUInt16LittleEndian(b.Slice 26)
                   EchoTimeMs = BinaryPrimitives.ReadUInt64LittleEndian(b.Slice 28)
-                  Cookie = BinaryPrimitives.ReadUInt128LittleEndian(b.Slice 68) }
+                  Cookie = BinaryPrimitives.ReadUInt128LittleEndian(b.Slice 68) },
+                body.[36 .. 67])
 
 /// Session keys (spec 6.5.5). Generation g keys come from PRK_g; PRK_0 also gives the
 /// fixed header-protection keys, graph seeds and K_path.
@@ -260,6 +290,7 @@ type SessionKeys(ikm: byte[], clientNonce: byte[], serverNonce: byte[], sessionI
     let info (label: string) (tail: byte[]) = ReadOnlySpan(Array.concat [ ctx; Kdf.ascii label; tail ])
 
     member _.SessionId = sessionId
+    member _.Suite = suite
     member _.TranscriptHash = th
     member _.HpUp = Kdf.expand (ReadOnlySpan prk0) (info "up hp" [||]) klen
     member _.HpDown = Kdf.expand (ReadOnlySpan prk0) (info "down hp" [||]) klen

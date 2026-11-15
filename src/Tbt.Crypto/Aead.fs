@@ -1,4 +1,5 @@
-/// ChaCha20-Poly1305 AEAD (RFC 8439 section 2.8) on the own ChaCha20 core.
+/// ChaCha20-Poly1305 AEAD (RFC 8439 section 2.8) on the own ChaCha core.
+/// Pass doubleRounds=4 for TBT-ChaCha8-Poly1305 (suite 0x03): same construction, 8 rounds.
 /// Open never throws on a bad tag: it checks the tag in constant time before it decrypts,
 /// so a forged frame costs one key-stream block and one MAC pass, no exception and no
 /// allocation. One instance per key; single owner thread.
@@ -144,7 +145,8 @@ type Poly1305() =
         BinaryPrimitives.WriteUInt64LittleEndian(tag.Slice 8, (h1 >>> 20) ||| (h2 <<< 24))
 
 [<Sealed>]
-type ChaCha20Poly1305Aead(key: ReadOnlySpan<byte>) =
+type ChaCha20Poly1305Aead(key: ReadOnlySpan<byte>, ?doubleRounds: int) =
+    let rounds = defaultArg doubleRounds 10
     let words = ChaCha20.keyWords key
     let mac = Poly1305()
     let polyKey: byte[] = Array.zeroCreate 32
@@ -152,7 +154,7 @@ type ChaCha20Poly1305Aead(key: ReadOnlySpan<byte>) =
     let scratch: uint32[] = Array.zeroCreate 64
 
     member private _.Authenticate(nonce: ReadOnlySpan<byte>, aad: ReadOnlySpan<byte>, cipher: ReadOnlySpan<byte>, tag: Span<byte>) =
-        ChaCha20.block words 0u nonce (Span polyKey)
+        ChaCha20.blockRounds rounds words 0u nonce (Span polyKey)
         mac.Init(ReadOnlySpan polyKey)
         mac.Update(aad, true)
         mac.Update(cipher, true)
@@ -165,7 +167,7 @@ type ChaCha20Poly1305Aead(key: ReadOnlySpan<byte>) =
     /// Encrypt plain into cipher (the same memory is allowed) and write the tag.
     member this.Encrypt(nonce: ReadOnlySpan<byte>, plain: ReadOnlySpan<byte>, cipher: Span<byte>, tag: Span<byte>, aad: ReadOnlySpan<byte>) =
         if nonce.Length <> 12 || tag.Length <> 16 || cipher.Length <> plain.Length then invalidArg "nonce" "bad nonce, tag or length"
-        ChaCha20.xorStream words 1u nonce plain cipher (Span scratch)
+        ChaCha20.xorStreamRounds rounds words 1u nonce plain cipher (Span scratch)
         this.Authenticate(nonce, aad, Span<byte>.op_Implicit cipher, tag)
 
     /// Check the tag in constant time; when it matches, decrypt cipher into plain (the same
@@ -175,6 +177,6 @@ type ChaCha20Poly1305Aead(key: ReadOnlySpan<byte>) =
         else
             this.Authenticate(nonce, aad, cipher, Span expected)
             if CryptographicOperations.FixedTimeEquals(ReadOnlySpan expected, tag) then
-                ChaCha20.xorStream words 1u nonce cipher plain (Span scratch)
+                ChaCha20.xorStreamRounds rounds words 1u nonce cipher plain (Span scratch)
                 true
             else false

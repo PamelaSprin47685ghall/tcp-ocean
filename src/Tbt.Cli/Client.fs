@@ -97,7 +97,7 @@ let run (o: Options) =
         let joinOne (id: int) =
             match JoinBootstrap.tryRepeated attempts backoff Thread.Sleep (fun i ->
                 let inc = uint32 (i + 1)
-                let join = JoinOffer(p.Keys.PathKey, entropy, p.Keys.SessionId, p.Symbol, p.Caps, maxPaths, uint16 id, inc, mss)
+                let join = JoinOffer(p.Keys.PathKey, entropy, p.Keys.SessionId, p.Symbol, p.Caps, maxPaths, uint16 id, inc, mss, p.Keys.Suite)
                 let struct (link, ack) = bootstrap server host join.Frame windowClamp timeoutMs
                 if (join.TryAccept(ReadOnlySpan ack)).IsSome then
                     link.PathId <- uint16 id

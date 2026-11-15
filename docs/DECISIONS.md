@@ -27,10 +27,10 @@ k − 1，stride = 1, 2, 4, 16, 64, 256。即 i = 0 是 t − 1 步，在第一�
 
 测试：`WireTests` 中的块头用例。
 
-## D4 只通告套件 0x02（spec 6.4.1）
+## D4 默认只通告套件 0x02（spec 6.4.1）
 
-本实现只实现 ChaCha20-Poly1305。CLIENT_INIT 的 suites 只置 bit1；SERVER_INIT 只选 0x02。
-AEGIS-128L（bit0）与 ChaCha8 的套件号保留，可在以后协商，但本实现不通告也不接受。
+默认 CLIENT_INIT 的 suites 只置 bit1，SERVER_INIT 选 0x02（ChaCha20-Poly1305）。现有握手向量与此一致。
+AEGIS-128L（bit0）仍未实现，不通告也不接受。ChaCha8（0x03）在双方显式提供时可以协商，见 D11。
 
 ## D5 FLOWSTATE 只与 FLOWSTATE2 一起协商（spec 6.10b.1）
 
@@ -95,3 +95,20 @@ flow_generation（或 PAD 标志）。线上格式不变。
 - 每路径接收窗口按规范第 9 章通告 600 000 B。吞洞仍让客户端内核 TCP 看不到上行丢包；
   窗口收紧后上行排队明显缩短（见 `docs/cases/uplink-window.md`），但断网造成的内核降窗
   还没有被完全隐藏（见 `docs/cases/uplink-ssthresh.md`）。
+
+## D11 X25519 装饰器与 TBT-ChaCha8-Poly1305（spec 6.5.8、6.4.1）
+
+X25519（RFC 7748）按规范 6.5.8：两端都置 caps.bit1 时，CLIENT_INIT 与 SERVER_INIT 各带 32 字节临时公钥，
+IKM = PSK ‖ X25519(本端私钥, 对端公钥)。共享秘密为全零（低阶点）或 bit1 已置但公钥全零时，握手失败。
+只一方通告该位时，交集不含 bit1，IKM 仍是 PSK。默认不通告 bit1，以免改变既有握手向量；
+`ClientOffer` / `ServerOffer` 的 `offerX25519` 打开后才置位。引导帧本身仍用 ChaCha20-Poly1305（6.5.2）。
+
+套件 0x03 是规范登记的 TBT-ChaCha8-Poly1305。归档没有完整算法说明和协商位。本实现将其定义为
+RFC 8439 第 2.8 节的 AEAD，只把 ChaCha 从 20 轮改为 8 轮（4 个双轮）；Nonce、AAD、Poly1305 与 klen=32
+与 0x02 相同；头部遮蔽用同样布局的 ChaCha8。CLIENT_INIT 的 suites 位图 bit2（0x04）通告 0x03
+（规范只写了 bit0/bit1）。默认仍只通告 0x02；双方 `offerChaCha8` 时服务端才选 0x03，不会把 0x02 悄悄换成 8 轮。
+JOIN / JOIN_ACK 的引导 AEAD 仍是 ChaCha20-Poly1305；ACK 里的 suite 字段回显本会话数据套件。
+
+测试：`HandshakeCryptoTests` 中的 RFC 7748 向量、独立脚本 `tests/vectors/chacha8_ietf.py` 的 8 轮 KATs、
+以及客户端与服务端在 X25519 / 0x03 / 两者同时开启时的互通。
+

@@ -163,9 +163,9 @@ let ``a path join is accepted only with matching fields`` () =
     let join = JoinOffer(kPath, SeededEntropy 4, p.Keys.SessionId, p.Symbol, p.Caps, 256, 9us, 1u, 1448)
     let r = (tryJoin kPath (ReadOnlySpan join.Frame)).Value
     Assert.Equal(9us, r.PathId)
-    let ack = joinAck kPath (SeededEntropy 5) p.Keys.SessionId p.Symbol p.Caps 256 (ReadOnlySpan join.Frame) r Tbt.Crypto.Join.JoinStatus.Accept 1448
+    let ack = joinAck kPath (SeededEntropy 5) p.Keys.SessionId p.Symbol p.Caps 256 (ReadOnlySpan join.Frame) r Tbt.Crypto.Join.JoinStatus.Accept 1448 Suite.ChaCha20Poly1305
     Assert.True(join.TryAccept(ReadOnlySpan ack).IsSome)
-    let wrongS = joinAck kPath (SeededEntropy 5) p.Keys.SessionId 1280 p.Caps 256 (ReadOnlySpan join.Frame) r Tbt.Crypto.Join.JoinStatus.Accept 1448
+    let wrongS = joinAck kPath (SeededEntropy 5) p.Keys.SessionId 1280 p.Caps 256 (ReadOnlySpan join.Frame) r Tbt.Crypto.Join.JoinStatus.Accept 1448 Suite.ChaCha20Poly1305
     Assert.True(join.TryAccept(ReadOnlySpan wrongS).IsNone)
     Assert.True((tryJoin (Array.zeroCreate 32) (ReadOnlySpan join.Frame)).IsNone)
 

@@ -160,7 +160,7 @@ let run (o: Options) =
             let paths = min maxPaths (min (int a.Hello.MaxPaths) (MemTier.maxBulkPaths (MemTier.ofCaps a.Params.Caps)))
             let admission =
                 JoinAdmission(a.Params.Keys.PathKey, entropy, clock, a.Params.Keys.SessionId, a.Params.Symbol, a.Params.Caps,
-                              paths, mss, config.MaxPaths)
+                              paths, mss, config.MaxPaths, a.Params.Keys.Suite)
             sessions.Add(Entry(carrier, paths, admission))
             if sndBufMode < 0 then
                 match tun with

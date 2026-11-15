@@ -34,8 +34,8 @@ let keyWords (key: ReadOnlySpan<byte>) =
         w.[i] <- BinaryPrimitives.ReadUInt32LittleEndian(key.Slice(4 * i))
     w
 
-let private blockCore (mix: bool) (key: uint32[]) (counter: uint32) (nonce: ReadOnlySpan<byte>) (output: Span<byte>) =
-    if key.Length <> 8 || nonce.Length <> 12 || output.Length > 64 then invalidArg "nonce" "bad key, nonce or output length"
+let private blockCore (doubleRounds: int) (mix: bool) (key: uint32[]) (counter: uint32) (nonce: ReadOnlySpan<byte>) (output: Span<byte>) =
+    if doubleRounds < 1 || key.Length <> 8 || nonce.Length <> 12 || output.Length > 64 then invalidArg "nonce" "bad key, nonce or output length"
     let n0 = BinaryPrimitives.ReadUInt32LittleEndian nonce
     let n1 = BinaryPrimitives.ReadUInt32LittleEndian(nonce.Slice 4)
     let n2 = BinaryPrimitives.ReadUInt32LittleEndian(nonce.Slice 8)
@@ -55,7 +55,7 @@ let private blockCore (mix: bool) (key: uint32[]) (counter: uint32) (nonce: Read
     let mutable x13 = n0
     let mutable x14 = n1
     let mutable x15 = n2
-    for _ in 1 .. 10 do
+    for _ in 1 .. doubleRounds do
         qr &x0 &x4 &x8 &x12
         qr &x1 &x5 &x9 &x13
         qr &x2 &x6 &x10 &x14
@@ -81,8 +81,12 @@ let private blockCore (mix: bool) (key: uint32[]) (counter: uint32) (nonce: Read
     put mix output 14 (x14 + n1)
     put mix output 15 (x15 + n2)
 
-/// Write the first output.Length (at most 64) key stream bytes of one block.
-let block key counter nonce output = blockCore false key counter nonce output
+/// Write the first output.Length (at most 64) key stream bytes of one 20-round block.
+let block key counter nonce output = blockCore 10 false key counter nonce output
+
+/// Same as block, with an explicit double-round count (10 = ChaCha20, 4 = ChaCha8).
+let blockRounds (doubleRounds: int) key counter nonce output =
+    blockCore doubleRounds false key counter nonce output
 
 let inline private rotl (v: Vector128<uint32>) (n: int) =
     Vector128.ShiftLeft(v, n) ||| Vector128.ShiftRightLogical(v, 32 - n)
@@ -112,7 +116,7 @@ let inline private quarter (a: Vector128<uint32>) (b: Vector128<uint32>) (c: Vec
 
 /// Four blocks at once, one block per lane: x_i holds word i of blocks ctr .. ctr+3.
 /// The 16 output vectors go to words (64 words, word i of block j at 4 i + j).
-let private quadBlock (key: uint32[]) (ctr: uint32) (n0: uint32) (n1: uint32) (n2: uint32) (words: Span<uint32>) =
+let private quadBlock (doubleRounds: int) (key: uint32[]) (ctr: uint32) (n0: uint32) (n1: uint32) (n2: uint32) (words: Span<uint32>) =
     let c0 = Vector128.Create 0x61707865u
     let c1 = Vector128.Create 0x3320646eu
     let c2 = Vector128.Create 0x79622d32u
@@ -145,7 +149,7 @@ let private quadBlock (key: uint32[]) (ctr: uint32) (n0: uint32) (n1: uint32) (n
     let mutable x13 = m0
     let mutable x14 = m1
     let mutable x15 = m2
-    for _ in 1 .. 10 do
+    for _ in 1 .. doubleRounds do
         let struct (x0', x4', x8', x12') = quarter x0 x4 x8 x12
         x0 <- x0'
         x4 <- x4'
@@ -204,11 +208,10 @@ let private quadBlock (key: uint32[]) (ctr: uint32) (n0: uint32) (n1: uint32) (n
     w.[14] <- x14 + m1
     w.[15] <- x15 + m2
 
-/// XOR src with the key stream from block counter (RFC 8439 section 2.4) into dst.
-/// dst may be the same memory as src.
-/// scratch is 64 words owned by the caller.
-let xorStream (key: uint32[]) (counter: uint32) (nonce: ReadOnlySpan<byte>) (src: ReadOnlySpan<byte>) (dst: Span<byte>) (scratch: Span<uint32>) =
-    if key.Length <> 8 || nonce.Length <> 12 || dst.Length <> src.Length || scratch.Length < 64 then
+/// XOR src with a ChaCha key stream of the given double-round count into dst.
+/// dst may be the same memory as src. scratch is 64 words owned by the caller.
+let xorStreamRounds (doubleRounds: int) (key: uint32[]) (counter: uint32) (nonce: ReadOnlySpan<byte>) (src: ReadOnlySpan<byte>) (dst: Span<byte>) (scratch: Span<uint32>) =
+    if doubleRounds < 1 || key.Length <> 8 || nonce.Length <> 12 || dst.Length <> src.Length || scratch.Length < 64 then
         invalidArg "dst" "bad key, nonce, length or scratch"
     let mutable at = 0
     let mutable ctr = counter
@@ -217,7 +220,7 @@ let xorStream (key: uint32[]) (counter: uint32) (nonce: ReadOnlySpan<byte>) (src
         let n1 = BinaryPrimitives.ReadUInt32LittleEndian(nonce.Slice 4)
         let n2 = BinaryPrimitives.ReadUInt32LittleEndian(nonce.Slice 8)
         while src.Length - at >= 256 do
-            quadBlock key ctr n0 n1 n2 scratch
+            quadBlock doubleRounds key ctr n0 n1 n2 scratch
             for j in 0 .. 3 do
                 let s = MemoryMarshal.Cast<byte, uint32>(src.Slice(at + 64 * j, 64))
                 let o = MemoryMarshal.Cast<byte, uint32>(dst.Slice(at + 64 * j, 64))
@@ -239,7 +242,7 @@ let xorStream (key: uint32[]) (counter: uint32) (nonce: ReadOnlySpan<byte>) (src
             let mutable b = r1
             let mutable c = r2
             let mutable d = r3
-            for _ in 1 .. 10 do
+            for _ in 1 .. doubleRounds do
                 columnRound &a &b &c &d
                 b <- Vector128.Shuffle(b, Vector128.Create(1u, 2u, 3u, 0u))
                 c <- Vector128.Shuffle(c, Vector128.Create(2u, 3u, 0u, 1u))
@@ -259,6 +262,10 @@ let xorStream (key: uint32[]) (counter: uint32) (nonce: ReadOnlySpan<byte>) (src
     src.Slice(at).CopyTo(dst.Slice at)
     while at < src.Length do
         let n = min 64 (src.Length - at)
-        blockCore true key ctr nonce (dst.Slice(at, n))
+        blockCore doubleRounds true key ctr nonce (dst.Slice(at, n))
         at <- at + n
         ctr <- ctr + 1u
+
+/// RFC 8439 section 2.4: 20-round ChaCha.
+let xorStream key counter nonce src dst scratch =
+    xorStreamRounds 10 key counter nonce src dst scratch

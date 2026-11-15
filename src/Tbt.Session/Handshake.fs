@@ -13,7 +13,8 @@ open Tbt.Wire
 /// Advertised default: mem_tier = 0 (1024 MiB). Bits 4–5 are a field, not a feature flag, so
 /// SupportedCaps leaves them clear; AllowedCaps accepts a known tier in those bits.
 let SupportedCaps = Caps.HpMask ||| Caps.StraddleOk ||| Caps.JoinAck2 ||| Caps.FlowState ||| Caps.FlowState2
-let AllowedCaps = SupportedCaps ||| Caps.MemTierMask
+/// mem_tier and X25519 may be set when offered; reserved bits 11–15 stay rejected.
+let AllowedCaps = SupportedCaps ||| Caps.MemTierMask ||| Caps.X25519
 
 /// FLOWSTATE counts only together with FLOWSTATE2 (DECISIONS.md D5).
 let private flowStatePair (caps: uint16) =
@@ -39,15 +40,26 @@ let private random (entropy: IEntropy) (n: int) =
 /// Client side of the main handshake on path 0. The CLIENT_INIT is rendered once (frozen).
 [<Sealed>]
 type ClientOffer(psk: byte[], clientId: Guid, entropy: IEntropy, unixTimeMs: uint64, mssClient: int, maxPaths: int,
-                 ?memTier: uint16) =
+                 ?memTier: uint16, ?offerX25519: bool, ?offerChaCha8: bool) =
     let tier = defaultArg memTier MemTier.Ti1024
+    let wantDh = defaultArg offerX25519 false
+    let wantChaCha8 = defaultArg offerChaCha8 false
     do if not (MemTier.isKnown tier) then invalidArg "memTier" "unknown mem_tier"
     let clientNonce = random entropy 32
+    let dhSecret, dhPublic =
+        if wantDh then
+            let sk = random entropy 32
+            let pk = Array.zeroCreate X25519.KeyLength
+            X25519.publicKey (ReadOnlySpan sk) (Span pk) |> ignore
+            sk, pk
+        else [||], Array.empty
+    let advertised = SupportedCaps ||| (if wantDh then Caps.X25519 else 0us)
+    let allowed = AllowedCaps &&& (if wantDh then ~~~0us else ~~~Caps.X25519)
     let hello =
-        { Version = 2uy; Suites = Suite.ChaCha20Poly1305Bit; Caps = MemTier.set SupportedCaps tier; ClientId = clientId
+        { Version = 2uy; Suites = Suite.advertisedBits wantChaCha8; Caps = MemTier.set advertised tier; ClientId = clientId
           UnixTimeMs = unixTimeMs; MssClient = uint16 mssClient; MaxPaths = uint16 maxPaths }
     let content =
-        ClientInit.build (ReadOnlySpan psk) (ReadOnlySpan clientNonce) hello ReadOnlySpan<byte>.Empty
+        ClientInit.build (ReadOnlySpan psk) (ReadOnlySpan clientNonce) hello (ReadOnlySpan dhPublic)
                          (ReadOnlySpan(random entropy (ClientInit.BodyLength - 64)))
 
     member _.Frame = Bootstrap.frame (ReadOnlySpan content)
@@ -59,14 +71,27 @@ type ClientOffer(psk: byte[], clientId: Guid, entropy: IEntropy, unixTimeMs: uin
         if si.IsEmpty then ValueNone
         else
             match ServerInit.tryOpen (ReadOnlySpan psk) (ReadOnlySpan clientNonce) si with
-            | ValueSome h when h.Status = ServerStatus.Ok && h.Suite = Suite.ChaCha20Poly1305 && h.PathId = 0us
-                               && Layout.isLegalSymbol (int h.Symbol) && h.Caps &&& ~~~AllowedCaps = 0us
+            | ValueSome(h, serverPub) when h.Status = ServerStatus.Ok && Suite.isImplemented h.Suite
+                               && Suite.offers hello.Suites h.Suite && h.PathId = 0us
+                               && Layout.isLegalSymbol (int h.Symbol) && h.Caps &&& ~~~allowed = 0us
                                && MemTier.isKnown (MemTier.ofCaps h.Caps)
                                && h.Caps &&& Caps.JoinAck2 <> 0us ->
-                let keys =
-                    SessionKeys(psk, clientNonce, si.Slice(0, 32).ToArray(), h.SessionId, clientId, h.Suite,
-                                Layout.frameLength (int h.Symbol), content, si.ToArray())
-                ValueSome(struct ({ Keys = keys; Symbol = int h.Symbol; Caps = h.Caps; Grant0 = h.RxWinGrant0 }, h))
+                let useDh = wantDh && (h.Caps &&& Caps.X25519) <> 0us
+                let mutable ikm = psk
+                let shared = Array.zeroCreate X25519.KeyLength
+                let ok =
+                    if not useDh then true
+                    elif X25519.isZero (ReadOnlySpan serverPub) then false
+                    elif not (X25519.compute (ReadOnlySpan dhSecret) (ReadOnlySpan serverPub) (Span shared)) then false
+                    else
+                        ikm <- X25519.ikm (ReadOnlySpan psk) (ReadOnlySpan shared)
+                        true
+                if not ok then ValueNone
+                else
+                    let keys =
+                        SessionKeys(ikm, clientNonce, si.Slice(0, 32).ToArray(), h.SessionId, clientId, h.Suite,
+                                    Layout.frameLength (int h.Symbol), content, si.ToArray())
+                    ValueSome(struct ({ Keys = keys; Symbol = int h.Symbol; Caps = h.Caps; Grant0 = h.RxWinGrant0 }, h))
             | _ -> ValueNone
 
 /// Recent client nonces per PSK inside the +-120 s window (spec 6.5.3), at most 4096.
@@ -98,7 +123,11 @@ type ServerAccept =
 
 /// Server side of the main handshake. psks: the configured client keys.
 [<Sealed>]
-type ServerOffer(psks: byte[][], entropy: IEntropy, grant0: uint16, maxPaths: int) =
+type ServerOffer(psks: byte[][], entropy: IEntropy, grant0: uint16, maxPaths: int,
+                 ?offerX25519: bool, ?offerChaCha8: bool) =
+    let wantDh = defaultArg offerX25519 false
+    let wantChaCha8 = defaultArg offerChaCha8 false
+    let allowed = AllowedCaps &&& (if wantDh then ~~~0us else ~~~Caps.X25519)
     let caches = Array.init psks.Length (fun _ -> ReplayCache())
 
     /// Try the bootstrap frame as CLIENT_INIT (spec 6.5.9 step 1). ValueNone: not ours, or
@@ -114,28 +143,44 @@ type ServerOffer(psks: byte[][], entropy: IEntropy, grant0: uint16, maxPaths: in
                 let psk = psks.[i]
                 if (ReadOnlySpan(keyHint (ReadOnlySpan psk) cn)).SequenceEqual(ClientInit.hint ci) then
                     match ClientInit.tryOpen (ReadOnlySpan psk) ci with
-                    | ValueSome(h, _) when abs (int64 h.UnixTimeMs - unixTimeMs) <= 120_000L
-                                           && h.Suites &&& Suite.ChaCha20Poly1305Bit <> 0uy
+                    | ValueSome(h, clientPub) when abs (int64 h.UnixTimeMs - unixTimeMs) <= 120_000L
+                                           && Suite.select h.Suites wantChaCha8 <> 0uy
                                            && h.Caps &&& Caps.JoinAck2 <> 0us && h.MssClient > 0us
                                            && MemTier.isKnown (MemTier.ofCaps h.Caps)
                                            && caches.[i].TryAdd(cn, unixTimeMs) ->
                         let symbol = FrameMath.symbolForMss (min (int h.MssClient) mssServer)
-                        let caps = flowStatePair (h.Caps &&& AllowedCaps)
-                        let paths = min maxPaths (min (int h.MaxPaths) (MemTier.maxBulkPaths (MemTier.ofCaps caps)))
-                        let sid = Guid(ReadOnlySpan(random entropy 16), true)
-                        let sh =
-                            { Status = ServerStatus.Ok; Suite = Suite.ChaCha20Poly1305; Caps = caps; SessionId = sid
-                              Symbol = uint16 symbol; PathId = 0us; MaxPaths = uint16 paths
-                              RxWinGrant0 = grant0; EchoTimeMs = h.UnixTimeMs; Cookie = UInt128.Zero }
-                        let sn = random entropy 32
-                        let si = ServerInit.build (ReadOnlySpan psk) cn (ReadOnlySpan sn) sh ReadOnlySpan<byte>.Empty
-                                                  (ReadOnlySpan(random entropy (ServerInit.BodyLength - 84)))
-                        let keys = SessionKeys(psk, cn.ToArray(), sn, sid, h.ClientId, sh.Suite, Layout.frameLength symbol,
-                                               ci.ToArray(), si)
-                        result <- ValueSome
-                            { Params = { Keys = keys; Symbol = symbol; Caps = caps; Grant0 = grant0 }
-                              Hello = h
-                              Reply = Bootstrap.frame (ReadOnlySpan si) }
+                        let caps = flowStatePair (h.Caps &&& allowed)
+                        let useDh = wantDh && (caps &&& Caps.X25519) <> 0us
+                        let suite = Suite.select h.Suites wantChaCha8
+                        let mutable ikm = psks.[i]
+                        let serverPub = Array.zeroCreate X25519.KeyLength
+                        let ok =
+                            if not useDh then true
+                            elif X25519.isZero (ReadOnlySpan clientPub) then false
+                            else
+                                let sk = random entropy 32
+                                X25519.publicKey (ReadOnlySpan sk) (Span serverPub) |> ignore
+                                let shared = Array.zeroCreate X25519.KeyLength
+                                if not (X25519.compute (ReadOnlySpan sk) (ReadOnlySpan clientPub) (Span shared)) then false
+                                else
+                                    ikm <- X25519.ikm (ReadOnlySpan psk) (ReadOnlySpan shared)
+                                    true
+                        if ok then
+                            let paths = min maxPaths (min (int h.MaxPaths) (MemTier.maxBulkPaths (MemTier.ofCaps caps)))
+                            let sid = Guid(ReadOnlySpan(random entropy 16), true)
+                            let sh =
+                                { Status = ServerStatus.Ok; Suite = suite; Caps = caps; SessionId = sid
+                                  Symbol = uint16 symbol; PathId = 0us; MaxPaths = uint16 paths
+                                  RxWinGrant0 = grant0; EchoTimeMs = h.UnixTimeMs; Cookie = UInt128.Zero }
+                            let sn = random entropy 32
+                            let si = ServerInit.build (ReadOnlySpan psk) cn (ReadOnlySpan sn) sh (ReadOnlySpan serverPub)
+                                                      (ReadOnlySpan(random entropy (ServerInit.BodyLength - 84)))
+                            let keys = SessionKeys(ikm, cn.ToArray(), sn, sid, h.ClientId, sh.Suite, Layout.frameLength symbol,
+                                                   ci.ToArray(), si)
+                            result <- ValueSome
+                                { Params = { Keys = keys; Symbol = symbol; Caps = caps; Grant0 = grant0 }
+                                  Hello = h
+                                  Reply = Bootstrap.frame (ReadOnlySpan si) }
                     | _ -> ()
                 i <- i + 1
             result
@@ -143,7 +188,8 @@ type ServerOffer(psks: byte[][], entropy: IEntropy, grant0: uint16, maxPaths: in
 /// Client side of one path join (spec 6.5.7). The JOIN is rendered once (frozen).
 [<Sealed>]
 type JoinOffer(kPath: byte[], entropy: IEntropy, sessionId: Guid, symbol: int, caps: uint16, maxPaths: int,
-               pathId: uint16, incarnation: uint32, mssClient: int) =
+               pathId: uint16, incarnation: uint32, mssClient: int, ?suite: byte) =
+    let suite = defaultArg suite Suite.ChaCha20Poly1305
     let nonce = random entropy 16
     let request: Join.JoinRequest = { PathId = pathId; Incarnation = incarnation; MssClient = uint16 mssClient; Role = Join.JoinRole.Bulk }
     let wire = Join.buildRequest (ReadOnlySpan kPath) (ReadOnlySpan nonce) request (ReadOnlySpan(random entropy 1031))
@@ -159,7 +205,7 @@ type JoinOffer(kPath: byte[], entropy: IEntropy, sessionId: Guid, symbol: int, c
     /// Check JOIN_ACK field by field (spec 6.5.7.3). ValueNone closes the new path.
     member _.TryAccept(frame: ReadOnlySpan<byte>) =
         match Join.tryOpenAck (ReadOnlySpan kPath) (ReadOnlySpan nonce) (ReadOnlySpan jth) frame with
-        | ValueSome a when a.Status = Join.JoinStatus.Accept && a.Role = request.Role && a.Suite = Suite.ChaCha20Poly1305
+        | ValueSome a when a.Status = Join.JoinStatus.Accept && a.Role = request.Role && a.Suite = suite
                            && a.SessionId = sessionId && a.PathId = pathId && a.Incarnation = incarnation
                            && int a.Symbol = symbol && int a.MaxPaths = maxPaths && a.Caps = caps
                            && a.MssClient = request.MssClient && a.MssServer > 0us -> ValueSome a
@@ -174,9 +220,9 @@ let tryJoin (kPath: byte[]) (frame: ReadOnlySpan<byte>) =
 
 /// Server: the JOIN_ACK for an accepted request.
 let joinAck (kPath: byte[]) (entropy: IEntropy) (sessionId: Guid) (symbol: int) (caps: uint16) (maxPaths: int)
-            (joinFrame: ReadOnlySpan<byte>) (r: Join.JoinRequest) (status: Join.JoinStatus) (mssServer: int) =
+            (joinFrame: ReadOnlySpan<byte>) (r: Join.JoinRequest) (status: Join.JoinStatus) (mssServer: int) (suite: byte) =
     let ack: Join.JoinAck =
-        { Status = status; Role = r.Role; Suite = Suite.ChaCha20Poly1305; SessionId = sessionId
+        { Status = status; Role = r.Role; Suite = suite; SessionId = sessionId
           PathId = r.PathId; Incarnation = r.Incarnation; Symbol = uint16 symbol; MaxPaths = uint16 maxPaths
           Caps = caps; MssClient = r.MssClient; MssServer = uint16 mssServer }
     Join.buildAck (ReadOnlySpan kPath) (Bootstrap.content(joinFrame).Slice(0, 16)) (ReadOnlySpan(Join.transcriptHash joinFrame))
@@ -209,7 +255,8 @@ type JoinDecision =
 /// nothing that still holds a frozen ACK is forgotten.
 [<Sealed>]
 type JoinAdmission(kPath: byte[], entropy: IEntropy, clock: IClock, sessionId: Guid, symbol: int, caps: uint16,
-                   maxPaths: int, mssServer: int, idLimit: int) =
+                   maxPaths: int, mssServer: int, idLimit: int, ?suite: byte) =
+    let suite = defaultArg suite Suite.ChaCha20Poly1305
     static let pathLimit = 288
     static let recordLimit = 1024
     static let frozenLimit = 288
@@ -282,7 +329,7 @@ type JoinAdmission(kPath: byte[], entropy: IEntropy, clock: IClock, sessionId: G
                             else Join.JoinStatus.Accept
                         highest.[p] <- r.Incarnation
                         if status = Join.JoinStatus.Accept then active.[p] <- r.Incarnation
-                        let ack = joinAck kPath entropy sessionId symbol caps maxPaths frame r status mssServer
+                        let ack = joinAck kPath entropy sessionId symbol caps maxPaths frame r status mssServer suite
                         records.[jth] <- struct (now, ack)
                         nonces.[nonce] <- jth
                         order.Enqueue(struct (jth, nonce))
