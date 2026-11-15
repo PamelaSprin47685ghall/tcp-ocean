@@ -39,6 +39,20 @@ type RateGroup(clock: IClock) =
     let mutable sampleRate = 0.0
     let mutable measuredSendRate = 0.0
     let mutable limited = false
+    /// The session had a real backlog (at least BacklogFrames queued) at some point in this
+    /// sample, whatever gate held it: the pacer, cwnd, the peer window, waiting repairs or
+    /// the coding window. Not app-limited in the BBR sense, so a startup round may count
+    /// as a full pipe. A source that keeps up with the network (an echo, a handshake
+    /// trickle) never sets it, and its rounds say nothing about the pipe.
+    let mutable backlogged = false
+    /// Startup rounds are counted by delivery, not by time: a round ends once one BDP of
+    /// the current estimate (bw x min RTT) has been delivered since the last one. While
+    /// the pipe delivers at its estimate this is one round per sample interval, as
+    /// before. A delivery stall (a hole on one path, a slow repair) then spans one round
+    /// however many sample intervals it lasts, instead of three "no growth" rounds that
+    /// end startup at a fraction of the pipe.
+    let mutable roundTarget = 0L
+    let mutable deliveryRounds = 0L
     let mutable startup = true
     let mutable draining = false
     let mutable fullBw = 0.0
@@ -126,6 +140,8 @@ type RateGroup(clock: IClock) =
         sampleSent <- sentBytes
         sampleRepair <- repairBytes
         lastSendRate <- Double.MaxValue
+        // Membership changes the aggregate delivered count: start a fresh delivery round.
+        roundTarget <- 0L
 
     /// True when some member delivered at or after t: a stall on every path at once is an
     /// outage, not one dead path, and must not demote them all.
@@ -202,6 +218,13 @@ type RateGroup(clock: IClock) =
         let reserve = this.Refill l
         repairTokens >= float bytes && tokens - float bytes >= -reserve
 
+    /// The session has at least BacklogFrames frames queued (called once per write round).
+    member _.NoteBacklog() = backlogged <- true
+
+    /// The bulk threshold of the paths (TunPath `bulk`): a backlog of this many frames is
+    /// data the sender could not put out, not an application that ran dry.
+    static member BacklogFrames = 16
+
     member _.OnSent(bytes: int) =
         tokens <- tokens - float bytes
         sentBytes <- sentBytes + int64 bytes
@@ -225,6 +248,7 @@ type RateGroup(clock: IClock) =
     member _.PacingRate = gain () * bw
     member _.Phase = phase ()
     member _.FullPipeRounds = fullCount
+    member _.DeliveryRounds = deliveryRounds
     member _.AppLimitedRounds = appLimited
     member _.Inflight = inflight ()
     member _.MinRttNs = minRtt ()
@@ -261,6 +285,7 @@ type RateGroup(clock: IClock) =
                 sampleSent <- sentBytes
                 sampleCopies <- copyEstimate ()
                 limited <- false
+                backlogged <- false
                 // Shared only when the paths that wait are more than one (or the only one): a
                 // single dead path while the others have nothing in flight is not an outage.
                 let mutable waiting = 0
@@ -288,6 +313,7 @@ type RateGroup(clock: IClock) =
                     // Crawl-acks during recovery are not capacity: keep the max filter
                     // so the repair reserve (0.5×rate) is not starved (UWOx4h: 55→0 in 4 s).
                     limited <- false
+                    backlogged <- false
                     sampleNs <- now
                     sampleDelivered <- d
                     sampleCopies <- cp
@@ -296,6 +322,11 @@ type RateGroup(clock: IClock) =
                     filter.[slot] <- if limited || rate > bw then rate else bw
                     bw <- Array.max filter
                     if limited then appLimited <- 0 else appLimited <- appLimited + 1
+                    // A delivery round ends once one BDP at the estimate has been delivered.
+                    let roundDone = d >= roundTarget
+                    if roundDone then
+                        deliveryRounds <- deliveryRounds + 1L
+                        roundTarget <- d + int64 (bw * float rtt)
                     if startup then
                         // Full-pipe only when this group has at least one BDP in flight.
                         // After idle, TryTake hits the 2 ms pacer (limited=true) with
@@ -310,10 +341,18 @@ type RateGroup(clock: IClock) =
                         // ratio of this group's estimate, not a hard-coded rate. Uplink
                         // and downlink are separate RateGroups and never copy a bw across.
                         let filled = bw > 0.0 && inflight () >= int (bw * float rtt)
-                        // A full pipe counts even if TryTake did not refuse: startup
-                        // cwnd is 2.885 BDP, and under loss inflight often sits
-                        // between 1 BDP and that cap, so the round is not "limited".
-                        if filled then
+                        // A full pipe counts even if TryTake did not refuse (startup cwnd
+                        // is 2.885 BDP; under loss inflight often sits between 1 BDP and
+                        // that cap), but only when the sender had a backlog: one BDP in
+                        // flight is exactly what a source that keeps up with the network
+                        // has, and the handshake trickle of a new session (a 0.2 Mbit
+                        // estimate, a few kB in flight) ended startup that way before the
+                        // first bulk byte, leaving 64-path echo at 3 Mbit for 38 s.
+                        // Below one BDP clears the count at any sample, as before; a full
+                        // round is judged once per delivery round.
+                        if not filled then
+                            fullCount <- 0
+                        elif roundDone && (limited || backlogged) then
                             if bw >= fullBw * 1.25 then
                                 fullBw <- bw
                                 fullCount <- 0
@@ -322,8 +361,6 @@ type RateGroup(clock: IClock) =
                                 if fullCount >= 3 then
                                     startup <- false
                                     draining <- true
-                        else
-                            fullCount <- 0
                     elif draining then
                         if inflight () <= int (bw * float rtt) then
                             draining <- false
@@ -335,6 +372,7 @@ type RateGroup(clock: IClock) =
                             fullBw <- 0.0
                             fullCount <- 0
                     limited <- false
+                    backlogged <- false
                     sampleNs <- now
                     sampleDelivered <- d
                     sampleCopies <- cp
@@ -345,6 +383,7 @@ type RateGroup(clock: IClock) =
         + " inflight=" + string (inflight ()) + " repair_kib=" + string (repairBytes / 1024L) + " phase="
         + phase ()
         + " full_rounds=" + string fullCount + " app_rounds=" + string appLimited
+        + " rounds=" + string deliveryRounds
         + " pacing_mbit=" + (gain () * bw * 8000.0).ToString("F1")
         + " send_mbit=" + (measuredSendRate * 8000.0).ToString("F1")
         + " sample_mbit=" + (sampleRate * 8000.0).ToString("F1")

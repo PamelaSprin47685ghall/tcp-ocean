@@ -1110,6 +1110,8 @@ type TunPath(output: ITunOutput, counters: TunCounters, localIp: uint32, localPo
 
     /// Timers (see ServiceCore).
     member this.Service(now: int64) =
+        // The last backlog the session reported still stands: not an app-limited round.
+        if backlog >= RateGroup.BacklogFrames then group.NoteBacklog()
         try this.ServiceCore now
         with ex -> this.Faulted ex
 
@@ -1146,7 +1148,11 @@ type TunPath(output: ITunOutput, counters: TunCounters, localIp: uint32, localPo
             head <- Array.Empty<byte>()
             headLen <- 0
 
-        member _.Backlog with set v = backlog <- v
+        member _.Backlog
+            with set v =
+                backlog <- v
+                // Data waiting is not an app-limited round for the group's startup check.
+                if v >= RateGroup.BacklogFrames then group.NoteBacklog()
         member _.Watch(_, _) = ()
         member _.Receive(_) = ()
         member _.UnsentBytes = 0
@@ -1164,7 +1170,7 @@ type TunPath(output: ITunOutput, counters: TunCounters, localIp: uint32, localPo
             elif repairQ.Count > 0 && (drainRepairs now; repairQ.Count > 0) then false
             else
                 let l = frameLength
-                let bulk = backlog >= 16
+                let bulk = backlog >= RateGroup.BacklogFrames
                 if int (sndNxt + uint64 l - sndUna) > peerWnd then false
                 elif isDemoted now then false
                 elif group.Ready then

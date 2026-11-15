@@ -37,8 +37,11 @@ type private Rounds(rateMbit: float, rttMs: int, paths: int) =
     member _.Bdp = int (rate * float rtt)
     member _.RoundBytes = int (rate * float period)
 
-    member _.Step(sent: int, delivered: int, inflight: int) =
+    /// One sample interval. backlog: the session had a bulk queue during it (a loaded
+    /// sender), as SessionCarrier reports once per write round through the paths.
+    member _.StepWith(sent: int, delivered: int, inflight: int, backlog: bool) =
         clock.Now <- clock.Now + period
+        if backlog then group.NoteBacklog()
         if sent > 0 then group.OnSent sent
         for i in 0 .. paths - 1 do
             let part value = value / paths + (if i < value % paths then 1 else 0)
@@ -48,7 +51,10 @@ type private Rounds(rateMbit: float, rttMs: int, paths: int) =
             if arrived > 0 then members.[i].LastDelivered <- clock.Now
         group.Service clock.Now
 
-    member this.Loaded() = this.Step(this.RoundBytes, this.RoundBytes, this.Bdp)
+    member this.Step(sent: int, delivered: int, inflight: int) = this.StepWith(sent, delivered, inflight, false)
+
+    /// A loaded round: a bulk sender with a queue keeps one BDP in flight.
+    member this.Loaded() = this.StepWith(this.RoundBytes, this.RoundBytes, this.Bdp, true)
 
 let private near expected actual =
     Assert.InRange(actual, expected * 0.999, expected * 1.001)
@@ -116,7 +122,7 @@ let ``idle keeps the full startup gain and can sample a larger pipe`` residualMb
     Assert.Equal(cwndBeforeIdle, group.Cwnd 1415)
     Assert.Equal(pacingBeforeIdle, group.PacingRate)
     let larger = rounds.RoundBytes * 2
-    rounds.Step(larger, larger, rounds.Bdp * 2)
+    rounds.StepWith(larger, larger, rounds.Bdp * 2, true)
     near (rounds.Rate * 2.0) group.Bandwidth
     Assert.True(group.InStartup, group.Describe())
     Assert.Equal(0, group.FullPipeRounds)
@@ -141,6 +147,86 @@ let ``a true idle and restart keep asymmetric direction estimates separate`` upM
     near up.Rate up.Group.Bandwidth
     near down.Rate down.Group.Bandwidth
     // A capacity increase in the uplink must not change the downlink estimate.
-    up.Step(up.RoundBytes * 2, up.RoundBytes * 2, up.Bdp * 2)
+    up.StepWith(up.RoundBytes * 2, up.RoundBytes * 2, up.Bdp * 2, true)
     near (up.Rate * 2.0) up.Group.Bandwidth
+    near down.Rate down.Group.Bandwidth
+
+[<Theory>]
+[<InlineData(32.0, 400, 8)>]
+[<InlineData(256.0, 400, 64)>]
+[<InlineData(200.0, 40, 4)>]
+let ``a handshake trickle with no backlog does not end startup`` pipeMbit rttMs paths =
+    // A new session: JOINs and control frames give a tiny rate sample and keep a few kB
+    // in flight, which is above one BDP of that tiny estimate. Nothing is queued.
+    let trickle = Rounds(0.2, rttMs, paths)
+    let group = trickle.Group
+    for _ in 1 .. 10 do trickle.Step(trickle.RoundBytes, trickle.RoundBytes, trickle.Bdp * 2)
+    Assert.True(group.InStartup, group.Describe())
+    Assert.Equal(0, group.FullPipeRounds)
+    // The first bulk then grows at the startup gain from that estimate.
+    let mutable rate = trickle.Rate
+    let period = float (max (int64 rttMs * 1_000_000L) 5_000_000L)
+    let cap = pipeMbit / 8000.0
+    while rate < cap do
+        rate <- min cap (rate * 2.885)
+        let bytes = int (rate * period)
+        trickle.StepWith(bytes, bytes, int (rate * float rttMs * 1_000_000.0), true)
+        Assert.True(group.InStartup, group.Describe())
+    near cap group.Bandwidth
+
+[<Theory>]
+[<InlineData(16.0, 400, 8)>]
+[<InlineData(36.0, 400, 8)>]
+[<InlineData(64.0, 400, 64)>]
+[<InlineData(20.0, 40, 4)>]
+let ``a delivery stall in startup is one round, not three`` residualMbit rttMs paths =
+    let rounds = Rounds(residualMbit, rttMs, paths)
+    let group = rounds.Group
+    rounds.Loaded()
+    // A hole on one path holds delivery for several sample intervals while the backlog
+    // keeps 2.885 BDP in flight. Time passes, but less than one BDP is delivered, so no
+    // delivery round ends and none counts as full.
+    let trickle = rounds.RoundBytes / 100
+    for _ in 1 .. 6 do
+        rounds.StepWith(trickle, trickle, int (2.885 * float rounds.Bdp), true)
+        Assert.True(group.InStartup, group.Describe())
+    Assert.Equal(0, group.FullPipeRounds)
+    // Delivery resumes at a larger rate: still startup, and the estimate grows.
+    let larger = rounds.RoundBytes * 2
+    rounds.StepWith(larger, larger, rounds.Bdp * 2, true)
+    Assert.True(group.InStartup, group.Describe())
+    near (rounds.Rate * 2.0) group.Bandwidth
+    Assert.Equal(0, group.FullPipeRounds)
+
+[<Theory>]
+[<InlineData(200.0, 40, 4)>]
+[<InlineData(32.0, 400, 8)>]
+[<InlineData(256.0, 400, 64)>]
+let ``a backlogged pipe ends startup without a TryTake refusal`` rateMbit rttMs paths =
+    // 20/200 5 %: the coding window or the peer window holds the sender, the pacer never
+    // refuses, inflight sits between 1 and 2.885 BDP. That is a full pipe (2bc2968).
+    let rounds = Rounds(rateMbit, rttMs, paths)
+    let group = rounds.Group
+    let inflight = int (1.6 * float rounds.Bdp)
+    for _ in 1 .. 3 do
+        rounds.StepWith(rounds.RoundBytes, rounds.RoundBytes, inflight, true)
+        Assert.True(group.InStartup, group.Describe())
+    rounds.StepWith(rounds.RoundBytes, rounds.RoundBytes, inflight, true)
+    Assert.Equal("drain", group.Phase)
+    near rounds.Rate group.Bandwidth
+
+[<Theory>]
+[<InlineData(20.0, 200.0)>]
+[<InlineData(80.0, 8.0)>]
+let ``a trickle on one direction does not end startup or move the other direction`` upMbit downMbit =
+    let up = Rounds(upMbit, 400, 8)
+    let down = Rounds(downMbit, 400, 8)
+    // Uplink only carries ACK-sized traffic with no backlog; downlink is loaded.
+    up.Loaded()
+    for _ in 1 .. 4 do
+        up.Step(up.RoundBytes / 50, up.RoundBytes / 50, up.Bdp)
+        down.Loaded()
+    Assert.True(up.Group.InStartup, up.Group.Describe())
+    Assert.Equal("drain", down.Group.Phase)
+    near up.Rate up.Group.Bandwidth
     near down.Rate down.Group.Bandwidth

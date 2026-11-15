@@ -223,6 +223,7 @@ type SessionCarrier(session: Session, bridge: FlowBridge, ?uplinkPace: bool, ?tu
     let writeRound () =
         let backlog = session.Tx.Queued
         for link in paths do link.Backlog <- backlog
+        if pace && backlog >= RateGroup.BacklogFrames then group.NoteBacklog()
         let mutable budget = 256
         let mutable go = true
         while go do
