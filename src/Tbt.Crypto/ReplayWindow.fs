@@ -44,3 +44,4 @@ type ReplayWindow() =
         set c
 
     member _.RightEdge = right
+    member _.HasCommit = any

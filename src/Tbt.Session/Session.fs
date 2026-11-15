@@ -4,6 +4,7 @@
 namespace Tbt.Session
 
 open System
+open System.Buffers.Binary
 open Tbt.Contracts
 open Tbt.Codec
 open Tbt.Crypto
@@ -22,6 +23,15 @@ type CloseState =
     /// The peer sent SESSION_CLOSE; our SESSION_CLOSED waits for its acknowledgement.
     | Draining = 2
     | Closed = 3
+
+/// PATH_CLOSE / PATH_CLOSED (spec 6.10a). A path_id stays blocked until the
+/// transaction ends and the host notes a new join of that id.
+type PathCloseState =
+    | Idle = 0
+    /// PATH_CLOSE was started or received; PATH_CLOSED is still in flight.
+    | Closing = 1
+    /// The transaction ended; the id is not reusable until NotePathJoined.
+    | Closed = 2
 
 [<Struct>]
 type SessionConfig =
@@ -132,6 +142,25 @@ type Session(role: Role, p: SessionParams, port: IFlowPort, clock: IClock, confi
     let mutable ctrlSent = 0L
     let mutable ctrlExecuted = 0L
     let mutable ctrlRejected = 0L
+    // Rekey (spec 6.5.6): one outstanding PREPARE/READY/RETIRE per direction.
+    let Rcut = 4096UL
+    let rekeyReserve = 256UL
+    let rekeyAgeNs = 24L * 3600L * 1_000_000_000L
+    let rekeyCells = 1UL <<< 32
+    let txKey (g: uint32) = if client then keys.UpKey g else keys.DownKey g
+    let rxKey (g: uint32) = if client then keys.DownKey g else keys.UpKey g
+    let mutable txCut = 0UL
+    let mutable txAwaitingReady = false
+    let mutable txNextGen = 0u
+    let mutable retireSeq = 0u
+    let mutable crossedCutNs = 0L
+    let mutable genStartedNs = clock.NowNs()
+    // Path close (spec 6.10a): one transaction per path_id.
+    let pathState: PathCloseState[] = Array.zeroCreate config.MaxPaths
+    let pathCloseSeq: uint32[] = Array.zeroCreate config.MaxPaths
+    let pathReplySeq: uint32[] = Array.zeroCreate config.MaxPaths
+    let pathGotClosed: bool[] = Array.zeroCreate config.MaxPaths
+    let mutable pathClosePending = 0
     let mutable winAcksSent = 0L
     let mutable nackSpan = 0
     let mutable nackDeficit = 0
@@ -187,6 +216,58 @@ type Session(role: Role, p: SessionParams, port: IFlowPort, clock: IClock, confi
             true
         else false
 
+    let writeU32 (v: uint32) =
+        BinaryPrimitives.WriteUInt32LittleEndian(Span(ctrlBody, 0, 4), v)
+
+    let writePrepare (gen: uint32) (cut: uint64) =
+        BinaryPrimitives.WriteUInt32LittleEndian(Span(ctrlBody, 0, 4), gen)
+        BinaryPrimitives.WriteUInt64LittleEndian(Span(ctrlBody, 4, 8), cut)
+
+    let writePathClose (path: uint16) (last: uint64) (reason: byte) =
+        BinaryPrimitives.WriteUInt16LittleEndian(Span(ctrlBody, 0, 2), path)
+        BinaryPrimitives.WriteUInt64LittleEndian(Span(ctrlBody, 2, 8), last)
+        ctrlBody.[10] <- reason
+
+    let writePathClosed (path: uint16) =
+        BinaryPrimitives.WriteUInt16LittleEndian(Span(ctrlBody, 0, 2), path)
+
+    let markPath (i: int) (st: PathCloseState) =
+        let was = pathState.[i]
+        if was <> PathCloseState.Idle && st = PathCloseState.Idle then
+            pathClosePending <- pathClosePending - 1
+        elif was = PathCloseState.Idle && st <> PathCloseState.Idle then
+            pathClosePending <- pathClosePending + 1
+        pathState.[i] <- st
+
+    let startRekey () =
+        if closeState <> CloseState.Open || txAwaitingReady || retireSeq <> 0u
+           || txKeys.Count <> 1 || txKeys.NewestGeneration = UInt32.MaxValue then false
+        else
+            let cut = tx.NextCounter + Rcut
+            if cut < tx.NextCounter then false
+            else
+                txNextGen <- txKeys.NewestGeneration + 1u
+                writePrepare txNextGen cut
+                let seq = ctrl.Start(CtrlOp.KeyPrepare, ReadOnlySpan(ctrlBody, 0, 12))
+                if seq = 0u then false
+                else
+                    txCut <- cut
+                    txAwaitingReady <- true
+                    crossedCutNs <- 0L
+                    tx.SetCutLimit(cut, rekeyReserve)
+                    true
+
+    let startRetire () =
+        if retireSeq <> 0u || txKeys.Count <> 2 then false
+        else
+            writeU32 txKeys.OldestGeneration
+            let seq = ctrl.Start(CtrlOp.KeyRetire, ReadOnlySpan(ctrlBody, 0, 4))
+            if seq = 0u then false
+            else
+                retireSeq <- seq
+                txKeys.RetireOldest()
+                true
+
     /// Execute one CTRL operation (rules 1, 2, 4). The acknowledgement rides the next WIN_ACK.
     let onCtrl (symbol: ReadOnlySpan<byte>) =
         let mutable h = Unchecked.defaultof<CtrlHead>
@@ -194,6 +275,7 @@ type Session(role: Role, p: SessionParams, port: IFlowPort, clock: IClock, confi
         else
             match ctrl.Arrive h.ControlSeq with
             | ControlArrival.Fresh ->
+                let body = symbol.Slice(Ctrl.HeadLength, h.BodyLength)
                 match h.Op with
                 | CtrlOp.SessionClose ->
                     // Accept only with room for the reply (rule 5); else the peer retries.
@@ -207,6 +289,63 @@ type Session(role: Role, p: SessionParams, port: IFlowPort, clock: IClock, confi
                     ctrl.Executed h.ControlSeq
                     ctrlExecuted <- ctrlExecuted + 1L
                     if closeSeq <> 0u then closeState <- CloseState.Closed
+                | CtrlOp.KeyPrepare ->
+                    let next = BinaryPrimitives.ReadUInt32LittleEndian body
+                    let cut = BinaryPrimitives.ReadUInt64LittleEndian(body.Slice 4)
+                    let maxSeen = if opener.HasCommit then opener.RightEdge else 0UL
+                    if not ctrl.CanReply then ()
+                    elif rxKeys.Count <> 1 || next <> rxKeys.NewestGeneration + 1u
+                         || next = 0u || cut <= maxSeen || cut <= rxKeys.NewestStart then
+                        ctrlRejected <- ctrlRejected + 1L
+                    else
+                        rxKeys.Install(next, ReadOnlySpan(rxKey next), cut)
+                        writeU32 next
+                        ctrl.Reply(CtrlOp.KeyReady, ReadOnlySpan(ctrlBody, 0, 4)) |> ignore
+                        ctrl.Executed h.ControlSeq
+                        ctrlExecuted <- ctrlExecuted + 1L
+                | CtrlOp.KeyReady ->
+                    let next = BinaryPrimitives.ReadUInt32LittleEndian body
+                    if not txAwaitingReady || next <> txNextGen || txKeys.Count <> 1 then
+                        ctrlRejected <- ctrlRejected + 1L
+                    else
+                        txKeys.Install(next, ReadOnlySpan(txKey next), txCut)
+                        tx.ClearCutLimit()
+                        txAwaitingReady <- false
+                        genStartedNs <- clock.NowNs()
+                        ctrl.Executed h.ControlSeq
+                        ctrlExecuted <- ctrlExecuted + 1L
+                | CtrlOp.KeyRetire ->
+                    let g = BinaryPrimitives.ReadUInt32LittleEndian body
+                    if rxKeys.Count <> 2 || g <> rxKeys.OldestGeneration then
+                        ctrlRejected <- ctrlRejected + 1L
+                    else
+                        rxKeys.RetireOldest()
+                        ctrl.Executed h.ControlSeq
+                        ctrlExecuted <- ctrlExecuted + 1L
+                | CtrlOp.PathClose ->
+                    let path = BinaryPrimitives.ReadUInt16LittleEndian body
+                    let i = int path
+                    if uint32 i >= uint32 config.MaxPaths then ctrlRejected <- ctrlRejected + 1L
+                    elif not ctrl.CanReply then ()
+                    else
+                        writePathClosed path
+                        let seq = ctrl.Reply(CtrlOp.PathClosed, ReadOnlySpan(ctrlBody, 0, 2))
+                        pathReplySeq.[i] <- seq
+                        pathCloseSeq.[i] <- 0u
+                        pathGotClosed.[i] <- false
+                        if pathState.[i] = PathCloseState.Idle then markPath i PathCloseState.Closing
+                        ctrl.Executed h.ControlSeq
+                        ctrlExecuted <- ctrlExecuted + 1L
+                | CtrlOp.PathClosed ->
+                    let path = BinaryPrimitives.ReadUInt16LittleEndian body
+                    let i = int path
+                    if uint32 i >= uint32 config.MaxPaths || pathState.[i] <> PathCloseState.Closing
+                       || pathCloseSeq.[i] = 0u then
+                        ctrlRejected <- ctrlRejected + 1L
+                    else
+                        pathGotClosed.[i] <- true
+                        ctrl.Executed h.ControlSeq
+                        ctrlExecuted <- ctrlExecuted + 1L
                 | _ ->
                     // Not supported here: not executed and not acknowledged (rule 1).
                     ctrlRejected <- ctrlRejected + 1L
@@ -296,6 +435,43 @@ type Session(role: Role, p: SessionParams, port: IFlowPort, clock: IClock, confi
     member _.Closed = closeState = CloseState.Closed
     /// The reason byte of the peer's SESSION_CLOSE, or -1.
     member _.PeerCloseReason = peerCloseReason
+    /// Start KEY_PREPARE for this direction (spec 6.5.6). Also used by the 2^32-cell / 24 h trigger.
+    member _.BeginRekey() = startRekey()
+    /// CutCounter of the outstanding or last started rekey, or 0.
+    member _.RekeyCut = txCut
+    member _.RekeyPending = txAwaitingReady
+    member _.TxKeyCount = txKeys.Count
+    member _.RxKeyCount = rxKeys.Count
+    member _.TxGeneration = txKeys.NewestGeneration
+    member _.RxGeneration = rxKeys.NewestGeneration
+    /// Start PATH_CLOSE for path (spec 6.10a). False when the id is busy or the log is full.
+    member _.BeginPathClose(path: uint16, reason: byte) =
+        let i = int path
+        if uint32 i >= uint32 config.MaxPaths || pathState.[i] <> PathCloseState.Idle
+           || closeState = CloseState.Closed then false
+        else
+            writePathClose path (tx.LastOnPath path) reason
+            let seq = ctrl.Start(CtrlOp.PathClose, ReadOnlySpan(ctrlBody, 0, 11))
+            if seq = 0u then false
+            else
+                pathCloseSeq.[i] <- seq
+                pathReplySeq.[i] <- 0u
+                pathGotClosed.[i] <- false
+                markPath i PathCloseState.Closing
+                true
+    member _.PathState(path: uint16) =
+        let i = int path
+        if uint32 i >= uint32 config.MaxPaths then PathCloseState.Closed else pathState.[i]
+    /// Allow path_id reuse after the close transaction ended (a new JOIN of this id).
+    member _.NotePathJoined(path: uint16) =
+        let i = int path
+        if uint32 i >= uint32 config.MaxPaths || pathState.[i] <> PathCloseState.Closed then false
+        else
+            pathCloseSeq.[i] <- 0u
+            pathReplySeq.[i] <- 0u
+            pathGotClosed.[i] <- false
+            markPath i PathCloseState.Idle
+            true
     member _.CtrlSent = ctrlSent
     member _.CtrlExecuted = ctrlExecuted
     member _.CtrlRejected = ctrlRejected
@@ -354,13 +530,13 @@ type Session(role: Role, p: SessionParams, port: IFlowPort, clock: IClock, confi
 
     /// True when a cell waits for a path.
     member _.WantsToSend =
-        ackDue || flowStateDue || (ctrl.Pending > 0 && ctrl.IsDue(clock.NowNs(), int64 tx.SrttNs)) || tx.HasCandidate
-        || (peerSeen && tx.HeartbeatDue)
+        ackDue || (ctrl.Pending > 0 && ctrl.IsDue(clock.NowNs(), int64 tx.SrttNs))
+        || (tx.CanSealPayload && (flowStateDue || tx.HasCandidate || (peerSeen && tx.HeartbeatDue)))
 
     /// WIN_ACK, CTRL, FLOW_STATE, or heartbeat: not paced by the uplink group.
     member _.ControlWaiting =
-        ackDue || flowStateDue || (ctrl.Pending > 0 && ctrl.IsDue(clock.NowNs(), int64 tx.SrttNs))
-        || (peerSeen && tx.HeartbeatDue)
+        ackDue || (ctrl.Pending > 0 && ctrl.IsDue(clock.NowNs(), int64 tx.SrttNs))
+        || (tx.CanSealPayload && (flowStateDue || (peerSeen && tx.HeartbeatDue)))
 
     /// A BOOSTER is at the front of the send queue (no control cell waits).
     member this.RepairWaiting = not this.ControlWaiting && tx.RepairWaiting
@@ -373,32 +549,41 @@ type Session(role: Role, p: SessionParams, port: IFlowPort, clock: IClock, confi
     member this.TryProduce(path: uint16, frame: Span<byte>) = this.TryProduce(path, frame, true)
     member _.TryProduce(path: uint16, frame: Span<byte>, allowRepair: bool) =
         let now = clock.NowNs()
-        if ackDue && peerSeen then
-            renderWinAck frame path now
-            noteAckSent now
-            true
-        elif renderCtrl frame path now then true
-        elif flowStateDue then
-            renderFlowState frame path
-            lastFlowStateNs <- now
-            flowStateDue <- snapshotPending ()
-            true
-        elif tx.TryRenderNext(frame, path, rx.AckStepLo, rx.Grant, rx.ErasureQ16, allowRepair) then
-            noteAckSent now
-            true
-        elif peerSeen && tx.HeartbeatDue then
-            tx.RenderHeartbeat(frame, path, rx.AckStepLo, rx.Grant, rx.ErasureQ16)
-            true
-        elif ackDue then
-            renderWinAck frame path now
-            noteAckSent now
-            true
-        else false
+        let i = int path
+        if uint32 i >= uint32 config.MaxPaths || pathState.[i] = PathCloseState.Closed then false
+        elif not tx.CanSeal then false
+        else
+            let payload = pathState.[i] = PathCloseState.Idle && tx.CanSealPayload
+            if ackDue && peerSeen then
+                renderWinAck frame path now
+                noteAckSent now
+                true
+            elif renderCtrl frame path now then true
+            elif payload && flowStateDue then
+                renderFlowState frame path
+                lastFlowStateNs <- now
+                flowStateDue <- snapshotPending ()
+                true
+            elif payload && tx.TryRenderNext(frame, path, rx.AckStepLo, rx.Grant, rx.ErasureQ16, allowRepair) then
+                noteAckSent now
+                true
+            elif payload && peerSeen && tx.HeartbeatDue then
+                tx.RenderHeartbeat(frame, path, rx.AckStepLo, rx.Grant, rx.ErasureQ16)
+                true
+            elif ackDue then
+                renderWinAck frame path now
+                noteAckSent now
+                true
+            else false
 
     /// Content for a whole-frame hole of path (borrowed shell, spec 6.7.2): BOOSTER, else an
     /// extra parity of the oldest unacknowledged step, else PAD; new cell_seq, flags FILL.
     member _.ProduceFill(path: uint16, frame: Span<byte>) =
-        tx.RenderFill(frame, path, rx.AckStepLo, rx.Grant, rx.ErasureQ16)
+        // Last 256 numbers of a rekey, and a path in PATH_CLOSE, must not take a
+        // DATA/PARITY/BOOSTER/PAD (spec 6.5.6, 6.10a). Leave the hole unfilled.
+        let i = int path
+        if uint32 i < uint32 config.MaxPaths && pathState.[i] = PathCloseState.Idle && tx.CanSealPayload then
+            tx.RenderFill(frame, path, rx.AckStepLo, rx.Grant, rx.ErasureQ16) |> ignore
 
     /// Timers: WIN_ACK at most every 10 ms while the ack state changes, else every second.
     member _.Tick() =
@@ -409,6 +594,22 @@ type Session(role: Role, p: SessionParams, port: IFlowPort, clock: IClock, confi
             if closeState <> CloseState.Open then closeState <- CloseState.Closed
             elif fault.Length = 0 then fault <- "control retry limit"
         if closeState = CloseState.Draining && not (ctrl.Contains replySeq) then closeState <- CloseState.Closed
+        if txAwaitingReady && not tx.CanSeal && fault.Length = 0 then fault <- "rekey failed"
+        if closeState = CloseState.Open && not txAwaitingReady && retireSeq = 0u && txKeys.Count = 1 then
+            if now - genStartedNs >= rekeyAgeNs || tx.NextCounter - txKeys.NewestStart >= rekeyCells then
+                startRekey() |> ignore
+        if not txAwaitingReady && txKeys.Count = 2 && retireSeq = 0u && tx.NextCounter >= txCut then
+            if crossedCutNs = 0L then crossedCutNs <- now
+            elif now - crossedCutNs >= 3L * int64 tx.SrttNs then startRetire() |> ignore
+        if pathClosePending > 0 then
+            for i in 0 .. config.MaxPaths - 1 do
+                if pathState.[i] = PathCloseState.Closing then
+                    let initiated = pathCloseSeq.[i] <> 0u
+                    let replied = pathReplySeq.[i] <> 0u
+                    if initiated && pathGotClosed.[i] && not (ctrl.Contains pathCloseSeq.[i]) then
+                        markPath i PathCloseState.Closed
+                    elif replied && not (ctrl.Contains pathReplySeq.[i]) then
+                        markPath i PathCloseState.Closed
         rx.Service now
         rx.Release()
         let changed = rx.AckStepLo <> lastAckLo || rx.AckStepLo + uint64 rx.Grant <> lastGrantLimit

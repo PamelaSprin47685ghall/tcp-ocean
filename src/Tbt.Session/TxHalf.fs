@@ -55,6 +55,9 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
     let mutable filled = 0
     let mutable acc = 0.0
     let mutable nextCounter = 0UL
+    let lastOnPath: uint64[] = Array.zeroCreate maxPaths
+    let mutable cutLimit = UInt64.MaxValue
+    let mutable cutReserve = 0UL
     let mutable peerAck = 0UL
     /// Highest step the peer has reported seeing (WIN_ACK t_hi = SeenEnd-1).
     /// Later than the cumulative frontier when a hole sits at t_lo; this is the
@@ -581,8 +584,33 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
     /// one plaintext only).
     member _.Seal(frame: Span<byte>, path: uint16) =
         sealer.Seal(frame, nextCounter, path)
+        let i = int path
+        if uint32 i < uint32 maxPaths then lastOnPath.[i] <- nextCounter
         nextCounter <- nextCounter + 1UL
         cellsSent <- cellsSent + 1L
+
+    /// Next cell_seq this direction will allocate (spec 6.5.6).
+    member _.NextCounter = nextCounter
+    /// Last cell_seq sealed on path, or 0 when none.
+    member _.LastOnPath(path: uint16) =
+        let i = int path
+        if uint32 i < uint32 maxPaths then lastOnPath.[i] else 0UL
+    /// Freeze allocation at and past limit until KEY_READY; reserve the last `reserve`
+    /// numbers for the rekey CTRL transaction (R_cut / 256 in spec 6.5.6).
+    member _.SetCutLimit(limit: uint64, reserve: uint64) =
+        cutLimit <- limit
+        cutReserve <- reserve
+    member _.ClearCutLimit() =
+        cutLimit <- UInt64.MaxValue
+        cutReserve <- 0UL
+    /// True while a number below CutCounter remains.
+    member _.CanSeal = nextCounter < cutLimit
+    /// False in the last reserved numbers (DATA / PARITY / BOOSTER / PAD must stop).
+    member _.CanSealPayload =
+        if nextCounter >= cutLimit then false
+        elif cutReserve = 0UL then true
+        elif cutLimit <= cutReserve then false
+        else nextCounter < cutLimit - cutReserve
 
     /// Render the next queued DATA or PARITY cell for path into frame and seal it.
     /// ackLo, grant and erasureQ16 are this end's receive state. False when nothing waits.

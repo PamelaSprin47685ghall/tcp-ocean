@@ -21,6 +21,8 @@ type KeyTable() =
 
     member _.Count = count
     member _.NewestGeneration = if count = 0 then invalidOp "no key" else gens.[count - 1]
+    member _.OldestGeneration = if count = 0 then invalidOp "no key" else gens.[0]
+    member _.NewestStart = if count = 0 then invalidOp "no key" else starts.[count - 1]
 
     /// Install generation gen for counters >= fromCounter. The first key must be gen 0
     /// from counter 0; later keys must be the next generation with a larger start.
@@ -106,6 +108,8 @@ type CellOpener(dir: Direction, symbolSize: int, keys: KeyTable, mask: IHeaderMa
     member _.Keys = keys
     member _.ReplayDrops = replayDrops
     member _.AuthFails = authFails
+    member _.HasCommit = replay.HasCommit
+    member _.RightEdge = replay.RightEdge
 
     /// Recover cell_seq without changing any state (receive pipeline step 3).
     member _.PeekCounter(frame: ReadOnlySpan<byte>) =
