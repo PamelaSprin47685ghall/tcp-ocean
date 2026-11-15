@@ -63,6 +63,11 @@ type SessionCarrier(session: Session, bridge: FlowBridge, ?uplinkPace: bool, ?tu
     let mutable slotVisits = 0L
     /// Unpaced writeBatch: originals sent since the last admitted repair.
     let mutable originalsSinceRepair = 0
+    /// A path change breaks the interval between aggregate kernel ACK samples.
+    let mutable pathVersion = 0L
+    let mutable statsPathVersion = -1L
+    let mutable statsNs = 0L
+    let mutable statsAck = -1L
 
     let pacerOf (pathId: uint16) =
         if tupleMbit <= 0.0 then None
@@ -121,6 +126,7 @@ type SessionCarrier(session: Session, bridge: FlowBridge, ?uplinkPace: bool, ?tu
             if not paths.[i].Alive then
                 paths.[i].Close()
                 paths.RemoveAt i
+                pathVersion <- pathVersion + 1L
             i <- i - 1
 
     /// Interactive slots that were readable in this round (re-read between bulk batches).
@@ -254,19 +260,39 @@ type SessionCarrier(session: Session, bridge: FlowBridge, ?uplinkPace: bool, ?tu
         let mutable ackKnown = true
         let mutable i = 0
         let pathTx = System.Text.StringBuilder()
+        let pathTcp = System.Text.StringBuilder()
+        let kernel = KernelTcpTotals()
         while i < paths.Count do
             match paths.[i] with
             | :? PathLink as pl ->
                 consTx <- consTx + pl.BytesWritten
-                let acked = pl.BytesAcked
+                let info = pl.TcpInfo
+                kernel.Add info
+                let acked = match info with ValueSome value -> value.BytesAcked | ValueNone -> -1L
                 if acked < 0L then ackKnown <- false
                 else consAck <- consAck + acked
                 if pathTx.Length > 0 then pathTx.Append(',') |> ignore
                 pathTx.Append(int pl.PathId).Append(':').Append(pl.BytesWritten) |> ignore
                 if acked >= 0L then pathTx.Append('/').Append(acked) |> ignore
+                if pathTcp.Length > 0 then pathTcp.Append(',') |> ignore
+                pathTcp.Append(int pl.PathId).Append('@').Append(pl.Incarnation).Append(':') |> ignore
+                match info with
+                | ValueSome value -> pathTcp.Append(KernelTcpInfo.describePath value) |> ignore
+                | ValueNone -> pathTcp.Append('-') |> ignore
             | _ -> ()
             i <- i + 1
+        let now = session.Clock.FreshNs()
+        let ackRate =
+            if kernel.Count = 0 || not ackKnown || statsAck < 0L || consAck < statsAck
+               || pathVersion <> statsPathVersion || now <= statsNs then "-"
+            else
+                (float (consAck - statsAck) * 8000.0 / float (now - statsNs)).ToString("F3", Globalization.CultureInfo.InvariantCulture)
+        statsNs <- now
+        statsAck <- if ackKnown then consAck else -1L
+        statsPathVersion <- pathVersion
         "paths=" + string paths.Count + " frames_in=" + string framesIn + " frames_out=" + string framesOut
+        + " tx_direction=" + (if session.Role = Role.Client then "up" else "down")
+        + " send_control=" + (if pace then "group" elif kernel.Count > 0 then "kernel" else "tun")
         + " tx_head=" + string tx.Head + " peer_ack=" + string tx.PeerAck + " grant_limit=" + string tx.GrantLimit
         + " queued=" + string tx.Queued + " srtt_ms=" + string (int (tx.SrttNs / 1e6))
         + " minrtt_ms=" + (if tx.MinRttNs = Int64.MaxValue then "-" else string (tx.MinRttNs / 1_000_000L))
@@ -283,17 +309,24 @@ type SessionCarrier(session: Session, bridge: FlowBridge, ?uplinkPace: bool, ?tu
         + " fills=" + string tx.FillsSent
         + " cons_tx_b=" + string consTx + " cons_ack_b=" + (if ackKnown then string consAck else "-")
         + " path_tx=" + pathTx.ToString()
+        + (if kernel.Count = 0 then ""
+           else kernel.Describe() + " kernel_ack_mbit=" + ackRate + " kernel_generation=" + string pathVersion
+                + " kernel_path=" + pathTcp.ToString())
         + (if not pace then ""
            else
             " pace_bw_mbit=" + (group.Bandwidth * 8000.0).ToString("F1")
             + " pace_inflight=" + string (max 0L (uniqueOut - tx.UniqueAcked * int64 session.FrameLength))
-            + " pace_phase=" + (if group.InStartup then "startup" else "probe" + string group.Cycle)
+            + " pace_phase=" + group.Phase
+            + " pace_pacing_mbit=" + (group.PacingRate * 8000.0).ToString("F1")
+            + " pace_full_rounds=" + string group.FullPipeRounds
+            + " pace_app_rounds=" + string group.AppLimitedRounds
             + " pace_repair_kib=" + string (group.RepairBytes / 1024L))
 
     /// Add a path whose bootstrap is done; frames it already holds come in at once.
     member this.AddPath(link: IPath) =
         link.FrameLength <- session.FrameLength
         paths.Add link
+        pathVersion <- pathVersion + 1L
         link.Attach this
 
     member _.HasPath(pathId: uint16) = paths.Exists(fun p -> p.PathId = pathId)
@@ -305,6 +338,7 @@ type SessionCarrier(session: Session, bridge: FlowBridge, ?uplinkPace: bool, ?tu
             let id = paths.[i].PathId
             paths.[i].Close()
             paths.RemoveAt i
+            pathVersion <- pathVersion + 1L
             pacers.Remove id |> ignore
 
     member _.Watch(poller: Poller) =

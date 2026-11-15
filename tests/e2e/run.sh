@@ -25,6 +25,10 @@
 #   HOST_PAUSE_DISCARD=1 marks a run invalid when dmesg shows a host VM fork or virtio_balloon
 #   "Out of puff" during the run window (count and evidence are always kept in host-pause.txt).
 #   Default is 0: record only. Event-loop stall alone is never a discard reason.
+#   Per-segment validity is always written to segments.json, independently of this
+#   legacy whole-run flag. STATS_GAP_S defaults to 2.5; mux and bulk logs stay separate.
+#   HOST_QUIET_S=60 and HOST_MIN_MEM_MIB=2560 gate the run after the build. If dmesg
+#   is unavailable the gate is unknown. HOST_QUIET_BYPASS=1 records an explicit override.
 #   PAUSE=stop_s/every_s (e.g. 5/12: SIGSTOP server and client together for stop_s every every_s
 #   while a session is up, like a suspended machine; both clocks jump. Log: pause.log.
 #   docs/cases/clock-jump-cwnd.md).
@@ -69,6 +73,23 @@ host_pause_discard=${HOST_PAUSE_DISCARD:-0}
 seed=${SEED:-7}
 ping_count=${PING_COUNT:-200}
 handshake_s=${HANDSHAKE_S:-10}
+host_quiet_s=${HOST_QUIET_S:-60}
+host_min_mem_mib=${HOST_MIN_MEM_MIB:-2560}
+host_quiet_bypass=${HOST_QUIET_BYPASS:-0}
+stats_gap_s=${STATS_GAP_S:-2.5}
+validate_loss() {
+    python3 - "$1" <<'PY'
+import math
+import sys
+try:
+    value = float(sys.argv[1])
+except ValueError:
+    value = float("nan")
+if not math.isfinite(value) or not 0 <= value <= 1:
+    sys.exit("refuse: loss must be a fraction in [0, 1]; use 0.05 for 5%")
+PY
+}
+validate_loss "$loss"
 # CARRIER=kernel: server paths on kernel TCP; CARRIER=tun: user-space TCP on tbt0 (default).
 carrier=${CARRIER:-tun}
 if [[ $carrier == tun ]]; then
@@ -129,11 +150,23 @@ preflight
 commit=$(git -C "$repo" rev-parse --short HEAD)
 [[ -n $(git -C "$repo" status --porcelain) ]] && commit="$commit-dirty"
 work=$(mktemp -d /tmp/tbtun-e2e.XXXXXX)
+python3 - "$work/run-options.json" <<'PY'
+import json
+import os
+from pathlib import Path
+import sys
+names = """PROFILE WINDOW WINDOW_CLAMP MAX_PATHS TBT_BIN SEED CARRIER ALLOW_DIRTY
+SKIP_ECHO SKIP_IPERF SKIP_REF PING_COUNT HANDSHAKE_S JOIN_CONCURRENCY UPLINK_PACE
+TUPLE_MBIT NEW_REPAIR WANEM_EXTRA WANEM_TUPLE_MODE WANEM_LOSS_POINT
+HOST_PAUSE_DISCARD HOST_QUIET_S HOST_MIN_MEM_MIB HOST_QUIET_BYPASS STATS_GAP_S
+PAUSE TBT_SERVER_EXTRA TBT_TRACE PING_TRACE ECHO_PROBE_LOG""".split()
+Path(sys.argv[1]).write_text(json.dumps({name: os.environ.get(name) for name in names}, indent=2) + "\n")
+PY
 stamp() { echo "$*" | tee -a "$work/stamp.txt"; }
 run_started_s=$(date +%s)
 run_started_iso=$(date --iso-8601=seconds)
 # Host dmesg snapshot at the start of the window (best-effort; never fatal).
-{ dmesg -T 2>/dev/null || sudo dmesg -T 2>/dev/null || true; } > "$work/dmesg-start.txt" || true
+{ LC_ALL=C dmesg -T 2>/dev/null || sudo env LC_ALL=C dmesg -T 2>/dev/null || true; } > "$work/dmesg-start.txt" || true
 stamp "stamp: script_commit=$commit owd_ms=$owd rate_mbit=$rate loss=$loss paths=$paths window=$window window_clamp=$window_clamp seed=$seed server_max_paths=$max_paths seconds=$seconds carrier=$carrier profile=${profile:-none}"
 stamp "run_window_start: unix=$run_started_s iso=$run_started_iso tz=$(date +%Z) host_pause_discard=$host_pause_discard (discard only on pre-declared host fork/balloon; never on event-loop stall alone)"
 if (( paths > max_paths )); then
@@ -179,7 +212,7 @@ finalize_stamp() {
     local rc=${1:-0}
     [[ -n ${work:-} && -d $work ]] || return 0
     [[ -f $work/stamp-finalized ]] && return 0
-    { dmesg -T 2>/dev/null || sudo dmesg -T 2>/dev/null || true; } > "$work/dmesg-end.txt" || true
+    { LC_ALL=C dmesg -T 2>/dev/null || sudo env LC_ALL=C dmesg -T 2>/dev/null || true; } > "$work/dmesg-end.txt" || true
     if [[ -f $work/wanem.stats ]]; then
         echo "wanem: $(tr '\n' ' ' < "$work/wanem.stats")"
     fi
@@ -192,6 +225,10 @@ finalize_stamp() {
         if (( status == 0 )); then status=3; fi
     fi
     stamp "stamp: script_commit=$commit owd_ms=$owd rate_mbit=$rate loss=$loss paths=$paths window=$window window_clamp=$window_clamp seed=$seed server_max_paths=$max_paths seconds=$seconds carrier=$carrier profile=${profile:-none} ping_count=$ping_count handshake_s=$handshake_s pause=${PAUSE:-none} join_concurrency=${JOIN_CONCURRENCY:-default} uplink_pace=$uplink_pace client_tuple_mbit=$tuple_mbit new_repair=$new_repair wanem_tuple_mode=${wanem_eff_mode:-?} wanem_loss_point=${wanem_eff_loss:-?} host_pause_discard=$host_pause_discard status=$status"
+    if ! python3 "$here/measure_segments.py" "$work" --stats-gap-s "$stats_gap_s" | tee -a "$work/stamp.txt"; then
+        stamp "segments: analysis_failed=yes (no validity verdict)"
+        if (( status == 0 )); then status=2; fi
+    fi
     echo "logs: $work"
     date +%s > "$work/stamp-finalized"
     if (( status != rc )); then exit "$status"; fi
@@ -232,6 +269,17 @@ stamp_bin server_bin "$work/aot/tbtun"
 # JIT: the assembly is tbtun.dll; the launcher (tbtun) is a host script / apphost.
 stamp_bin client_bin "$work/jit/tbtun.dll"
 stamp_bin client_apphost "$work/jit/tbtun"
+# The launcher assembly alone does not identify the JIT carrier/session code.
+# Include all runtime assemblies and configuration in a stable manifest.
+python3 - "$work/jit" "$work/client-bundle.sha256" <<'PY'
+import hashlib
+from pathlib import Path
+import sys
+root, output = map(Path, sys.argv[1:])
+paths = sorted([*root.glob("*.dll"), *root.glob("*.json")], key=lambda path: path.name)
+output.write_text("".join(f"{hashlib.sha256(path.read_bytes()).hexdigest()}  {path.name}\n" for path in paths))
+PY
+stamp "client_bundle: sha256=$(sha256sum "$work/client-bundle.sha256" | awk '{print $1}') manifest=client-bundle.sha256"
 cp "$here/echo.py" "$work/echo.py"
 python3 -c 'import os; print(os.urandom(32).hex())' > "$work/psk"
 printf 'owd_ms=%s\nrate_mbit=%s\nloss=%s\nseed=%s\n' "$owd" "$rate" "$loss" "$seed" > "$work/wanem.conf"
@@ -246,7 +294,14 @@ wanem_eff_tuple=$(awk -F= '$1=="tuple_mbit"{v=$2} END{print v}' "$work/wanem.con
 wanem_eff_bucket=$(awk -F= '$1=="tuple_bucket_bytes"{v=$2} END{print v}' "$work/wanem.conf")
 wanem_eff_to_far=$(awk -F= '$1=="rate_to_far_mbit"{v=$2} END{print v}' "$work/wanem.conf")
 wanem_eff_to_near=$(awk -F= '$1=="rate_to_near_mbit"{v=$2} END{print v}' "$work/wanem.conf")
+wanem_eff_loss_rate=$(awk -F= '$1=="loss"{v=$2} END{print v}' "$work/wanem.conf")
+wanem_eff_seed=$(awk -F= '$1=="seed"{v=$2} END{print v}' "$work/wanem.conf")
+validate_loss "$wanem_eff_loss_rate"
 stamp "flags: uplink_pace=$uplink_pace client_tuple_mbit=$tuple_mbit new_repair=$new_repair join_concurrency=${JOIN_CONCURRENCY:-default} window=$window window_clamp=$window_clamp max_paths=$max_paths carrier=$carrier profile=${profile:-none} wanem_tuple_mbit=${wanem_eff_tuple:-0} wanem_tuple_bucket=${wanem_eff_bucket:-default} wanem_rate_to_far=${wanem_eff_to_far:-} wanem_rate_to_near=${wanem_eff_to_near:-} wanem_tuple_mode=$wanem_eff_mode wanem_loss_point=$wanem_eff_loss wanem_seed=$seed wanem_version=2 host_pause_discard=$host_pause_discard skip_echo=${SKIP_ECHO:-0} skip_iperf=${SKIP_IPERF:-0} skip_ref=${SKIP_REF:-0} ping_count=$ping_count handshake_s=$handshake_s pause=${PAUSE:-none}"
+stamp "flags: wanem_seed=$wanem_eff_seed wanem_loss=$wanem_eff_loss_rate host_quiet_s=$host_quiet_s host_min_mem_mib=$host_min_mem_mib host_quiet_bypass=$host_quiet_bypass stats_gap_s=$stats_gap_s"
+printf 'server_extra=%q\n' "${TBT_SERVER_EXTRA:-}" | tee -a "$work/stamp.txt"
+{ LC_ALL=C dmesg -T 2>/dev/null || sudo env LC_ALL=C dmesg -T 2>/dev/null || true; } > "$work/dmesg-preflight.txt" || true
+python3 "$here/host_noise.py" "$work" "$host_quiet_s" "$host_min_mem_mib" "$host_quiet_bypass" | tee -a "$work/stamp.txt"
 sudo TBTUN_NETNS_LOCK_HELD=1 "$here/netns.sh" up "$work"
 if [[ -n ${wanem_eff_to_far:-} || -n ${wanem_eff_to_near:-} ]]; then
     echo "link: owd ${owd} ms each way, ${rate} Mbit/s fallback, to_far ${wanem_eff_to_far:-$rate} / to_near ${wanem_eff_to_near:-$rate} Mbit/s, segment loss ${loss}; paths ${paths}; window ${window}; window_clamp ${window_clamp}; seed ${seed}; server_max_paths ${max_paths}; server carrier ${carrier}; client_tuple_mbit ${tuple_mbit}; uplink_pace ${uplink_pace}; wanem_tuple_mode ${wanem_eff_mode}; wanem_loss_point ${wanem_eff_loss}"
@@ -388,31 +443,57 @@ fi
 
 if [[ ${SKIP_ECHO:-0} != 1 ]]; then
 tunnel mux 10.200.2.2:7000
-run_case() { local rc=0; "$@" || rc=$?; if (( rc )); then echo "FAILED (exit $rc$( (( rc == 124 )) && echo ", timed out")): ${*:6}"; status=1; fi; }
-run_case in_ns near timeout 120 python3 -u "$work/echo.py" check 127.0.0.1 1080 8 1000000
-run_case in_ns near timeout 120 python3 -u "$work/echo.py" check 127.0.0.1 1080 64 20000
-run_case in_ns near timeout $(( 90 + (2 * owd + 20) * ping_count / 1000 )) python3 -u "$work/echo.py" ping 127.0.0.1 1080 "$ping_count"
-run_case in_ns near timeout $(( seconds + 90 )) python3 -u "$work/echo.py" bulk 127.0.0.1 1080 up "$seconds"
-run_case in_ns near timeout $(( seconds + 90 )) python3 -u "$work/echo.py" bulk 127.0.0.1 1080 down "$seconds"
+run_case() {
+    local name=$1 direction=$2 rc=0
+    local codes=()
+    shift 2
+    python3 "$here/record_segment.py" begin "$work" "$name" mux "$direction" "$@"
+    if "$@" 2>&1 | tee "$work/segments/$name.out"; then
+        codes=("${PIPESTATUS[@]}")
+    else
+        codes=("${PIPESTATUS[@]}")
+    fi
+    rc=${codes[0]}
+    if (( codes[1] != 0 && rc == 0 )); then rc=${codes[1]}; fi
+    python3 "$here/record_segment.py" end "$work" "$name" "$rc"
+    if (( rc )); then echo "FAILED (exit $rc): $name"; status=1; fi
+}
+run_case echo1 both in_ns near timeout 120 python3 -u "$work/echo.py" check 127.0.0.1 1080 8 1000000
+run_case echo_small both in_ns near timeout 120 python3 -u "$work/echo.py" check 127.0.0.1 1080 64 20000
+run_case ping both in_ns near timeout $(( 90 + (2 * owd + 20) * ping_count / 1000 )) python3 -u "$work/echo.py" ping 127.0.0.1 1080 "$ping_count"
+run_case bulk_up up in_ns near timeout $(( seconds + 90 )) python3 -u "$work/echo.py" bulk 127.0.0.1 1080 up "$seconds"
+run_case bulk_down1 down in_ns near timeout $(( seconds + 90 )) python3 -u "$work/echo.py" bulk 127.0.0.1 1080 down "$seconds"
 # pingbulk keeps bulk running until every probe finishes; allow RTT + 20 ms spacing * count, plus margin.
-run_case in_ns near timeout $(( 90 + (2 * owd + 20) * ping_count / 1000 )) python3 -u "$work/echo.py" pingbulk 127.0.0.1 1080 "$ping_count" "$seconds"
-run_case in_ns near timeout 120 python3 -u "$work/echo.py" check 127.0.0.1 1080 8 1000000
+run_case pingbulk down in_ns near timeout $(( 90 + (2 * owd + 20) * ping_count / 1000 )) python3 -u "$work/echo.py" pingbulk 127.0.0.1 1080 "$ping_count" "$seconds"
+run_case echo2 both in_ns near timeout 120 python3 -u "$work/echo.py" check 127.0.0.1 1080 8 1000000
 report mux; stop mux
 fi
 
 if [[ ${SKIP_IPERF:-0} != 1 ]]; then
 # Session 2: iperf3 cases back to back on one session (control flow idles while data runs).
 tunnel bulk 10.200.2.2:5201
+iperf_index=0
 for args in "" "-R" "-P $paths" "-R -P $paths" ""; do
     # shellcheck disable=SC2086
     sleep 2  # iperf3 -s takes one test at a time: let the last one finish on the far side
-    if json=$(timeout $((seconds + 30)) sudo ip netns exec tbe_near iperf3 -c 127.0.0.1 -p 1080 -t "$seconds" $args -J) \
+    iperf_index=$((iperf_index + 1))
+    direction=up
+    [[ $args == *-R* ]] && direction=down
+    name=iperf_$iperf_index
+    # shellcheck disable=SC2086
+    python3 "$here/record_segment.py" begin "$work" "$name" bulk "$direction" iperf3 -c 127.0.0.1 -p 1080 -t "$seconds" $args -J
+    rc=0
+    # shellcheck disable=SC2086
+    if json=$(timeout $((seconds + 30)) sudo ip netns exec tbe_near iperf3 -c 127.0.0.1 -p 1080 -t "$seconds" $args -J 2>"$work/segments/$name.stderr") \
         && out=$(goodput <<<"$json"); then
         echo "iperf3 ${args:-up}: $out Mbit/s"
     else
+        rc=$?
         echo "FAILED: iperf3 ${args:-up}: $(python3 -c 'import json,sys; print(json.load(sys.stdin).get("error","no result"))' <<<"$json" 2>/dev/null)"
         status=1
     fi
+    printf '%s\n' "$json" > "$work/segments/$name.out"
+    python3 "$here/record_segment.py" end "$work" "$name" "$rc"
 done
 report bulk; stop bulk
 fi

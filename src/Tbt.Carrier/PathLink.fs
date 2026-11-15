@@ -36,6 +36,8 @@ type PathLink(socket: Socket, probe: INotSentProbe) =
     member val BytesWritten = 0L with get, set
     /// Peer cumulative ACK of this socket's payload (tcpi_bytes_acked), or -1.
     member _.BytesAcked = SocketTuning.tryBytesAcked socket
+    /// Local TCP sender state. This read is for diagnostics only.
+    member _.TcpInfo = KernelTcpInfo.tryRead socket
 
     /// Read what the kernel holds into the buffer.
     member _.Receive() =

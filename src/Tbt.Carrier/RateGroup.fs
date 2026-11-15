@@ -35,6 +35,9 @@ type RateGroup(clock: IClock) =
     let mutable sampleCopies = 0L
     /// Unique delivery rate of the last sample (goodput, bytes per ns), for the log.
     let mutable goodput = 0.0
+    let mutable copyRate = 0.0
+    let mutable sampleRate = 0.0
+    let mutable measuredSendRate = 0.0
     let mutable limited = false
     let mutable startup = true
     let mutable draining = false
@@ -110,6 +113,11 @@ type RateGroup(clock: IClock) =
             | 0 -> 1.25
             | 1 -> 0.75
             | _ -> cruiseGain
+
+    let phase () =
+        if startup then "startup"
+        elif draining then "drain"
+        else "probe" + string cycle
 
     let restartSample (now: int64) =
         sampleNs <- now
@@ -210,6 +218,16 @@ type RateGroup(clock: IClock) =
     member _.WireSentBytes = sentBytes
     /// Unique delivery rate of the last sample (bytes per ns).
     member _.Goodput = goodput
+    /// Rates are bytes per ns. CopyRate is an estimate, not unique delivery.
+    member _.CopyRate = copyRate
+    member _.LastSampleRate = sampleRate
+    member _.LastSendRate = measuredSendRate
+    member _.PacingRate = gain () * bw
+    member _.Phase = phase ()
+    member _.FullPipeRounds = fullCount
+    member _.AppLimitedRounds = appLimited
+    member _.Inflight = inflight ()
+    member _.MinRttNs = minRtt ()
     member _.InStartup = startup
     member _.Cycle = cycle
     static member CwndGain = cwndGain
@@ -232,6 +250,13 @@ type RateGroup(clock: IClock) =
                 // Nothing delivered on any path for a whole round: an outage, not a rate. A zero
                 // sample would empty the max filter in 10 rounds, and the paced repairs that
                 // end the outage would then wait on a pacer with no rate.
+                // A fully idle round breaks the full-pipe evidence from the last burst.
+                // Keep that evidence during an outage or a send with no delivery yet.
+                if inflight () = 0 && sentBytes = sampleSent then fullCount <- 0
+                goodput <- 0.0
+                copyRate <- 0.0
+                sampleRate <- 0.0
+                measuredSendRate <- float (sentBytes - sampleSent) / float (now - sampleNs)
                 sampleNs <- now
                 sampleSent <- sentBytes
                 sampleCopies <- copyEstimate ()
@@ -248,10 +273,13 @@ type RateGroup(clock: IClock) =
                 // The bottleneck carried the unique bytes plus, by estimate, the extra copies:
                 // the wire rate the pacer spends (it charges every copy) is their sum.
                 goodput <- float (max 0L (d - sampleDelivered)) / float (now - sampleNs)
+                copyRate <- float (max 0L (cp - sampleCopies)) / float (now - sampleNs)
                 let ackRate = float (max 0L (d - sampleDelivered) + max 0L (cp - sampleCopies)) / float (now - sampleNs)
                 let sendRate = float (sentBytes - sampleSent) / float (now - sampleNs)
+                measuredSendRate <- sendRate
                 // What was delivered in this interval was sent in about the last one.
                 let rate = min ackRate (max sendRate lastSendRate)
+                sampleRate <- rate
                 lastSendRate <- sendRate
                 let recovering = protectRecovery && repairBytes > sampleRepair
                 sampleSent <- sentBytes
@@ -315,7 +343,12 @@ type RateGroup(clock: IClock) =
         "group paths=" + string memberCount + " bw_mbit=" + (bw * 8000.0).ToString("F1")
         + " goodput_mbit=" + (goodput * 8000.0).ToString("F1") + " copy_est_kib=" + string (copyEstimate () / 1024L)
         + " inflight=" + string (inflight ()) + " repair_kib=" + string (repairBytes / 1024L) + " phase="
-        + (if startup then "startup" elif draining then "drain" else "probe" + string cycle)
+        + phase ()
+        + " full_rounds=" + string fullCount + " app_rounds=" + string appLimited
+        + " pacing_mbit=" + (gain () * bw * 8000.0).ToString("F1")
+        + " send_mbit=" + (measuredSendRate * 8000.0).ToString("F1")
+        + " sample_mbit=" + (sampleRate * 8000.0).ToString("F1")
+        + " copy_mbit=" + (copyRate * 8000.0).ToString("F1")
 
 /// Optional per-5-tuple pacer for the client uplink (e.g. PROFILE=rtt400 at 4 Mbit).
 /// Off when rateMbit <= 0 so the 20 ms / 200 Mbit matrix is not capped per path.
