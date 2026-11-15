@@ -62,3 +62,17 @@ module Ctrl =
         else
             h <- { ControlSeq = seq; Op = op; BodyLength = n }
             true
+
+    let writeCapacityBody (budget: uint64) (body: Span<byte>) =
+        BinaryPrimitives.WriteUInt64LittleEndian(body, budget)
+
+    let readCapacityBody (body: ReadOnlySpan<byte>) =
+        BinaryPrimitives.ReadUInt64LittleEndian body
+
+    let writeMssNoticeBody (path: uint16) (mss: uint16) (body: Span<byte>) =
+        BinaryPrimitives.WriteUInt16LittleEndian(body, path)
+        BinaryPrimitives.WriteUInt16LittleEndian(body.Slice 2, mss)
+
+    let readMssNoticeBody (body: ReadOnlySpan<byte>) =
+        struct (BinaryPrimitives.ReadUInt16LittleEndian body,
+                BinaryPrimitives.ReadUInt16LittleEndian(body.Slice 2))

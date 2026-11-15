@@ -171,3 +171,36 @@ let ``FLOW_STATE format 2 counts 256 flows and rejects half-valid pages`` () =
     // An increment must not carry snapshot fields.
     FlowState.writeHead { head 0 5 false false with SnapshotId = 0u } (Span b)
     Assert.False(FlowState.tryReadHead (ReadOnlySpan b) &h)
+
+[<Fact>]
+let ``CAPACITY_CHANGE body is little-endian u64 and MSS_NOTICE is path_id then mss`` () =
+    let b = Array.zeroCreate<byte> 1344
+    let body = Ctrl.write 7u CtrlOp.CapacityChange (Span b)
+    Assert.Equal(8, body.Length)
+    Ctrl.writeCapacityBody 0x0102030405060708UL body
+    let mutable h = Unchecked.defaultof<CtrlHead>
+    Assert.True(Ctrl.tryReadHead (ReadOnlySpan b) &h)
+    Assert.Equal(7u, h.ControlSeq)
+    Assert.Equal(CtrlOp.CapacityChange, h.Op)
+    Assert.Equal(8, h.BodyLength)
+    Assert.Equal(0x0102030405060708UL, Ctrl.readCapacityBody (ReadOnlySpan(b, Ctrl.HeadLength, 8)))
+    Assert.Equal(0x08uy, b.[Ctrl.HeadLength])
+    Assert.Equal(0x01uy, b.[Ctrl.HeadLength + 7])
+    // A non-exact body length is refused.
+    b.[6] <- 7uy
+    Assert.False(Ctrl.tryReadHead (ReadOnlySpan b) &h)
+
+    let b2 = Array.zeroCreate<byte> 1344
+    let body2 = Ctrl.write 3u CtrlOp.MssNotice (Span b2)
+    Assert.Equal(4, body2.Length)
+    Ctrl.writeMssNoticeBody 287us 1448us body2
+    Assert.True(Ctrl.tryReadHead (ReadOnlySpan b2) &h)
+    Assert.Equal(CtrlOp.MssNotice, h.Op)
+    Assert.Equal(4, h.BodyLength)
+    let struct (path, mss) = Ctrl.readMssNoticeBody (ReadOnlySpan(b2, Ctrl.HeadLength, 4))
+    Assert.Equal(287us, path)
+    Assert.Equal(1448us, mss)
+    Assert.Equal(0x1Fuy, b2.[Ctrl.HeadLength])
+    Assert.Equal(0x01uy, b2.[Ctrl.HeadLength + 1])
+    b2.[6] <- 5uy
+    Assert.False(Ctrl.tryReadHead (ReadOnlySpan b2) &h)

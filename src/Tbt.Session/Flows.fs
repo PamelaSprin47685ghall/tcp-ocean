@@ -216,7 +216,8 @@ type FlowTable(port: IFlowPort, store: ISourceStore, stepUndelivered: Action<uin
     // rest is charged per flow as RxLimit - consumed - C0, and released only by consumption
     // or close (a promise is never taken back).
     let c0 = int64 credit.Initial
-    let sharedPool = max 0L (int64 credit.PoolBytes - int64 slotCount * c0)
+    let mutable budgetCap = int64 credit.PoolBytes
+    let mutable sharedPool = max 0L (budgetCap - int64 slotCount * c0)
     let mutable poolUsed = 0L
     let consumed (f: Flow) = f.RxDelivered - uint64 f.Reserve.Count
     /// Bytes f may still make this end hold: after the peer's FIN or RST nothing more comes,
@@ -323,8 +324,18 @@ type FlowTable(port: IFlowPort, store: ISourceStore, stepUndelivered: Action<uin
     /// Flows whose rx limit changed and waits for a FLOW_STATE report.
     member _.ReportsDue = reportsDue
     member _.RxActive = rxActive
-    /// Shared-pool bytes charged now (at most PoolBytes - 256 x C0).
+    /// Shared-pool bytes charged now (at most the current budget cap minus 256 x C0).
     member _.PoolUsed = poolUsed
+    /// Session rx budget cap in bytes (CTRL CAPACITY_CHANGE). Starts at PoolBytes.
+    member _.BudgetCap = budgetCap
+    /// Tighten or raise the rx budget cap. Already issued RxLimit values are kept.
+    /// False when the cap cannot cover CommittedBytes (spec 6.10a rule 7).
+    member this.TrySetBudgetCap(bytes: int64) =
+        if bytes < this.CommittedBytes then false
+        else
+            budgetCap <- bytes
+            sharedPool <- max 0L (budgetCap - int64 slotCount * c0)
+            true
     /// Every byte this end may still have to hold: per active slot its commitment (at least
     /// C0), C0 per free slot. Never above PoolBytes when credit is on.
     member _.CommittedBytes =

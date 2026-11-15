@@ -95,6 +95,7 @@ let ``ctrl: a body that does not match the operation is refused`` () =
 // ---- wired into the session ---------------------------------------------------------
 
 open Tbt.Contracts
+open Tbt.Crypto.Bootstrap
 open Tbt.Tests.SessionTests
 
 /// A CTRL cell from c, sealed as c would send it.
@@ -423,3 +424,177 @@ let ``path close: AddPath after PATH_CLOSED calls NotePathJoined and the id can 
     pair.Client.Tick()
     Assert.True(pair.Client.TryProduce(1us, Span frame) || not pair.Client.WantsToSend)
     Assert.True(carrier.HasPath 1us)
+
+let private capacityBody (budget: uint64) =
+    let b = Array.zeroCreate<byte> 8
+    Ctrl.writeCapacityBody budget (Span b)
+    b
+
+let private mssBody (path: uint16) (mss: uint16) =
+    let b = Array.zeroCreate<byte> 4
+    Ctrl.writeMssNoticeBody path mss (Span b)
+    b
+
+[<Fact>]
+let ``capacity: CAPACITY_CHANGE is executed, caps future credit, and never retracts issued limits`` () =
+    let pair = Pair(SessionConfig.defaults, 1, 0.0, 70)
+    for _ in 1 .. 20 do pair.Round() |> ignore
+    let reserved = 256L * int64 CreditPolicy.C0
+    Assert.Equal(uint64 pair.Client.Flows.Credit.PoolBytes, pair.Client.RxBudget)
+    Assert.Equal(UInt64.MaxValue, pair.Server.PeerRxBudget)
+    Assert.Equal(reserved, pair.Server.Flows.CommittedBytes)
+    // Open a flow and deliver enough that the server's rx limit grows above C0.
+    let data = Array.init 80_000 (fun i -> byte (i * 7 + 1))
+    let mutable slot = -1
+    Assert.True(pair.Client.TryOpenFlow(&slot))
+    let mutable sent = 0
+    let mutable n = 0
+    while n < 400 && pair.Server.Flows.[slot].RxLimit <= uint64 CreditPolicy.C0 do
+        sent <- sent + pair.Feed(pair.Client, slot, ReadOnlySpan(data, sent, data.Length - sent), false)
+        pair.Round() |> ignore
+        n <- n + 1
+    let limit0 = pair.Server.Flows.[slot].RxLimit
+    Assert.True(limit0 > uint64 CreditPolicy.C0, "rx limit did not grow: " + string limit0)
+    let committed = pair.Server.Flows.CommittedBytes
+    Assert.True(pair.Server.BeginCapacityChange(uint64 committed))
+    Assert.Equal(uint64 committed, pair.Server.RxBudget)
+    Assert.Equal(committed, pair.Server.Flows.BudgetCap)
+    Assert.Equal(limit0, pair.Server.Flows.[slot].RxLimit)
+    // A cap below already issued commitments is an explicit failure; state is unchanged.
+    Assert.False(pair.Server.BeginCapacityChange(uint64 (committed - 1L)))
+    Assert.False(pair.Server.BeginCapacityChange 0UL)
+    Assert.Equal(uint64 committed, pair.Server.RxBudget)
+    Assert.Equal(limit0, pair.Server.Flows.[slot].RxLimit)
+    let mutable r = 0
+    while r < 200 do
+        if sent < data.Length then
+            sent <- sent + pair.Feed(pair.Client, slot, ReadOnlySpan(data, sent, data.Length - sent), false)
+        pair.Round() |> ignore
+        r <- r + 1
+    Assert.Equal(limit0, pair.Server.Flows.[slot].RxLimit)
+    Assert.True(pair.Server.Flows.CommittedBytes <= committed)
+    // The client recorded the peer's announcement; session S is unchanged.
+    Assert.Equal(uint64 committed, pair.Client.PeerRxBudget)
+    Assert.Equal(1L, pair.Client.CtrlExecuted)
+    Assert.Equal(0L, pair.Client.CtrlRejected)
+    Assert.Equal(pair.ClientParams.Symbol, pair.Client.SymbolSize)
+    Assert.False(pair.Client.Faulted || pair.Server.Faulted)
+
+[<Fact>]
+let ``capacity: a repeated CAPACITY_CHANGE is executed once; a stale budget does not roll back`` () =
+    let pair = Pair(SessionConfig.defaults, 1, 0.0, 71)
+    let s = pair.Server
+    s.OnFrame(0us, Span(ctrlCell pair.Client 2u CtrlOp.CapacityChange (capacityBody 40_000_000UL))) |> ignore
+    s.OnFrame(0us, Span(ctrlCell pair.Client 2u CtrlOp.CapacityChange (capacityBody 40_000_000UL))) |> ignore
+    Assert.Equal(1L, s.CtrlExecuted)
+    Assert.Equal(0L, s.CtrlRejected)
+    Assert.Equal(40_000_000UL, s.PeerRxBudget)
+    // An older seq is ACKed (executed) but must not overwrite the newer budget.
+    s.OnFrame(0us, Span(ctrlCell pair.Client 1u CtrlOp.CapacityChange (capacityBody 20_000_000UL))) |> ignore
+    Assert.Equal(2L, s.CtrlExecuted)
+    Assert.Equal(40_000_000UL, s.PeerRxBudget)
+    // Zero is refused and does not move the recorded budget; seq 3 stays fresh.
+    s.OnFrame(0us, Span(ctrlCell pair.Client 3u CtrlOp.CapacityChange (capacityBody 0UL))) |> ignore
+    Assert.Equal(1L, s.CtrlRejected)
+    Assert.Equal(2L, s.CtrlExecuted)
+    Assert.Equal(40_000_000UL, s.PeerRxBudget)
+    s.OnFrame(0us, Span(ctrlCell pair.Client 3u CtrlOp.CapacityChange (capacityBody 50_000_000UL))) |> ignore
+    Assert.Equal(3L, s.CtrlExecuted)
+    Assert.Equal(50_000_000UL, s.PeerRxBudget)
+
+[<Fact>]
+let ``mss: MSS_NOTICE updates path MSS, keeps session S, and accepts a straddle shrink`` () =
+    let pair = Pair(SessionConfig.defaults, 2, 0.0, 72)
+    for _ in 1 .. 20 do pair.Round() |> ignore
+    let s0 = pair.Client.SymbolSize
+    let l0 = pair.Client.FrameLength
+    Assert.Equal(0us, pair.Client.PathMss 1us)
+    Assert.Equal(0us, pair.Client.LocalPathMss 1us)
+    Assert.True(pair.Client.PathFitsOneSegment 1us)
+    Assert.True(pair.Client.BeginMssNotice(1us, 1448us))
+    Assert.Equal(1448us, pair.Client.LocalPathMss 1us)
+    Assert.Equal(0us, pair.Client.PathMss 1us)
+    let mutable n = 0
+    while pair.Server.PathMss 1us = 0us && n < 2000 do
+        pair.Round() |> ignore
+        n <- n + 1
+    Assert.Equal(1448us, pair.Server.PathMss 1us)
+    Assert.Equal(0us, pair.Server.LocalPathMss 1us)
+    Assert.True(pair.Server.PathFitsOneSegment 1us)
+    Assert.Equal(s0, pair.Client.SymbolSize)
+    Assert.Equal(l0, pair.Client.FrameLength)
+    Assert.Equal(s0, pair.Server.SymbolSize)
+    Assert.True((pair.ClientParams.Caps &&& Caps.StraddleOk) <> 0us)
+    // With STRADDLE_OK, a shrink that no longer fits one segment is accepted; S is still fixed.
+    Assert.True(pair.Client.BeginMssNotice(1us, 1200us))
+    n <- 0
+    while pair.Server.PathMss 1us <> 1200us && n < 2000 do
+        pair.Round() |> ignore
+        n <- n + 1
+    Assert.Equal(1200us, pair.Server.PathMss 1us)
+    Assert.False(pair.Server.PathFitsOneSegment 1us)
+    Assert.Equal(s0, pair.Server.SymbolSize)
+    Assert.Equal(l0, pair.Server.FrameLength)
+    Assert.False(pair.Client.Faulted || pair.Server.Faulted)
+
+[<Fact>]
+let ``mss: zero, unknown path, closed path and a shrink without STRADDLE_OK are refused`` () =
+    let pair = Pair(SessionConfig.defaults, 2, 0.0, 73)
+    for _ in 1 .. 20 do pair.Round() |> ignore
+    Assert.False(pair.Client.BeginMssNotice(1us, 0us))
+    Assert.False(pair.Client.BeginMssNotice(300us, 1448us))
+    Assert.Equal(0us, pair.Client.LocalPathMss 1us)
+    let s = pair.Server
+    s.OnFrame(0us, Span(ctrlCell pair.Client 1u CtrlOp.MssNotice (mssBody 1us 0us))) |> ignore
+    s.OnFrame(0us, Span(ctrlCell pair.Client 2u CtrlOp.MssNotice (mssBody 300us 1448us))) |> ignore
+    Assert.Equal(2L, s.CtrlRejected)
+    Assert.Equal(0L, s.CtrlExecuted)
+    Assert.Equal(0us, s.PathMss 1us)
+    // Without STRADDLE_OK a shrink that cannot carry L is not executed (JOIN rule mid-session).
+    let noStraddle = { pair.ServerParams with Caps = pair.ServerParams.Caps &&& ~~~Caps.StraddleOk }
+    let lonely = Session(Role.Server, noStraddle, RecordingPort(), pair.Clock, SessionConfig.defaults)
+    lonely.OnFrame(0us, Span(ctrlCell pair.Client 1u CtrlOp.MssNotice (mssBody 1us 1200us))) |> ignore
+    Assert.Equal(1L, lonely.CtrlRejected)
+    Assert.Equal(0L, lonely.CtrlExecuted)
+    Assert.Equal(0us, lonely.PathMss 1us)
+    // A legal notice still works on this session (control_seq 1 is still fresh).
+    lonely.OnFrame(0us, Span(ctrlCell pair.Client 1u CtrlOp.MssNotice (mssBody 1us 1448us))) |> ignore
+    Assert.Equal(1L, lonely.CtrlExecuted)
+    Assert.Equal(1448us, lonely.PathMss 1us)
+    Assert.True(lonely.PathFitsOneSegment 1us)
+    // After PATH_CLOSE completes, a notice for that id is refused until a new join.
+    Assert.True(pair.Client.BeginPathClose(1us, 1uy))
+    let mutable n = 0
+    while pair.Client.PathState 1us <> PathCloseState.Closed && n < 2000 do
+        pair.Round() |> ignore
+        n <- n + 1
+    Assert.Equal(PathCloseState.Closed, pair.Client.PathState 1us)
+    Assert.False(pair.Client.BeginMssNotice(1us, 1448us))
+    let executed = pair.Server.CtrlExecuted
+    let rejected = pair.Server.CtrlRejected
+    pair.Server.OnFrame(0us, Span(ctrlCell pair.Client 40u CtrlOp.MssNotice (mssBody 1us 1448us))) |> ignore
+    Assert.Equal(executed, pair.Server.CtrlExecuted)
+    Assert.True(pair.Server.CtrlRejected > rejected)
+    Assert.True(pair.Client.NotePathJoined 1us)
+    Assert.Equal(0us, pair.Client.LocalPathMss 1us)
+    Assert.Equal(0us, pair.Client.PathMss 1us)
+    Assert.True(pair.Client.BeginMssNotice(1us, 1448us))
+    Assert.Equal(1448us, pair.Client.LocalPathMss 1us)
+
+[<Fact>]
+let ``mss: a repeated MSS_NOTICE is executed once; a stale mss does not roll back`` () =
+    let pair = Pair(SessionConfig.defaults, 2, 0.0, 74)
+    let s = pair.Server
+    s.OnFrame(0us, Span(ctrlCell pair.Client 2u CtrlOp.MssNotice (mssBody 1us 1448us))) |> ignore
+    s.OnFrame(0us, Span(ctrlCell pair.Client 2u CtrlOp.MssNotice (mssBody 1us 1448us))) |> ignore
+    Assert.Equal(1L, s.CtrlExecuted)
+    Assert.Equal(0L, s.CtrlRejected)
+    Assert.Equal(1448us, s.PathMss 1us)
+    s.OnFrame(0us, Span(ctrlCell pair.Client 1u CtrlOp.MssNotice (mssBody 1us 1400us))) |> ignore
+    Assert.Equal(2L, s.CtrlExecuted)
+    Assert.Equal(1448us, s.PathMss 1us)
+    // Path 0 is independent of path 1.
+    s.OnFrame(0us, Span(ctrlCell pair.Client 3u CtrlOp.MssNotice (mssBody 0us 1448us))) |> ignore
+    Assert.Equal(3L, s.CtrlExecuted)
+    Assert.Equal(1448us, s.PathMss 0us)
+    Assert.Equal(1448us, s.PathMss 1us)

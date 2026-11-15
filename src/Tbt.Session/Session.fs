@@ -162,6 +162,14 @@ type Session(role: Role, p: SessionParams, port: IFlowPort, clock: IClock, confi
     let pathReplySeq: uint32[] = Array.zeroCreate config.MaxPaths
     let pathGotClosed: bool[] = Array.zeroCreate config.MaxPaths
     let mutable pathClosePending = 0
+    // CAPACITY_CHANGE (spec 6.10a op 6): this end's rx budget, and the peer's last announcement.
+    let mutable rxBudget = int64 credit.PoolBytes
+    let mutable peerRxBudget = UInt64.MaxValue
+    let mutable capacitySeq = 0u
+    // MSS_NOTICE (spec 6.10a op 9): last announced effective MSS per path_id.
+    let pathMss: uint16[] = Array.zeroCreate config.MaxPaths
+    let localPathMss: uint16[] = Array.zeroCreate config.MaxPaths
+    let pathMssSeq: uint32[] = Array.zeroCreate config.MaxPaths
     let mutable winAcksSent = 0L
     let mutable nackSpan = 0
     let mutable nackDeficit = 0
@@ -231,6 +239,23 @@ type Session(role: Role, p: SessionParams, port: IFlowPort, clock: IClock, confi
 
     let writePathClosed (path: uint16) =
         BinaryPrimitives.WriteUInt16LittleEndian(Span(ctrlBody, 0, 2), path)
+
+    let writeCapacity (budget: uint64) =
+        Ctrl.writeCapacityBody budget (Span(ctrlBody, 0, 8))
+
+    let writeMssNotice (path: uint16) (mss: uint16) =
+        Ctrl.writeMssNoticeBody path mss (Span(ctrlBody, 0, 4))
+
+    let pathFits (mss: uint16) = FrameMath.fitsOneSegment s (int mss)
+
+    /// A notice is acceptable when the path_id is live, mss is nonzero, and either
+    /// the session frame still fits one segment or STRADDLE_OK was negotiated.
+    let mssAcceptable (path: uint16) (mss: uint16) =
+        let i = int path
+        uint32 i < uint32 config.MaxPaths
+        && pathState.[i] = PathCloseState.Idle
+        && mss > 0us
+        && (pathFits mss || (p.Caps &&& Caps.StraddleOk) <> 0us)
 
     let markPath (i: int) (st: PathCloseState) =
         let was = pathState.[i]
@@ -345,6 +370,27 @@ type Session(role: Role, p: SessionParams, port: IFlowPort, clock: IClock, confi
                         ctrlRejected <- ctrlRejected + 1L
                     else
                         pathGotClosed.[i] <- true
+                        ctrl.Executed h.ControlSeq
+                        ctrlExecuted <- ctrlExecuted + 1L
+                | CtrlOp.CapacityChange ->
+                    // The peer announces its rx budget. We record it; we do not
+                    // retract our own issued grants. A stale seq is ACKed but does not roll back.
+                    let budget = Ctrl.readCapacityBody body
+                    if budget = 0UL then ctrlRejected <- ctrlRejected + 1L
+                    else
+                        if h.ControlSeq > capacitySeq then
+                            peerRxBudget <- budget
+                            capacitySeq <- h.ControlSeq
+                        ctrl.Executed h.ControlSeq
+                        ctrlExecuted <- ctrlExecuted + 1L
+                | CtrlOp.MssNotice ->
+                    let struct (path, mss) = Ctrl.readMssNoticeBody body
+                    let i = int path
+                    if not (mssAcceptable path mss) then ctrlRejected <- ctrlRejected + 1L
+                    else
+                        if h.ControlSeq > pathMssSeq.[i] then
+                            pathMss.[i] <- mss
+                            pathMssSeq.[i] <- h.ControlSeq
                         ctrl.Executed h.ControlSeq
                         ctrlExecuted <- ctrlExecuted + 1L
                 | _ ->
@@ -477,8 +523,58 @@ type Session(role: Role, p: SessionParams, port: IFlowPort, clock: IClock, confi
             pathCloseSeq.[i] <- 0u
             pathReplySeq.[i] <- 0u
             pathGotClosed.[i] <- false
+            pathMss.[i] <- 0us
+            localPathMss.[i] <- 0us
+            pathMssSeq.[i] <- 0u
             markPath i PathCloseState.Idle
             true
+    /// Start CAPACITY_CHANGE: this end's new rx budget cap in bytes (spec 6.10a op 6).
+    /// False when the cap cannot cover already issued commitments, the budget is 0,
+    /// the session is closed, or the log is full. Issued RxLimit values are kept.
+    member _.BeginCapacityChange(budget: uint64) =
+        if closeState = CloseState.Closed || budget = 0UL then false
+        else
+            let cap = if budget > uint64 Int64.MaxValue then Int64.MaxValue else int64 budget
+            if cap < flows.CommittedBytes then false
+            else
+                writeCapacity budget
+                let seq = ctrl.Start(CtrlOp.CapacityChange, ReadOnlySpan(ctrlBody, 0, 8))
+                if seq = 0u then false
+                else
+                    flows.TrySetBudgetCap cap |> ignore
+                    rxBudget <- cap
+                    true
+    /// This end's current rx budget cap in bytes.
+    member _.RxBudget = uint64 rxBudget
+    /// The peer's last announced rx budget, or UInt64.MaxValue before any notice.
+    member _.PeerRxBudget = peerRxBudget
+    /// Start MSS_NOTICE for path (spec 6.10a op 9). Session S is unchanged.
+    member _.BeginMssNotice(path: uint16, mss: uint16) =
+        if closeState = CloseState.Closed || not (mssAcceptable path mss) then false
+        else
+            writeMssNotice path mss
+            let seq = ctrl.Start(CtrlOp.MssNotice, ReadOnlySpan(ctrlBody, 0, 4))
+            if seq = 0u then false
+            else
+                localPathMss.[int path] <- mss
+                true
+    /// Last MSS the peer announced for path, or 0 if none.
+    member _.PathMss(path: uint16) =
+        let i = int path
+        if uint32 i >= uint32 config.MaxPaths then 0us else pathMss.[i]
+    /// Last MSS this end announced for path, or 0 if none.
+    member _.LocalPathMss(path: uint16) =
+        let i = int path
+        if uint32 i >= uint32 config.MaxPaths then 0us else localPathMss.[i]
+    /// True when every known MSS for path still carries a session frame in one segment.
+    /// An unset (0) MSS does not disqualify the path.
+    member _.PathFitsOneSegment(path: uint16) =
+        let i = int path
+        if uint32 i >= uint32 config.MaxPaths then false
+        else
+            let peer = pathMss.[i]
+            let local = localPathMss.[i]
+            (peer = 0us || pathFits peer) && (local = 0us || pathFits local)
     member _.CtrlSent = ctrlSent
     member _.CtrlExecuted = ctrlExecuted
     member _.CtrlRejected = ctrlRejected
