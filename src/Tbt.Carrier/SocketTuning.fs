@@ -4,25 +4,27 @@ namespace Tbt.Carrier
 
 open System
 open System.Net.Sockets
-open System.Runtime.InteropServices
 
 /// Bytes the kernel holds for a socket that it did not send yet.
 type INotSentProbe =
     /// The unsent byte count, or -1 when the system cannot tell.
     abstract NotSent: socket: Socket -> int
 
-module private SocketNative =
-    [<DllImport("libc", SetLastError = true)>]
-    extern int ioctl(nativeint fd, unativeint request, int& value)
-
-/// Linux: ioctl SIOCOUTQNSD.
+/// Linux: ioctl SIOCOUTQNSD (only constructed when the probe succeeded).
 [<Sealed>]
 type LinuxNotSentProbe() =
-    static let SIOCOUTQNSD = 0x894Bun
+    interface INotSentProbe with
+        member _.NotSent(socket) = Native.trySiocoutqnsd socket.Handle
+
+/// Android / Linux-layout TCP_INFO.tcpi_notsent_bytes, when SIOCOUTQNSD is absent.
+[<Sealed>]
+type TcpInfoNotSentProbe() =
     interface INotSentProbe with
         member _.NotSent(socket) =
-            let mutable value = 0
-            if SocketNative.ioctl(socket.Handle, SIOCOUTQNSD, &value) = 0 then value else -1
+            match KernelTcpInfo.tryRead socket with
+            | ValueSome info when info.NotSentBytes >= 0L && info.NotSentBytes <= int64 Int32.MaxValue ->
+                int info.NotSentBytes
+            | _ -> -1
 
 [<Sealed>]
 type NoNotSentProbe() =
@@ -71,17 +73,26 @@ module SocketTuning =
         else windowClamp * paths
 
     let probe () : INotSentProbe =
-        if OperatingSystem.IsLinux() then LinuxNotSentProbe() else NoNotSentProbe()
+        let c = Platform.current.Value
+        if c.HasSiocoutqnsd then LinuxNotSentProbe()
+        elif c.HasTcpInfoNotSent then TcpInfoNotSentProbe()
+        else NoNotSentProbe()
 
     /// Settings for a path socket: no Nagle, small unsent queue (Linux TCP_NOTSENT_LOWAT).
     /// clamp is TCP_WINDOW_CLAMP in bytes (default WindowClamp, spec ch. 9).
     let path (socket: Socket, clamp: int) =
         socket.NoDelay <- true
-        if OperatingSystem.IsLinux() then
-            try socket.SetRawSocketOption(6, 25, ReadOnlySpan(BitConverter.GetBytes NotSentLimit))
+        let c = Platform.current.Value
+        if c.HasTcpNotsentLowat then
+            try socket.SetRawSocketOption(6, c.TcpNotsentLowatOption, ReadOnlySpan(BitConverter.GetBytes NotSentLimit))
             with :? SocketException -> ()
+        if c.HasTcpWindowClamp then
             // TCP_WINDOW_CLAMP; autotuning stays on (no SO_RCVBUF, spec 3.6).
             try socket.SetRawSocketOption(6, 10, ReadOnlySpan(BitConverter.GetBytes clamp))
+            with :? SocketException -> ()
+        elif OperatingSystem.IsWindows() then
+            // Coarse send-queue cap when SIO_TCP_INFO / notsent is not implemented (D13).
+            try socket.SendBufferSize <- 384 * 1024
             with :? SocketException -> ()
 
     /// Settings for a local flow socket.

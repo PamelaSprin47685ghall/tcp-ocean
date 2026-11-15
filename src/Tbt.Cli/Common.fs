@@ -75,14 +75,35 @@ let readPsks (path: string) =
         if k.Length <> 32 then failwith "a PSK has 32 bytes (64 hex digits)"
         k)
 
-/// Resident set size in KiB (Linux), or -1.
+/// Resident set size in KiB. Linux uses /proc/self/status; elsewhere WorkingSet64. -1 if unknown.
 let rssKiB () =
     try
         File.ReadAllLines "/proc/self/status"
         |> Array.tryFind (fun l -> l.StartsWith "VmRSS:")
         |> Option.map (fun l -> Int64.Parse(l.Substring(6).Trim().Split(' ').[0]))
         |> Option.defaultValue -1L
-    with :? IOException -> -1L
+    with :? IOException ->
+        try Process.GetCurrentProcess().WorkingSet64 / 1024L
+        with _ -> -1L
+
+/// Register SIGINT/SIGTERM on POSIX, or Console.CancelKeyPress on Windows.
+/// The callback must be safe to run from a signal / console handler.
+let onInterrupt (action: unit -> unit) : IDisposable =
+    let mutable posix = true
+    try
+        let handle (c: Runtime.InteropServices.PosixSignalContext) =
+            c.Cancel <- true
+            action ()
+        let a = Runtime.InteropServices.PosixSignalRegistration.Create(Runtime.InteropServices.PosixSignal.SIGINT, handle)
+        let b = Runtime.InteropServices.PosixSignalRegistration.Create(Runtime.InteropServices.PosixSignal.SIGTERM, handle)
+        { new IDisposable with
+            member _.Dispose() = a.Dispose(); b.Dispose() }
+    with :? PlatformNotSupportedException ->
+        posix <- false
+        let handler = ConsoleCancelEventHandler(fun _ ev -> ev.Cancel <- true; action ())
+        Console.CancelKeyPress.AddHandler handler
+        { new IDisposable with
+            member _.Dispose() = Console.CancelKeyPress.RemoveHandler handler }
 
 /// Accept from a non-blocking listener; null when nothing waits.
 let tryAccept (listener: System.Net.Sockets.Socket) : System.Net.Sockets.Socket | null =

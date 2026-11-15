@@ -1375,7 +1375,9 @@ module private UnixPair =
     extern nativeint sysWrite(int fd, byte[] buf, nativeint n)
     let AF_UNIX = 1
     let typ = 2 ||| 0x800 ||| 0x80000 // SOCK_DGRAM | SOCK_NONBLOCK | SOCK_CLOEXEC
+    let isAvailable = Platform.current.Value.CanAdoptTunFd && Platform.current.Value.HasLibc
     let openPair () =
+        if not isAvailable then failwith "posix socketpair is not available on this platform"
         let sv = Array.zeroCreate<int> 2
         if sysSocketpair(AF_UNIX, typ, 0, sv) <> 0 then failwith "socketpair"
         sv
@@ -1386,50 +1388,75 @@ module private UnixPair =
 
 [<Fact>]
 let ``budgeted TUN Receive stops at the cap so Service can interleave`` () =
-    let sv = UnixPair.openPair()
-    try
-        let clock = ManualClock() :> Tbt.Contracts.IClock
-        let entropy = SeededEntropy 1 :> Tbt.Contracts.IEntropy
-        let local = System.Net.IPEndPoint(System.Net.IPAddress.Parse "10.200.3.2", 8443)
-        let stack = TunStack(sv.[0], local, clock, entropy, 4)
-        for _ in 1 .. 10 do UnixPair.writeOne sv.[1]
-        Assert.Equal(3, stack.Receive(3))
-        Assert.Equal(3, stack.LastReceiveCount)
-        Assert.Contains("recv_capped=1", stack.Describe())
-        // Seven datagrams remain on the fd — a Service() in the server loop
-        // would run now, before the next budgeted drain.
-        Assert.Equal(3, stack.Receive(3))
-        Assert.Equal(3, stack.LastReceiveCount)
-        Assert.Contains("recv_capped=2", stack.Describe())
-        Assert.Equal(4, stack.Receive(128))
-        Assert.Equal(4, stack.LastReceiveCount)
-        Assert.Contains("recv_capped=2", stack.Describe())
-        Assert.Equal(0, stack.Receive(128))
-    finally
-        UnixPair.close sv.[0]
-        UnixPair.close sv.[1]
+    if not UnixPair.isAvailable then ()
+    else
+        let sv = UnixPair.openPair()
+        try
+            let clock = ManualClock() :> Tbt.Contracts.IClock
+            let entropy = SeededEntropy 1 :> Tbt.Contracts.IEntropy
+            let local = System.Net.IPEndPoint(System.Net.IPAddress.Parse "10.200.3.2", 8443)
+            let stack = TunStack(sv.[0], local, clock, entropy, 4)
+            for _ in 1 .. 10 do UnixPair.writeOne sv.[1]
+            Assert.Equal(3, stack.Receive(3))
+            Assert.Equal(3, stack.LastReceiveCount)
+            Assert.Contains("recv_capped=1", stack.Describe())
+            // Seven datagrams remain on the fd — a Service() in the server loop
+            // would run now, before the next budgeted drain.
+            Assert.Equal(3, stack.Receive(3))
+            Assert.Equal(3, stack.LastReceiveCount)
+            Assert.Contains("recv_capped=2", stack.Describe())
+            Assert.Equal(4, stack.Receive(128))
+            Assert.Equal(4, stack.LastReceiveCount)
+            Assert.Contains("recv_capped=2", stack.Describe())
+            Assert.Equal(0, stack.Receive(128))
+        finally
+            UnixPair.close sv.[0]
+            UnixPair.close sv.[1]
 
 [<Fact>]
 let ``adaptive Receive yields so Service can interleave before EAGAIN`` () =
-    let sv = UnixPair.openPair()
-    try
-        let clock = ManualClock() :> Tbt.Contracts.IClock
-        let entropy = SeededEntropy 1 :> Tbt.Contracts.IEntropy
-        let local = System.Net.IPEndPoint(System.Net.IPAddress.Parse "10.200.3.2", 8443)
-        let stack = TunStack(sv.[0], local, clock, entropy, 4)
-        for _ in 1 .. 10 do UnixPair.writeOne sv.[1]
-        let mutable calls = 0
-        let n = stack.Receive(1_000_000, yieldWhen=fun () -> calls <- calls + 1; calls >= 4)
-        Assert.Equal(4, n)
-        Assert.Equal(4, stack.LastReceiveCount)
-        Assert.Contains("recv_yielded=1", stack.Describe())
-        Assert.Contains("recv_capped=0", stack.Describe())
-        Assert.Equal(6, stack.Receive(1_000_000))
-        Assert.Equal(0, stack.Receive(1_000_000))
-        Assert.Contains("recv_yielded=1", stack.Describe())
-    finally
-        UnixPair.close sv.[0]
-        UnixPair.close sv.[1]
+    if not UnixPair.isAvailable then ()
+    else
+        let sv = UnixPair.openPair()
+        try
+            let clock = ManualClock() :> Tbt.Contracts.IClock
+            let entropy = SeededEntropy 1 :> Tbt.Contracts.IEntropy
+            let local = System.Net.IPEndPoint(System.Net.IPAddress.Parse "10.200.3.2", 8443)
+            let stack = TunStack(sv.[0], local, clock, entropy, 4)
+            for _ in 1 .. 10 do UnixPair.writeOne sv.[1]
+            let mutable calls = 0
+            let n = stack.Receive(1_000_000, yieldWhen=fun () -> calls <- calls + 1; calls >= 4)
+            Assert.Equal(4, n)
+            Assert.Equal(4, stack.LastReceiveCount)
+            Assert.Contains("recv_yielded=1", stack.Describe())
+            Assert.Contains("recv_capped=0", stack.Describe())
+            Assert.Equal(6, stack.Receive(1_000_000))
+            Assert.Equal(0, stack.Receive(1_000_000))
+            Assert.Contains("recv_yielded=1", stack.Describe())
+        finally
+            UnixPair.close sv.[0]
+            UnixPair.close sv.[1]
+
+
+[<Fact>]
+let ``TunStack.Attach refuses a bad fd and accepts an injected descriptor`` () =
+    let clock = ManualClock() :> Tbt.Contracts.IClock
+    let entropy = SeededEntropy 2 :> Tbt.Contracts.IEntropy
+    let local = System.Net.IPEndPoint(System.Net.IPAddress.Parse "10.200.3.2", 8443)
+    Assert.True(isNull (TunStack.Attach(-1, local, clock, entropy, 4)))
+    if not UnixPair.isAvailable then ()
+    else
+        let sv = UnixPair.openPair()
+        try
+            let stack = TunStack.Attach(sv.[0], local, clock, entropy, 4, sndBuf = 0)
+            Assert.False(isNull stack)
+            let stack = nonNull stack
+            Assert.Equal(sv.[0], stack.Fd)
+            UnixPair.writeOne sv.[1]
+            Assert.Equal(1, stack.Receive(8))
+        finally
+            UnixPair.close sv.[0]
+            UnixPair.close sv.[1]
 
 [<Fact>]
 let ``tun sndbuf auto is window_clamp times paths, or zero to leave the kernel default`` () =

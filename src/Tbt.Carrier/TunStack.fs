@@ -207,6 +207,20 @@ type TunStack(fd: int, local: IPEndPoint, clock: IClock, entropy: IEntropy, maxC
         + String.Join("", groups.Values |> Seq.map (fun g -> "\n  " + g.Describe()))
         + String.Join("", conns.Values |> Seq.map (fun c -> "\n  path " + string (c :> IPath).PathId + " " + c.Describe()))
 
+
+    /// Adopt an already-open TUN file descriptor (Android VpnService.Builder.establish(),
+    /// a test socketpair, or any host that already created the device). Does not run
+    /// TUNSETIFF or SIOCSIFTXQLEN — the host owns the interface. Returns null when
+    /// this process cannot read raw fds, or fd is negative. The caller keeps ownership
+    /// of the descriptor.
+    static member Attach(fd: int, local: IPEndPoint, clock: IClock, entropy: IEntropy, maxConnections: int,
+                         ?windowClamp: int, ?sndBuf: int) : TunStack | null =
+        if fd < 0 || not Platform.current.Value.CanAdoptTunFd then null
+        else
+            let t = TunStack(fd, local, clock, entropy, maxConnections, ?windowClamp=windowClamp)
+            t.SetSndBuf(defaultArg sndBuf SocketTuning.TunSndBuf)
+            t
+
     /// Open the TUN device name; null when it fails. Sizes the TUN qdisc
     /// (SIOCSIFTXQLEN, default TunTxQueueLen) so a 64-path burst is not dropped
     /// while this process is in a budgeted Receive / Service turn. sndBuf > 0

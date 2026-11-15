@@ -40,49 +40,56 @@ let ``poller: a socket is readable only with input, and writable when it has spa
     Assert.True(p.IsWritable a)
 
 [<Fact>]
-let ``poller: epoll is the default on Linux`` () =
+let ``poller: default backend follows the epoll/poll/select capability`` () =
     use p = new Poller()
-    Assert.Equal((if OperatingSystem.IsLinux() then PollerBackend.Epoll else PollerBackend.Select), p.Backend)
+    let expected =
+        let c = Platform.current.Value
+        if c.HasEpoll then PollerBackend.Epoll
+        elif c.HasPoll then PollerBackend.Poll
+        else PollerBackend.Select
+    Assert.Equal(expected, p.Backend)
 
 [<Fact>]
 let ``poller: epoll sees a new socket that gets the number of a closed one`` () =
-    use p = new Poller(PollerBackend.Epoll)
-    let a, b = pair ()
-    let fd = int b.Handle
-    Assert.False(waitRead p b)
-    a.Dispose()
-    b.Dispose()
-    // Open pairs until one end gets the old descriptor number.
-    let mutable found = None
-    let spare = Collections.Generic.List<Socket>()
-    for _ in 1 .. 20 do
-        if found.IsNone then
-            let c, d = pair ()
-            if int d.Handle = fd then found <- Some(c, d)
-            elif int c.Handle = fd then found <- Some(d, c)
-            else spare.Add c; spare.Add d
-    match found with
-    | None -> failwith "no descriptor reuse"
-    | Some(writer, reader) ->
-        use writer = writer
-        use reader = reader
-        writer.Send([| 7uy |]) |> ignore
-        Assert.True(waitRead p reader)
-    for s in spare do s.Dispose()
+    if not Platform.current.Value.HasEpoll then () else
+        use p = new Poller(PollerBackend.Epoll)
+        let a, b = pair ()
+        let fd = int b.Handle
+        Assert.False(waitRead p b)
+        a.Dispose()
+        b.Dispose()
+        // Open pairs until one end gets the old descriptor number.
+        let mutable found = None
+        let spare = Collections.Generic.List<Socket>()
+        for _ in 1 .. 20 do
+            if found.IsNone then
+                let c, d = pair ()
+                if int d.Handle = fd then found <- Some(c, d)
+                elif int c.Handle = fd then found <- Some(d, c)
+                else spare.Add c; spare.Add d
+        match found with
+        | None -> failwith "no descriptor reuse"
+        | Some(writer, reader) ->
+            use writer = writer
+            use reader = reader
+            writer.Send([| 7uy |]) |> ignore
+            Assert.True(waitRead p reader)
+        for s in spare do s.Dispose()
 
 [<Fact>]
 let ``poller: a socket left out of a round is not reported`` () =
-    use p = new Poller(PollerBackend.Epoll)
-    let a, b = pair ()
-    use a = a
-    use b = b
-    let c, d = pair ()
-    use c = c
-    use d = d
-    a.Send([| 1uy |]) |> ignore
-    Assert.True(waitRead p b)
-    // Next round watches only d: b's pending input must not end the wait.
-    let t0 = Diagnostics.Stopwatch.GetTimestamp()
-    Assert.False(waitRead p d)
-    Assert.False(p.IsReadable b)
-    Assert.True(Diagnostics.Stopwatch.GetElapsedTime(t0).TotalMilliseconds >= 150.0)
+    if not Platform.current.Value.HasEpoll then () else
+        use p = new Poller(PollerBackend.Epoll)
+        let a, b = pair ()
+        use a = a
+        use b = b
+        let c, d = pair ()
+        use c = c
+        use d = d
+        a.Send([| 1uy |]) |> ignore
+        Assert.True(waitRead p b)
+        // Next round watches only d: b's pending input must not end the wait.
+        let t0 = Diagnostics.Stopwatch.GetTimestamp()
+        Assert.False(waitRead p d)
+        Assert.False(p.IsReadable b)
+        Assert.True(Diagnostics.Stopwatch.GetElapsedTime(t0).TotalMilliseconds >= 150.0)

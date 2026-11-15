@@ -125,7 +125,7 @@ let ``kernel sender totals stay independent in asymmetric directions`` () =
 
 [<Fact>]
 let ``reading a live kernel socket leaves its byte stream and options intact`` () =
-    if OperatingSystem.IsLinux() then
+    if Platform.current.Value.HasLinuxTcpInfo then
         use listener = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp)
         listener.Bind(IPEndPoint(IPAddress.Loopback, 0))
         listener.Listen 1

@@ -138,3 +138,38 @@ ChaCha20-Poly1305；0x01 只用于套件选定之后的数据帧 AEAD 和头部�
 
 测试：RFC 附录与 JSON 参考向量、伪造标签零分配、客户端与服务端在 `offerAegis` 时的互通，
 以及只一方通告时仍落在 0x02。
+
+## D13 客户端可移植性与 Android TUN fd 注入
+
+规范要的是高兼容 JIT 客户端，并单独列出 Android。服务端仍是 Linux NativeAOT，其 epoll、
+SIOCOUTQNSD、TUNSETIFF、TCP_NOTSENT_LOWAT、TCP_WINDOW_CLAMP、Linux TCP_INFO 快路径在探测成功时
+与原先 `OperatingSystem.IsLinux()` 分支一致，默认 Linux 行为不变。
+
+共享层把 Linux 假设改成启动时探测（`Platform.current`），失败则优雅回退，不当成“队列为零”：
+
+| 能力 | 探测 | 缺失时的回退 |
+| --- | --- | --- |
+| epoll(7) | `epoll_create1` | POSIX `poll(2)`（macOS / 无 epoll 的 Unix），再不行 `Socket.Select`（Windows） |
+| poll(2) | `poll(..., 0, 0)` | `Socket.Select`（只能等套接字，不能等原始 fd） |
+| `/dev/net/tun` | 路径存在再 `open`/`TUNSETIFF` | `TunStack.Open` 返回 null，不调用 libc |
+| 原始 TUN fd | libc 可解析 | `TunStack.Attach` 返回 null |
+| SIOCOUTQNSD | 对 TCP 套接字 ioctl，成功才通告 | 改用 Linux 布局的 `TCP_INFO.tcpi_notsent_bytes`（Android：SELinux 拒绝该 ioctl） |
+| Linux TCP_INFO | `getsockopt` 选项 11，optlen ≥ 104 / 148 | `KernelTcpInfo.tryRead` 为 none；写门控为“不可知”（-1），不是 0 |
+| TCP_NOTSENT_LOWAT | 试 Linux 25，再试 Darwin 0x201 | 不设该选项 |
+| TCP_WINDOW_CLAMP | 选项 10 | Linux/Android 不设 SO_RCVBUF（保持自动调谐）；Windows 把 SO_SNDBUF 限制在 384 KiB 作为粗门控 |
+| SIGINT/SIGTERM | `PosixSignalRegistration` | Windows 上 `Console.CancelKeyPress` |
+| RSS | `/proc/self/status` | `Process.WorkingSet64` |
+
+`TunStack.Attach(fd, ...)` 是 Android VpnService 的注入入口：宿主用 `Builder.establish()` 拿到 fd
+后交给用户态 TCP 栈，本进程不执行 TUNSETIFF / SIOCSIFTXQLEN，fd 仍由宿主持有。现有 `Open(name)`
+只用于 Linux 命名设备，行为不变。当前 `tbtun client` 仍是内核 TCP 监听器，没有改默认数据路径。
+
+**关于 net10.0-android。** 核心客户端是 `net10.0` JIT，可以被未来的 `net10.0-android` 或手写 JNI 宿主引用。
+本环境没有安装 Android workload，完整 APK（VpnService、`protect(fd)`、前台通知、Doze）不在这次范围。
+规范第十四章倾向 `linux-bionic-arm64` NativeAOT 共享库 + 手写 JNI，而不是以 Mono / 实验性
+PublishAot 的 .NET for Android 应用作为产品路径。本次的结论：JIT 核心加 fd 注入足够作为宿主的
+附着点；不能声称已经在真机 APK 或 bionic AOT 上验证。
+
+仍待完成：Windows `SIO_TCP_INFO` 写门控；macOS/iOS `utun` 设备（不只是注入 fd）；Android
+`VpnService.protect(fd)`、前台服务与 Doze 下的单调时钟推进；`linux-bionic-arm64` 交叉与真机证据；
+把本地 VPN 捕获接到现有 `tbtun client` 会话（现在客户端只听本地 TCP，不读 TUN）。

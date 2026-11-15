@@ -5,7 +5,6 @@ module Tbt.Cli.Client
 open System
 open System.Net
 open System.Net.Sockets
-open System.Runtime.InteropServices
 open System.Threading
 open System.Threading.Tasks
 open System.Collections.Concurrent
@@ -128,13 +127,9 @@ let run (o: Options) =
         use poller = new Poller()
         let statsMs = int64 (o.Int("stats-s", 0)) * 1000L
         let mutable lastStats = Environment.TickCount64
-        // SIGINT/SIGTERM: close the session with SESSION_CLOSE (spec 6.10a), at most 2 s.
+        // SIGINT/SIGTERM (or Ctrl-C on Windows): close the session with SESSION_CLOSE (spec 6.10a), at most 2 s.
         let mutable stopAt = 0L
-        let onSignal (c: PosixSignalContext) =
-            c.Cancel <- true
-            if stopAt = 0L then stopAt <- Environment.TickCount64 + 2000L
-        use _int = PosixSignalRegistration.Create(PosixSignal.SIGINT, onSignal)
-        use _term = PosixSignalRegistration.Create(PosixSignal.SIGTERM, onSignal)
+        use _interrupt = onInterrupt (fun () -> if stopAt = 0L then stopAt <- Environment.TickCount64 + 2000L)
         while carrier.Alive && not (stopAt > 0L && Environment.TickCount64 > stopAt) do
             attachJoined ()
             if stopAt > 0L && session.CloseState = CloseState.Open then

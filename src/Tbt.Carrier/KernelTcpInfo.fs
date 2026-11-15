@@ -70,7 +70,7 @@ module KernelTcpInfo =
     /// Called by diagnostics, never by the send gate. Reading once gives all
     /// fields from the same socket snapshot and replaces the old ACK-only read.
     let tryRead (socket: Socket) =
-        if not (OperatingSystem.IsLinux()) then ValueNone
+        if not Platform.current.Value.HasLinuxTcpInfo then ValueNone
         else
             try
                 let buffer = Array.zeroCreate<byte> 256

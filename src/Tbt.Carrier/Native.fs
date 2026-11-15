@@ -63,6 +63,29 @@ let poll (fds: PollFd[]) (count: int) (timeoutMs: int) =
 
 let lastError () = Marshal.GetLastPInvokeError()
 
+/// True when libc (or an alias such as libSystem / bionic) resolves in this process.
+/// The first call may execute a harmless close(-1).
+let hasLibc =
+    lazy (
+        try
+            sysClose -1 |> ignore
+            true
+        with :? DllNotFoundException | :? EntryPointNotFoundException -> false)
+
+let SIOCOUTQNSD = 0x894Bun
+
+/// ioctl SIOCOUTQNSD; -1 when libc or the ioctl is missing, or the call fails.
+let trySiocoutqnsd (handle: nativeint) =
+    if not hasLibc.Value then -1
+    else
+        let buf = Array.zeroCreate<byte> 4
+        try
+            use p = fixed &buf.[0]
+            if sysIoctl(int handle, SIOCOUTQNSD, NativePtr.toNativeInt p) = 0 then
+                BitConverter.ToInt32(buf, 0)
+            else -1
+        with :? DllNotFoundException | :? EntryPointNotFoundException -> -1
+
 [<DllImport("libc", EntryPoint = "epoll_create1", SetLastError = true)>]
 extern int sysEpollCreate1(int flags)
 
@@ -85,7 +108,11 @@ let EpollCtlMod = 3
 let epollEventSize = if RuntimeInformation.ProcessArchitecture = Architecture.X64 then 12 else 16
 let epollDataOffset = if epollEventSize = 12 then 4 else 8
 
-let epollCreate () = sysEpollCreate1 0x80000 (* EPOLL_CLOEXEC *)
+let epollCreate () =
+    if not hasLibc.Value then -1
+    else
+        try sysEpollCreate1 0x80000 (* EPOLL_CLOEXEC *)
+        with :? DllNotFoundException | :? EntryPointNotFoundException -> -1
 
 /// epoll_ctl with one event record in scratch (at least epollEventSize bytes).
 let epollCtl (epfd: int) (op: int) (fd: int) (events: uint32) (scratch: byte[]) =
@@ -102,20 +129,22 @@ let epollWait (epfd: int) (buffer: byte[]) (timeoutMs: int) =
 /// Attach to the TUN device name (IFF_TUN | IFF_NO_PI), non-blocking. The device is made
 /// beforehand (ip tuntap add ... user <user>), so the server needs no root. -1 on failure.
 let openTun (name: string) =
-    let path = "/dev/net/tun\000"B
-    use pp = fixed &path.[0]
-    let fd = sysOpen(NativePtr.toNativeInt pp, 2 ||| 0x800)
-    if fd < 0 then fd
+    if not hasLibc.Value || not (IO.File.Exists "/dev/net/tun") then -1
     else
-        let ifr = Array.zeroCreate<byte> 40
-        let n = Text.Encoding.ASCII.GetBytes(name, 0, min 15 name.Length, ifr, 0)
-        ignore n
-        BitConverter.TryWriteBytes(Span(ifr, 16, 2), 0x0001s ||| 0x1000s) |> ignore
-        use ip = fixed &ifr.[0]
-        if sysIoctl(fd, 0x400454caun, NativePtr.toNativeInt ip) < 0 then
-            sysClose fd |> ignore
-            -1
-        else fd
+        let path = "/dev/net/tun\000"B
+        use pp = fixed &path.[0]
+        let fd = sysOpen(NativePtr.toNativeInt pp, 2 ||| 0x800)
+        if fd < 0 then fd
+        else
+            let ifr = Array.zeroCreate<byte> 40
+            let n = Text.Encoding.ASCII.GetBytes(name, 0, min 15 name.Length, ifr, 0)
+            ignore n
+            BitConverter.TryWriteBytes(Span(ifr, 16, 2), 0x0001s ||| 0x1000s) |> ignore
+            use ip = fixed &ifr.[0]
+            if sysIoctl(fd, 0x400454caun, NativePtr.toNativeInt ip) < 0 then
+                sysClose fd |> ignore
+                -1
+            else fd
 
 let SIOCGIFTXQLEN = 0x8942un
 let SIOCSIFTXQLEN = 0x8943un
@@ -131,35 +160,39 @@ let private ifreq (name: string) =
 /// Get or set a network device's txqueuelen (SIOCG/SIOCSIFTXQLEN) via a datagram socket.
 /// Returns (ok, qlen, errno). CAP_NET_ADMIN is typically required to set.
 let tryTxQueueLen (name: string) (setTo: int option) =
-    let fd = sysSocket(2, 2, 0) // AF_INET, SOCK_DGRAM
-    if fd < 0 then struct (false, 0, lastError ())
+    if not hasLibc.Value then struct (false, 0, 38)
     else
-        try
-            let ifr = ifreq name
-            match setTo with
-            | Some q ->
-                BitConverter.TryWriteBytes(Span(ifr, 16, 4), q) |> ignore
-                use ip = fixed &ifr.[0]
-                if sysIoctl(fd, SIOCSIFTXQLEN, NativePtr.toNativeInt ip) < 0 then
-                    struct (false, q, lastError ())
-                else
-                    // Read back the value the kernel kept.
+        let fd = sysSocket(2, 2, 0) // AF_INET, SOCK_DGRAM
+        if fd < 0 then struct (false, 0, lastError ())
+        else
+            try
+                let ifr = ifreq name
+                match setTo with
+                | Some q ->
+                    BitConverter.TryWriteBytes(Span(ifr, 16, 4), q) |> ignore
+                    use ip = fixed &ifr.[0]
+                    if sysIoctl(fd, SIOCSIFTXQLEN, NativePtr.toNativeInt ip) < 0 then
+                        struct (false, q, lastError ())
+                    else
+                        // Read back the value the kernel kept.
+                        use ig = fixed &ifr.[0]
+                        if sysIoctl(fd, SIOCGIFTXQLEN, NativePtr.toNativeInt ig) < 0 then
+                            struct (true, q, 0)
+                        else struct (true, BitConverter.ToInt32(ifr, 16), 0)
+                | None ->
                     use ig = fixed &ifr.[0]
                     if sysIoctl(fd, SIOCGIFTXQLEN, NativePtr.toNativeInt ig) < 0 then
-                        struct (true, q, 0)
+                        struct (false, 0, lastError ())
                     else struct (true, BitConverter.ToInt32(ifr, 16), 0)
-            | None ->
-                use ig = fixed &ifr.[0]
-                if sysIoctl(fd, SIOCGIFTXQLEN, NativePtr.toNativeInt ig) < 0 then
-                    struct (false, 0, lastError ())
-                else struct (true, BitConverter.ToInt32(ifr, 16), 0)
-        finally
-            sysClose fd |> ignore
+            finally
+                sysClose fd |> ignore
 
 let trySetTunSndBuf (tunFd: int) (bytes: int) =
-    let buf = Array.zeroCreate<byte> 4
-    BitConverter.TryWriteBytes(Span buf, bytes) |> ignore
-    use p = fixed &buf.[0]
-    if sysIoctl(tunFd, TUNSETSNDBUF, NativePtr.toNativeInt p) < 0 then
-        struct (false, bytes, lastError ())
-    else struct (true, bytes, 0)
+    if not hasLibc.Value then struct (false, bytes, 38)
+    else
+        let buf = Array.zeroCreate<byte> 4
+        BitConverter.TryWriteBytes(Span buf, bytes) |> ignore
+        use p = fixed &buf.[0]
+        if sysIoctl(tunFd, TUNSETSNDBUF, NativePtr.toNativeInt p) < 0 then
+            struct (false, bytes, lastError ())
+        else struct (true, bytes, 0)

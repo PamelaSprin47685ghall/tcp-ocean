@@ -2,7 +2,8 @@
   <PropertyGroup>
     <OutputType>Exe</OutputType>
     <AssemblyName>tbtun</AssemblyName>
-    <PublishAot>true</PublishAot>
+    <!-- Server NativeAOT stays on for Linux publish; the JIT client cross-builds without AOT. -->
+    <PublishAot Condition="'$(RuntimeIdentifier)' == '' or $(RuntimeIdentifier.StartsWith('linux-'))">true</PublishAot>
     <InvariantGlobalization>true</InvariantGlobalization>
     <UseSystemResourceKeys>true</UseSystemResourceKeys>
     <ServerGarbageCollector>false</ServerGarbageCollector>

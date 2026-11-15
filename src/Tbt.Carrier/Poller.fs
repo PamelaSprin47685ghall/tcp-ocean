@@ -16,12 +16,14 @@ type PollerBackend =
 
 [<Sealed>]
 type Poller(backend: PollerBackend) =
+    let caps = Platform.current.Value
     let epfd =
-        if OperatingSystem.IsLinux() && backend = PollerBackend.Epoll then Native.epollCreate () else -1
+        if caps.HasEpoll && backend = PollerBackend.Epoll then Native.epollCreate () else -1
     let backend =
-        if not (OperatingSystem.IsLinux()) || backend = PollerBackend.Select then PollerBackend.Select
-        elif epfd >= 0 then PollerBackend.Epoll
-        else PollerBackend.Poll
+        if backend = PollerBackend.Select then PollerBackend.Select
+        elif backend = PollerBackend.Epoll && epfd >= 0 then PollerBackend.Epoll
+        elif caps.HasPoll then PollerBackend.Poll
+        else PollerBackend.Select
     let usePoll = backend <> PollerBackend.Select
     /// Interest the kernel holds (epoll): descriptor -> events.
     let registered = Dictionary<int, uint32>()

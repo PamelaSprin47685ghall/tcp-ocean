@@ -1,6 +1,7 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <ItemGroup>
     <Compile Include="Native.fs" />
+    <Compile Include="Platform.fs" />
     <Compile Include="KernelTcpInfo.fs" />
     <Compile Include="SocketTuning.fs" />
     <Compile Include="Poller.fs" />
