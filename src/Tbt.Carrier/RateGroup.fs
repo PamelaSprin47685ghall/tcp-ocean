@@ -282,7 +282,10 @@ type RateGroup(clock: IClock) =
                         // ratio of this group's estimate, not a hard-coded rate. Uplink
                         // and downlink are separate RateGroups and never copy a bw across.
                         let filled = bw > 0.0 && inflight () >= int (bw * float rtt)
-                        if limited && filled then
+                        // A full pipe counts even if TryTake did not refuse: startup
+                        // cwnd is 2.885 BDP, and under loss inflight often sits
+                        // between 1 BDP and that cap, so the round is not "limited".
+                        if filled then
                             if bw >= fullBw * 1.25 then
                                 fullBw <- bw
                                 fullCount <- 0
