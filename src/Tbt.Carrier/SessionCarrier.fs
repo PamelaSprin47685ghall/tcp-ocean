@@ -324,10 +324,14 @@ type SessionCarrier(session: Session, bridge: FlowBridge, ?uplinkPace: bool, ?tu
 
     /// Add a path whose bootstrap is done; frames it already holds come in at once.
     member this.AddPath(link: IPath) =
-        link.FrameLength <- session.FrameLength
-        paths.Add link
-        pathVersion <- pathVersion + 1L
-        link.Attach this
+        // A JOIN of a path_id whose PATH_CLOSE transaction has ended must clear the
+        // session block (spec 6.10a). A path still in Closing is not reusable.
+        session.NotePathJoined link.PathId |> ignore
+        if session.PathState link.PathId <> PathCloseState.Closing then
+            link.FrameLength <- session.FrameLength
+            paths.Add link
+            pathVersion <- pathVersion + 1L
+            link.Attach this
 
     member _.HasPath(pathId: uint16) = paths.Exists(fun p -> p.PathId = pathId)
 
@@ -407,5 +411,5 @@ type SessionCarrier(session: Session, bridge: FlowBridge, ?uplinkPace: bool, ?tu
             framesIn <- framesIn + 1L
             session.OnFrame(path, frame)
         member _.Frontier = session.Frontier
-        member _.ProduceFill(path, frame) = session.ProduceFill(path, frame) |> ignore
+        member _.ProduceFill(path, frame) = session.ProduceFill(path, frame)
         member _.Fail(reason) = session.Fail reason

@@ -471,7 +471,8 @@ type Session(role: Role, p: SessionParams, port: IFlowPort, clock: IClock, confi
     /// Allow path_id reuse after the close transaction ended (a new JOIN of this id).
     member _.NotePathJoined(path: uint16) =
         let i = int path
-        if uint32 i >= uint32 config.MaxPaths || pathState.[i] <> PathCloseState.Closed then false
+        if uint32 i >= uint32 config.MaxPaths || pathState.[i] = PathCloseState.Closing then false
+        elif pathState.[i] = PathCloseState.Idle then true
         else
             pathCloseSeq.[i] <- 0u
             pathReplySeq.[i] <- 0u
@@ -588,10 +589,13 @@ type Session(role: Role, p: SessionParams, port: IFlowPort, clock: IClock, confi
     /// extra parity of the oldest unacknowledged step, else PAD; new cell_seq, flags FILL.
     member _.ProduceFill(path: uint16, frame: Span<byte>) =
         // Last 256 numbers of a rekey, and a path in PATH_CLOSE, must not take a
-        // DATA/PARITY/BOOSTER/PAD (spec 6.5.6, 6.10a). Leave the hole unfilled.
+        // DATA/PARITY/BOOSTER/PAD (spec 6.5.6, 6.10a). False: the caller must not send
+        // the buffer (it was not sealed).
         let i = int path
         if uint32 i < uint32 config.MaxPaths && pathState.[i] = PathCloseState.Idle && tx.CanSealPayload then
             tx.RenderFill(frame, path, rx.AckStepLo, rx.Grant, rx.ErasureQ16) |> ignore
+            true
+        else false
 
     /// Timers: WIN_ACK at most every 10 ms while the ack state changes, else every second.
     member _.Tick() =

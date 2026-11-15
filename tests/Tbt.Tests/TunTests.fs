@@ -15,6 +15,7 @@ let L = 1415
 type RecordingOutput() =
     let scratch = Array.zeroCreate<byte> 65536
     member val Packets = List<byte[]>()
+    member _.Scratch = scratch
     interface ITunOutput with
         member o.Write(p) = o.Packets.Add(p.ToArray())
         member _.Scratch = scratch
@@ -23,6 +24,7 @@ type RecordingOutput() =
 type RecordingOwner() =
     member val Frames = List<byte[]>()
     member val Fills = 0 with get, set
+    member val FillOk = true with get, set
     member val Failures = List<string>()
     member val Throw = false with get, set
     interface IPathOwner with
@@ -31,8 +33,11 @@ type RecordingOwner() =
             o.Frames.Add(frame.ToArray())
             0UL
         member o.ProduceFill(_, frame) =
-            o.Fills <- o.Fills + 1
-            frame.Fill 0xABuy
+            if not o.FillOk then false
+            else
+                o.Fills <- o.Fills + 1
+                frame.Fill 0xABuy
+                true
         member _.Frontier = 0UL
         member o.Fail(reason) = o.Failures.Add reason
 
@@ -163,6 +168,38 @@ let ``downlink: a hole shown by SACK is refilled at once with new content, two c
         Assert.Equal(starts.[1], r.Seq)
         Assert.Equal(L, r.PayloadLength)
         Assert.True(bytes.AsSpan(r.PayloadAt, r.PayloadLength).IndexOfAnyExcept(0xABuy) < 0)
+
+[<Fact>]
+let ``downlink: a refused ProduceFill does not send the shared scratch buffer`` () =
+    let f = Fixture 1
+    f.Open()
+    let ip = f.Path :> IPath
+    ip.Backlog <- 100
+    let starts = List<uint32>()
+    for _ in 1 .. 3 do
+        f.Clock.Now <- f.Clock.Now + 20_000_000L
+        let mutable frame = Span<byte>.Empty
+        Assert.True(ip.TryBeginFrame(&frame))
+        frame.Fill 0x11uy
+        ip.CommitFrame()
+        starts.Add (parse f.Out.Packets.[f.Out.Packets.Count - 1]).Seq
+    // Poison the scratch so a leak would be visible, then refuse the fill.
+    f.Out.Scratch.AsSpan().Fill 0xCDuy
+    f.Owner.FillOk <- false
+    let n = f.Out.Packets.Count
+    let o = Array.zeroCreate<byte> 12
+    o.[0] <- 1uy
+    o.[1] <- 1uy
+    o.[2] <- 5uy
+    o.[3] <- 10uy
+    BinaryPrimitives.WriteUInt32BigEndian(Span(o, 4, 4), starts.[2])
+    BinaryPrimitives.WriteUInt32BigEndian(Span(o, 8, 4), starts.[2] + uint32 L)
+    f.Clock.Now <- f.Clock.Now + 40_000_000L
+    let struct (s, p) = clientSegment (f.Data0) (starts.[1]) Packet.Ack o ReadOnlySpan.Empty
+    f.Path.OnSegment(s, Span p, f.Clock.Now)
+    Assert.Equal(0, f.Owner.Fills)
+    Assert.Equal(n, f.Out.Packets.Count)
+    Assert.Equal(0L, f.Path.Counters.BorrowRetx)
 
 let sackOption (blocks: (uint32 * uint32) list) =
     let o = Array.zeroCreate<byte> (4 + 8 * blocks.Length)

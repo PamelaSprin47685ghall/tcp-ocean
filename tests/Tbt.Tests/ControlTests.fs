@@ -5,6 +5,7 @@ open System.Buffers.Binary
 open Xunit
 open Tbt.Wire
 open Tbt.Session
+open Tbt.Carrier
 
 let private render (log: ControlLog) now srtt =
     let cell = Array.zeroCreate<byte> 64
@@ -357,3 +358,67 @@ let ``rekey: a lowered cell trigger completes PREPARE, READY and RETIRE`` () =
     let after = if pair.ServerPort.Data.ContainsKey slot then int pair.ServerPort.Data.[slot].Length else 0
     Assert.True(after > before, "post-auto-rekey delivery stalled")
     Assert.Equal(0L, pair.Server.Opener.AuthFails)
+
+[<Fact>]
+let ``produce fill: a closed path or a cut reserve does not seal and returns false`` () =
+    let pair = Pair(SessionConfig.defaults, 2, 0.0, 61)
+    for _ in 1 .. 20 do pair.Round() |> ignore
+    let c = pair.Client
+    let frame = Array.zeroCreate<byte> c.FrameLength
+    let start = c.Tx.NextCounter
+    // Path 1 is still idle: a fill is allowed and consumes a counter.
+    c.ProduceFill(0us, Span frame) |> ignore
+    Assert.True(c.Tx.NextCounter > start)
+    Assert.True(c.BeginPathClose(1us, 1uy))
+    let mutable n = 0
+    while c.PathState 1us <> PathCloseState.Closed && n < 2000 do
+        pair.Round() |> ignore
+        n <- n + 1
+    Assert.Equal(PathCloseState.Closed, c.PathState 1us)
+    let mid = c.Tx.NextCounter
+    Assert.False(c.ProduceFill(1us, Span frame))
+    Assert.Equal(mid, c.Tx.NextCounter)
+    // The last 256 numbers of a rekey are reserved: no payload fill.
+    c.Tx.SetCutLimit(c.Tx.NextCounter + 8UL, 256UL)
+    Assert.False(c.Tx.CanSealPayload)
+    Assert.False(c.ProduceFill(0us, Span frame))
+    Assert.Equal(mid, c.Tx.NextCounter)
+
+[<Fact>]
+let ``path close: AddPath after PATH_CLOSED calls NotePathJoined and the id can send again`` () =
+    let pair = Pair(SessionConfig.defaults, 2, 0.0, 62)
+    for _ in 1 .. 20 do pair.Round() |> ignore
+    Assert.True(pair.Client.BeginPathClose(1us, 5uy))
+    Assert.Equal(PathCloseState.Closing, pair.Client.PathState 1us)
+    let bridge = FlowBridge(ValueNone)
+    let carrier = SessionCarrier(pair.Client, bridge)
+    let stub =
+        let mutable pathId = 1us
+        let mutable frameLength = 0
+        { new IPath with
+            member _.PathId with get () = pathId and set v = pathId <- v
+            member _.FrameLength with get () = frameLength and set v = frameLength <- v
+            member _.Alive = true
+            member _.Attach(_) = ()
+            member _.Backlog with set (_: int) = ()
+            member _.Watch(_, _) = ()
+            member _.Receive(_) = ()
+            member _.TryBeginFrame(_) = false
+            member _.CommitFrame() = ()
+            member _.Close() = () }
+    // While the close transaction is open, the id must not be attached again.
+    carrier.AddPath stub
+    Assert.Equal(PathCloseState.Closing, pair.Client.PathState 1us)
+    Assert.False(carrier.HasPath 1us)
+    let mutable n = 0
+    while pair.Client.PathState 1us <> PathCloseState.Closed && n < 2000 do
+        pair.Round() |> ignore
+        n <- n + 1
+    Assert.Equal(PathCloseState.Closed, pair.Client.PathState 1us)
+    let frame = Array.zeroCreate<byte> pair.Client.FrameLength
+    Assert.False(pair.Client.TryProduce(1us, Span frame))
+    carrier.AddPath stub
+    Assert.Equal(PathCloseState.Idle, pair.Client.PathState 1us)
+    pair.Client.Tick()
+    Assert.True(pair.Client.TryProduce(1us, Span frame) || not pair.Client.WantsToSend)
+    Assert.True(carrier.HasPath 1us)

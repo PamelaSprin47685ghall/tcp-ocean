@@ -12,7 +12,9 @@ type private AckOwner() =
     interface IPathOwner with
         member _.OnFrame(_, _) = 0UL
         member owner.Frontier = owner.Frontier
-        member _.ProduceFill(_, frame) = frame.Clear()
+        member _.ProduceFill(_, frame) =
+            frame.Clear()
+            true
         member _.Fail(reason) = failwith reason
 
 type private AckFixture(sack: bool) =

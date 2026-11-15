@@ -128,7 +128,8 @@ let run (o: Options) =
             | ValueSome r ->
                 done' <- true
                 let c = e.Carrier
-                let d = e.Admission.Decide(ReadOnlySpan frame, r, c.Paths.Count, c.HasPath r.PathId, s.CloseState <> CloseState.Open)
+                let blocked = s.CloseState <> CloseState.Open || s.PathState r.PathId = PathCloseState.Closing
+                let d = e.Admission.Decide(ReadOnlySpan frame, r, c.Paths.Count, c.HasPath r.PathId, blocked)
                 match d.Verdict with
                 | JoinVerdict.Accept ->
                     link.PathId <- r.PathId

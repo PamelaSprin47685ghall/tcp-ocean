@@ -712,31 +712,33 @@ type TunPath(output: ITunOutput, counters: TunCounters, localIp: uint32, localPo
         let s = &ring.[at i]
         let p = output.Scratch
         let copies = min (2 + s.Retx) 4
+        let mutable filled = true
         if s.Kind = 0uy then
             let off = int (s.Seq - relBase)
             Buffer.BlockCopy(reliable, off, p, Packet.DataOffset, s.Length)
         else
-            owner.ProduceFill(pathId, Span(p, Packet.DataOffset, s.Length))
-            counters.BorrowRetx <- counters.BorrowRetx + 1L
-        let n = Packet.build (Span p) localIp remoteIp localPort remotePort (uint32 s.Seq) (uint32 rcvNxt)
-                             (Packet.Ack ||| Packet.Psh) (window ()) ReadOnlySpan.Empty s.Length ipId
-        ipId <- ipId + 1us
-        for _ in 1 .. copies do output.Write(ReadOnlySpan(p, 0, n))
-        wireSent <- wireSent + int64 (copies * s.Length)
-        counters.SegmentsSent <- counters.SegmentsSent + int64 copies
-        counters.SegmentsLost <- counters.SegmentsLost + 1L
-        tokens <- tokens - float (copies * n)
-        // Every copy crosses the same bottleneck, a demoted path's too: all are charged to the
-        // group (payload bytes, as its rate samples count).
-        if demoted then counters.DemotedRepairs <- counters.DemotedRepairs + 1L
-        group.OnRepair(copies * s.Length)
-        s.Duplicates <- s.Duplicates + (copies - 1) * s.Length
-        s.Retx <- s.Retx + 1
-        s.SentNs <- now
-        s.Delivered <- delivered
-        s.DeliveredNs <- deliveredNs
-        s.FirstSentNs <- lastDeliveredSentNs
-        ackDue <- false
+            filled <- owner.ProduceFill(pathId, Span(p, Packet.DataOffset, s.Length))
+            if filled then counters.BorrowRetx <- counters.BorrowRetx + 1L
+        if filled then
+            let n = Packet.build (Span p) localIp remoteIp localPort remotePort (uint32 s.Seq) (uint32 rcvNxt)
+                                 (Packet.Ack ||| Packet.Psh) (window ()) ReadOnlySpan.Empty s.Length ipId
+            ipId <- ipId + 1us
+            for _ in 1 .. copies do output.Write(ReadOnlySpan(p, 0, n))
+            wireSent <- wireSent + int64 (copies * s.Length)
+            counters.SegmentsSent <- counters.SegmentsSent + int64 copies
+            counters.SegmentsLost <- counters.SegmentsLost + 1L
+            tokens <- tokens - float (copies * n)
+            // Every copy crosses the same bottleneck, a demoted path's too: all are charged to the
+            // group (payload bytes, as its rate samples count).
+            if demoted then counters.DemotedRepairs <- counters.DemotedRepairs + 1L
+            group.OnRepair(copies * s.Length)
+            s.Duplicates <- s.Duplicates + (copies - 1) * s.Length
+            s.Retx <- s.Retx + 1
+            s.SentNs <- now
+            s.Delivered <- delivered
+            s.DeliveredNs <- deliveredNs
+            s.FirstSentNs <- lastDeliveredSentNs
+            ackDue <- false
 
     /// Index of the segment that starts at seq, or -1.
     let find (seq: uint64) =
