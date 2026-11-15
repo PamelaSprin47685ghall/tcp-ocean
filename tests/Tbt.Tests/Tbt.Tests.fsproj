@@ -17,6 +17,7 @@
     <Compile Include="TunTests.fs" />
     <Compile Include="TunAckSchedulingTests.fs" />
     <Compile Include="RateGroupTests.fs" />
+    <Compile Include="KernelTcpInfoTests.fs" />
     <Compile Include="PaceTests.fs" />
     <Compile Include="FuzzTests.fs" />
     <Compile Include="PollerTests.fs" />

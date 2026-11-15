@@ -90,10 +90,6 @@ module SocketTuning =
     /// Linux TCP_INFO.tcpi_bytes_acked (offset 120), or -1 when unavailable.
     /// RFC 4898 thru octets acked: payload the peer has cumulatively ACKed.
     let tryBytesAcked (socket: Socket) =
-        if not (OperatingSystem.IsLinux()) then -1L
-        else
-            try
-                let buf = Array.zeroCreate<byte> 256
-                let n = socket.GetRawSocketOption(6, 11, Span buf) // SOL_TCP, TCP_INFO
-                if n >= 128 then BitConverter.ToInt64(buf, 120) else -1L
-            with :? SocketException -> -1L
+        match KernelTcpInfo.tryRead socket with
+        | ValueSome info -> info.BytesAcked
+        | ValueNone -> -1L
