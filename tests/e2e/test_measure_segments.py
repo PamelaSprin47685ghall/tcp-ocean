@@ -258,6 +258,86 @@ class MeasurementTests(unittest.TestCase):
         self.assertEqual(result["status"], "insufficient")
         self.assertIn("provenance_incomplete", result["baseline"]["excluded"][0]["reasons"])
 
+    def test_unknown_or_malformed_script_commit_does_not_count(self):
+        for value in (None, "", "unknown", "missing", "na", "abc123", "a" * 41, "g" * 7):
+            with self.subTest(value=value):
+                left = [run("7"), run("9")]
+                left[0]["metadata"]["script_commit"] = value
+                result = compare.compare(left, [run("7"), run("9")])[0]
+                self.assertEqual(result["baseline"]["n"], 1)
+                self.assertEqual(result["status"], "insufficient")
+                self.assertIn("provenance_incomplete", result["baseline"]["excluded"][0]["reasons"])
+
+    def test_short_full_and_dirty_script_commits_remain_usable(self):
+        for value in ("abc1234", "a" * 40, "ABC1234", "abc1234-dirty", "a" * 40 + "-dirty"):
+            with self.subTest(value=value):
+                item = run()
+                item["metadata"]["script_commit"] = value
+                self.assertTrue(compare.provenance_complete(item, item["records"][0]))
+
+    def test_binary_hash_and_build_commit_must_have_the_right_format(self):
+        for label in ("server_bin", "client_bin", "client_bundle"):
+            for value in (None, "", "unknown", "missing", "na", "a" * 63, "a" * 65, "g" * 64):
+                with self.subTest(label=label, hash=value):
+                    item = run()
+                    item["provenance"][label]["sha256"] = value
+                    self.assertFalse(compare.provenance_complete(item, item["records"][0]))
+        for label in ("server_bin", "client_bin"):
+            for value in (None, "", "unknown", "missing", "na", "abc123", "a" * 41, "abc1234-dirty"):
+                with self.subTest(label=label, commit=value):
+                    item = run()
+                    item["provenance"][label]["build_commit"] = value
+                    self.assertFalse(compare.provenance_complete(item, item["records"][0]))
+
+    def test_seed_aliases_do_not_count_as_two_seeds(self):
+        left = [run("7"), run("07")]
+        result = compare.compare(left, [run("7"), run("9")])[0]
+        self.assertEqual(result["baseline"]["n"], 2)
+        self.assertEqual(result["baseline"]["seeds"], ["7"])
+        self.assertEqual(result["status"], "insufficient")
+
+    def test_seed_must_be_an_exact_nonnegative_decimal_integer(self):
+        for value in (None, "", "unknown", "na", "NaN", "-1", "+7", "7.0", "7e0", "0x7",
+                      True, 7.0, -1, 2 ** 53, str(2 ** 53), "9007199254740993"):
+            with self.subTest(value=value):
+                item = run()
+                item["metadata"]["wanem_seed"] = value
+                result = compare.compare([item], [run()])[0]["baseline"]
+                self.assertEqual(result["n"], 0)
+                self.assertIn("provenance_incomplete", result["excluded"][0]["reasons"])
+
+    def test_seed_zero_and_exact_upper_bound_remain_usable(self):
+        for value in (0, "0", 7, "0007", 2 ** 53 - 1, str(2 ** 53 - 1)):
+            with self.subTest(value=value):
+                item = run()
+                item["metadata"]["wanem_seed"] = value
+                self.assertTrue(compare.provenance_complete(item, item["records"][0]))
+                self.assertEqual(compare.normalized_seed(item["metadata"]), int(value))
+
+    def test_missing_seed_is_rejected_but_requested_seed_is_a_known_fallback(self):
+        item = run()
+        del item["metadata"]["wanem_seed"]
+        self.assertTrue(compare.provenance_complete(item, item["records"][0]))
+        del item["metadata"]["seed"]
+        self.assertFalse(compare.provenance_complete(item, item["records"][0]))
+
+    def test_paths_must_be_present_positive_and_equal(self):
+        for value in (None, "", "unknown", "0", "-1", "64.0", 64.0, True):
+            with self.subTest(value=value):
+                item = run()
+                item["metadata"]["paths"] = value
+                item["negotiated"]["mux"]["paths"] = value
+                self.assertFalse(compare.provenance_complete(item, item["records"][0]))
+        item = run()
+        del item["metadata"]["paths"]
+        del item["negotiated"]["mux"]["paths"]
+        self.assertFalse(compare.provenance_complete(item, item["records"][0]))
+        item = run()
+        item["negotiated"]["mux"]["paths"] = "8"
+        self.assertFalse(compare.provenance_complete(item, item["records"][0]))
+        item["negotiated"]["mux"]["paths"] = 64
+        self.assertTrue(compare.provenance_complete(item, item["records"][0]))
+
     def test_loss_percent_mistake_is_rejected_before_testbed(self):
         for value in ("5", "nan", "inf", "-0.05"):
             result = subprocess.run(["bash", str(HERE / "run.sh"), "20", "200", value, "4", "10"],

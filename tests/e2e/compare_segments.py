@@ -4,6 +4,7 @@ import argparse
 import json
 import math
 from pathlib import Path
+import re
 import statistics
 
 
@@ -38,24 +39,51 @@ def scenario(run):
     return result
 
 
+def matches(pattern, value):
+    return isinstance(value, str) and re.fullmatch(pattern, value) is not None
+
+
+def nonnegative_integer(value, maximum=None):
+    if type(value) is int:
+        parsed = value
+    elif matches(r"[0-9]+", value):
+        try:
+            parsed = int(value)
+        except ValueError:
+            return None
+    else:
+        return None
+    return parsed if parsed >= 0 and (maximum is None or parsed <= maximum) else None
+
+
+def normalized_seed(metadata):
+    # wanem reads the value through atof before converting it to uint64_t.
+    # Stay in the exact integer range of that conversion. Do not count aliases
+    # such as 7 and 07 as different random sequences.
+    return nonnegative_integer(metadata.get("wanem_seed", metadata.get("seed")),
+                               maximum=2 ** 53 - 1)
+
+
 def provenance_complete(run, record):
     bins = run.get("provenance", {})
-    known_hashes = all(bins.get(label, {}).get("sha256") not in (None, "unknown", "missing")
+    known_hashes = all(matches(r"[0-9a-fA-F]{64}", bins.get(label, {}).get("sha256"))
                        for label in ("server_bin", "client_bin", "client_bundle"))
-    known_builds = all(bins.get(label, {}).get("build_commit") not in (None, "unknown", "missing")
+    known_builds = all(matches(r"[0-9a-fA-F]{7,40}", bins.get(label, {}).get("build_commit"))
                        for label in ("server_bin", "client_bin"))
     metadata = run.get("metadata", {})
-    negotiated = run.get("negotiated", {}).get(record["session"], {}).get("paths")
-    return bool(known_hashes and known_builds and metadata.get("script_commit")
+    requested = nonnegative_integer(metadata.get("paths"))
+    negotiated = nonnegative_integer(run.get("negotiated", {}).get(record["session"], {}).get("paths"))
+    return bool(known_hashes and known_builds
+                and matches(r"[0-9a-fA-F]{7,40}(?:-dirty)?", metadata.get("script_commit"))
                 and metadata.get("wanem_version") not in (None, "unknown", "na")
-                and metadata.get("wanem_seed", metadata.get("seed")) is not None
-                and negotiated == metadata.get("paths"))
+                and normalized_seed(metadata) is not None
+                and requested is not None and requested > 0 and negotiated == requested)
 
 
 def summarize(samples):
     usable, excluded, failures, observed_failures = [], [], [], []
     for run, record, metric in samples:
-        seed = run["metadata"].get("wanem_seed", run["metadata"].get("seed"))
+        seed = normalized_seed(run["metadata"])
         item = {"work": run["work"], "seed": seed, "value": record["metrics"].get(metric),
                 "validity": record["validity"], "returncode": record.get("returncode"),
                 "reasons": record["reasons"]}
