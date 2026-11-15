@@ -34,6 +34,7 @@ python3 tests/vectors/make_handshake_vectors.py > tests/vectors/handshake-vector
 ```sh
 python3 tests/e2e/test_tb_guard.py
 python3 tests/e2e/test_echo.py
+python3 tests/e2e/test_measure_segments.py
 ```
 
 ## 模块
@@ -107,7 +108,7 @@ p99 只统计收发都落在满载区间内的探测，并给出超时/失败的
 完整算术和窗口预算见 `docs/cases/matrix.md`。
 
 下表是 2026-11-12 的早期对照（单向 20 ms，200 Mbit/s，4 条路径，每例 10 s），用来说明 TUN 载体相对内核载体在丢包下的差异。
-当前主线是 `2bc2968`（2026-11-15）：20/200 0% 有效 bulk/iperf 仍在约 143 Mbit/s（预算约 98%）；5% 下行约 134–137、上行约 150；
+最近的吞吐基线是 `2bc2968`（2026-11-15）：20/200 0% 有效 bulk/iperf 仍在约 143 Mbit/s（预算约 98%）；5% 下行约 134–137、上行约 150；
 `PROFILE=rtt400` 的 64 路 down1 有效样本约 137（已消除一度出现的 96–133 爬行）；64 路上行从洞修复前的约 2 Mbit 回到约 93–121。更细的有效样本见 `docs/cases/`。
 
 iperf3 经隧道（Mbit/s），普通 TCP 不走隧道作参考：
@@ -125,7 +126,8 @@ iperf3 经隧道（Mbit/s），普通 TCP 不走隧道作参考：
 
 ## 当前状态
 
-以主线 `2bc2968` 为准（2026-11-15 合入；其祖先含洞修复 `351943c`：close-reserve、自适应 TUN drain、2 MB sndbuf）。
+代码以主线 `546fb0a` 为基线，含 CTRL 换钥和关路径处理；吞吐数据仍来自 `2bc2968`，未当作新代码的测量结果。
+`2bc2968` 的祖先含洞修复 `351943c`：close-reserve、自适应 TUN drain、2 MB sndbuf。当前分支的候选修复仍待官方 A/B。
 与规范的长期偏差见 `docs/DECISIONS.md`。分项进度见 `docs/t9u-status.md` 和 `docs/cases/`。
 部署按专用线考虑：上下行可以不对称，也会有多种带宽；速率估计必须按方向（及路径组）分开，不能把上行学到的带宽拷到下行，或反过来。不要为跨流公平或让路做设计。合入默认参数时，bulk/iperf 不得差于当时主线，交互只需可用。
 
@@ -136,7 +138,7 @@ iperf3 经隧道（Mbit/s），普通 TCP 不走隧道作参考：
 - 服务器 TUN + 用户态 TCP 载体：吞洞、借壳修复、RACK、与 SACK 无关的 RTO 兜底、合规 D-SACK、每路径接收窗口 600 000 B。
 - 速率组：稳态在途上限约 1.25 倍带宽时延积，巡航增益 1.05，修补计入节拍；闲置或方向切换后 app-limited 轮次会清掉过期的满管计数并保持 startup，满管按在途 ≥ 1 BDP 计（不要求 pacer 拒绝）。
 - 会话 SRTT 的 Karn 规则；断网时路径保活（全组停住不当成死路径）。
-- CTRL 可靠日志与 SESSION_CLOSE；Linux 默认使用 epoll，亦可退回 poll。
+- CTRL 可靠日志、SESSION_CLOSE、换钥与关路径；Linux 默认使用 epoll，亦可退回 poll。
 - 就绪集调度（RS-1…3）与有界批次（Q-3）。
 - 会话级最后手段：对端矛盾的 k、或路径入口异常，只关闭该会话并计数。
 - netns 端到端（echo、批量、丢包，两种载体，以及非对称 profile）；测试床有全局锁和所有权记录。
@@ -150,17 +152,28 @@ iperf3 经隧道（Mbit/s），普通 TCP 不走隧道作参考：
 
 **仍开放**
 
+- 64 路上行的有效样本仍散在约 93–121 Mbit/s。默认 `UPLINK_PACE=0` 时，实际发送控制在客户端内核 TCP，
+  上行 RateGroup 不运行；诊断入口与判别条件见 [上行观测](docs/cases/uplink-observation.md)。
+- 方向切换的修复需要继续按残留类别比较。真空闲时清除旧满管计数的机制与回归见
+  [速率组空闲记录](docs/cases/rate-group-idle.md)；不可用的 ACK 不再中断 TUN drain，见
+  [ACK 调度记录](docs/cases/tun-ack-drain.md)。两处控制修复仍待官方 A/B，不把单测作为吞吐验收。
 - 交互延迟放到最后处理。空闲时 p99 约一个 RTT；满载时还有约一个 RTT 的队头阻塞。`urgent` 队列已有优先调度，但校验渲染仍传 `urgent=false`，不能当成原设计的紧急 GF(16) 路径已经接通。
 - 规范里让客户端内核始终以为工况很好：预算回路（CONGESTION_WARN、`rx_win_grant`）和断网尾部丢包隐藏，仍在进行。
 - 评审指出、尚未在主线收完的计量与许可问题：JOIN 生命周期、修补节拍与“已确认送达”的分计、D-SACK 依据真实接收历史。
 - 默认 `--window=1024`、接收历史 320 步，在 400 ms RTT 的理想在途预算约 299 Mbit/s；进入原场景前要先冻结窗口和内存。
 - 400 ms RTT、每五元组 4 Mbit/s、256 路及 30% 丢包的原验收场景：测试床刚提供配置和短校准，还没有大战役数据。
-- 64 路上行有效样本仍散在约 93–121 Mbit/s。
-- CTRL 换钥、关路径；MemoryGovernor 与 384 MiB 档；t9u 其余项（HHF 保持定时器、完整晚绑定、浅队列需与就绪集和交互信用一起再试，等）。
+- MemoryGovernor 与 384 MiB 档；t9u 其余项（HHF 保持定时器、完整晚绑定、浅队列需与就绪集和交互信用一起再试，等）。
 
 **已知限制**
 
-- 吞洞让客户端内核 TCP 看不到上行丢包。每路径 600 000 B 的窗口已经把上行排队从约 300 ms 降到约 110 ms；排队明显改善，吞吐未见一致的下降趋势，但还不宜写成已经证明完全不退（见 `docs/cases/uplink-window.md`）。
+- 吞洞的目标是在[可检验的包络](docs/cases/rto-envelope.md)内让客户端内核看不到上行丢包。
+  无内核重传、无 RTO、无窗口收缩和应用限时恢复分开验收；反馈中断超过剩余内核计时器预算时，
+  不能承诺零 RTO。每路径 600 000 B 的窗口已经把上行排队从约 300 ms 降到约 110 ms；
+  排队明显改善，吞吐未见一致的下降趋势，但还不宜写成已经证明完全不退（见 `docs/cases/uplink-window.md`）。
 - 测量环境是共享机器，别的进程会抢 CPU，整机也出现过数分钟的暂停（例如 virtio balloon）。单轮结果有噪声，结论以多轮、同一时段交替对比为准；某一测量段若与主机暂停或日志缺口重叠，该段不能当产品结论。
+
+官方脚本逐段保存 `segments.json`，按各自的 mux / bulk 会话检查 host pause、stats gap 和
+clock jump；缺证据记 unknown。比较器按配置和残留类别池化至少两个有效种子，并保留失败和
+排除原因。命令及二进制打戳规则见[分段有效性](docs/cases/measurement-validity.md)。
 
 `Tbt.Contracts` 仍被各模块使用（布局常量、时钟、熵接口），保留。

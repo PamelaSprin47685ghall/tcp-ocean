@@ -4,6 +4,9 @@
 - `DECISIONS.md`：规范未写死、本实现定下的互通规则。
 - `t9u-status.md`、`cases/`：实现进度、A/B 与故障记录；不是规范本身。
 - 仓库根目录的 `README.md` 与 `AGENTS.md` 描述如何构建、测试和合入；以主线当前提交为准。
+- 难点跟进：[上行观测](cases/uplink-observation.md)、[真空闲后的组计数](cases/rate-group-idle.md)、
+  [ACK 与 TUN drain](cases/tun-ack-drain.md)、[丢包隐藏包络](cases/rto-envelope.md)、
+  [分段测量有效性](cases/measurement-validity.md)。
 - 测试向量在 `../tests/vectors/`：
   - `tbt-sc2-vectors.json`、`join-ack-v22-vectors.json`：随规范发布的规范性向量。
   - `handshake-vectors.json`：由 `make_handshake_vectors.py`（Python `cryptography`，与 F# 代码无共享）按 spec 6.3–6.5 独立生成。
