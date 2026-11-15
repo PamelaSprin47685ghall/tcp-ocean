@@ -2,7 +2,7 @@
 
 **Draft, not ready to merge. No throughput fix is claimed.**
 
-Reviewed base: `496d511a45053253970f78509803ddad5877c955`. This work adds default-off, bilaterally negotiated arrival evidence, an observation-only shadow sampler, and independent diagnostic runners. It does not connect shadow estimates to RateGroup, change pacing defaults, replace copy-estimate telemetry, redesign ledger credit, or modify protected ACK/write-gate/recovery behavior.
+Historical experiment base: `496d511a45053253970f78509803ddad5877c955`. Main commit `701e228357137023ad6f7ebfd4c4301f1c2f2cf2` has since been integrated to include its NativeLib constructor-call fix; the measurements below retain their original baseline and do not become new-head performance evidence. This work adds default-off, bilaterally negotiated arrival evidence, an observation-only shadow sampler, and independent diagnostic runners. It does not connect shadow estimates to RateGroup, change pacing defaults, replace copy-estimate telemetry, redesign ledger credit, or modify protected ACK/write-gate/recovery behavior.
 
 Capability `0x0800` and WIN_ACK bytes 80–95 are **tentative experimental allocations, not globally reserved**. Maintainers must coordinate protocol allocation and unpublished parallel work before any integration. The visible open uplink-evidence diagnostic PR does not assign these fields; that is not proof of global availability.
 
@@ -11,8 +11,12 @@ Capability `0x0800` and WIN_ACK bytes 80–95 are **tentative experimental alloc
 - Latest test-project suite: **400 passed, 0 failed, 0 skipped**. New lifecycle tests preserve existing assertions. Successful single-process builds: zero warnings/errors.
 - Actual legacy/new assembly interoperability was checked in both directions, plus deterministic default handshake/DATA/WIN_ACK byte equivalence. The in-process TunPath packet fixture uses a simulated TCP peer; it is not an OS end-to-end test.
 - The independent runner was separately published with NativeAOT inside Alpine Linux and exercised actual client kernel TCP ↔ server TunPath/TUN. Client execution was JIT; server execution was NativeAOT.
-- **The complete solution is not green:** clean base also has `Tbt.NativeLib/ClientHost.cs:188` CS7036 concerning `offerChaCha20`. This unrelated baseline/parallel API issue was not patched or suppressed. No audit/warning checks or protected assertions were disabled.
+- **Historical build failure:** clean `496d511` reproduced `Tbt.NativeLib/ClientHost.cs:188` CS7036 concerning `offerChaCha20`; the original PR CI reported CS1729 for the same ten-argument call. Main fixed that call in `701e228`, now integrated here. This is no longer a claimed current-main blocker. Updated-head validation must be recorded separately; historical test-project passes do not establish full-solution success. No audit/warning checks or protected assertions were disabled.
 - Testbed guard tests: 11 passed. Echo test assertions passed, but existing shutdown `OSError(107)` diagnostics were observed; this is not an exception-free claim.
+
+## Main integration validation (701e228)
+
+After integrating the upstream NativeLib call-site fix, the complete Release solution build succeeded with zero warnings/errors. The complete test assembly was run directly: **400 passed, 0 failed, 0 skipped** (27.560 s). Offline guard (11) and measurement (39) tests and shell syntax checks passed. Echo's five assertions passed with exit 0, but the known background shutdown `OSError(107)` was still printed. Local commands used writable cache/runtime directories; audit and warnings-as-errors stayed enabled. No new QEMU or NativeAOT performance evidence was collected for this maintenance update; new-head CI is checked separately.
 
 ## Original real-Linux four-mode pilot: retain failures
 
