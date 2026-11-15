@@ -26,6 +26,7 @@ jobs:
           python3 tests/e2e/test_tb_guard.py
           python3 tests/e2e/test_echo.py
           python3 tests/e2e/test_measure_segments.py
+          python3 tests/e2e/test_uplink_evidence.py
           bash -n tests/e2e/run.sh
 
   aot-server:
