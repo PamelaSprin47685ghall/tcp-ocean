@@ -240,25 +240,27 @@ let ``microbench: ChaCha8 vs ChaCha20 AEAD on a data-cell body`` () =
     let aad = Array.init 18 (fun i -> byte (i + 3))
     // 40-byte meta + 1344-byte symbol, the plaintext of one S=1344 cell.
     let plain = Array.init 1384 (fun i -> byte i)
-    let run (rounds: int) (iters: int) =
+    let run (rounds: int) (iters: int) (warm: int) =
         let aead = ChaCha20Poly1305Aead(ReadOnlySpan key, rounds)
         let cipher = Array.zeroCreate plain.Length
         let tag = Array.zeroCreate 16
         let back = Array.zeroCreate plain.Length
-        aead.Encrypt(ReadOnlySpan nonce, ReadOnlySpan plain, Span cipher, Span tag, ReadOnlySpan aad)
-        Assert.True(aead.TryDecrypt(ReadOnlySpan nonce, ReadOnlySpan cipher, ReadOnlySpan tag, Span back, ReadOnlySpan aad))
-        let sw = Stopwatch.StartNew()
-        for _ in 1 .. iters do
+        let once () =
             aead.Encrypt(ReadOnlySpan nonce, ReadOnlySpan plain, Span cipher, Span tag, ReadOnlySpan aad)
             if not (aead.TryDecrypt(ReadOnlySpan nonce, ReadOnlySpan cipher, ReadOnlySpan tag, Span back, ReadOnlySpan aad)) then
                 failwith "bench decrypt failed"
+        for _ in 1 .. warm do once ()
+        GC.Collect()
+        GC.WaitForPendingFinalizers()
+        let before = GC.GetAllocatedBytesForCurrentThread()
+        let sw = Stopwatch.StartNew()
+        for _ in 1 .. iters do once ()
         sw.Stop()
-        sw.Elapsed.TotalNanoseconds / float iters
-    // Warm both paths, then measure.
-    run 10 64 |> ignore
-    run 4 64 |> ignore
-    let ns20 = run 10 8000
-    let ns8 = run 4 8000
+        let alloc = GC.GetAllocatedBytesForCurrentThread() - before
+        sw.Elapsed.TotalNanoseconds / float iters, alloc
+    let ns20, a20 = run 10 20000 4000
+    let ns8, a8 = run 4 20000 4000
     Assert.True(ns8 > 0.0 && ns20 > 0.0)
-    // Recorded for the report; we do not fail the suite on the ratio.
-    eprintfn "cell AEAD ns/op ChaCha20=%.0f ChaCha8=%.0f ratio=%.2f" ns20 ns8 (ns20 / ns8)
+    // Per-cell AEAD itself must not allocate (see CryptoTests); this print is for the report.
+    eprintfn "cell AEAD ns/op ChaCha20=%.0f ChaCha8=%.0f ratio=%.2f alloc/op 20=%.3f 8=%.3f"
+        ns20 ns8 (ns20 / ns8) (float a20 / 20000.0) (float a8 / 20000.0)

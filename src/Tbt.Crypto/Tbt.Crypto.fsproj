@@ -12,5 +12,6 @@
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="../Tbt.Contracts/Tbt.Contracts.fsproj" />
+    <ProjectReference Include="../Tbt.Kernels/Tbt.Kernels.csproj" />
   </ItemGroup>
 </Project>

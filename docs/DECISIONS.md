@@ -109,6 +109,10 @@ RFC 8439 第 2.8 节的 AEAD，只把 ChaCha 从 20 轮改为 8 轮（4 个双�
 （规范只写了 bit0/bit1）。默认仍只通告 0x02；双方 `offerChaCha8` 时服务端才选 0x03，不会把 0x02 悄悄换成 8 轮。
 JOIN / JOIN_ACK 的引导 AEAD 仍是 ChaCha20-Poly1305；ACK 里的 suite 字段回显本会话数据套件。
 
-测试：`HandshakeCryptoTests` 中的 RFC 7748 向量、独立脚本 `tests/vectors/chacha8_ietf.py` 的 8 轮 KATs、
+测试：`HandshakeCryptoTests` 中的 RFC 7748 向量（含 1 次与 1000 次迭代）、独立脚本 `tests/vectors/chacha8_ietf.py` 的 8 轮 KATs、
 以及客户端与服务端在 X25519 / 0x03 / 两者同时开启时的互通。
+
+X25519 使用 5×51-bit limb 的恒定时间 Montgomery ladder（cswap、固定指令序列、ladder 与求逆不分配）。
+每 cell 的 AEAD 零分配：ChaCha 在 AVX2 上走 8-block Vector256 核，否则 Vector128；Poly1305 是 44-bit limb 的托管实现。
+套件 0x02 也可与平台 `ChaCha20Poly1305`（Linux 上为 OpenSSL）交叉验证。TryDecrypt 不抛异常，伪造帧也不分配。
 
