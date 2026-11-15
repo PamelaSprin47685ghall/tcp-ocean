@@ -7,6 +7,7 @@ when a pre-declared host-pause discard applies. Event-loop stall is never a reas
 import datetime
 import re
 import sys
+import time
 from pathlib import Path
 
 
@@ -53,6 +54,7 @@ def wanem_field(stats: Path, prefix, field):
 def main():
     work = Path(sys.argv[1])
     started = int(sys.argv[2])
+    ended = time.time()
     discard_rule = sys.argv[3] != "0"
 
     end_txt = ""
@@ -62,14 +64,17 @@ def main():
     pat = re.compile(r"^\[([^\]]+)\]\s*(.*)$")
     fork_re = re.compile(r"virtual machine fork", re.I)
     balloon_re = re.compile(r"Out of puff|virtio_balloon", re.I)
-    forks, balloons, lines = [], [], []
+    forks, balloons, lines, unknown = [], [], [], []
     for raw in end_txt.splitlines():
         m = pat.match(raw)
         if not m:
             continue
         ts, msg = m.group(1), m.group(2)
         unix = parse_dmesg_ts(ts)
-        if unix is not None and unix < started:
+        if unix is not None and (unix < started or unix >= ended):
+            continue
+        if unix is None and (fork_re.search(msg) or balloon_re.search(msg)):
+            unknown.append(raw)
             continue
         kind = None
         if fork_re.search(msg):
@@ -89,8 +94,9 @@ def main():
         f"host_pause_events={events} fork={len(forks)} balloon={len(balloons)}",
         f"discard_rule=HOST_PAUSE_DISCARD={'1' if discard_rule else '0'}",
         f"discarded={'yes' if discarded else 'no'}",
-        f"run_valid={'no' if discarded else 'yes'}",
-        "note=event-loop stall or SUT clock_jumps alone are never a discard reason",
+        f"whole_run_host_marker={'discarded' if discarded else 'not_discarded'}",
+        f"host_evidence={'unknown' if unknown or not end_txt.strip() else 'available'}",
+        "note=use segments.json for measurement validity; event-loop stall alone is not a discard reason",
     ]
     if lines:
         body.extend(lines)
@@ -100,7 +106,7 @@ def main():
     print(
         f"host_pause: events={events} fork={len(forks)} balloon={len(balloons)} "
         f"discard_rule={'1' if discard_rule else '0'} discarded={'yes' if discarded else 'no'} "
-        f"run_valid={'no' if discarded else 'yes'} evidence={evidence}"
+        f"whole_run_host_marker={'discarded' if discarded else 'not_discarded'} evidence={evidence}"
     )
 
     stats = work / "wanem.stats"
