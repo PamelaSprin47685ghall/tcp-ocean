@@ -80,6 +80,9 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
     /// Unique cells in custody plus those of steps the peer has reported seeing (t_hi)
     /// that are still ahead of peer_ack. Client uplink rate samples use this.
     let mutable uniqueArrived = 0L
+    // Live sum of first copies in [peerAck, peerSeenHi]. Keep it separate from
+    // the public snapshot: renders alone must not advance UniqueArrived.
+    let mutable seenOutstanding = 0L
     /// Repair (spec 5.8): BOOSTER cells go before all other cells.
     let repairs = Queue<Candidate>(256)
     /// Interactive steps (spec 16.3 CR-1): one small session-level reserve, sent before the
@@ -144,14 +147,7 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
     let index (t: uint64) = int (t &&& uint64 (capacity - 1))
 
     let refreshUniqueArrived () =
-        let mutable n = uniqueAcked
-        if peerSeenHi >= peerAck && encoder.Head > 0UL then
-            let last = min peerSeenHi (encoder.Head - 1UL)
-            let mutable step = peerAck
-            while step <= last do
-                n <- n + int64 uniqueCells.[index step]
-                step <- step + 1UL
-        uniqueArrived <- n
+        uniqueArrived <- uniqueAcked + seenOutstanding
 
 
     let seal (k: int) (small: bool) =
@@ -298,7 +294,9 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
                 // SRTT. Credit unique cells before Release may drop StepUsed.
                 let mutable tAck = peerAck
                 while tAck < ack do
-                    uniqueAcked <- uniqueAcked + int64 uniqueCells.[index tAck]
+                    let n = int64 uniqueCells.[index tAck]
+                    uniqueAcked <- uniqueAcked + n
+                    if tAck <= peerSeenHi then seenOutstanding <- seenOutstanding - n
                     uniqueCells.[index tAck] <- 0
                     tAck <- tAck + 1UL
                 let now = clock.NowNs()
@@ -417,6 +415,14 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
     /// at the frontier.
     member _.OnPeerSeen(thi: uint64) =
         if thi > peerSeenHi then
+            // Only newly covered steps enter the live sum. A later first render
+            // within this range updates the sum, but not the public snapshot.
+            if encoder.Head > 0UL then
+                let last = min thi (encoder.Head - 1UL)
+                let mutable t = max peerAck (peerSeenHi + 1UL)
+                while t <= last do
+                    seenOutstanding <- seenOutstanding + int64 uniqueCells.[index t]
+                    t <- t + 1UL
             peerSeenHi <- thi
             refreshUniqueArrived ()
 
@@ -688,6 +694,8 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
                     if first then
                         uniqueCells.[index t] <- uniqueCells.[index t] + 1
                         uniqueRendered <- uniqueRendered + 1L
+                        if t >= peerAck && t <= peerSeenHi then
+                            seenOutstanding <- seenOutstanding + 1L
                     ok <- true
                     done' <- true
         ok
