@@ -21,6 +21,15 @@ type Candidate =
       Span: byte
       Round: byte }
 
+/// Default scheduler history for one absolute (tLo, span). A ring tag distinguishes
+/// successive encoder generations; entries are never cleared on the seal hot path.
+[<Struct; NoEquality; NoComparison>]
+type internal RepairRangeHistory =
+    { Lo: uint64
+      LastNs: int64
+      LastDeficit: int
+      NextSeq: int }
+
 /// Smallest m such that P(Bin(k + m, 1 - eps) < need(k)) <= 1e-3 (spec 5.7 small steps).
 module SmallStep =
     let private binomialBelow (n: int) (p: float) (need: int) =
@@ -125,12 +134,13 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
     /// Opt-in per-step / evidence / tail-timer scheduler. Off = main's span OnNack,
     /// 1.05×minRTT wait, and Karn over the last repair range, exactly.
     let mutable newRepair = false
-    /// Main (flag-off) repair-range state: one BOOSTER span, one wait clock.
+    /// Latest accepted default repair round, retained for the existing Karn check.
     let mutable repairLo = 0UL
-    let mutable repairSpan = 0
-    let mutable repairSeq = 0
     let mutable repairNs = 0L
-    let mutable repairDeficit = 0
+    // Allocate only when a valid default repair first needs history. Retain it
+    // across mode changes; LastDeficit > 0 distinguishes initialized entries.
+    let repairHistoryLength = Checked.(*) encoder.Capacity CodeGraph.MaxBoosterSpan
+    let mutable repairHistory: RepairRangeHistory[] = Array.empty
     /// When a BOOSTER for this step was sealed (0: none in this generation).
     let boostSentNs: int64[] = Array.zeroCreate encoder.Capacity
     let mutable lastSourceNs = 0L
@@ -515,32 +525,40 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
                     this.ArmStep(tLo + uint64 j, share)
                 this.DrainDueRepairs()
         else
-            // Main: one range, BOOSTERs enqueued now. Same range waits RepairWaitNs
-            // unless the deficit grew. tLo below peerAck is ignored; a due prefix
-            // is not applied (that was 5df6fa4, gated with the new scheduler).
+            // Default: a genuinely new range repairs immediately. Remember each
+            // held absolute range across interleaved/reordered reports. Equal or
+            // smaller deficit waits; the existing deficit-growth exception stays.
+            // repairLo/repairNs remain the latest accepted round for Karn.
+            let validSpan = span > 0
             let now = clock.FreshNs()
             let span = int (min (uint64 (min span CodeGraph.MaxBoosterSpan)) (encoder.Head - min tLo encoder.Head))
-            if tLo >= peerAck && span >= 1 && deficit >= 1 && encoder.StepUsed tLo > 0 then
-                let same = tLo = repairLo && span = repairSpan
-                if not same || deficit > repairDeficit || float (now - repairNs) >= this.RepairWaitNs then
-                    if same && deficit <= repairDeficit then repairRepeats <- repairRepeats + 1L
-                    if not same then
-                        repairLo <- tLo
-                        repairSpan <- span
-                        repairSeq <- 0
-                    repairDeficit <- deficit
+            if validSpan && tLo >= peerAck && span >= 1 && span <= CodeGraph.MaxBoosterSpan && deficit >= 1 && encoder.StepUsed tLo > 0 then
+                if repairHistory.Length = 0 then
+                    repairHistory <- Array.zeroCreate repairHistoryLength
+                let index = int (tLo % uint64 encoder.Capacity) * CodeGraph.MaxBoosterSpan + span - 1
+                let old = repairHistory.[index]
+                let same = old.LastDeficit > 0 && old.Lo = tLo
+                if not same || deficit > old.LastDeficit || float (now - old.LastNs) >= this.RepairWaitNs then
+                    if same && deficit <= old.LastDeficit then repairRepeats <- repairRepeats + 1L
+                    repairLo <- tLo
                     repairNs <- now
+                    let next = if same then old.NextSeq else 0
                     let n = min 64 (int (ceil (float (deficit + 2) / (1.0 - min 0.9 erasure))))
-                    if repairSeq + n <= 256 then
+                    let mutable after = next
+                    if next + n <= 256 then
                         for i in 0 .. n - 1 do
-                            repairs.Enqueue { Kind = CellType.Booster; Step = tLo; Index = byte (repairSeq + i)
+                            repairs.Enqueue { Kind = CellType.Booster; Step = tLo; Index = byte (next + i)
                                               Span = byte span; Round = byte n }
-                        repairSeq <- repairSeq + n
+                        after <- next + n
                     else
                         for j in 0 .. span - 1 do
                             let t = tLo + uint64 j
                             for s in 0 .. encoder.StepUsed t - 1 do
                                 repairs.Enqueue { Kind = CellType.Data; Step = t; Index = byte s; Span = 0uy; Round = 0uy }
+                    // An oversized round falls back to DATA without consuming the
+                    // remaining seeds: a later smaller round may still use them.
+                    repairHistory.[index] <-
+                        { Lo = tLo; LastNs = now; LastDeficit = deficit; NextSeq = after }
 
     /// Tail rule (spec 5.8): input paused for 50 ms and the peer lacks steps: a HEARTBEAT
     /// every 50 ms carries tx_head_step.
