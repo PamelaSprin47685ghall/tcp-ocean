@@ -5,7 +5,7 @@
 - First-copy accounting fix is on main: a6b8ede5ed5c07f95a44b9310e10efa3593f3fd0. It avoids counting DATA repair fallback as a second unique cell while retaining wire charging. The recorded CI run passed, including NativeAOT.
 - PR #2 (`d17d7f2`): offline uplink segment evidence tooling.
 - PR #3 (`0b9f6bd`): experimental, default-off negotiated coded-cell feedback and shadow estimator. **Not for merge as-is:** tentative protocol bit 0x0800 and WIN_ACK bytes 80–95 require coordination; no controller integration or throughput validation.
-- PR #4 (`76889915`): fixes FlowTable ReportsDue lifecycle leak on slot close/reuse.
+- PR #4 (`76889915`): fixes FlowTable ReportsDue lifecycle leak on slot close/reuse. Main commit `5234d971378fea534dccca8cd2c77893b3c7e385` already incorporates the fix, regression tests, and case documentation; do not apply it again. PR #4 remains open, not recorded as merged. [CI for that main commit](https://github.com/PamelaSprin47685ghall/tcp-ocean/actions/runs/43843406687) passed.
 - PR #5 (`a5b9f04`): fixes interleaved valid NACK ranges losing repair wait/seed progress. Lazy table costs approximately 384 KiB per active default-repair session at C4096; evaluate memory/GC at scale.
 
 The PRs remain drafts; see their descriptions and current GitHub checks for exact scope and current status. Do not combine them blindly with concurrent ACK, write-gate, CTRL or startup work.
