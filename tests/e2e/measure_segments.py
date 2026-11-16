@@ -98,7 +98,11 @@ def read_log(path, anchor, gap_s):
 
 
 AFFECTED = {True: "yes", False: "no", None: "unknown"}
-FREEZE_FILES = ("freeze.jsonl", "freeze-icmp.jsonl")
+FREEZE_FILES = ("wanem.stats.freeze", "freeze.jsonl", "freeze-icmp.jsonl")
+# Only wanem's own lateness says the emulated link stopped. The timer probe sees stalls of
+# its own process (any vCPU stall, mostly not on the testbed's processes); the ICMP probe
+# shares the bottleneck queue. Both are kept as evidence, neither marks a segment.
+LINK_FREEZE_FILE = "wanem.stats.freeze"
 
 
 def read_freezes(work):
@@ -127,26 +131,29 @@ def read_freezes(work):
 
 
 def freeze_view(record, detectors, metadata, min_ms):
-    """Annotate, never invalidate. A freeze costs about its own length of delivery on every
-    path at once; it starts tail repair when it outlasts the RTT. So a segment is
-    freeze_affected when a freeze of at least min_ms and longer than the path RTT falls in
-    it ("low RTT" relative to that freeze). Shorter freezes are still listed."""
+    """Annotate, never invalidate. A link freeze costs about its own length of delivery on
+    every path at once; it starts tail repair when it outlasts the RTT. So a segment is
+    freeze_affected when a wanem freeze of at least min_ms and longer than the path RTT falls
+    in it ("low RTT" relative to that freeze). Shorter or probe-only events are still listed."""
     start = record["start"]["unix_ns"] / 1e9
     end = record["end"]["unix_ns"] / 1e9 if "end" in record else None
     owd = number(metadata.get("owd_ms"))
     rtt_ms = 2 * owd if owd is not None else None
     covering = [d for d in detectors if end is not None and d["start"] is not None and d["end"] is not None
-                and d["start"] <= start and d["end"] >= end]
+                and d["start"] <= start and d["end"] >= end and d["file"] == LINK_FREEZE_FILE]
     if end is None or not covering:
         evidence = "unavailable"
     else:
         evidence = "observed"
     events = sorted((event for d in detectors for event in d["events"]
                      if end is not None and overlaps(start, end, event)), key=lambda event: event["start"])
-    long = [event for event in events if event["ms"] >= min_ms and (rtt_ms is None or event["ms"] > rtt_ms)]
+    long = [event for event in events if event["file"] == LINK_FREEZE_FILE and event["ms"] >= min_ms
+            and (rtt_ms is None or event["ms"] > rtt_ms)]
     affected = True if long else (False if evidence == "observed" else None)
+    link = [e for e in events if e["file"] == LINK_FREEZE_FILE]
     return {"evidence": evidence, "detectors": [d["file"] for d in covering], "min_ms": min_ms,
-            "rtt_ms": rtt_ms, "count": len(events), "max_ms": max((e["ms"] for e in events), default=0.0),
+            "rtt_ms": rtt_ms, "count": len(link), "max_ms": max((e["ms"] for e in link), default=0.0),
+            "other_count": len(events) - len(link),
             "affected": affected, "events": events}
 
 

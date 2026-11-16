@@ -77,9 +77,11 @@ host_quiet_s=${HOST_QUIET_S:-60}
 host_min_mem_mib=${HOST_MIN_MEM_MIB:-2560}
 host_quiet_bypass=${HOST_QUIET_BYPASS:-0}
 stats_gap_s=${STATS_GAP_S:-2.5}
-# Freeze detector (freeze_probe.py): every stop of the box of at least FREEZE_MS is
-# recorded in freeze.jsonl. FREEZE_ICMP=1 also probes the near->far path through wanem
-# (freeze-icmp.jsonl); it adds ~0.1 Mbit/s of probes, which shifts wanem's loss pattern.
+# Freezes: wanem logs every packet it writes >=50 ms late (the emulated link stopped) to
+# wanem.stats.freeze; measure_segments marks a segment freeze_affected when such a freeze
+# is >= FREEZE_MS and longer than the RTT. freeze_probe.py adds evidence only: a timer-gap
+# loop (freeze.jsonl; stalls of its own process) and, with FREEZE_ICMP=1, an ICMP probe
+# near->far (freeze-icmp.jsonl; ~0.1 Mbit/s of probes, which shifts wanem's loss pattern).
 freeze_ms=${FREEZE_MS:-50}
 freeze_icmp=${FREEZE_ICMP:-0}
 validate_loss() {

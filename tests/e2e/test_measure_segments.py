@@ -339,9 +339,9 @@ class MeasurementTests(unittest.TestCase):
         self.assertTrue(compare.provenance_complete(item, item["records"][0]))
 
     # Freeze detector. Freezes annotate segments; they never change validity.
-    def freeze_file(self, events, start=0, end=30, name="freeze.jsonl"):
+    def freeze_file(self, events, start=0, end=30, name="wanem.stats.freeze", source="wanem"):
         lines = [{"kind": "freeze_probe_start", "unix": BASE + start}] if start is not None else []
-        lines += [{"kind": "freeze", "source": "timer", "start": BASE + a, "end": BASE + a + ms / 1000, "ms": ms}
+        lines += [{"kind": "freeze", "source": source, "start": BASE + a, "end": BASE + a + ms / 1000, "ms": ms}
                   for a, ms in events]
         if end is not None:
             lines.append({"kind": "freeze_probe_end", "unix": BASE + end})
@@ -360,6 +360,13 @@ class MeasurementTests(unittest.TestCase):
     def test_freeze_outside_segment_leaves_it_freeze_free(self):
         view = measure.freeze_view(record(1, 3), self.freeze_file([(5, 116)]), {"owd_ms": "20"}, 50)
         self.assertEqual((view["evidence"], view["affected"], view["count"]), ("observed", False, 0))
+
+    def test_probe_only_stalls_are_listed_but_do_not_mark(self):
+        self.freeze_file([], end=30)
+        detectors = self.freeze_file([(2, 120)], name="freeze.jsonl", source="timer")
+        view = measure.freeze_view(record(1, 3), detectors, {"owd_ms": "20"}, 50)
+        self.assertEqual((view["evidence"], view["affected"], view["count"], view["other_count"]),
+                         ("observed", False, 0, 1))
 
     def test_detector_without_closing_line_is_not_freeze_free(self):
         view = measure.freeze_view(record(1, 3), self.freeze_file([], end=None), {"owd_ms": "20"}, 50)

@@ -31,6 +31,11 @@
  * Build: gcc -O2 -o wanem wanem.c -lm
  *        gcc -O2 -DWANEM_SCHED_TEST -o test_wanem wanem.c -lm
  * Run: wanem <tun-name> <config> <stats>
+ *
+ * Freeze log (<stats>.freeze, one JSON line per event): a packet written WANEM_FREEZE_MS or more after
+ * its due time means the emulated link stopped (wanem or the whole box was not running, or the TUN
+ * write was stuck). Consecutive late packets form one event: start = earliest due time, end = last late
+ * write. Times are CLOCK_REALTIME seconds. This is a measurement, never a behaviour change.
  */
 #define _GNU_SOURCE
 #include <errno.h>
@@ -366,10 +371,41 @@ static void flush_pending(int fd) {
     wqn = dst;
 }
 
+#ifndef WANEM_FREEZE_MS
+#define WANEM_FREEZE_MS 50
+#endif
+static FILE *freeze_log;
+static uint64_t fz_start, fz_end, fz_late_max, fz_packets;
+static void freeze_flush(void) {
+    if (!fz_packets) return;
+    if (freeze_log) {
+        struct timespec rt; clock_gettime(CLOCK_REALTIME, &rt);
+        double off = (double)rt.tv_sec + rt.tv_nsec / 1e9 - now_ns() / 1e9;
+        fprintf(freeze_log, "{\"kind\": \"freeze\", \"source\": \"wanem\", \"start\": %.4f, \"end\": %.4f,"
+                " \"ms\": %.1f, \"late_max_ms\": %.1f, \"packets\": %llu, \"write_pending\": %ld}\n",
+                fz_start / 1e9 + off, fz_end / 1e9 + off, (fz_end - fz_start) / 1e6, fz_late_max / 1e6,
+                (unsigned long long)fz_packets, wqn);
+        fflush(freeze_log);
+    }
+    fz_packets = 0;
+}
+/* due: when the packet should have left; t: when it is leaving. */
+static void freeze_note(uint64_t due, uint64_t t) {
+    uint64_t late = t > due ? t - due : 0;
+    if (late < (uint64_t)WANEM_FREEZE_MS * 1000000ULL) { freeze_flush(); return; }
+    if (fz_packets && due > fz_end) freeze_flush();
+    if (!fz_packets) { fz_start = due; fz_late_max = 0; }
+    if (due < fz_start) fz_start = due;
+    fz_end = t;
+    if (late > fz_late_max) fz_late_max = late;
+    fz_packets++;
+}
+
 static void emit_due(int fd, uint64_t t) {
     if (wqn) flush_pending(fd);
     while (due_h.n && due_h.a[0].t_ns <= t) {
         pkt_t p = hpop(&due_h);
+        freeze_note(p.t_ns, t);
         if (!write_one(fd, p.buf, p.len, p.seq))
             break; /* EAGAIN: parked; later dues wait so writes stay in order */
     }
@@ -612,6 +648,31 @@ int main(void) {
     C.rate_to_far_mbit = 0;
     C.rate_to_near_mbit = 0;
 
+    /* Freeze log: on-time writes log nothing; packets due at 1.000 s and 1.002 s written at
+     * 1.110 s form one 110 ms event; a later late packet is a second event. */
+    freeze_log = tmpfile();
+    const uint64_t ms = 1000000ULL;
+    freeze_note(1000 * ms, 1001 * ms);
+    freeze_note(1000 * ms, 1110 * ms);
+    freeze_note(1002 * ms, 1110 * ms);
+    freeze_note(1111 * ms, 1111 * ms);
+    freeze_note(2000 * ms, 2060 * ms);
+    freeze_flush();
+    rewind(freeze_log);
+    char line[512]; int events = 0; double first_ms = 0; unsigned long long first_packets = 0;
+    while (fgets(line, sizeof line, freeze_log)) {
+        if (!events) {
+            char *m = strstr(line, "\"ms\": "), *n = strstr(line, "\"packets\": ");
+            if (m) first_ms = atof(m + 6);
+            if (n) first_packets = strtoull(n + 11, NULL, 10);
+        }
+        events++;
+    }
+    fclose(freeze_log); freeze_log = NULL;
+    expect("freeze: two events", events == 2);
+    expect("freeze: first spans due to last late write", first_ms > 109.9 && first_ms < 110.1);
+    expect("freeze: first merges both late packets", first_packets == 2);
+
     if (failures) { fprintf(stderr, "%d wanem schedule test(s) failed\n", failures); return 1; }
     fprintf(stderr, "all wanem schedule tests passed\n");
     return 0;
@@ -628,9 +689,27 @@ int main(int argc, char **argv) {
     signal(SIGPIPE, SIG_IGN);
     signal(SIGTERM, on_term);
     signal(SIGINT, on_term);
+    char freeze_path[4096];
+    snprintf(freeze_path, sizeof freeze_path, "%s.freeze", argv[3]);
+    freeze_log = fopen(freeze_path, "a");
+    if (freeze_log) {
+        struct timespec rt; clock_gettime(CLOCK_REALTIME, &rt);
+        fprintf(freeze_log, "{\"kind\": \"freeze_probe_start\", \"unix\": %.4f, \"min_ms\": %d, \"source\": \"wanem\"}\n",
+                rt.tv_sec + rt.tv_nsec / 1e9, WANEM_FREEZE_MS);
+        fflush(freeze_log);
+    }
     unsigned char tmp[65536]; uint64_t next_stats = now_ns() + 1000000000ULL;
     for (;;) {
-        if (ending) { uint64_t t = now_ns(); promote_ready(t); emit_due(fd, t); write_stats(argv[3]); return 0; }
+        if (ending) {
+            uint64_t t = now_ns(); promote_ready(t); emit_due(fd, t); write_stats(argv[3]);
+            freeze_flush();
+            if (freeze_log) {
+                struct timespec rt; clock_gettime(CLOCK_REALTIME, &rt);
+                fprintf(freeze_log, "{\"kind\": \"freeze_probe_end\", \"unix\": %.4f}\n", rt.tv_sec + rt.tv_nsec / 1e9);
+                fclose(freeze_log);
+            }
+            return 0;
+        }
         if (reload) { reload = 0; load(argv[2]); }
         uint64_t t = now_ns();
         promote_ready(t);

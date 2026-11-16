@@ -37,6 +37,19 @@ def checksum(data):
     return ~total & 0xFFFF
 
 
+def steal_jiffies():
+    # Total steal over all CPUs from the first /proc/stat line (USER_HZ ticks): time the
+    # hypervisor ran something else while a vCPU wanted to run. A whole-VM stop of T ms
+    # shows as about ncpu*T of steal; a stall of only this process (CPU contention,
+    # interrupts) shows none.
+    try:
+        with open("/proc/stat", "rb") as stat:
+            fields = stat.readline().split()
+        return int(fields[8])
+    except (OSError, IndexError, ValueError):
+        return None
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("out")
@@ -48,6 +61,9 @@ def main():
     stop = []
     signal.signal(signal.SIGTERM, lambda *_: stop.append(1))
     signal.signal(signal.SIGINT, lambda *_: stop.append(1))
+
+    hz = os.sysconf("SC_CLK_TCK")
+    ncpu = os.cpu_count() or 1
 
     def emit(source, start_mono, end_mono, **extra):
         # Wall time from the monotonic offset at emission: a wall-clock step inside the
@@ -67,17 +83,30 @@ def main():
     interval = args.icmp_interval_ms / 1000.0
     limit = args.min_ms / 1000.0
     start = time.monotonic()
+    try:
+        policy = {os.SCHED_OTHER: "other", os.SCHED_FIFO: "fifo", os.SCHED_RR: "rr"}.get(os.sched_getscheduler(0), "?")
+    except OSError:
+        policy = "unknown"
     out.write(json.dumps({"kind": "freeze_probe_start", "unix": round(time.time(), 4), "min_ms": args.min_ms,
-                          "icmp_target": args.icmp_target, "pid": os.getpid()}) + "\n")
+                          "icmp_target": args.icmp_target, "pid": os.getpid(), "sched": policy,
+                          "ncpu": ncpu}) + "\n")
     last_wake = start
+    last_steal = steal_jiffies()
     next_probe = start
     last_reply = None
     replies = probes = 0
     while not stop:
         now = time.monotonic()
+        steal = steal_jiffies() if sock is None else None
         if sock is None and now - last_wake >= limit:
-            emit("timer", last_wake, now)
+            # steal_cpu_ms: steal during the gap divided by the CPU count; close to the gap
+            # length means every vCPU was stopped (whole-VM freeze).
+            extra = {}
+            if steal is not None and last_steal is not None:
+                extra = {"steal_cpu_ms": round((steal - last_steal) * 1000 / hz / ncpu, 1)}
+            emit("timer", last_wake, now, **extra)
         last_wake = now
+        last_steal = steal
         if sock is not None:
             if now >= next_probe:
                 seq = (seq + 1) & 0xFFFF
