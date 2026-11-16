@@ -49,7 +49,8 @@ type SessionCarrier(session: Session, bridge: FlowBridge, ?uplinkPace: bool, ?tu
     let mutable framesOut = 0L
     /// Bytes of DATA/PARITY/BOOSTER put on the wire (not WIN_ACK/CTRL/heartbeat).
     let mutable wireOut = 0L
-    /// DATA/PARITY bytes only (BOOSTER copies go in wireOut but not here).
+    /// First successfully rendered DATA/initial PARITY bytes on charged submissions.
+    /// Repeated DATA and BOOSTER copies remain in wireOut, not uniqueOut.
     let mutable uniqueOut = 0L
     let group = RateGroup(session.Clock)
     let member' = SessionRateMember(session, (fun () -> session.FrameLength), (fun () -> uniqueOut), (fun () -> wireOut))
@@ -182,20 +183,23 @@ type SessionCarrier(session: Session, bridge: FlowBridge, ?uplinkPace: bool, ?tu
                             attempt <- true
                             allowRepair <- false
                             charge <- 2
+                        let uniqueBefore = session.Tx.UniqueRendered
                         if attempt && session.TryProduce(link.PathId, frame, allowRepair) then
+                            let uniqueDelta = session.Tx.UniqueRendered - uniqueBefore
                             link.CommitFrame()
                             framesOut <- framesOut + 1L
                             budget <- budget - 1
                             progress <- true
                             if unpacedRepair then originalsSinceRepair <- 0
                             elif unpacedData then originalsSinceRepair <- originalsSinceRepair + 1
+                            if charge = 1 || charge = 2 then
+                                uniqueOut <- uniqueOut + uniqueDelta * int64 fl
                             if charge = 1 then
                                 wireOut <- wireOut + int64 fl
                                 group.OnRepair fl
                                 chargePath link.PathId fl
                             elif charge = 2 then
                                 wireOut <- wireOut + int64 fl
-                                uniqueOut <- uniqueOut + int64 fl
                                 group.OnSent fl
                                 chargePath link.PathId fl
                     j <- j + 1

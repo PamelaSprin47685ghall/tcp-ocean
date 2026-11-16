@@ -70,6 +70,11 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
     let mutable cellsSent = 0L
     /// First-copy DATA/PARITY cells per step (not BOOSTERs), still in the window.
     let uniqueCells: int[] = Array.zeroCreate capacity
+    // DATA can be selected from either the original queue or a repair fallback.
+    // One bit per source slot records the first successful Seal, not queue origin.
+    // Reuse follows encoder lifetime; custody alone must not clear this mask.
+    let renderedData: uint16[] = Array.zeroCreate encoder.Capacity
+    let mutable uniqueRendered = 0L
     /// Cumulative first-copy cells the peer has in custody (sum of uniqueCells over acked steps).
     let mutable uniqueAcked = 0L
     /// Unique cells in custody plus those of steps the peer has reported seeing (t_hi)
@@ -162,6 +167,7 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
         let si = int (t % uint64 sealNs.Length)
         spilled.[index t] <- spillPending && not wasUrgent
         spillPending <- false
+        renderedData.[si] <- 0us
         sealNs.[si] <- clock.FreshNs()
         lastRepairNs.[si] <- 0L
         repairCount.[si] <- 0
@@ -206,6 +212,10 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
     member _.CellsSent = cellsSent
     /// First-copy DATA/PARITY cells the peer has in custody.
     member _.UniqueAcked = uniqueAcked
+    /// Successfully rendered/sealed first DATA identities and initial queued PARITY.
+    /// Monotonic generation accounting, not socket submission or delivery evidence.
+    /// Extra RenderFill PARITY and BOOSTER copies are intentionally excluded.
+    member _.UniqueRendered = uniqueRendered
     /// Custody cells plus first-copy cells of steps the peer has reported seeing
     /// (WIN_ACK t_hi) even if a hole still sits at the frontier. An in-order
     /// high-water: steps between peer_ack and t_hi are counted as arrived.
@@ -653,7 +663,6 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
                     ok <- true
                     done' <- true
                 elif rendered then
-                    uniqueCells.[index t] <- uniqueCells.[index t] + 1
                     for i in 0 .. 5 do
                         let r = CodeGraph.Strides.[i]
                         kHist.[i] <- if t < r then 0 else (let h = encoder.StepUsed(t - r) in if h = 0 then 16 else h)
@@ -667,6 +676,18 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
                     frame.[frame.Length - 1] <- 10uy
                     if t > carrierWm.[int path] then carrierWm.[int path] <- t
                     this.Seal(frame, path)
+                    let first =
+                        if c.Kind <> CellType.Data then true
+                        else
+                            let si = int (t % uint64 renderedData.Length)
+                            let bit = uint16 (1 <<< int c.Index)
+                            if renderedData.[si] &&& bit <> 0us then false
+                            else
+                                renderedData.[si] <- renderedData.[si] ||| bit
+                                true
+                    if first then
+                        uniqueCells.[index t] <- uniqueCells.[index t] + 1
+                        uniqueRendered <- uniqueRendered + 1L
                     ok <- true
                     done' <- true
         ok
