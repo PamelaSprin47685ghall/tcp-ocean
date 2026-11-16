@@ -338,6 +338,89 @@ class MeasurementTests(unittest.TestCase):
         item["negotiated"]["mux"]["paths"] = 64
         self.assertTrue(compare.provenance_complete(item, item["records"][0]))
 
+    # Freeze detector. Freezes annotate segments; they never change validity.
+    def freeze_file(self, events, start=0, end=30, name="freeze.jsonl"):
+        lines = [{"kind": "freeze_probe_start", "unix": BASE + start}] if start is not None else []
+        lines += [{"kind": "freeze", "source": "timer", "start": BASE + a, "end": BASE + a + ms / 1000, "ms": ms}
+                  for a, ms in events]
+        if end is not None:
+            lines.append({"kind": "freeze_probe_end", "unix": BASE + end})
+        (self.work / name).write_text("".join(json.dumps(line) + "\n" for line in lines))
+        return measure.read_freezes(self.work)
+
+    def test_freeze_longer_than_rtt_marks_low_rtt_segment_affected(self):
+        view = measure.freeze_view(record(1, 3), self.freeze_file([(2, 116)]), {"owd_ms": "20"}, 50)
+        self.assertEqual((view["evidence"], view["affected"], view["count"], view["max_ms"]),
+                         ("observed", True, 1, 116))
+
+    def test_freeze_shorter_than_rtt_is_listed_but_not_affected(self):
+        view = measure.freeze_view(record(1, 3), self.freeze_file([(2, 116)]), {"owd_ms": "200"}, 50)
+        self.assertEqual((view["affected"], view["count"]), (False, 1))
+
+    def test_freeze_outside_segment_leaves_it_freeze_free(self):
+        view = measure.freeze_view(record(1, 3), self.freeze_file([(5, 116)]), {"owd_ms": "20"}, 50)
+        self.assertEqual((view["evidence"], view["affected"], view["count"]), ("observed", False, 0))
+
+    def test_detector_without_closing_line_is_not_freeze_free(self):
+        view = measure.freeze_view(record(1, 3), self.freeze_file([], end=None), {"owd_ms": "20"}, 50)
+        self.assertEqual((view["evidence"], view["affected"]), ("unavailable", None))
+        view = measure.freeze_view(record(1, 3), [], {"owd_ms": "20"}, 50)
+        self.assertEqual((view["evidence"], view["affected"]), ("unavailable", None))
+
+    def test_freeze_seen_without_full_coverage_still_counts(self):
+        view = measure.freeze_view(record(1, 3), self.freeze_file([(2, 90)], end=None), {"owd_ms": "20"}, 50)
+        self.assertEqual((view["evidence"], view["affected"]), ("unavailable", True))
+
+    def test_analyze_annotates_freezes_without_changing_validity(self):
+        (self.work / "segments").mkdir()
+        row = record(1, 8, "bulk_up")
+        (self.work / "segments" / "bulk_up.segment.json").write_text(json.dumps(row))
+        (self.work / "dmesg-end.txt").write_text("[Sun Nov 15 11:50:00 2026] boot complete\n")
+        (self.work / "stamp.txt").write_text("stamp: owd_ms=20 seed=7\n")
+        for side in ("client", "server"):
+            prefix = "paths=4" if side == "client" else "sessions=1"
+            (self.work / f"{side}-mux.log").write_text("".join(
+                f"12:00:{second:02d}.000 stats {prefix} frames_in=1\n" for second in range(10)))
+        self.freeze_file([(4, 104)])
+        result = measure.analyze(self.work)
+        self.assertEqual(result["records"][0]["validity"], "valid")
+        self.assertTrue(result["records"][0]["freeze_affected"])
+        self.assertEqual(len(result["freezes"][0]["events"]), 1)
+
+    def test_compare_reports_all_and_freeze_free_views(self):
+        left = [run("7", 100), run("9", 110), run("11", 90)]
+        right = [run("7", 101), run("9", 111), run("11", 80)]
+        for side in (left, right):
+            for item in side:
+                item["records"][0]["freeze_affected"] = False
+            side[2]["records"][0]["freeze_affected"] = True
+        right.append(run("13", 50))
+        result = compare.compare(left, right)[0]
+        self.assertEqual((result["baseline"]["n"], result["candidate"]["n"]), (3, 4))
+        free = result["freeze_free"]
+        self.assertEqual((free["baseline"]["n"], free["candidate"]["n"]), (2, 2))
+        self.assertEqual((free["candidate"]["freeze_affected"], free["candidate"]["freeze_unknown"]), (1, 1))
+        self.assertEqual(free["median_delta"], 1)
+        self.assertEqual(free["status"], "review_required")
+
+    def test_probe_records_a_stopped_process_as_a_freeze(self):
+        out = self.work / "probe.jsonl"
+        probe = subprocess.Popen([sys.executable, str(HERE / "freeze_probe.py"), str(out), "--min-ms", "50"])
+        try:
+            import signal, time
+            time.sleep(0.3)
+            probe.send_signal(signal.SIGSTOP)
+            time.sleep(0.15)
+            probe.send_signal(signal.SIGCONT)
+            time.sleep(0.2)
+        finally:
+            probe.terminate()
+            probe.wait(timeout=5)
+        rows = [json.loads(line) for line in out.read_text().splitlines()]
+        freezes = [row for row in rows if row["kind"] == "freeze"]
+        self.assertEqual([row["kind"] for row in rows][::len(rows) - 1], ["freeze_probe_start", "freeze_probe_end"])
+        self.assertTrue(any(130 <= row["ms"] <= 400 and row["source"] == "timer" for row in freezes), freezes)
+
     def test_loss_percent_mistake_is_rejected_before_testbed(self):
         for value in ("5", "nan", "inf", "-0.05"):
             result = subprocess.run(["bash", str(HERE / "run.sh"), "20", "200", value, "4", "10"],

@@ -147,8 +147,23 @@ def compare(baseline, candidate):
         class_known = group["key"]["residual_class"] not in ("unknown", "outside_reference_bands")
         enough = left["enough_samples"] and right["enough_samples"] and class_known
         delta = right["median"] - left["median"] if left["median"] is not None and right["median"] is not None else None
+        # Second view, never a replacement: only segments whose freeze detector covered
+        # them and saw no freeze longer than the RTT. Segments without detector evidence
+        # are neither freeze-free nor affected; they are counted, not guessed.
+        free = {}
+        for side in ("baseline", "candidate"):
+            kept = [sample for sample in group[side] if sample[1].get("freeze_affected") is False]
+            free[side] = summarize(kept)
+            free[side]["freeze_affected"] = sum(1 for sample in group[side] if sample[1].get("freeze_affected") is True)
+            free[side]["freeze_unknown"] = sum(1 for sample in group[side] if sample[1].get("freeze_affected") is None)
+        free_delta = (free["candidate"]["median"] - free["baseline"]["median"]
+                      if free["baseline"]["median"] is not None and free["candidate"]["median"] is not None else None)
+        free["median_delta"] = free_delta
+        free["status"] = ("review_required" if free["baseline"]["enough_samples"]
+                          and free["candidate"]["enough_samples"] and class_known else "insufficient")
         result.append({**group["key"], "baseline": left, "candidate": right,
-                       "median_delta": delta, "status": "review_required" if enough else "insufficient",
+                       "median_delta": delta, "freeze_free": free,
+                       "status": "review_required" if enough else "insufficient",
                        "note": "Inspect stable floor and interaction failures; a single low sample is not a veto."})
     return result
 

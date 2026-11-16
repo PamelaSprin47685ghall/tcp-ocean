@@ -97,6 +97,59 @@ def read_log(path, anchor, gap_s):
     return result
 
 
+AFFECTED = {True: "yes", False: "no", None: "unknown"}
+FREEZE_FILES = ("freeze.jsonl", "freeze-icmp.jsonl")
+
+
+def read_freezes(work):
+    """Detector files written by freeze_probe.py: events plus each detector's covered span."""
+    detectors = []
+    for name in FREEZE_FILES:
+        path = work / name
+        if not path.exists():
+            continue
+        detector = {"file": name, "start": None, "end": None, "events": [], "malformed": 0}
+        for line in path.read_text(errors="replace").splitlines():
+            try:
+                row = json.loads(line)
+            except ValueError:
+                detector["malformed"] += 1
+                continue
+            if row.get("kind") == "freeze_probe_start":
+                detector["start"] = number(row.get("unix"))
+            elif row.get("kind") == "freeze_probe_end":
+                detector["end"] = number(row.get("unix"))
+            elif row.get("kind") == "freeze" and None not in (number(row.get("start")), number(row.get("end"))):
+                detector["events"].append({**row, "kind": "freeze_" + str(row.get("source", "unknown")),
+                                           "file": name})
+        detectors.append(detector)
+    return detectors
+
+
+def freeze_view(record, detectors, metadata, min_ms):
+    """Annotate, never invalidate. A freeze costs about its own length of delivery on every
+    path at once; it starts tail repair when it outlasts the RTT. So a segment is
+    freeze_affected when a freeze of at least min_ms and longer than the path RTT falls in
+    it ("low RTT" relative to that freeze). Shorter freezes are still listed."""
+    start = record["start"]["unix_ns"] / 1e9
+    end = record["end"]["unix_ns"] / 1e9 if "end" in record else None
+    owd = number(metadata.get("owd_ms"))
+    rtt_ms = 2 * owd if owd is not None else None
+    covering = [d for d in detectors if end is not None and d["start"] is not None and d["end"] is not None
+                and d["start"] <= start and d["end"] >= end]
+    if end is None or not covering:
+        evidence = "unavailable"
+    else:
+        evidence = "observed"
+    events = sorted((event for d in detectors for event in d["events"]
+                     if end is not None and overlaps(start, end, event)), key=lambda event: event["start"])
+    long = [event for event in events if event["ms"] >= min_ms and (rtt_ms is None or event["ms"] > rtt_ms)]
+    affected = True if long else (False if evidence == "observed" else None)
+    return {"evidence": evidence, "detectors": [d["file"] for d in covering], "min_ms": min_ms,
+            "rtt_ms": rtt_ms, "count": len(events), "max_ms": max((e["ms"] for e in events), default=0.0),
+            "affected": affected, "events": events}
+
+
 def residual_class(bandwidth, metadata, name):
     if name != "bulk_down1" or metadata.get("profile") != "rtt400" or metadata.get("paths") != "8":
         return "not_classed"
@@ -175,7 +228,7 @@ def classify(record, logs, host_events, evidence_unknown, gap_s):
             "reasons": sorted(set([event["kind"] for event in events] + unknown)), "events": events}
 
 
-def analyze(work, gap_s=2.5):
+def analyze(work, gap_s=2.5, freeze_ms=50.0):
     stamp = (work / "stamp.txt").read_text(errors="replace") if (work / "stamp.txt").exists() else ""
     metadata = {}
     for line in stamp.splitlines():
@@ -198,9 +251,12 @@ def analyze(work, gap_s=2.5):
         evidence_unknown.append("host_event_time_unknown")
     sessions = {session: [read_log(work / f"{side}-{session}.log", anchor, gap_s)
                           for side in ("client", "server")] for session in ("mux", "bulk")}
+    detectors = read_freezes(work)
     for record in records:
         logs = sessions[record["session"]]
         record.update(classify(record, logs, host_events, evidence_unknown, gap_s))
+        record["freeze"] = freeze_view(record, detectors, metadata, freeze_ms)
+        record["freeze_affected"] = record["freeze"]["affected"]
         record["metrics"] = metrics_from_output(work / record["output"])
         record["transition"] = transition(record, logs, metadata, gap_s)
         record["product_pass"] = record.get("returncode") == 0
@@ -216,23 +272,35 @@ def analyze(work, gap_s=2.5):
     return {"schema": 1, "work": str(work.resolve()), "metadata": metadata,
             "provenance": provenance, "negotiated": negotiated, "stamp": stamp.splitlines(),
             "wanem_config": config, "requested_options": options, "host_gate": gate,
-            "stats_gap_s": gap_s, "records": records}
+            "stats_gap_s": gap_s, "freeze_ms": freeze_ms,
+            "freezes": [{key: d[key] for key in ("file", "start", "end", "malformed")} | {"events": d["events"]}
+                        for d in detectors], "records": records}
 
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("work", type=Path)
     parser.add_argument("--stats-gap-s", type=float, default=2.5)
+    parser.add_argument("--freeze-ms", type=float, default=50.0)
     args = parser.parse_args()
+    if not math.isfinite(args.freeze_ms) or args.freeze_ms <= 0:
+        parser.error("--freeze-ms must be positive")
     if not math.isfinite(args.stats_gap_s) or args.stats_gap_s <= 0:
         parser.error("--stats-gap-s must be positive")
-    result = analyze(args.work, args.stats_gap_s)
+    result = analyze(args.work, args.stats_gap_s, args.freeze_ms)
     (args.work / "segments.json").write_text(json.dumps(result, indent=2, ensure_ascii=False) + "\n")
     for record in result["records"]:
         print(f"segment: name={record['name']} session={record['session']} "
               f"validity={record['validity']} rc={record.get('returncode', 'unfinished')} "
               f"residual_class={record['transition']['residual_class']} "
-              f"reasons={','.join(record['reasons']) or 'none'}")
+              f"reasons={','.join(record['reasons']) or 'none'} "
+              f"freeze={record['freeze']['evidence']}:{record['freeze']['count']}"
+              f"/max_ms={record['freeze']['max_ms']:g} "
+              f"freeze_affected={AFFECTED[record['freeze_affected']]}")
+    for detector in result.get("freezes", []):
+        covered = "yes" if detector["start"] is not None and detector["end"] is not None else "no"
+        print(f"freeze: file={detector['file']} complete={covered} events={len(detector['events'])} "
+              f"ms={','.join(format(e['ms'], 'g') for e in detector['events']) or 'none'}")
     print(f"segments: path={args.work / 'segments.json'} count={len(result['records'])}")
 
 

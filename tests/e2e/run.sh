@@ -77,6 +77,11 @@ host_quiet_s=${HOST_QUIET_S:-60}
 host_min_mem_mib=${HOST_MIN_MEM_MIB:-2560}
 host_quiet_bypass=${HOST_QUIET_BYPASS:-0}
 stats_gap_s=${STATS_GAP_S:-2.5}
+# Freeze detector (freeze_probe.py): every stop of the box of at least FREEZE_MS is
+# recorded in freeze.jsonl. FREEZE_ICMP=1 also probes the near->far path through wanem
+# (freeze-icmp.jsonl); it adds ~0.1 Mbit/s of probes, which shifts wanem's loss pattern.
+freeze_ms=${FREEZE_MS:-50}
+freeze_icmp=${FREEZE_ICMP:-0}
 validate_loss() {
     python3 - "$1" <<'PY'
 import math
@@ -159,7 +164,8 @@ names = """PROFILE WINDOW WINDOW_CLAMP MAX_PATHS TBT_BIN SEED CARRIER ALLOW_DIRT
 SKIP_ECHO SKIP_IPERF SKIP_REF PING_COUNT HANDSHAKE_S JOIN_CONCURRENCY UPLINK_PACE
 TUPLE_MBIT NEW_REPAIR WANEM_EXTRA WANEM_TUPLE_MODE WANEM_LOSS_POINT
 HOST_PAUSE_DISCARD HOST_QUIET_S HOST_MIN_MEM_MIB HOST_QUIET_BYPASS STATS_GAP_S
-PAUSE TBT_SERVER_EXTRA TBT_CLIENT_EXTRA TBT_TRACE PING_TRACE ECHO_PROBE_LOG""".split()
+PAUSE TBT_SERVER_EXTRA TBT_CLIENT_EXTRA TBT_TRACE PING_TRACE ECHO_PROBE_LOG
+FREEZE_MS FREEZE_ICMP""".split()
 Path(sys.argv[1]).write_text(json.dumps({name: os.environ.get(name) for name in names}, indent=2) + "\n")
 PY
 stamp() { echo "$*" | tee -a "$work/stamp.txt"; }
@@ -188,6 +194,13 @@ pids_of() {
     true
 }
 pause_pid=""
+freeze_pid=""
+freeze_icmp_pid=""
+# stop_freeze: end the freeze detectors so each writes its closing line (coverage proof).
+stop_freeze() {
+    if [[ -n $freeze_icmp_pid ]]; then sudo kill -TERM "$freeze_icmp_pid" 2>/dev/null || true; wait "$freeze_icmp_pid" 2>/dev/null || true; freeze_icmp_pid=""; fi
+    if [[ -n $freeze_pid ]]; then kill -TERM "$freeze_pid" 2>/dev/null || true; wait "$freeze_pid" 2>/dev/null || true; freeze_pid=""; fi
+}
 # stop_pause: end the PAUSE loop and resume anything it left stopped.
 stop_pause() {
     if [[ -n $pause_pid ]]; then kill "$pause_pid" 2>/dev/null || true; wait "$pause_pid" 2>/dev/null || true; pause_pid=""; fi
@@ -196,6 +209,7 @@ stop_pause() {
 cleanup() {
     local rc=$?
     stop_pause
+    stop_freeze
     for exe in "$work/aot/tbtun" "$work/jit/tbtun"; do pids_of "$exe" | xargs -r sudo kill 2>/dev/null || true; done
     # Do not kill by the fixed namespace names. netns.sh down verifies ownership, then
     # signals leftover processes in the recorded namespaces only, then deletes them.
@@ -225,7 +239,7 @@ finalize_stamp() {
         if (( status == 0 )); then status=3; fi
     fi
     stamp "stamp: script_commit=$commit owd_ms=$owd rate_mbit=$rate loss=$loss paths=$paths window=$window window_clamp=$window_clamp seed=$seed server_max_paths=$max_paths seconds=$seconds carrier=$carrier profile=${profile:-none} ping_count=$ping_count handshake_s=$handshake_s pause=${PAUSE:-none} join_concurrency=${JOIN_CONCURRENCY:-default} uplink_pace=$uplink_pace client_tuple_mbit=$tuple_mbit new_repair=$new_repair wanem_tuple_mode=${wanem_eff_mode:-?} wanem_loss_point=${wanem_eff_loss:-?} host_pause_discard=$host_pause_discard status=$status"
-    if ! python3 "$here/measure_segments.py" "$work" --stats-gap-s "$stats_gap_s" | tee -a "$work/stamp.txt"; then
+    if ! python3 "$here/measure_segments.py" "$work" --stats-gap-s "$stats_gap_s" --freeze-ms "$freeze_ms" | tee -a "$work/stamp.txt"; then
         stamp "segments: analysis_failed=yes (no validity verdict)"
         if (( status == 0 )); then status=2; fi
     fi
@@ -234,6 +248,8 @@ finalize_stamp() {
     if (( status != rc )); then exit "$status"; fi
 }
 trap cleanup EXIT
+python3 "$here/freeze_probe.py" "$work/freeze.jsonl" --min-ms "$freeze_ms" &
+freeze_pid=$!
 
 if [[ -n ${TBT_BIN:-} ]]; then
     ln -s "$(cd "$TBT_BIN/aot" && pwd)" "$work/aot"
@@ -298,12 +314,16 @@ wanem_eff_loss_rate=$(awk -F= '$1=="loss"{v=$2} END{print v}' "$work/wanem.conf"
 wanem_eff_seed=$(awk -F= '$1=="seed"{v=$2} END{print v}' "$work/wanem.conf")
 validate_loss "$wanem_eff_loss_rate"
 stamp "flags: uplink_pace=$uplink_pace client_tuple_mbit=$tuple_mbit new_repair=$new_repair join_concurrency=${JOIN_CONCURRENCY:-default} window=$window window_clamp=$window_clamp max_paths=$max_paths carrier=$carrier profile=${profile:-none} wanem_tuple_mbit=${wanem_eff_tuple:-0} wanem_tuple_bucket=${wanem_eff_bucket:-default} wanem_rate_to_far=${wanem_eff_to_far:-} wanem_rate_to_near=${wanem_eff_to_near:-} wanem_tuple_mode=$wanem_eff_mode wanem_loss_point=$wanem_eff_loss wanem_seed=$seed wanem_version=2 host_pause_discard=$host_pause_discard skip_echo=${SKIP_ECHO:-0} skip_iperf=${SKIP_IPERF:-0} skip_ref=${SKIP_REF:-0} ping_count=$ping_count handshake_s=$handshake_s pause=${PAUSE:-none}"
-stamp "flags: wanem_seed=$wanem_eff_seed wanem_loss=$wanem_eff_loss_rate host_quiet_s=$host_quiet_s host_min_mem_mib=$host_min_mem_mib host_quiet_bypass=$host_quiet_bypass stats_gap_s=$stats_gap_s"
+stamp "flags: wanem_seed=$wanem_eff_seed wanem_loss=$wanem_eff_loss_rate host_quiet_s=$host_quiet_s host_min_mem_mib=$host_min_mem_mib host_quiet_bypass=$host_quiet_bypass stats_gap_s=$stats_gap_s freeze_ms=$freeze_ms freeze_icmp=$freeze_icmp"
 printf 'server_extra=%q\n' "${TBT_SERVER_EXTRA:-}" | tee -a "$work/stamp.txt"
 printf 'client_extra=%q\n' "${TBT_CLIENT_EXTRA:-}" | tee -a "$work/stamp.txt"
 { LC_ALL=C dmesg -T 2>/dev/null || sudo env LC_ALL=C dmesg -T 2>/dev/null || true; } > "$work/dmesg-preflight.txt" || true
 python3 "$here/host_noise.py" "$work" "$host_quiet_s" "$host_min_mem_mib" "$host_quiet_bypass" | tee -a "$work/stamp.txt"
 sudo TBTUN_NETNS_LOCK_HELD=1 "$here/netns.sh" up "$work"
+if [[ $freeze_icmp != 0 ]]; then
+    sudo ip netns exec tbe_near python3 "$here/freeze_probe.py" "$work/freeze-icmp.jsonl" --min-ms "$freeze_ms" --icmp-target 10.200.2.2 &
+    freeze_icmp_pid=$!
+fi
 if [[ -n ${wanem_eff_to_far:-} || -n ${wanem_eff_to_near:-} ]]; then
     echo "link: owd ${owd} ms each way, ${rate} Mbit/s fallback, to_far ${wanem_eff_to_far:-$rate} / to_near ${wanem_eff_to_near:-$rate} Mbit/s, segment loss ${loss}; paths ${paths}; window ${window}; window_clamp ${window_clamp}; seed ${seed}; server_max_paths ${max_paths}; server carrier ${carrier}; client_tuple_mbit ${tuple_mbit}; uplink_pace ${uplink_pace}; wanem_tuple_mode ${wanem_eff_mode}; wanem_loss_point ${wanem_eff_loss}"
 else
