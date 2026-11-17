@@ -51,8 +51,6 @@ type TunCounters() =
     member val Faults = 0L with get, set
     /// Gaps between two calls longer than the stall limit, cut from the timeline.
     member val ClockJumps = 0L with get, set
-    /// Deliveries of segments sent before a clock jump: no RTT or rate sample taken.
-    member val JumpSamplesSkipped = 0L with get, set
     /// Swallowed (virtually acked) bytes whose first copy arrived later: not duplicates.
     member val LateFirstBytes = 0L with get, set
     /// Swallowed ranges forgotten because the record was full (a later first arrival of
@@ -64,6 +62,8 @@ type TunCounters() =
     member val RepairsDeferred = 0L with get, set
     /// Repairs sent while the path was demoted (still charged to the bottleneck).
     member val DemotedRepairs = 0L with get, set
+    /// Deliveries of segments sent before a clock jump: no RTT or rate sample taken.
+    member val JumpSamplesSkipped = 0L with get, set
 
 [<Struct>]
 type SentSegment =
@@ -681,21 +681,22 @@ type TunPath(output: ITunOutput, counters: TunCounters, localIp: uint32, localPo
         group.OnDelivered(s.Length, s.GroupDelivered, s.GroupDeliveredNs, s.GroupFirstSentNs, s.SentNs, now)
         if s.Retx > 0 then heldBehindRepair <- true
         // Sent before the last clock jump: its RTT and rate are unknowable (see catchUp).
-        let crossed = s.SentNs < jumpNs
-        if crossed then counters.JumpSamplesSkipped <- counters.JumpSamplesSkipped + 1L
-        if s.Retx = 0 && not heldBehindRepair && not crossed && now >= s.SentNs then
-            let rtt = float (now - s.SentNs)
-            srttNs <- if srttNs = 0.0 then rtt else 0.875 * srttNs + 0.125 * rtt
-            let r = now - s.SentNs
-            if TraceGate.On then Trace.record Trace.Rtt (uint64 inflight) pathId (int (r / 1000L))
-            if r < minRttNs || now - minRttStamp > 10_000_000_000L then
-                minRttNs <- r
-                minRttStamp <- now
-        if interval > 0L && not crossed then
-            let rate = float (delivered - s.Delivered) / float interval
-            let slot = int (round % int64 bwRounds.Length)
-            if rate > bwRounds.[slot] then bwRounds.[slot] <- rate
-            btlBw <- Array.max bwRounds
+        // One compare on the normal path; the samples below are main's code unchanged.
+        if s.SentNs < jumpNs then counters.JumpSamplesSkipped <- counters.JumpSamplesSkipped + 1L
+        else
+            if s.Retx = 0 && not heldBehindRepair && now >= s.SentNs then
+                let rtt = float (now - s.SentNs)
+                srttNs <- if srttNs = 0.0 then rtt else 0.875 * srttNs + 0.125 * rtt
+                let r = now - s.SentNs
+                if TraceGate.On then Trace.record Trace.Rtt (uint64 inflight) pathId (int (r / 1000L))
+                if r < minRttNs || now - minRttStamp > 10_000_000_000L then
+                    minRttNs <- r
+                    minRttStamp <- now
+            if interval > 0L then
+                let rate = float (delivered - s.Delivered) / float interval
+                let slot = int (round % int64 bwRounds.Length)
+                if rate > bwRounds.[slot] then bwRounds.[slot] <- rate
+                btlBw <- Array.max bwRounds
         // Round trips counted by delivery (BBR).
         if s.Delivered >= nextRoundDelivered then
             nextRoundDelivered <- delivered
