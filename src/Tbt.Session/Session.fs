@@ -175,7 +175,12 @@ type Session(role: Role, p: SessionParams, port: IFlowPort, clock: IClock, confi
     let mutable nackSpan = 0
     let mutable nackDeficit = 0
     let mutable lastNackNs = 0L
+    let arrivalEvidenceEnabled = p.Caps &&& Caps.ExperimentalArrivalEvidence <> 0us
+    let peerArrival: ArrivalAccounting.PeerCounter | null = if arrivalEvidenceEnabled then ArrivalAccounting.PeerCounter(Layout.frameLength s) else null
     do
+        if arrivalEvidenceEnabled then
+            tx.EnableArrivalEvidence()
+            rx.EnableArrivalEvidence()
         rx.Attach flows
         // The client may send at once within rx_win_grant0. The server sends no down step
         // before the first authenticated client cell gives a grant (DECISIONS.md D6).
@@ -198,7 +203,11 @@ type Session(role: Role, p: SessionParams, port: IFlowPort, clock: IClock, confi
               DecodedBitmap0 = 0UL; DecodedBitmap1 = 0UL; DecodedBitmap2 = 0UL; DecodedBitmap3 = 0UL
               CtrlAckHi = ctrl.AckHi; CtrlAckBitmap = ctrl.AckBitmap }
         symbol.Clear()
-        WinAck.writeHead head symbol
+        if arrivalEvidenceEnabled then
+            match rx.AcceptedCodedFrameEvidence with
+            | ValueSome evidence -> WinAck.writeHeadWithArrival head evidence symbol
+            | ValueNone -> invalidOp "negotiated arrival counter missing"
+        else WinAck.writeHead head symbol
         let meta =
             { Type = CellType.WinAck; Flags = MetaFlags.None; Slot = 0uy; StepUsed = 0uy; Aux = 0us
               RxWinGrant = rx.Grant; StepId = 0UL; AckStepLo = rx.AckStepLo; CarrierWm = tx.CarrierWm path
@@ -590,6 +599,11 @@ type Session(role: Role, p: SessionParams, port: IFlowPort, clock: IClock, confi
     member _.Governor = governor
     member _.MemTier = MemTier.ofCaps p.Caps
     member _.InteractiveSources = interactiveSources
+    member _.ArrivalEvidenceEnabled = arrivalEvidenceEnabled
+    member _.PeerAcceptedCodedFrameEvidence =
+        match peerArrival, tx.GeneratedCodedFrameEvidence with
+        | null, _ | _, ValueNone -> ValueNone
+        | peer, ValueSome generated -> peer.WithGeneratedBound generated
     member _.WinAcksSent = winAcksSent
     member _.Opener = opener
     /// Decode frontier t_lo of the receive half.
@@ -615,7 +629,20 @@ type Session(role: Role, p: SessionParams, port: IFlowPort, clock: IClock, confi
                 if rx.Decoder.KConflicts > 0L && fault.Length = 0 then fault <- "peer step_used conflict"
             | CellType.WinAck ->
                 let mutable h = Unchecked.defaultof<WinAckHead>
-                if WinAck.tryReadHead (Span<byte>.op_Implicit (frame.Slice(Layout.SymbolOffset, s))) &h then
+                let body = Span<byte>.op_Implicit (frame.Slice(Layout.SymbolOffset, s))
+                let accepted =
+                    if not arrivalEvidenceEnabled then WinAck.tryReadHead body &h
+                    else
+                        let mutable report = Unchecked.defaultof<CodedArrivalEvidence>
+                        if not (WinAck.tryReadHeadWithArrival body &h &report) then false
+                        else
+                            // Invalid accounting evidence must not suppress the unchanged
+                            // CTRL/THi/NACK processing of a structurally valid WIN_ACK.
+                            match peerArrival, tx.GeneratedCodedFrameEvidence with
+                            | null, _ | _, ValueNone -> ()
+                            | peer, ValueSome generated -> peer.TryObserve(report, generated) |> ignore
+                            true
+                if accepted then
                     ctrl.OnAck(h.CtrlAckHi, h.CtrlAckBitmap)
                     tx.OnPeerSeen h.THi
                     if h.NackFlags &&& 1uy <> 0uy then tx.OnNack(h.TLo, int h.Span, int h.Deficit)

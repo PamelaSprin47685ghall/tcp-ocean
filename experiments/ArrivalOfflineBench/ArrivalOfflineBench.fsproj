@@ -1,0 +1,9 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup><OutputType>Exe</OutputType><AssemblyName>arrival-offline-bench</AssemblyName></PropertyGroup>
+  <ItemGroup><Compile Include="Program.fs" /></ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="../ArrivalShadowRunner/Tbt.ArrivalShadowRunner.fsproj" />
+    <ProjectReference Include="../../src/Tbt.Session/Tbt.Session.fsproj" />
+    <ProjectReference Include="../../src/Tbt.Carrier/Tbt.Carrier.fsproj" />
+  </ItemGroup>
+</Project>

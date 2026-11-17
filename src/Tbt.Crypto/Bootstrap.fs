@@ -70,6 +70,10 @@ module Caps =
     [<Literal>]
     let JoinAck2 = 0x0400us
 
+    /// Experimental, opt-in only; bit11 remains reserved in baseline v2.2.
+    [<Literal>]
+    let ExperimentalArrivalEvidence = 0x0800us
+
     [<Literal>]
     let Reserved = 0xF800us
 

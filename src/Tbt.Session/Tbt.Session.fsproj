@@ -2,6 +2,8 @@
   <ItemGroup>
     <Compile Include="Flows.fs" />
     <Compile Include="ControlLog.fs" />
+    <Compile Include="ArrivalAccounting.fs" />
+    <Compile Include="ArrivalShadow.fs" />
     <Compile Include="TxHalf.fs" />
     <Compile Include="ParityHold.fs" />
     <Compile Include="RxHalf.fs" />

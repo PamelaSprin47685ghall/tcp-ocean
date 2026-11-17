@@ -52,6 +52,7 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
     let queue = Queue<Candidate>(4096)
     let carrierWm: uint64[] = Array.zeroCreate maxPaths
     let kHist: int[] = Array.zeroCreate 6
+    let mutable arrivalCounter: ArrivalAccounting.Counter | null = null
     let mutable filled = 0
     let mutable acc = 0.0
     let mutable nextCounter = 0UL
@@ -211,6 +212,14 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
     member _.UrgentSources = urgentSources
     member _.CellsSent = cellsSent
     /// First-copy DATA/PARITY cells the peer has in custody.
+    member _.OriginalCellsRetiredByFrontier = uniqueAcked
+    member _.SeenThroughStepInferredCells = uniqueArrived
+    member _.EnableArrivalEvidence() =
+        if isNull arrivalCounter then arrivalCounter <- ArrivalAccounting.Counter(Layout.frameLength symbolSize)
+    member _.GeneratedCodedFrameEvidence =
+        match arrivalCounter with
+        | null -> ValueNone
+        | counter -> ValueSome counter.Evidence
     member _.UniqueAcked = uniqueAcked
     /// Successfully rendered/sealed first DATA identities and initial queued PARITY.
     /// Monotonic generation accounting, not socket submission or delivery evidence.
@@ -593,7 +602,14 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
     /// Seal a rendered frame with the next counter of this direction (one counter seals
     /// one plaintext only).
     member _.Seal(frame: Span<byte>, path: uint16) =
+        let coded = not (isNull arrivalCounter) &&
+                    (let kind = frame.[Layout.MetaOffset]
+                     kind = byte CellType.Data || kind = byte CellType.Parity || kind = byte CellType.Booster)
         sealer.Seal(frame, nextCounter, path)
+        if coded then
+            match arrivalCounter with
+            | null -> ()
+            | counter -> counter.AddFrame()
         let i = int path
         if uint32 i < uint32 maxPaths then lastOnPath.[i] <- nextCounter
         nextCounter <- nextCounter + 1UL

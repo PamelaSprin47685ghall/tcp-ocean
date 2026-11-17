@@ -1,0 +1,20 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <AssemblyName>arrival-shadow-runner</AssemblyName>
+    <InvariantGlobalization>true</InvariantGlobalization>
+    <ServerGarbageCollector>false</ServerGarbageCollector>
+    <ConcurrentGarbageCollection>false</ConcurrentGarbageCollection>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="Observer.fs" />
+    <Compile Include="Lifecycle.fs" />
+    <Compile Include="Program.fs" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="../../src/Tbt.Contracts/Tbt.Contracts.fsproj" />
+    <ProjectReference Include="../../src/Tbt.Crypto/Tbt.Crypto.fsproj" />
+    <ProjectReference Include="../../src/Tbt.Session/Tbt.Session.fsproj" />
+    <ProjectReference Include="../../src/Tbt.Carrier/Tbt.Carrier.fsproj" />
+  </ItemGroup>
+</Project>
