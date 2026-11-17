@@ -198,7 +198,7 @@ type TunStack(fd: int, local: IPEndPoint, clock: IClock, entropy: IEntropy, maxC
         + " write_fail=" + string writeFailures + " seg_sent=" + string counters.SegmentsSent
         + " seg_lost=" + string counters.SegmentsLost + " borrow_retx=" + string counters.BorrowRetx
         + " tail_repairs=" + string counters.TailRepairs + " rtos=" + string counters.Rtos + " dsacks=" + string counters.Dsacks + " demotions=" + string counters.Demotions + " faults=" + string counters.Faults
-        + " clock_jumps=" + string counters.ClockJumps + " up_holes=" + string counters.UpHoles
+        + " clock_jumps=" + string counters.ClockJumps + " jump_skips=" + string counters.JumpSamplesSkipped + " up_holes=" + string counters.UpHoles
         + " virtual_ack=" + string counters.VirtualAcks + " fast_swallow=" + string counters.FastSwallows
         + " cells_rx=" + string counters.CellsReceived + " cells_spanning=" + string counters.CellsSpanning
         + " cells_dropped=" + string counters.CellsDropped + " swallow_b=" + string counters.BytesSwallowed + " late_first_b=" + string counters.LateFirstBytes

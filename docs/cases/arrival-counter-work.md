@@ -69,3 +69,21 @@ Validation on this exact candidate and base:
 - Offline guard 11/11, echo 5/5, measurement 48/48; shell syntax and diff checks passed. Echo still logged the existing background shutdown `OSError(107)` despite successful assertions and exit 0; it was not changed or hidden.
 - Earlier default parallel MSBuild and first-run/cache attempts hit sandbox read-only/IPC limits. The successful builds used writable CLI/NuGet caches and `-m:1 -nodeReuse:false`, not relaxed warnings or audit. An initial benchmark-script syntax error was corrected before collecting any rows.
 - Independent code review found no blocking counter-equivalence issue. NativeAOT was not run locally (no clang); remote CI remains a separate check and does not replace native semantic or network acceptance.
+
+## Main integration, 2026-11-17
+
+Merged main `1cf420e8a61fae3f1de2f6fe0b3d16e6e0ab2b75` into the draft without rewriting the original commit. The incoming commits add the server-stall RTT/rate-sample guard, its regression and TODO/testbed notes. Their files are preserved exactly as on main. The PR's TxHalf change, eight oracle cases, component script and historical CSV rows are unchanged; the old timing table is **not** a fresh benchmark of this integration.
+
+Full Release builds of clean main and the integrated candidate each completed with zero warnings/errors. Full test DLLs were run without filters:
+
+| Run | Main | Integrated candidate |
+|---|---|---|
+| Initial | 373 passed, 0 failed | 380 passed, **1 failed** |
+| Fixed follow-up round 1 (A then B) | 373 passed, 0 failed | 381 passed, 0 failed |
+| Fixed follow-up round 2 (A then B) | 373 passed, 0 failed | 381 passed, 0 failed |
+
+The initial candidate failure was `JoinTests.a full decision cache refuses new joins without forgetting, and frees only digests whose ACK expired`: `ArgumentOutOfRangeException` at `Handshake.fs:306`. The initial build/test work overlapped; the two predetermined follow-up A/B rounds were serial. This distinction is recorded, **not** asserted as the cause. The failure is retained and unresolved, not erased by the two passing runs. JOIN/Bootstrap code is unchanged and the new oracle fixtures have independent state; review found no direct counter-code path to this failure, but cannot exclude indirect GC/scheduling effects. The JOIN fixture uses a manual clock, so elapsed machine time alone is not an explanation.
+
+Offline guard 11/11, echo 5/5, measurement 48/48, shell syntax and diff checks passed again. Echo retained the existing background shutdown `OSError(107)`. No shared network testbed was started, no lock or foreign process was touched, no official throughput sample or local NativeAOT result was added. CI on the updated head is a separate validation, not a cure for the unresolved local failure and not throughput acceptance.
+
+The new TODO prioritizes the 64-path reverse-parallel inflight ceiling and records separate maintained experiments for repair history and arrival evidence. This integration does not claim to solve that ceiling or supersede those experiments. The public draft heads and TODO descriptions do not establish that all parallel local changes are published; none is overwritten or imported into this draft.

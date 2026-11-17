@@ -376,6 +376,61 @@ let ``downlink: a clock jump (process or box stall) does not expire every timer 
     Assert.True(tail >= 1L && tail <= 4L, sprintf "tail repairs in 60 ms: %d of %d" tail (outstanding - outstanding / 2))
     Assert.True(f.Path.Counters.SegmentsSent - sent0 <= 16L, sprintf "segments sent %d" (f.Path.Counters.SegmentsSent - sent0))
 
+[<Fact>]
+let ``downlink: a stall of this process alone does not collapse SRTT and min RTT`` () =
+    // Steady sending, each frame acked 40 ms after it went out. Then only this process stalls
+    // for 450 ms (the peer does not): every ACK of what was in flight arrives during the stall
+    // and is read right after it. catchUp moves the send stamps forward by the stall, so those
+    // ACKs used to read as RTTs of 1-40 ms; min RTT and SRTT collapsed, the tail timer fired at
+    // a fraction of the real RTT and repaired every segment, and Karn then kept every later
+    // sample out (a 64-path -R -P64 run crawled for 35 s, docs/cases/server-stall-rtt.md).
+    let f = Fixture 1
+    f.Open()
+    let ip = f.Path :> IPath
+    ip.Backlog <- 100
+    let starts = List<uint32>()
+    let sentAt = List<int64>()
+    let l = uint32 L
+    let ack (cum: uint32) =
+        let struct (s, p) = clientSegment f.Data0 cum Packet.Ack [||] ReadOnlySpan.Empty
+        f.Path.OnSegment(s, Span p, f.Clock.Now)
+    let mutable acked = 0
+    let step () =
+        f.Clock.Now <- f.Clock.Now + 1_000_000L
+        let before = acked
+        while acked < sentAt.Count && f.Clock.Now - sentAt.[acked] >= 40_000_000L do acked <- acked + 1
+        if acked > before then ack (starts.[acked - 1] + l)
+        let mutable frame = Span<byte>.Empty
+        if ip.TryBeginFrame(&frame) then
+            frame.Fill 0x33uy
+            ip.CommitFrame()
+            starts.Add (parse f.Out.Packets.[f.Out.Packets.Count - 1]).Seq
+            sentAt.Add f.Clock.Now
+        f.Path.Service f.Clock.Now
+    for _ in 1 .. 200 do step ()
+    let outstanding = starts.Count - acked
+    Assert.True(outstanding >= 8, sprintf "outstanding %d" outstanding)
+    let minRtt0 = (f.Path :> IRateMember).MinRttNs
+    Assert.InRange(minRtt0, 39_000_000L, 42_000_000L)
+    let tail0 = f.Path.Counters.TailRepairs
+    let lost0 = f.Path.Counters.SegmentsLost
+    // The stall: the peer acked everything in flight 40 ms after each send, all queued.
+    f.Clock.Now <- f.Clock.Now + 450_000_000L
+    // The stall is real time: what was sent before it went out then, and is acked by now.
+    for i in acked .. sentAt.Count - 1 do sentAt.[i] <- sentAt.[i] - 450_000_000L
+    acked <- starts.Count
+    ack (starts.[acked - 1] + l)
+    Assert.Equal(1L, f.Path.Counters.ClockJumps)
+    Assert.Equal(int64 outstanding, f.Path.Counters.JumpSamplesSkipped)
+    let minRtt1 = (f.Path :> IRateMember).MinRttNs
+    Assert.True(minRtt1 >= minRtt0, sprintf "min RTT %d -> %d ns" minRtt0 minRtt1)
+    Assert.True(f.Path.SrttNs >= 35e6, sprintf "srtt %.0f ns" f.Path.SrttNs)
+    // Steady again at 40 ms: no repairs, SRTT stays at the path's RTT.
+    for _ in 1 .. 300 do step ()
+    Assert.Equal(tail0, f.Path.Counters.TailRepairs)
+    Assert.Equal(lost0, f.Path.Counters.SegmentsLost)
+    Assert.InRange(f.Path.SrttNs, 35e6, 50e6)
+
 type private FakeMember() =
     member val Inflight = 0 with get, set
     member val Delivered = 0L with get, set

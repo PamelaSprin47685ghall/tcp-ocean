@@ -62,6 +62,8 @@ type TunCounters() =
     member val RepairsDeferred = 0L with get, set
     /// Repairs sent while the path was demoted (still charged to the bottleneck).
     member val DemotedRepairs = 0L with get, set
+    /// Deliveries of segments sent before a clock jump: no RTT or rate sample taken.
+    member val JumpSamplesSkipped = 0L with get, set
 
 [<Struct>]
 type SentSegment =
@@ -628,15 +630,23 @@ type TunPath(output: ITunOutput, counters: TunCounters, localIp: uint32, localPo
 
     // ---- clock jumps ------------------------------------------------------------------
 
+    /// Last clock jump (stamp after the shift): segments sent before it crossed the stall.
+    let mutable jumpNs = Int64.MinValue
+
     /// Cut a stall from the timeline: every send, delivery and timer stamp moves forward by d,
     /// so after the stall the timers run on from where they were. Without this, all timers
     /// expire at once (a repair storm) and the first ACKs give RTT samples as long as the stall.
+    /// The shift is right only if the peer stalled too (the whole box paused). If only this
+    /// process stalled, the peer's ACKs kept coming and wait in the TUN queue: against shifted
+    /// send stamps they read as RTTs of a few ms. Segments that crossed a jump therefore give
+    /// no RTT and no rate sample (onDelivered); see docs/cases/server-stall-rtt.md.
     let catchUp (now: int64) =
         let gap = now - seenNs
         seenNs <- now
         if gap > stallNs then
             let d = gap - 1_000_000L
             counters.ClockJumps <- counters.ClockJumps + 1L
+            jumpNs <- now
             for i in 0 .. ringCount - 1 do
                 let s = &ring.[at i]
                 s.SentNs <- s.SentNs + d
@@ -670,19 +680,23 @@ type TunPath(output: ITunOutput, counters: TunCounters, localIp: uint32, localPo
         lastDeliveredSentNs <- s.SentNs
         group.OnDelivered(s.Length, s.GroupDelivered, s.GroupDeliveredNs, s.GroupFirstSentNs, s.SentNs, now)
         if s.Retx > 0 then heldBehindRepair <- true
-        if s.Retx = 0 && not heldBehindRepair && now >= s.SentNs then
-            let rtt = float (now - s.SentNs)
-            srttNs <- if srttNs = 0.0 then rtt else 0.875 * srttNs + 0.125 * rtt
-            let r = now - s.SentNs
-            if TraceGate.On then Trace.record Trace.Rtt (uint64 inflight) pathId (int (r / 1000L))
-            if r < minRttNs || now - minRttStamp > 10_000_000_000L then
-                minRttNs <- r
-                minRttStamp <- now
-        if interval > 0L then
-            let rate = float (delivered - s.Delivered) / float interval
-            let slot = int (round % int64 bwRounds.Length)
-            if rate > bwRounds.[slot] then bwRounds.[slot] <- rate
-            btlBw <- Array.max bwRounds
+        // Sent before the last clock jump: its RTT and rate are unknowable (see catchUp).
+        // One compare on the normal path; the samples below are main's code unchanged.
+        if s.SentNs < jumpNs then counters.JumpSamplesSkipped <- counters.JumpSamplesSkipped + 1L
+        else
+            if s.Retx = 0 && not heldBehindRepair && now >= s.SentNs then
+                let rtt = float (now - s.SentNs)
+                srttNs <- if srttNs = 0.0 then rtt else 0.875 * srttNs + 0.125 * rtt
+                let r = now - s.SentNs
+                if TraceGate.On then Trace.record Trace.Rtt (uint64 inflight) pathId (int (r / 1000L))
+                if r < minRttNs || now - minRttStamp > 10_000_000_000L then
+                    minRttNs <- r
+                    minRttStamp <- now
+            if interval > 0L then
+                let rate = float (delivered - s.Delivered) / float interval
+                let slot = int (round % int64 bwRounds.Length)
+                if rate > bwRounds.[slot] then bwRounds.[slot] <- rate
+                btlBw <- Array.max bwRounds
         // Round trips counted by delivery (BBR).
         if s.Delivered >= nextRoundDelivered then
             nextRoundDelivered <- delivered
