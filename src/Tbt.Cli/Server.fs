@@ -300,8 +300,16 @@ let run (o: Options) =
             match tun with
             | null -> false
             | t -> t.Busy
-        let rxPending = sessions.Exists(fun e -> e.Carrier.HasPendingRx)
-        let busy = tunBusy || sessions.Exists(fun e -> e.Carrier.Session.WantsToSend)
+        // An async session's TxHalf queues belong to its coordinator thread.  Reading
+        // WantsToSend (and HasPendingRx) here raced with that thread and corrupted
+        // Queue<T>; the crash surfaced as SIGABRT from TxHalf.HasCandidate.  Each
+        // coordinator already derives its own wait from WaitMs(), so the main loop
+        // only inspects sessions it actually owns.
+        let rxPending =
+            sessions.Exists(fun e -> e.Coordinator.IsNone && e.Carrier.HasPendingRx)
+        let busy =
+            tunBusy
+            || sessions.Exists(fun e -> e.Coordinator.IsNone && e.Carrier.Session.WantsToSend)
         // A socket accepted in this round joins `pending` after this round's Wait, so
         // the poller has not registered it yet.  Waiting for an event on it would stall
         // the bootstrap head until the 10 s / 100 s timeout, which the peer sees as a
