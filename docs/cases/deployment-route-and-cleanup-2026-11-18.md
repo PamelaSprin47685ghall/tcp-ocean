@@ -121,6 +121,22 @@ HND0 的 `git status --porcelain`（第一次审计）显示 10 个修改文件�
 `src/Tbt.Async`、`src/Tbt.Cli/AsyncMode.fs`、`AsyncPaths.fs` 与 fsproj 的引用，
 并重新发布二进制。同步前要保留 HND0 现有的 10 个修改文件，不能直接覆盖。
 
+### 2026-11-19 更新：源码树与运行二进制已分离
+
+上段的“异步模式尚未部署到 HND0”只对源码树成立，对运行实例已不成立：
+
+| 项 | 本机 JYSZ | HND0 |
+|---|---|---|
+| 源码 HEAD | `0568804` | `1cf420e` + 10 个未提交改动 |
+| `src/Tbt.Async` | 存在 | **不存在** |
+| 运行二进制 SHA-256 | `c882b2ba…` | `c882b2ba…`（相同） |
+| 异步日志字段 | 有 | 有（6 小时窗口 808 行） |
+
+部署走 `dotnet publish` 产物，不依赖 HND0 源码树；二进制内已编译 `Tbt.Async`，
+异步在 HND0 上实际生效。源码树未同步只影响“在 HND0 上重新编译”，不影响运行。
+若要在 HND0 上改代码重编，仍需先同步 `src/Tbt.Async`、`src/Tbt.Cli/AsyncMode.fs`、
+`AsyncPaths.fs` 与 fsproj 引用，并保留现有 10 个修改文件。
+
 ## 5. P2-10 的 SSE2 对比方法
 
 `Gf16.mulAddInto` 的分派顺序是：SSSE3/NEON → 表查；`Sse2.IsSupported` → `sse2MulAdd`；

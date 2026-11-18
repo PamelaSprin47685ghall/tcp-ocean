@@ -159,7 +159,10 @@ let run (o: Options) =
             if stopAt > 0L && session.CloseState = CloseState.Open then
                 log "closing the session"
                 session.Close 0uy |> ignore
-            if statsMs > 0L && Environment.TickCount64 - lastStats >= statsMs then
+            // In async mode the coordinator emits the stats line on its own
+            // thread, where the per-window counters live; this path serves the
+            // synchronous fallback.
+            if not asyncMode && statsMs > 0L && Environment.TickCount64 - lastStats >= statsMs then
                 lastStats <- Environment.TickCount64
                 log ("stats " + carrier.Describe() + " rss_kib=" + string (rssKiB ()))
                 Tbt.Contracts.Trace.flush ()
@@ -185,6 +188,13 @@ let run (o: Options) =
                 | _ -> AsyncSessionCoordinator.create carrier clock
             coordinator.BeforeWait <- watchListener
             coordinator.BeforeService <- serve
+            coordinator.StatsEveryMs <- statsMs
+            coordinator.OnStats <-
+                (fun () ->
+                    lastStats <- Environment.TickCount64
+                    log ("stats " + carrier.Describe() + " rss_kib=" + string (rssKiB ())
+                         + coordinator.Stats.DescribeWindow())
+                    Tbt.Contracts.Trace.flush ())
             coordinator.Start()
             // Block on the coordinator's completion signal. The only timed part
             // is an explicit stop deadline, which is a single wait, not a poll.
@@ -200,7 +210,8 @@ let run (o: Options) =
             while carrier.Alive && not (stopAt > 0L && Environment.TickCount64 > stopAt) do
                 beforeWait poller
                 carrier.Watch poller
-                poller.Wait(carrier.WaitMs())
+                // WaitMs() is milliseconds; Poller.Wait takes microseconds.
+                poller.Wait(carrier.WaitMs() * 1000)
                 clock.Tick() |> ignore
                 acceptNow poller
                 carrier.Service poller

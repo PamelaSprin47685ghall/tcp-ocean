@@ -1,5 +1,11 @@
 # Async Rewrite Completion Roadmap
 
+> **历史文档（2024-11-17 快照），不是当前状态。**
+> 下文 “Completed Infrastructure (80%)” 与 “~20 errors remaining” 描述的是该日期的中间态。
+> 真实状态：`dotnet build Tbt.slnx -c Release -p:PublishAot=false` 0 警告/0 错误，
+> `Tbt.Session.Tests` 239/239、`Tbt.Async.Tests` 8/8，异步已是生产默认。
+> 当前状态以 `02-integration-status.md`、`05-final-status.md`、`06-verification-log.md` 为准。
+
 ## Current Status (2024-11-17)
 
 ### Completed Infrastructure (80%)

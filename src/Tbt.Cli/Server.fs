@@ -191,6 +191,8 @@ let run (o: Options) =
                 match ioGroup, channel with
                 | Some group, Some rx ->
                     let co = AsyncSessionCoordinator.createWith carrier clock group rx
+                    co.StatsEveryMs <- statsMs
+                    co.OnStats <- (fun () -> log ("stats " + carrier.Describe() + co.Stats.DescribeWindow()))
                     co.Start()
                     log ("session " + a.Params.Keys.SessionId.ToString() + " on an async coordinator thread")
                     Some co
@@ -214,28 +216,29 @@ let run (o: Options) =
             let p = pending.[i]
             let link = p.Link
             let mutable leave = false
-            // Read unconditionally. A socket accepted in this round joins `pending`
-            // after this round's Wait, so the poller has not registered it yet and
-            // IsReadable is false until the next pass; gating on it let the entry
-            // time out and the peer saw CLOSE-WAIT. Receive is non-blocking.
-            let r = link.Receive()
-            if r <> IoResult.WouldBlock then
-                if p.Silent then
-                    let mutable f = Span<byte>.Empty
-                    link.FrameLength <- max 1 link.Buffered
-                    while link.TryTakeFrame(&f) do ()
-                    link.FrameLength <- Layout.BootFrameLength
-                else
-                    let mutable failed = false
-                    let mutable boot = Span<byte>.Empty
-                    if link.TryTakeHead(&failed) then
-                        if link.TryTakeFrame(&boot) then
-                            leave <- classify link (boot.ToArray())
-                            if not leave then p.Silent <- true
-                    elif failed then p.Silent <- true
-                if not leave && r = IoResult.Closed then
-                    link.Close()
-                    leave <- true
+            // Read only when the poller reports the socket readable. An entry
+            // accepted this round is registered at the top of the next loop pass,
+            // so that is the first pass in which it can be read. Reading
+            // unconditionally broke the server accept path (sessions stayed 0).
+            if poller.IsReadable link.Socket then
+                let r = link.Receive()
+                if r <> IoResult.WouldBlock then
+                    if p.Silent then
+                        let mutable f = Span<byte>.Empty
+                        link.FrameLength <- max 1 link.Buffered
+                        while link.TryTakeFrame(&f) do ()
+                        link.FrameLength <- Layout.BootFrameLength
+                    else
+                        let mutable failed = false
+                        let mutable boot = Span<byte>.Empty
+                        if link.TryTakeHead(&failed) then
+                            if link.TryTakeFrame(&boot) then
+                                leave <- classify link (boot.ToArray())
+                                if not leave then p.Silent <- true
+                        elif failed then p.Silent <- true
+                    if not leave && r = IoResult.Closed then
+                        link.Close()
+                        leave <- true
             if not leave && now - p.Since > (if p.Silent then 60_000L else 15_000L) then
                 link.Close()
                 leave <- true
@@ -297,14 +300,22 @@ let run (o: Options) =
             match tun with
             | null -> false
             | t -> t.Busy
-        let rxPending = sessions.Exists(fun e -> e.Carrier.HasPendingRx)
-        let busy = tunBusy || sessions.Exists(fun e -> e.Carrier.Session.WantsToSend)
+        // An async session's TxHalf queues belong to its coordinator thread.  Reading
+        // WantsToSend (and HasPendingRx) here raced with that thread and corrupted
+        // Queue<T>; the crash surfaced as SIGABRT from TxHalf.HasCandidate.  Each
+        // coordinator already derives its own wait from WaitMs(), so the main loop
+        // only inspects sessions it actually owns.
+        let rxPending =
+            sessions.Exists(fun e -> e.Coordinator.IsNone && e.Carrier.HasPendingRx)
+        let busy =
+            tunBusy
+            || sessions.Exists(fun e -> e.Coordinator.IsNone && e.Carrier.Session.WantsToSend)
         // A socket accepted in this round joins `pending` after this round's Wait, so
         // the poller has not registered it yet.  Waiting for an event on it would stall
         // the bootstrap head until the 10 s / 100 s timeout, which the peer sees as a
         // dead path.  With pending work, poll without blocking and service it at once.
         poller.Wait(
-            if rxPending || pending.Count > 0 then 0
+            if rxPending then 0
             elif busy then 1000
             elif sessions.Count > 0 then 10_000
             else 100_000
@@ -396,7 +407,10 @@ let run (o: Options) =
                  + " tun_drain=" + drainMode)
             winRecvUs <- 0L; winRecvUsMax <- 0L; winSvcUs <- 0L; winSvcUsMax <- 0L
             winCsvcUs <- 0L; winIterN <- 0; winIterUsMax <- 0L; winSvcGapMax <- 0L
-            for e in sessions do log ("stats " + e.Carrier.Describe())
+            // An async session's carrier belongs to its coordinator thread; walking
+            // it here would race with that thread's path joins and drops.
+            for e in sessions do
+                if e.Coordinator.IsNone then log ("stats " + e.Carrier.Describe())
             match tun with
             | null -> ()
             | t -> log ("stats " + t.Describe())

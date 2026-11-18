@@ -127,7 +127,11 @@ type Poller(backend: PollerBackend) =
                 ownerRegistered.Remove fd |> ignore
             if count = 0 then Thread.Sleep(max 1 (timeoutUs / 1000))
             else
-                let n = Native.epollWait epfd events (max 0 ((timeoutUs + 999) / 1000))
+                // A negative timeout means block until an event arrives.  Rounding it up
+                // to milliseconds with (t + 999) / 1000 turns -1 into 0, which makes the
+                // call non-blocking and turns every IO thread into a spin loop.
+                let waitMs = if timeoutUs < 0 then -1 else (timeoutUs + 999) / 1000
+                let n = Native.epollWait epfd events waitMs
                 for k in 0 .. n - 1 do
                     let at = k * Native.epollEventSize
                     let ev = BitConverter.ToUInt32(events, at)
@@ -139,7 +143,9 @@ type Poller(backend: PollerBackend) =
         elif usePoll then
             if count = 0 then
                 Thread.Sleep(max 1 (timeoutUs / 1000))
-            else Native.poll fds count (max 0 ((timeoutUs + 999) / 1000)) |> ignore
+            else
+                let waitMs = if timeoutUs < 0 then -1 else (timeoutUs + 999) / 1000
+                Native.poll fds count waitMs |> ignore
             stale <- true
         else
             readable.Clear()
