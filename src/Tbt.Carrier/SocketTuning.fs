@@ -4,6 +4,7 @@ namespace Tbt.Carrier
 
 open System
 open System.Net.Sockets
+open System.Text
 
 /// Bytes the kernel holds for a socket that it did not send yet.
 type INotSentProbe =
@@ -95,6 +96,16 @@ module SocketTuning =
     /// clamp is TCP_WINDOW_CLAMP in bytes (default WindowClamp, spec ch. 9).
     let path (socket: Socket, clamp: int) =
         socket.NoDelay <- true
+        // Linux TCP_CONGESTION (level 6, option 13). Some hosts default to cubic;
+        // on a path carrying a 14-19 % retransmit rate cubic collapsed cwnd to
+        // 2-4 MSS, so the client's ACK stream arrived late and the peer's BBR (it
+        // already ran BBR) cut its send rate: three consecutive 30 s downloads
+        // fell 7.38 -> 4.77 -> 2.85 Mbit/s while the client's own minrtt stayed
+        // at 320-329 ms and cell_loss was zero. BBR is the product requirement;
+        // ask the kernel for it and stay silent when the module is absent.
+        if OperatingSystem.IsLinux() then
+            try socket.SetRawSocketOption(6, 13, ReadOnlySpan<byte>(Encoding.ASCII.GetBytes "bbr"))
+            with :? SocketException -> ()
         let c = Platform.current.Value
         if c.HasTcpNotsentLowat then
             try socket.SetRawSocketOption(6, c.TcpNotsentLowatOption, ReadOnlySpan(BitConverter.GetBytes NotSentLimit))
