@@ -138,3 +138,53 @@ poller.Wait(
 - `install` 前必须 `xz -dc | sha256sum` 与本地 AOT 一致；空文件事故的 sha 是 `e3b0c442…`。
 - 两端 drop-in 可随时重建：`Environment=TBTUN_ASYNC_MODE=0`，`daemon-reload && restart`。
 - 同步回退保留，用于对照与故障定位。
+
+## 代理 204 但大流量为 0：先查 mihomo，而不是 tbtun
+
+现象：`curl -x http://127.0.0.1:17893 http://www.gstatic.com/generate_204` 返回 204，
+但 30 秒下载只有 0–3 Mbit/s，`flowread` 的 `calls` 猛涨而 `bytes` 几乎不动。
+
+诊断（在 HND0 上）：
+
+```sh
+ss -tn | grep 18443
+# ESTAB 1682545 0     127.0.0.1:18443 127.0.0.1:55638   ← mihomo Recv-Q 不读
+# FIN-WAIT-1 0 14280658 127.0.0.1:55638 127.0.0.1:18443 ← tbtun Send-Q 发不出
+```
+
+两侧积压说明 mihomo 的 vless 入站已经不读 tbtun 送来的数据。tbtun 自身
+`tx_head = peer_ack`、`csvc_us` 极低，不是瓶颈。
+
+确认 18443 的主人：
+
+```sh
+ss -lntp | grep 18443     # 必须是 mihomo-tbt4 的 pid，不是 mihomo-090 等其它实例
+systemctl is-active mihomo-tbt4
+```
+
+恢复（两端各一次，按“先 HND0、等 3 秒、再本地”的顺序，避免旧半开连接抢在新建之前）：
+
+```sh
+# HND0
+kill -TERM <mihomo-tbt4 pid>
+systemd-run --unit=mihomo-tbt4 --property=Restart=on-failure \
+  /usr/local/bin/mihomo -d /etc/mihomo-tbt4
+
+# 本地
+kill -TERM <hnd0tbt4 pid>
+systemd-run --unit=mihomo-hnd0tbt4 --property=Restart=on-failure \
+  /opt/mihomo/mihomo -f /run/hnd0tbt4.yaml -d /run
+
+# 然后依次重启两端 tbtun
+systemctl restart tbtun-hnd0   # 先 HND0
+sleep 3
+systemctl restart tbtun-hnd0   # 再本地
+```
+
+恢复判据：`ss -tn | grep 18443` 的 Recv-Q/Send-Q 接近 0；`sessions=1`、`paths=256`；
+`flowread` 两次采样的 `bytes` 差与下载字节同量级。
+
+## 上传测试端点
+
+- `http://speedtest.tele2.net/upload.php`：15 秒稳定 **8.39 Mbit/s**，可用。
+- `https://speed.cloudflare.com/__up`：多次返回 0 字节，端点不可靠，不要用它做验收。
