@@ -112,6 +112,14 @@ type AsyncPollerGroup(threadCount: int) =
     member _.Wake() =
         if wakeFd >= 0 then Native.write wakeFd (ReadOnlySpan<byte> wakeToken) |> ignore
 
+    /// Wake one IO thread. A path with a newly committed frame must wake its
+    /// owner: the owner blocks in epoll, and a socket that is only writable
+    /// produces no event, so PumpTx would otherwise never run.
+    member _.WakeThread(index: int) =
+        let i = ((index % width) + width) % width
+        if threadWakes.[i] >= 0 then
+            Native.write threadWakes.[i] (ReadOnlySpan<byte> wakeToken) |> ignore
+
     /// Consume the wake token.
     member _.ClearWake() =
         if wakeFd >= 0 then
@@ -319,6 +327,8 @@ type AsyncPathLink private (socket: Socket, probe: INotSentProbe, group: AsyncPo
         member this.TryBeginFrame(frame) = this.BeginFrame(&frame)
         member this.CommitFrame() =
             let head = Volatile.Read(&txHead)
+            let idle = head = Volatile.Read(&txTail)
             txLen.[head % slotCount] <- Volatile.Read(&frameLength)
             Volatile.Write(&txHead, head + 1)
+            if idle then group.WakeThread(group.ThreadFor pathId)
         member this.Close() = this.Close()

@@ -214,8 +214,12 @@ let run (o: Options) =
             let p = pending.[i]
             let link = p.Link
             let mutable leave = false
-            if poller.IsReadable link.Socket then
-                let r = link.Receive()
+            // Read unconditionally. A socket accepted in this round joins `pending`
+            // after this round's Wait, so the poller has not registered it yet and
+            // IsReadable is false until the next pass; gating on it let the entry
+            // time out and the peer saw CLOSE-WAIT. Receive is non-blocking.
+            let r = link.Receive()
+            if r <> IoResult.WouldBlock then
                 if p.Silent then
                     let mutable f = Span<byte>.Empty
                     link.FrameLength <- max 1 link.Buffered
@@ -295,7 +299,16 @@ let run (o: Options) =
             | t -> t.Busy
         let rxPending = sessions.Exists(fun e -> e.Carrier.HasPendingRx)
         let busy = tunBusy || sessions.Exists(fun e -> e.Carrier.Session.WantsToSend)
-        poller.Wait(if rxPending then 0 elif busy then 1000 elif sessions.Count > 0 then 10_000 else 100_000)
+        // A socket accepted in this round joins `pending` after this round's Wait, so
+        // the poller has not registered it yet.  Waiting for an event on it would stall
+        // the bootstrap head until the 10 s / 100 s timeout, which the peer sees as a
+        // dead path.  With pending work, poll without blocking and service it at once.
+        poller.Wait(
+            if rxPending || pending.Count > 0 then 0
+            elif busy then 1000
+            elif sessions.Count > 0 then 10_000
+            else 100_000
+        )
         clock.Tick() |> ignore
         let iterA = stamp ()
         let now = Environment.TickCount64

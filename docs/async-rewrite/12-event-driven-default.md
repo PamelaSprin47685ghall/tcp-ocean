@@ -39,13 +39,40 @@
 
 `Tbt.Async.fsproj` 现在只编译 `SPSCQueue`、`MPMCQueue`、`AsyncSocket`（保留 `BufferPool` 给单测）、`ComputePool`、`FrameAdapter`、`AsyncSession`。
 
+## CommitFrame 唤醒（2026-11-18，异步默认后的第一个回归）
+
+现象：异步设为默认并部署两端后，本地到 HND0 的 244 条 TCP 连接建立，但服务端 `frames_in=0`，代理 `000`、20 秒超时。
+
+根因：IO 线程从 `poller.Wait 1000` 改成 `poller.Wait -1` 后，只在 socket 可读或 eventfd 被写时醒来。`AsyncPathLink.CommitFrame` 只递增 `txHead`，不写任何 fd；而一个只有待发数据的 TCP socket 不会产生读事件，`PumpTx` 永远不执行，bootstrap 帧发不出去，握手死锁。
+
+修复：
+
+```fsharp
+// AsyncPollerGroup
+member _.WakeThread(index: int) =
+    let i = ((index % width) + width) % width
+    if threadWakes.[i] >= 0 then
+        Native.write threadWakes.[i] (ReadOnlySpan<byte> wakeToken) |> ignore
+
+// AsyncPathLink.CommitFrame
+let head = Volatile.Read(&txHead)
+let idle = head = Volatile.Read(&txTail)
+txLen.[head % slotCount] <- Volatile.Read(&frameLength)
+Volatile.Write(&txHead, head + 1)
+if idle then group.WakeThread(group.ThreadFor pathId)
+```
+
+只在队列从空变非空时写一次 eventfd，批量提交不会每帧一次系统调用。
+
 ## 验证
 
-- `dotnet build src/Tbt.Cli -c Release -p:PublishAot=false` → 0 warning / 0 error，26 s。
+- `dotnet build Tbt.slnx -c Release -p:PublishAot=false` → 0 warning / 0 error，47 s。
 - `Tbt.Session.Tests` 239/239，8.2 s；`Tbt.Async.Tests` 8/8，218 ms。
-- AOT `eb2b9cc8…` 部署本地后：启动日志出现 async 行，`systemctl is-active` = `active`，代理 `204`，到 HND0 的连接 265 条。
+- AOT `eb2b9cc8…` 部署本地后启动日志出现 async 行。
+- 修复版 AOT `feea9b05…`：构建 0 error，本地待验证；HND0 需要重新传输。
 
 ## 待办
 
-- HND0 仍是旧版；异步默认要在服务端也生效需要部署 `eb2b9cc8…`。
+- HND0 需要部署 `feea9b05…` 并把 `TBTUN_ASYNC_MODE` 的临时回退 drop-in 删除，两端才都在异步默认下运行。
+- 传输必须分块、先删远端旧文件、传完 `xz -dc | sha256sum` 校验后才 install。
 - 同步回退保留，用于对照与故障定位。
