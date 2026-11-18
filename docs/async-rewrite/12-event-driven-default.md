@@ -71,8 +71,70 @@ if idle then group.WakeThread(group.ThreadFor pathId)
 - AOT `eb2b9cc8…` 部署本地后启动日志出现 async 行。
 - 修复版 AOT `feea9b05…`：构建 0 error，本地待验证；HND0 需要重新传输。
 
-## 待办
+## accept 读门控（第二个回归，已修）
 
-- HND0 需要部署 `feea9b05…` 并把 `TBTUN_ASYNC_MODE` 的临时回退 drop-in 删除，两端才都在异步默认下运行。
-- 传输必须分块、先删远端旧文件、传完 `xz -dc | sha256sum` 校验后才 install。
+现象：本地客户端与服务端的 TCP 连接全部建立，但对端很快进入 `CLOSE-WAIT`；服务端 `sessions=0`、
+`recv_calls=0`，代理超时。
+
+根因在 `Server.run` 的两个细节：
+
+```fsharp
+// 旧：servicePending 依赖 poller 的就绪表
+if poller.IsReadable link.Socket then
+    let r = link.Receive()
+
+// 旧：Wait 超时只看 rxPending / busy / sessions.Count
+poller.Wait(if rxPending then 0 elif busy then 1000 elif sessions.Count > 0 then 10_000 else 100_000)
+```
+
+1. 新 accept 的 socket 是在本轮 `Wait` 之后才加入 `pending` 的，本轮还没 `WatchRead` 它，
+   `IsReadable` 为假；下一轮注册与 `stale` 清空的时序稍有偏差，读就会持续失败。
+2. `Wait` 的超时没有考虑 `pending.Count`。已有 pending socket 时仍可能等 10/100 秒，
+   bootstrap head 在这段时间里读不到，15 秒后 `Pending` 超时 `link.Close()`，对端看到的就是 `CLOSE-WAIT`。
+
+修复：
+
+```fsharp
+// servicePending：直接读，WouldBlock 无害
+match link.Receive() with
+| IoResult.Progress -> ...
+| IoResult.WouldBlock -> ()
+| _ -> failed <- true
+
+// Wait：只要还有 pending socket 就非阻塞轮转
+poller.Wait(
+    if rxPending || pending.Count > 0 then 0
+    elif busy then 1000
+    elif sessions.Count > 0 then 10_000
+    else 100_000)
+```
+
+`PathLink.Receive` 的语义已核对：`WouldBlock` 返回 `WouldBlock`，只有 `n = 0` 或真实错误才是
+`Closed`，所以去掉门控不会把半包误判为断链。
+
+## 异步服务端的待查问题（未闭环）
+
+两端同为 `d1fcac35…` 且都开异步时，HND0 `sessions=0`、`frames_in=0`、代理 `000`；
+而“本地异步客户端 + HND0 同步服务端”曾稳定 `204`。因此问题在**异步服务端路径**，
+不在客户端。目前尚未定位到具体行。
+
+隔离方法（每次只改一个变量）：
+
+| 本地客户端 | HND0 服务端 | 预期 |
+|---|---|---|
+| 同步（drop-in） | 同步（drop-in） | 已确认 204，生产回退组合 |
+| 异步 | 同步 | 曾确认 204（`d1fcac35` + 同步 drop-in） |
+| 同步 | 异步 | 待测；若失败即可锁定服务端 |
+| 异步 | 异步 | 待测 |
+
+下一步的诊断点：在 `classify` 入口记录 `TryTakeHead` / `TryTakeFrame` 的返回值、`pending` 数量、
+本轮 `Wait` 的毫秒数，跑 20 秒即可区分“没读到 head”与“读到但 coordinator 创建失败”。
+
+## 部署与回退
+
+- HND0 的 SSH 上行只有 5–9 KB/s。传 1.58 MB 的 xz 必须走隧道（`/tmp/connect.py` 作为
+  `scp -o ProxyCommand=...`），或先删远端旧文件再分块 `cat >>`；**不要**在截断的压缩流上用
+  `rsync --inplace`，块结构混合会拼出长度正确但内容损坏的文件。
+- `install` 前必须 `xz -dc | sha256sum` 与本地 AOT 一致；空文件事故的 sha 是 `e3b0c442…`。
+- 两端 drop-in 可随时重建：`Environment=TBTUN_ASYNC_MODE=0`，`daemon-reload && restart`。
 - 同步回退保留，用于对照与故障定位。

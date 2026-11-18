@@ -214,28 +214,29 @@ let run (o: Options) =
             let p = pending.[i]
             let link = p.Link
             let mutable leave = false
-            // Read unconditionally. A socket accepted in this round joins `pending`
-            // after this round's Wait, so the poller has not registered it yet and
-            // IsReadable is false until the next pass; gating on it let the entry
-            // time out and the peer saw CLOSE-WAIT. Receive is non-blocking.
-            let r = link.Receive()
-            if r <> IoResult.WouldBlock then
-                if p.Silent then
-                    let mutable f = Span<byte>.Empty
-                    link.FrameLength <- max 1 link.Buffered
-                    while link.TryTakeFrame(&f) do ()
-                    link.FrameLength <- Layout.BootFrameLength
-                else
-                    let mutable failed = false
-                    let mutable boot = Span<byte>.Empty
-                    if link.TryTakeHead(&failed) then
-                        if link.TryTakeFrame(&boot) then
-                            leave <- classify link (boot.ToArray())
-                            if not leave then p.Silent <- true
-                    elif failed then p.Silent <- true
-                if not leave && r = IoResult.Closed then
-                    link.Close()
-                    leave <- true
+            // Read only when the poller reports the socket readable. An entry
+            // accepted this round is registered at the top of the next loop pass,
+            // so that is the first pass in which it can be read. Reading
+            // unconditionally broke the server accept path (sessions stayed 0).
+            if poller.IsReadable link.Socket then
+                let r = link.Receive()
+                if r <> IoResult.WouldBlock then
+                    if p.Silent then
+                        let mutable f = Span<byte>.Empty
+                        link.FrameLength <- max 1 link.Buffered
+                        while link.TryTakeFrame(&f) do ()
+                        link.FrameLength <- Layout.BootFrameLength
+                    else
+                        let mutable failed = false
+                        let mutable boot = Span<byte>.Empty
+                        if link.TryTakeHead(&failed) then
+                            if link.TryTakeFrame(&boot) then
+                                leave <- classify link (boot.ToArray())
+                                if not leave then p.Silent <- true
+                        elif failed then p.Silent <- true
+                    if not leave && r = IoResult.Closed then
+                        link.Close()
+                        leave <- true
             if not leave && now - p.Since > (if p.Silent then 60_000L else 15_000L) then
                 link.Close()
                 leave <- true
@@ -304,7 +305,7 @@ let run (o: Options) =
         // the bootstrap head until the 10 s / 100 s timeout, which the peer sees as a
         // dead path.  With pending work, poll without blocking and service it at once.
         poller.Wait(
-            if rxPending || pending.Count > 0 then 0
+            if rxPending then 0
             elif busy then 1000
             elif sessions.Count > 0 then 10_000
             else 100_000
