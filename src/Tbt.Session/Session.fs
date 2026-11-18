@@ -758,6 +758,32 @@ type Session(role: Role, p: SessionParams, port: IFlowPort, clock: IClock, confi
             elif flows.ReportsDue > 0 && now - lastFlowStateNs >= flowStatePeriodNs then
                 flowStateDue <- true
 
+    /// Microseconds until a protocol timer needs this thread: WIN_ACK, NACK,
+    /// FLOW_STATE, control retransmission, or a heartbeat. -1 when nothing is
+    /// pending. A wait can then block on descriptors and wake exactly at the next
+    /// deadline, instead of re-running the loop on a fixed interval.
+    member _.NextTimerUs() =
+        let now = clock.NowNs()
+        let mutable next = Int64.MaxValue
+        let at (deadline: int64) = if deadline < next then next <- deadline
+        // A stamp of 0 means the timer has never fired. Adding a period to it would
+        // name an instant long in the past, and the caller would treat that as "run
+        // now" on every round: a spin. An unset timer starts counting from now.
+        let stampOr (stamp: int64) (period: int64) = if stamp <= 0L then now + period else stamp + period
+        if ackDue then next <- now
+        elif peerSeen || rx.AckStepLo > 0UL then
+            let changed = rx.AckStepLo <> lastAckLo || rx.AckStepLo + uint64 rx.Grant <> lastGrantLimit
+            at (stampOr lastAckNs (if changed then winAckPeriodNs else keepAliveNs))
+        if nackDeficit > 0 then at (stampOr lastNackNs winAckPeriodNs)
+        if credit.Enabled && not flowStateDue then
+            if flows.ReportsDue > 0 then at (stampOr lastFlowStateNs flowStatePeriodNs)
+            if flows.ReportsDue > 0 || flows.RxActive > 0 then at (stampOr lastSnapshotNs snapshotPeriodNs)
+        if peerSeen && tx.CanSealPayload then at tx.NextHeartbeatNs
+        if ctrl.Pending > 0 then at (now + 10_000_000L)
+        if next = Int64.MaxValue then -1L
+        elif next <= now then 0L
+        else max 1L ((next - now + 999L) / 1000L)
+
     // ---- local flows ------------------------------------------------------------------
 
     /// Client: a new local connection. False when all 256 slots are busy.

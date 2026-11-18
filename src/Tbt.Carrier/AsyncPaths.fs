@@ -38,10 +38,17 @@ type RxChannel() =
     member _.Count = Volatile.Read(&count)
     member _.WakeFd = wakeFd
 
-    member _.Enqueue(frame: RxFrame) =
+    /// Wake the session thread without delivering a frame. A path that drained its
+    /// socket buffer makes the write gate admit again, but the kernel reports no
+    /// readiness for bytes that merely left the send queue, so the drain itself is
+    /// the event. Costs one eventfd write, no allocation.
+    member _.Wake() =
+        if wakeFd >= 0 then Native.write wakeFd (ReadOnlySpan<byte> wakeToken) |> ignore
+
+    member this.Enqueue(frame: RxFrame) =
         queue.Enqueue frame
         Interlocked.Increment(&count) |> ignore
-        if wakeFd >= 0 then Native.write wakeFd (ReadOnlySpan<byte> wakeToken) |> ignore
+        this.Wake()
 
     /// Consume the wake token on the session thread.
     member _.ClearWake() =
@@ -263,6 +270,7 @@ type AsyncPathLink private (socket: Socket, probe: INotSentProbe, group: AsyncPo
     member private this.PumpTx() =
         if Volatile.Read(&alive) = 1 then
             let mutable go = true
+            let mutable progress = false
             while go && txTail < Volatile.Read(&txHead) do
                 let slot = txTail % slotCount
                 let offset = txSent.[slot]
@@ -283,12 +291,16 @@ type AsyncPathLink private (socket: Socket, probe: INotSentProbe, group: AsyncPo
                         go <- false
                     else
                         bytesWritten <- bytesWritten + int64 n
+                        progress <- true
                         if offset + n >= committed then
                             txSent.[slot] <- 0
                             txTail <- txTail + 1
                         else
                             txSent.[slot] <- offset + n
                             go <- false
+            // Bytes reached the kernel: unsent is now lower, so WriteGate may admit a
+            // new frame at once. Without this wake the session thread waits out a timer.
+            if progress then channel.Wake()
 
     member private this.PumpRx(poller: Poller) =
         if Volatile.Read(&alive) = 1 && poller.IsReadable socket then

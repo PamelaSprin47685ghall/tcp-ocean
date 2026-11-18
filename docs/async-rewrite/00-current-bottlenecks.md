@@ -43,6 +43,13 @@ Main Thread (100% CPU):
 4. **Encoding blocks sending** - can't overlap compute and IO
 
 ### Why Multi-Stream Is Slower
+
+> **2026-11-19 更正：本节结论已被推翻，保留为历史记录。** 异步协调器成为默认后，
+> `FlowBridge` 只访问 ready set 里的槽位，256 条路径各有独立 IO 线程，下面的
+> 「串行读」已不存在；生产单流实测 71.3 Mbit/s（下载）、61.5 Mbit/s（纯隧道上传）。
+> 而且「多流更慢」本身不是要解决的问题：tbtun 的职责就是把一条本地 TCP 流拆成
+> 256 条公网路径，单流即已占满 256 路，多流倍率推不出瓶颈。
+
 With `max-connections: 1` in mihomo, 3 streams multiplex over one smux connection.
 But tbtun processes flows sequentially in FlowBridge.Read():
 ```fsharp

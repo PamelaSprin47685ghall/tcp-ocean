@@ -691,6 +691,14 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
         peerAck < encoder.Head && encoder.Head > 0UL && queue.Count = 0 && urgent.Count = 0 && repairs.Count = 0
         && now - lastSourceNs >= 50_000_000L && now - lastHeartbeatNs >= 50_000_000L
 
+    /// Nanoseconds until HeartbeatDue can turn true, or Int64.MaxValue while the
+    /// tail rule does not apply. A session can sleep until this instant instead of
+    /// polling to discover that the heartbeat is due.
+    member _.NextHeartbeatNs =
+        if peerAck < encoder.Head && encoder.Head > 0UL && queue.Count = 0 && urgent.Count = 0 && repairs.Count = 0 then
+            max lastSourceNs lastHeartbeatNs + 50_000_000L
+        else Int64.MaxValue
+
     /// Render and seal a HEARTBEAT for path.
     member this.RenderHeartbeat(frame: Span<byte>, path: uint16, ackLo: uint64, grant: uint16, erasureQ16: uint16) =
         lastHeartbeatNs <- clock.NowNs()
