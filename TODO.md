@@ -1,5 +1,19 @@
 # TODO — 剩余问题清单
 
+> **状态：全部 14 项已关闭（2026-11-18）。**
+>
+> 证据索引：
+> - P0-1～P0-4（Tbt.Async 编译、生产接线、真实帧解析、无锁单测）：`docs/async-rewrite/06-verification-log.md`、`tests/Tbt.Async.Tests`（8/8）
+> - P1-5～P1-9（吞吐、多流、SRTT、FEC、服务循环）：`docs/async-rewrite/10-p1-acceptance.md`
+> - P2-10（SSE2 A/B）：`docs/cases/slow-consumer-cpu-stall.md`
+> - P2-11（测试编译）：`docs/cases/test-build-latency-2026-11-18.md`
+> - P2-12/13（路由与清理）：`docs/cases/deployment-route-and-cleanup-2026-11-18.md`
+> - 异步默认、事件驱动与 mihomo 诊断：`docs/async-rewrite/12-event-driven-default.md`
+> - 生产看门狗：`deploy/README.md`
+>
+> 约束均未改：256 路、TCP-only、`:39443` 静默、无 TLS/REALITY、TFO/BBR、smux 配置；
+> `rho=0.25` 语义保留在 `TBTUN_FEC_ADAPTIVE=0`，默认自适应；GF(16) 上行未改。
+
 更新时间：2026-11-18
 项目路径：`~/tcp-ocean`（本地）、`/root/tcp-ocean`（HND0）
 
