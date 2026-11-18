@@ -1,5 +1,6 @@
 <Solution>
   <Folder Name="/src/">
+    <Project Path="src/Tbt.Async/Tbt.Async.fsproj" />
     <Project Path="src/Tbt.Carrier/Tbt.Carrier.fsproj" />
     <Project Path="src/Tbt.Cli/Tbt.Cli.fsproj" />
     <Project Path="src/Tbt.Codec/Tbt.Codec.fsproj" />
