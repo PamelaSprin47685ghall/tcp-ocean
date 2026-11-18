@@ -55,6 +55,12 @@ type RxHalf(symbolSize: int, field: CodeField, decoder: Decoder, opener: CellOpe
     let mutable lastFoldedExpected = 0
     let mutable lastFoldedReceived = 0
     let mutable folds = 0L
+    /// How far the fold may lag the decoder frontier before a path stops pinning it.
+    /// A path whose `pathStep` sits more than this behind the frontier is slow or dead:
+    /// letting it pin the fold was harmless with four paths, but on the live 256-path
+    /// link one lagging path froze `estimateFloor` while the ring kept reusing slots, so
+    /// the estimator folded almost nothing and reported 22 % erasure on a clean tunnel.
+    let reorderSteps = uint64 (max 64 (capacitySteps / 2))
     let mutable flows: FlowTable = Unchecked.defaultof<_>
     let index (t: uint64) = int (t % uint64 capacitySteps)
 
@@ -86,8 +92,16 @@ type RxHalf(symbolSize: int, field: CodeField, decoder: Decoder, opener: CellOpe
         let f = decoder.Frontier
         let mutable stable = f
         for p in 0 .. maxPaths - 1 do
-            if lastCellNs - pathSeenNs.[p] <= pathActiveNs && pathStep.[p] < stable then
-                stable <- pathStep.[p]
+            // Do not gate on `pathSeenNs`: at 310 ms RTT a healthy path can go
+            // longer than the 50 ms activity window without a cell, was treated
+            // as dead, and the fallback then folded steps whose cells were still
+            // in flight. That reported 22 % erasure on a clean tunnel. A path
+            // still pins the fold through its real `pathStep`; only one that
+            // lags the frontier by the whole reorder budget is overridden.
+            let floorP =
+                if pathStep.[p] + reorderSteps < f then f - reorderSteps
+                else pathStep.[p]
+            if floorP < stable then stable <- floorP
         while estimateFloor < stable do
             let i = index estimateFloor
             if expectedStep.[i] = estimateFloor && expected.[i] > 0uy then

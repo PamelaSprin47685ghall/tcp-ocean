@@ -154,7 +154,7 @@ let run (o: Options) =
         // the readiness Wait just filled. Accept runs after Wait, where the
         // listener's readiness is still visible.
         let watchListener (pl: Poller) = pl.WatchRead listener
-        let serve (pl: Poller) =
+        let housekeeping () =
             attachJoined ()
             if stopAt > 0L && session.CloseState = CloseState.Open then
                 log "closing the session"
@@ -163,15 +163,19 @@ let run (o: Options) =
                 lastStats <- Environment.TickCount64
                 log ("stats " + carrier.Describe() + " rss_kib=" + string (rssKiB ()))
                 Tbt.Contracts.Trace.flush ()
+        let acceptNow (pl: Poller) =
             if pl.IsReadable listener then
                 let mutable go = true
                 while go do
                     match tryAccept listener with
                     | null -> go <- false
                     | s -> if not (bridge.TryAdd s) then s.Dispose()
-        let cycle (pl: Poller) =
+        let beforeWait (pl: Poller) =
             watchListener pl
-            serve pl
+            housekeeping ()
+        let serve (pl: Poller) =
+            housekeeping ()
+            acceptNow pl
 
         if asyncMode then
             log "async mode: session loop on its own thread (TBTUN_ASYNC_MODE)"
@@ -182,16 +186,23 @@ let run (o: Options) =
             coordinator.BeforeWait <- watchListener
             coordinator.BeforeService <- serve
             coordinator.Start()
-            while coordinator.Alive && carrier.Alive
+            // Block on the coordinator's completion signal. The only timed part
+            // is an explicit stop deadline, which is a single wait, not a poll.
+            let mutable go = true
+            while go && carrier.Alive
                   && not (stopAt > 0L && Environment.TickCount64 > stopAt) do
-                Thread.Sleep 50
+                let waitMs =
+                    if stopAt <= 0L then Timeout.Infinite
+                    else max 1 (int (stopAt - Environment.TickCount64))
+                go <- not (coordinator.Stopped.Wait waitMs)
             coordinator.Stop()
         else
             while carrier.Alive && not (stopAt > 0L && Environment.TickCount64 > stopAt) do
-                cycle poller
+                beforeWait poller
                 carrier.Watch poller
                 poller.Wait(carrier.WaitMs())
                 clock.Tick() |> ignore
+                acceptNow poller
                 carrier.Service poller
         log (if session.Closed then "session closed" else "all paths closed")
         try joinTask.Wait 2000 |> ignore with _ -> ()

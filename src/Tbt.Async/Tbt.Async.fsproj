@@ -11,11 +11,7 @@
     <Compile Include="MPMCQueue.fs" />
     <Compile Include="AsyncSocket.fs" />
     <Compile Include="ComputePool.fs" />
-    <Compile Include="IOThread.fs" />
     <Compile Include="FrameAdapter.fs" />
-    <Compile Include="AsyncCodec.fs" />
-    <Compile Include="AsyncPathLink.fs" />
-    <Compile Include="AsyncFlowBridge.fs" />
     <Compile Include="AsyncSession.fs" />
   </ItemGroup>
 

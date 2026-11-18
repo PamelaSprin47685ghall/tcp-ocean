@@ -7,14 +7,15 @@ module Tbt.Cli.AsyncMode
 
 open System
 
-/// True when TBTUN_ASYNC_MODE is 1, true, on, or enabled (case-insensitive).
+/// Async is the default. Only an explicit disable keeps the synchronous loop.
+/// True unless TBTUN_ASYNC_MODE is 0, false, off, or disabled (case-insensitive).
 let isEnabled () =
     match Environment.GetEnvironmentVariable "TBTUN_ASYNC_MODE" with
-    | null -> false
+    | null -> true
     | value ->
         match value.Trim().ToLowerInvariant() with
-        | "1" | "true" | "on" | "enabled" -> true
-        | _ -> false
+        | "0" | "false" | "off" | "disabled" -> false
+        | _ -> true
 
 /// One line for the startup log.
 let describe () =

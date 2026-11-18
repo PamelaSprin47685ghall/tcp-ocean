@@ -205,19 +205,21 @@ let ``the trace is off by default, costs no allocation off, and writes its recor
     IO.File.Delete file
 
 [<Fact>]
-let ``write gate: first pass is notsent 0, second pass is at most 16 KiB, unknown only on the second`` () =
+let ``write gate: first pass admits up to 4 KiB, second up to 256 KiB, unknown only on the second`` () =
     Assert.True(WriteGate.admits 1 0)
-    Assert.False(WriteGate.admits 1 1)
-    Assert.False(WriteGate.admits 1 16384)
+    Assert.True(WriteGate.admits 1 1)
+    Assert.True(WriteGate.admits 1 4096)
+    Assert.False(WriteGate.admits 1 4097)
     Assert.False(WriteGate.admits 1 -1)
     Assert.True(WriteGate.admits 2 0)
     Assert.True(WriteGate.admits 2 1)
-    Assert.True(WriteGate.admits 2 16384)
-    Assert.False(WriteGate.admits 2 16385)
+    Assert.True(WriteGate.admits 2 4097)
+    Assert.True(WriteGate.admits 2 262144)
+    Assert.False(WriteGate.admits 2 262145)
     Assert.True(WriteGate.admits 2 -1)
 
 [<Fact>]
-let ``write batch prefers empty paths and only then those with notsent at most 16 KiB`` () =
+let ``write batch prefers empty paths and only then those with notsent at most 256 KiB`` () =
     use listener = listen ()
     let struct (session, bridge) = clientOnBridge ()
     let struct (app, local) = loopPair listener
@@ -233,19 +235,23 @@ let ``write batch prefers empty paths and only then those with notsent at most 1
     let carrier = SessionCarrier(session, bridge)
     let empty = CountingPath(0us, unsent = 0)
     let queued = CountingPath(1us, unsent = 8000)
-    let full = CountingPath(2us, unsent = 20000)
+    let full = CountingPath(2us, unsent = 300000)
     carrier.AddPath empty
     carrier.AddPath queued
     carrier.AddPath full
     let n = carrier.WriteBatch 8
     Assert.True(n > 0)
     Assert.True(empty.Frames > 0)
-    Assert.Equal(0, queued.Frames)
+    // Pass 2 must run whenever pass 1 gated a path, not only when pass 1 made
+    // no progress at all. With 256 paths one idle path set `progress` and the
+    // other 255 were skipped every round: the live link sent about six frames
+    // per Service iteration (3 Mbit/s) while 50 MB sat queued.
+    Assert.True(queued.Frames > 0)
     Assert.Equal(0, full.Frames)
     // No empty path: the second pass may use a path with notsent ≤ 16 KiB, never one above it.
     let onlyQueued = SessionCarrier(session, bridge)
     let mid = CountingPath(0us, unsent = 8000)
-    let over = CountingPath(1us, unsent = 20000)
+    let over = CountingPath(1us, unsent = 300000)
     onlyQueued.AddPath mid
     onlyQueued.AddPath over
     let n2 = onlyQueued.WriteBatch 8

@@ -17,8 +17,11 @@ type WorkerStats() =
     member val TotalWorkUs = 0L with get, set
 
 /// One worker thread. It only calls the task queue and the task body.
+///
+/// The worker blocks on a semaphore instead of spinning: an idle pool must not
+/// burn a core, and a queued task must wake a worker at once.
 [<Sealed>]
-type ComputeWorker(workerId: int, taskQueue: MPMCTaskQueue) =
+type ComputeWorker(workerId: int, taskQueue: MPMCTaskQueue, wake: SemaphoreSlim) =
     let stats = WorkerStats()
     let mutable running = false
     let mutable thread: Thread option = None
@@ -26,11 +29,10 @@ type ComputeWorker(workerId: int, taskQueue: MPMCTaskQueue) =
     let toUs (ticks: int64) = ticks * 1_000_000L / Stopwatch.Frequency
 
     let loop () =
-        let mutable idleSpins = 0
         while Volatile.Read(&running) do
+            wake.Wait()
             match taskQueue.TryDequeue workerId with
             | Some task ->
-                idleSpins <- 0
                 if not task.CancellationToken.IsCancellationRequested then
                     let start = Stopwatch.GetTimestamp()
                     try
@@ -41,11 +43,13 @@ type ComputeWorker(workerId: int, taskQueue: MPMCTaskQueue) =
                         stats.TasksFailed <- stats.TasksFailed + 1L
                     stats.TotalWorkUs <- stats.TotalWorkUs + toUs (Stopwatch.GetTimestamp() - start)
             | None ->
-                idleSpins <- idleSpins + 1
                 stats.IdleSpins <- stats.IdleSpins + 1L
-                if idleSpins < 100 then Thread.SpinWait 20
-                elif idleSpins < 1000 then Thread.Yield() |> ignore
-                else Thread.Sleep 1
+                ()
+
+    /// Stop the loop without waiting for the thread to join.
+    member _.RequestStop() =
+        Volatile.Write(&running, false)
+        wake.Release() |> ignore
 
     /// Start the worker thread. Idempotent.
     member _.Start() =
@@ -61,6 +65,7 @@ type ComputeWorker(workerId: int, taskQueue: MPMCTaskQueue) =
     /// Stop the worker thread. Idempotent.
     member _.Stop() =
         Volatile.Write(&running, false)
+        wake.Release() |> ignore
         match thread with
         | None -> ()
         | Some t ->
@@ -79,7 +84,8 @@ type ComputePool(workerCount: int, queueCapacity: int) =
             invalidArg "queueCapacity" "capacity must be a positive power of 2"
 
     let taskQueue = MPMCTaskQueue(queueCapacity, workerCount)
-    let workers = Array.init workerCount (fun i -> ComputeWorker(i, taskQueue))
+    let wake = new SemaphoreSlim(0)
+    let workers = Array.init workerCount (fun i -> ComputeWorker(i, taskQueue, wake))
     let mutable started = false
 
     member _.Start() =
@@ -88,6 +94,7 @@ type ComputePool(workerCount: int, queueCapacity: int) =
             for w in workers do w.Start()
 
     member _.Stop() =
+        for w in workers do w.RequestStop()
         for w in workers do w.Stop()
         started <- false
 
@@ -97,6 +104,7 @@ type ComputePool(workerCount: int, queueCapacity: int) =
               Work = work
               CancellationToken = defaultArg cancellationToken CancellationToken.None }
         |> ignore
+        wake.Release() |> ignore
 
     member _.EnqueueEncoding(work: unit -> unit, ?cancellationToken: CancellationToken) =
         taskQueue.Enqueue
@@ -104,6 +112,7 @@ type ComputePool(workerCount: int, queueCapacity: int) =
               Work = work
               CancellationToken = defaultArg cancellationToken CancellationToken.None }
         |> ignore
+        wake.Release() |> ignore
 
     member _.EnqueueBackground(work: unit -> unit, ?cancellationToken: CancellationToken) =
         taskQueue.Enqueue
@@ -111,6 +120,7 @@ type ComputePool(workerCount: int, queueCapacity: int) =
               Work = work
               CancellationToken = defaultArg cancellationToken CancellationToken.None }
         |> ignore
+        wake.Release() |> ignore
 
     member _.PendingCount = taskQueue.ApproximateCount
     member _.WorkerCount = workerCount

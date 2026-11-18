@@ -116,6 +116,11 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
     let mutable urgentSteps = 0L
     let mutable urgentSources = 0L
     let mutable boostersSent = 0L
+    /// Byte-conservation counters: cells sealed, cells dropped because peer_ack passed
+    /// them before a path took them, and the high-water mark of the cell queues.
+    let mutable sealedCells = 0L
+    let mutable droppedAcked = 0L
+    let mutable queueHigh = 0
     /// Seal time per step, for the round-trip estimate (seal to ack) and per-step
     /// expected arrival (seal + RepairWait).
     let sealNs: int64[] = Array.zeroCreate encoder.Capacity
@@ -148,11 +153,12 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
     /// deadline derived from SRTT was short.
     let clampSrttToObservedMin () =
         let observed = min minCurNs minPrevNs
-        // Before the first 10 s min-window rolls, minPrevNs is still unset and the
-        // EWMA is climbing from its initial value. Raising it to the first sample
-        // there would erase that smoothing (a single 400 ms sample must leave SRTT
-        // near 137.5 ms, not 400 ms). Clamp only once a previous window exists.
-        if minPrevNs <> Int64.MaxValue && observed <> Int64.MaxValue && srttNs < float observed then
+        // `SrttNs >= MinRttNs` is a product invariant, not a preference. The first
+        // window used to be exempt so one large sample would not erase the EWMA
+        // smoothing; that exemption let a live 310 ms link report srtt=189 for as
+        // long as the 10 s bucket had not rolled, because the clamp only ran from
+        // the two sampling branches. Clamp whenever an observed minimum exists.
+        if observed <> Int64.MaxValue && srttNs < float observed then
             srttNs <- float observed
     let mutable repairRepeats = 0L
     /// BOOSTERs sent for a step whose first copy later arrived (ack sooner than minRTT after the repair).
@@ -220,6 +226,9 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
         stepFlags.[index t] <- (if small then MetaFlags.EndOfBurst else MetaFlags.None)
         for s in 0 .. k - 1 do target.Enqueue { Kind = CellType.Data; Step = t; Index = byte s; Span = 0uy; Round = 0uy }
         for p in 0 .. m - 1 do target.Enqueue { Kind = CellType.Parity; Step = t; Index = byte p; Span = 0uy; Round = 0uy }
+        sealedCells <- sealedCells + int64 (k + m)
+        let qn = queue.Count + urgent.Count
+        if qn > queueHigh then queueHigh <- qn
         filled <- 0
         t
 
@@ -249,6 +258,11 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
     member _.UrgentSteps = urgentSteps
     member _.UrgentSources = urgentSources
     member _.CellsSent = cellsSent
+    /// Cells sealed into the queues, cells dropped because peer_ack passed them, and the
+    /// high-water mark of the cell queues.
+    member _.SealedCells = sealedCells
+    member _.DroppedAcked = droppedAcked
+    member _.QueueHigh = queueHigh
     /// First-copy DATA/PARITY cells the peer has in custody.
     member _.UniqueAcked = uniqueAcked
     /// Successfully rendered/sealed first DATA identities and initial queued PARITY.
@@ -368,20 +382,31 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
                     elif now - sealAt > 0L then
                         let sample = now - sealAt
                         let m = min minCurNs minPrevNs
-                        let used =
-                            if m = Int64.MaxValue then sample
-                            else min sample (3L * m)
-                        // RFC 6298: RTTVAR first from the pre-update SRTT, then SRTT.
-                        let err = float used - srttNs
-                        if rttvarNs = 0.0 then rttvarNs <- abs err / 2.0
-                        else rttvarNs <- rttvarNs + (abs err - rttvarNs) / 4.0
-                        srttNs <- srttNs + (float used - srttNs) / 8.0
-                        if now - minSinceNs >= 10_000_000_000L then
-                            minPrevNs <- minCurNs
-                            minCurNs <- Int64.MaxValue
-                            minSinceNs <- now
-                        if sample < minCurNs then minCurNs <- sample
-                        clampSrttToObservedMin ()
+                        // A step sealed before the handshake finished can be acked
+                        // tens of seconds later. That seal-to-ack gap is not a path
+                        // RTT; taking it as the RFC 6298 seed pinned SRTT and MinRtt
+                        // at 30 s on the live link and made every deadline absurd.
+                        if m = Int64.MaxValue && sample > 2_000_000_000L then
+                            rttSkipped <- rttSkipped + 1L
+                        else
+                            let used =
+                                if m = Int64.MaxValue then sample
+                                else min sample (3L * m)
+                            // RFC 6298 §2.2: the first clean sample becomes SRTT itself,
+                            // and half of it becomes RTTVAR.
+                            if rttvarNs = 0.0 then
+                                srttNs <- float used
+                                rttvarNs <- float used / 2.0
+                            else
+                                let err = float used - srttNs
+                                rttvarNs <- rttvarNs + (abs err - rttvarNs) / 4.0
+                                srttNs <- srttNs + (float used - srttNs) / 8.0
+                            if now - minSinceNs >= 10_000_000_000L then
+                                minPrevNs <- minCurNs
+                                minCurNs <- Int64.MaxValue
+                                minSinceNs <- now
+                            if sample < minCurNs then minCurNs <- sample
+                            clampSrttToObservedMin ()
                 else
                     // Main Karn: only a step that was never repaired measures the
                     // path. Of a jump, use the newest never-repaired step: a repair
@@ -419,18 +444,28 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
                         let sample = now - sealAt
                         if sample > 0L then
                             let m = min minCurNs minPrevNs
-                            let used =
-                                if m = Int64.MaxValue then sample
-                                else min sample (3L * m)
-                            srttNs <- srttNs + (float used - srttNs) / 8.0
-                            if now - minSinceNs >= 10_000_000_000L then
-                                minPrevNs <- minCurNs
-                                minCurNs <- Int64.MaxValue
-                                minSinceNs <- now
-                            if sample < minCurNs then minCurNs <- sample
-                            clampSrttToObservedMin ()
+                            if m = Int64.MaxValue && sample > 2_000_000_000L then
+                                rttSkipped <- rttSkipped + 1L
+                            else
+                                let used =
+                                    if m = Int64.MaxValue then sample
+                                    else min sample (3L * m)
+                                if rttvarNs = 0.0 then
+                                    srttNs <- float used
+                                    rttvarNs <- float used / 2.0
+                                else
+                                    let err = float used - srttNs
+                                    rttvarNs <- rttvarNs + (abs err - rttvarNs) / 4.0
+                                    srttNs <- srttNs + (float used - srttNs) / 8.0
+                                if now - minSinceNs >= 10_000_000_000L then
+                                    minPrevNs <- minCurNs
+                                    minCurNs <- Int64.MaxValue
+                                    minSinceNs <- now
+                                if sample < minCurNs then minCurNs <- sample
+                                clampSrttToObservedMin ()
                 peerAck <- ack
                 if ack > 0UL then peerSeenHi <- max peerSeenHi (ack - 1UL)
+                clampSrttToObservedMin ()
                 refreshUniqueArrived ()
                 if ack > CodeGraph.HistorySpan then encoder.Release(ack - CodeGraph.HistorySpan)
             // The grant is relative to THIS report's own ack: a late (reordered) report with an
@@ -449,7 +484,11 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
         if abs (erasure - before) > 0.01 then
             for k in 1 .. 16 do smallParities.[k] <- SmallStep.parities k erasure
 
-    member _.SrttNs = srttNs
+    member _.SrttNs =
+        // Last line of defence: the invariant must hold for every reader, even
+        // on an ack path that produced no new sample (idle downlink).
+        let observed = min minCurNs minPrevNs
+        if observed <> Int64.MaxValue && srttNs < float observed then float observed else srttNs
     /// Windowed minimum RTT sample (Int64.MaxValue before the first clean sample).
     member _.MinRttNs = min minCurNs minPrevNs
     /// RTT samples skipped by the Karn rule.
@@ -678,8 +717,10 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
         while repairs.TryPeek(&c) && c.Step + uint64 (max 1uy c.Span) <= peerAck do
             repairs.Dequeue() |> ignore
         while urgent.TryPeek(&c) && c.Step < peerAck do
+            droppedAcked <- droppedAcked + 1L
             urgent.Dequeue() |> ignore
         while queue.TryPeek(&c) && c.Step < peerAck do
+            droppedAcked <- droppedAcked + 1L
             queue.Dequeue() |> ignore
         repairs.Count > 0 || urgent.Count > 0 || queue.Count > 0
 

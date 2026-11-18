@@ -149,24 +149,35 @@ type SessionCarrier(session: Session, bridge: FlowBridge, ?uplinkPace: bool, ?tu
     /// it instead of asking the kernel twice, and only revisits paths whose gate
     /// refused them in pass 1.
     let batchNotSent = Array.zeroCreate<int> 512
+    /// writeBatch gate diagnostics. Cumulative; the difference between two
+    /// Describe windows is the per-window rate.
+    let mutable gate1Pass = 0L
+    let mutable gate1Deny = 0L
+    let mutable gate2Pass = 0L
+    let mutable gate2Deny = 0L
+    let mutable beginFail = 0L
+    let mutable produceFail = 0L
 
     let writeBatch (budget0: int) =
         let mutable budget = budget0
         let mutable progress = true
+        let mutable gated = false
         let mutable passes = 0
         let fl = session.FrameLength
         let now = session.Clock.NowNs()
         primeSample ()
         while progress && passes < 4 && budget > 0 && paths.Count > 0 && session.WantsToSend do
             progress <- false
+            gated <- false
             passes <- passes + 1
             let n = paths.Count
-            // Pass 2 relaxes the gate to notSent <= 16 KiB (spec 3.14) and runs only
-            // when pass 1 made no progress at all. A path that pass 1 refused is not
-            // starved by this: the path layer keeps emptying its own queue, and the
-            // batch rotates its start index every round.
+            // Pass 2 relaxes the gate to notSent <= 16 KiB (spec 3.14). It must run
+            // whenever pass 1 gated at least one path, not only when pass 1 made no
+            // progress at all: with 256 paths a single idle path sets `progress`, and
+            // the other 255 were skipped every round. The live link then sent about
+            // six frames per Service iteration (3 Mbit/s) while 50 MB sat queued.
             for pass in 1 .. 2 do
-              if pass = 1 || not progress then
+              if pass = 1 || gated then
                 let mutable j = 0
                 while j < n && budget > 0 do
                     let idx = (next + j) % n
@@ -176,10 +187,23 @@ type SessionCarrier(session: Session, bridge: FlowBridge, ?uplinkPace: bool, ?tu
                         if pass = 1 then
                             let v = link.UnsentBytes
                             batchNotSent.[idx] <- v
+                            if v <> 0 then gated <- true
                             v
                         else batchNotSent.[idx]
-                    if (pass = 1 || notSent <> 0) && WriteGate.admits pass notSent
-                       && link.TryBeginFrame(&frame) then
+                    let eligible = pass = 1 || notSent <> 0
+                    let admitted =
+                        if not eligible then false
+                        elif WriteGate.admits pass notSent then
+                            if pass = 1 then gate1Pass <- gate1Pass + 1L
+                            else gate2Pass <- gate2Pass + 1L
+                            true
+                        else
+                            if pass = 1 then gate1Deny <- gate1Deny + 1L
+                            else gate2Deny <- gate2Deny + 1L
+                            false
+                    let begun = admitted && link.TryBeginFrame(&frame)
+                    if admitted && not begun then beginFail <- beginFail + 1L
+                    if begun then
                         let mutable allowRepair = true
                         let mutable charge = 0
                         let mutable attempt = false
@@ -204,7 +228,9 @@ type SessionCarrier(session: Session, bridge: FlowBridge, ?uplinkPace: bool, ?tu
                             allowRepair <- false
                             charge <- 2
                         let uniqueBefore = session.Tx.UniqueRendered
-                        if attempt && session.TryProduce(link.PathId, frame, allowRepair) then
+                        let produced = attempt && session.TryProduce(link.PathId, frame, allowRepair)
+                        if attempt && not produced then produceFail <- produceFail + 1L
+                        if produced then
                             let uniqueDelta = session.Tx.UniqueRendered - uniqueBefore
                             link.CommitFrame()
                             framesOut <- framesOut + 1L
@@ -354,12 +380,18 @@ type SessionCarrier(session: Session, bridge: FlowBridge, ?uplinkPace: bool, ?tu
         + " efloor=" + string rx.EstimateFloor + " efolds=" + string rx.EstimateFolds
         + " elast=" + string rx.LastFoldedExpected + "/" + string rx.LastFoldedReceived + "@" + string rx.LastFoldedStep
         + " urgent_full=" + string session.Tx.UrgentFull + " flows=" + string bridge.Active
+        + " flowread=" + string bridge.ReadCalls + "/" + string bridge.ReadBytes + "/" + string bridge.WouldBlock
         + " opened=" + string session.Flows.Counters.Opened + " closed=" + string session.Flows.Counters.Closed
         + " local_fail=" + string session.Flows.Counters.LocalFailures
         + " stale=" + string session.Flows.Counters.StaleSources
         + " flow_state=" + string session.FlowStatesSent + "/" + string session.FlowStatesRejected
         + " flow_credit=" + (if creditDiag.Length = 0 then "-" else creditDiag.ToString())
         + " fills=" + string tx.FillsSent
+        + " gate1=" + string gate1Pass + "/" + string gate1Deny
+        + " gate2=" + string gate2Pass + "/" + string gate2Deny
+        + " beginfail=" + string beginFail + " producefail=" + string produceFail
+        + " sealed=" + string session.Tx.SealedCells + " dropack=" + string session.Tx.DroppedAcked
+        + " qhigh=" + string session.Tx.QueueHigh
         + " cons_tx_b=" + string consTx + " cons_ack_b=" + (if ackKnown then string consAck else "-")
         + " path_tx=" + pathTx.ToString()
         + (if kernel.Count = 0 then ""

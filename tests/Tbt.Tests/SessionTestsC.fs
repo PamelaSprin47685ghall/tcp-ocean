@@ -108,9 +108,10 @@ let ``a jump in peer ack samples only the newest sealed step, not the oldest`` (
     sealUntil (afterGap + 2UL)
     clock.Now <- clock.Now + 400_000_000L
     c.Tx.OnPeerAck(c.Tx.Head, 100us)
-    // Newest step: 400 ms → SRTT 100 + (400-100)/8 = 137.5 ms. The 8 s gap would
-    // have pushed SRTT above a second if the oldest step in the jump were used.
-    Assert.InRange(c.Tx.SrttNs, 130e6, 150e6)
+    // RFC 6298: the first clean sample becomes SRTT itself (400 ms), not an EWMA
+    // from a 100 ms guess. The 8 s gap would have pushed SRTT above a second if
+    // the oldest step in the jump were used.
+    Assert.InRange(c.Tx.SrttNs, 390e6, 410e6)
 
 [<Fact>]
 let ``an oversized seal-to-custody sample is clamped to three times minRTT`` () =
@@ -138,10 +139,10 @@ let ``an oversized seal-to-custody sample is clamped to three times minRTT`` () 
     sealUntil (head0 + 1UL)
     clock.Now <- clock.Now + 8_000_000_000L
     c.Tx.OnPeerAck(c.Tx.Head, 100us)
-    // minRTT stays 400 ms; the 8 s sample is used as 1.2 s. SRTT starts at
-    // 137.5 ms after the first sample, then 137.5 + (1200-137.5)/8 = 270.3 ms.
+    // minRTT stays 400 ms; the 8 s sample is used as 1.2 s. RFC 6298 seeds SRTT
+    // at 400 ms and RTTVAR at 200 ms, so SRTT = 400 + (1200-400)/8 = 500 ms.
     Assert.Equal(400_000_000L, c.Tx.MinRttNs)
-    Assert.InRange(c.Tx.SrttNs, 250e6, 300e6)
+    Assert.InRange(c.Tx.SrttNs, 480e6, 520e6)
     // Deadline is clamped SRTT + 4·RTTVAR, never below minRTT or above 4×minRTT.
     // It must not follow the 8 s sample, and must exceed 1.05×minRTT once queueing/var is known.
     Assert.True(c.Tx.RepairWaitNs >= float c.Tx.MinRttNs, sprintf "wait %g min %d" c.Tx.RepairWaitNs c.Tx.MinRttNs)
