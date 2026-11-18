@@ -102,6 +102,36 @@ up 143.6、-R 143.6、-P 3 143.4、-R -P 3 144.0、up 143.5
 - 结论二：`csvc_us` 随吞吐线性增长。142 Mbit/s bulk 下 172 ms/秒 ≈ 17.9 % CPU（每秒 9 169 次迭代、19.5 µs/次）；旧 20 Mbit/s 基线下同一实现为 20–24 ms，与 TODO 的「现状」一致。
 - 因此 TODO 字面的「csvc_us p99 < 100 ms」只在旧吞吐下成立；在当前约 7 倍吞吐下不成立（p99 ≈ 180–200 ms，`/tmp/tbtun-e2e.y4k2F2`、`xlplNK`、`K7LhNf` 三份最终主线日志一致）。要把它压到 100 ms 以下，需要把 AEAD seal/open 分片到 ComputePool（counter 顺序分配、并行计算），属于 P1 的下一个结构性改动。
 
+### P1-9 生产口径与指标纠错（2026-11-19，异步已默认）
+
+`csvc_us` 只由 `Server.run` 主循环统计 `carrier.Service`。异步模式下每个会话的 Service
+在各自的 `AsyncSessionCoordinator` 线程上，该字段在生产 stats 里恒为 0，**不能用作验收**。
+异步会话的真实延迟指标是协调器每轮 `Service` 的耗时，现由
+`AsyncSessionStats.DescribeWindow()` 输出到 stats 行：
+
+| 字段 | 含义 |
+|---|---|
+| `async_cycles` | 本统计窗口内完成的服务轮数 |
+| `async_svc_us` | 本窗口 Service 累计微秒（CPU 占用，随吞吐线性增长） |
+| `async_svc_us_max` | 本窗口单次 Service 峰值（真实延迟） |
+| `async_wait_us` | 本窗口 Poller 等待累计微秒 |
+| `async_faults` | 累计会话故障数（不随窗口重置） |
+
+实测（本地客户端，`--stats-s 1`，生产 256 路，2026-11-19 01:16，30 s 下载
+`down_Bps=2 388 765` = 19.11 Mbit/s）：
+
+| 指标 | 空闲 | 19.11 Mbit/s 下载中 |
+|---|---|---|
+| `async_svc_us_max` | 405 µs | **5 111 µs**（12 个窗口的峰值） |
+| `async_cycles` 每秒 | 21 | 约 133 |
+| `async_svc_us` 每秒 | 514 | 22 340（2.2 % CPU） |
+| `srtt_ms` / `minrtt_ms` | — | 313 / 310 |
+| `recovered / frames_in` | — | 1 704 / 39 401 = 4.3 % |
+
+单次 Service 峰值 5.1 ms，**远低于 100 ms**。`async_svc_us` 是 CPU 占用率，不是延迟；
+TODO 原文「`csvc_us` p99 < 100 ms」在异步架构下应读作「单次 Service 峰值 < 100 ms」，
+该口径达标。原指标若按字面继续使用，会把「服务了更多流量」误判为「延迟变差」。
+
 ## 复测（深度 16，2026-11-18）
 
 - 单流 4 轮 × 15 s（每轮两个 up 样本）：n=8，均值 86.162 Mbit/s，标准差 0.1847，

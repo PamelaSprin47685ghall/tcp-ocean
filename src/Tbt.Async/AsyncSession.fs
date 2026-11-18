@@ -22,6 +22,25 @@ type AsyncSessionStats() =
     member val WaitUs = 0L with get, set
     member val Faults = 0L with get, set
 
+    /// One line for the stats log: this window's cycle count, the time spent
+    /// inside Service, and the longest single Service call. Reading clears the
+    /// window so consecutive lines cover consecutive periods; `Faults` stays
+    /// cumulative because a session that failed once must keep saying so.
+    /// `ServiceUsMax` is the real latency figure: `ServiceUs` grows with the
+    /// traffic served in one window, so it measures CPU occupancy, not delay.
+    member this.DescribeWindow() =
+        let line =
+            " async_cycles=" + string this.Cycles
+            + " async_svc_us=" + string this.ServiceUs
+            + " async_svc_us_max=" + string this.ServiceUsMax
+            + " async_wait_us=" + string this.WaitUs
+            + " async_faults=" + string this.Faults
+        this.Cycles <- 0L
+        this.ServiceUs <- 0L
+        this.ServiceUsMax <- 0L
+        this.WaitUs <- 0L
+        line
+
 /// Drives one SessionCarrier on a dedicated thread with its own Poller.
 [<Sealed>]
 type AsyncSessionCoordinator(carrier: SessionCarrier, clock: CachedClock, ?poller: Poller,

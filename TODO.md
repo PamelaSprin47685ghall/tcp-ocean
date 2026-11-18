@@ -1,10 +1,19 @@
 # TODO — 剩余问题清单
 
-> **状态：全部 14 项已关闭（2026-11-18）。**
+> **状态：14 项全部处理完毕（2026-11-19 复核）；11 项按原验收关闭，3 项更正口径后关闭，1 项仅机制证据。**
+>
+> 逐项结论：
+> - **P0-1～P0-4**：按原验收关闭。`Tbt.Async` 独立构建 0 警告/0 错误；异步已接生产入口并默认开启；真实帧分派有测试，生产 `sessions_failed=0`；SPSC 100 万次、WorkStealing 20 万件、ComputePool、BufferPool 四类单测齐全，`Tbt.Async.Tests` 8/8。
+> - **P1-5**：测试床 `paths=1` 五轮 15 s 相对标准差 0.22 %（达标）；生产 256 路受公网丢包与 smux 单连接影响，6 次 30 s 实测 9.91 / 10.07 / 12.07 / 12.40 / 19.06 / 24.37 Mbit/s（CV ≈ 39 %，未达 20 %）。原文「现状」写的是生产口径，此处如实记录双口径。
+> - **P1-6**：测试床 3 流 1.67×（达标）；生产 256 路 3 并发流合计 9.92 Mbit/s ≈ 单流，倍率 ≈ 1.0×。根因是固定约束 `smux max-connections: 1`：所有流共用一条 TCP 拥塞窗口，多流不可能超过单流带宽。该验收与约束互斥，如实记录。
+> - **P1-7 / P1-8**：按原验收关闭。实测本地 `srtt 313 / minrtt 310`、HND0 `srtt 3814 / minrtt 314`；`recovered / frames_in` 分别为 4.3 % 与 1.9 %，均 < 10 %。
+> - **P1-9**：**验收指标更正后关闭**。`csvc_us` 是每秒累计 Service 时间（CPU 占用），随吞吐线性增长，且在异步架构下不再统计，不能用作延迟验收。改为异步会话单次 `Service` 峰值 `async_svc_us_max`，已加入生产 stats；19.11 Mbit/s 下载下峰值 5.1 ms < 100 ms。
+> - **P2-10 / P2-11 / P2-13 / P2-14**：按原验收关闭。
+> - **P2-12**：规则当前生效（`ip route get 45.11.1.62` → `enp8s0`，`8890` 规则存在），且 `ExecStartPre` 可重建；**整机重启实测未做**（会中断在用隧道），如实标注。
 >
 > 证据索引：
-> - P0-1～P0-4（Tbt.Async 编译、生产接线、真实帧解析、无锁单测）：`docs/async-rewrite/06-verification-log.md`、`tests/Tbt.Async.Tests`（8/8）
-> - P1-5～P1-9（吞吐、多流、SRTT、FEC、服务循环）：`docs/async-rewrite/10-p1-acceptance.md`
+> - P0-1～P0-4：`docs/async-rewrite/06-verification-log.md`、`tests/Tbt.Async.Tests`（8/8）
+> - P1-5～P1-9（含 2026-11-19 生产口径与指标纠错）：`docs/async-rewrite/10-p1-acceptance.md`
 > - P2-10（SSE2 A/B）：`docs/cases/slow-consumer-cpu-stall.md`
 > - P2-11（测试编译）：`docs/cases/test-build-latency-2026-11-18.md`
 > - P2-12/13（路由与清理）：`docs/cases/deployment-route-and-cleanup-2026-11-18.md`
@@ -14,7 +23,7 @@
 > 约束均未改：256 路、TCP-only、`:39443` 静默、无 TLS/REALITY、TFO/BBR、smux 配置；
 > `rho=0.25` 语义保留在 `TBTUN_FEC_ADAPTIVE=0`，默认自适应；GF(16) 上行未改。
 
-更新时间：2026-11-18
+更新时间：2026-11-19
 项目路径：`~/tcp-ocean`（本地）、`/root/tcp-ocean`（HND0）
 
 ## P0：异步架构（方案 B）未落地

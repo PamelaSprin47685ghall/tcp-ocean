@@ -192,7 +192,7 @@ let run (o: Options) =
                 | Some group, Some rx ->
                     let co = AsyncSessionCoordinator.createWith carrier clock group rx
                     co.StatsEveryMs <- statsMs
-                    co.OnStats <- (fun () -> log ("stats " + carrier.Describe()))
+                    co.OnStats <- (fun () -> log ("stats " + carrier.Describe() + co.Stats.DescribeWindow()))
                     co.Start()
                     log ("session " + a.Params.Keys.SessionId.ToString() + " on an async coordinator thread")
                     Some co
