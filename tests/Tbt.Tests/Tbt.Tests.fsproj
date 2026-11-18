@@ -2,8 +2,13 @@
   <PropertyGroup>
     <OutputType>Exe</OutputType>
     <IsPackable>false</IsPackable>
+    <Nullable>disable</Nullable>
     <UseMicrosoftTestingPlatformRunner>true</UseMicrosoftTestingPlatformRunner>
     <TestingPlatformDotnetTestSupport>true</TestingPlatformDotnetTestSupport>
+    <!-- Test code does not need the F# optimiser. Session and handshake
+         tests live in Tbt.Tests.Session; see
+         docs/cases/test-build-latency-2026-11-18.md. -->
+    <Optimize>false</Optimize>
   </PropertyGroup>
   <ItemGroup>
     <Compile Include="Vectors.fs" />
@@ -11,25 +16,10 @@
     <Compile Include="CodecTests.fs" />
     <Compile Include="WireTests.fs" />
     <Compile Include="CryptoTests.fs" />
-    <Compile Include="SessionTests.fs" />
-    <Compile Include="UniqueRepairTests.fs" />
-    <Compile Include="HandshakeCryptoTests.fs" />
-    <Compile Include="JoinTests.fs" />
-    <Compile Include="BootstrapTests.fs" />
-    <Compile Include="TunTests.fs" />
-    <Compile Include="TunAckSchedulingTests.fs" />
-    <Compile Include="RtoEnvelopeTests.fs" />
     <Compile Include="RateGroupTests.fs" />
     <Compile Include="KernelTcpInfoTests.fs" />
-    <Compile Include="PaceTests.fs" />
-    <Compile Include="FuzzTests.fs" />
     <Compile Include="PollerTests.fs" />
     <Compile Include="PlatformTests.fs" />
-    <Compile Include="GovernorTests.fs" />
-    <Compile Include="ControlTests.fs" />
-    <Compile Include="CliTests.fs" />
-    <Compile Include="BridgeTests.fs" />
-    <Compile Include="FlowReportLifecycleTests.fs" />
   </ItemGroup>
   <ItemGroup>
     <None Include="../vectors/*.json" CopyToOutputDirectory="PreserveNewest" LinkBase="vectors" />
@@ -44,6 +34,5 @@
     <ProjectReference Include="../../src/Tbt.Crypto/Tbt.Crypto.fsproj" />
     <ProjectReference Include="../../src/Tbt.Session/Tbt.Session.fsproj" />
     <ProjectReference Include="../../src/Tbt.Carrier/Tbt.Carrier.fsproj" />
-    <ProjectReference Include="../../src/Tbt.Cli/Tbt.Cli.fsproj" />
   </ItemGroup>
 </Project>

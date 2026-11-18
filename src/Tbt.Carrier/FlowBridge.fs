@@ -70,6 +70,7 @@ type FlowBridge(target: EndPoint voption) =
     /// Start a non-blocking connect; return its first result.
     static member private Connect(socket: Socket, ep: EndPoint) =
         try
+            SocketTuning.fastOpenConnect socket
             socket.Connect ep
             SocketError.Success
         with :? SocketException as e -> e.SocketErrorCode
@@ -108,7 +109,7 @@ type FlowBridge(target: EndPoint voption) =
         match locals.[slot] with
         | null -> ()
         | socket ->
-            let mutable budget = 16
+            let mutable budget = 4096
             let mutable app = Span<byte>.Empty
             let mutable go = true
             while go && budget > 0 && session.FlowSending slot do

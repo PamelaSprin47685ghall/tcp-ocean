@@ -1,0 +1,22 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <!-- Small, fast test project for the async infrastructure only. It links the
+       AsyncTests source from Tbt.Tests so the two projects cannot drift, but it
+       does not reference Tbt.Cli or the large session/TUN suites. -->
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <IsPackable>false</IsPackable>
+    <UseMicrosoftTestingPlatformRunner>true</UseMicrosoftTestingPlatformRunner>
+    <TestingPlatformDotnetTestSupport>true</TestingPlatformDotnetTestSupport>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="../Tbt.Tests/AsyncTests.fs" Link="AsyncTests.fs" />
+  </ItemGroup>
+  <ItemGroup>
+    <PackageReference Include="xunit.v3" Version="3.2.2" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="../../src/Tbt.Contracts/Tbt.Contracts.fsproj" />
+    <ProjectReference Include="../../src/Tbt.Wire/Tbt.Wire.fsproj" />
+    <ProjectReference Include="../../src/Tbt.Async/Tbt.Async.fsproj" />
+  </ItemGroup>
+</Project>

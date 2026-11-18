@@ -12,6 +12,7 @@ open Tbt.Wire
 type ParityHold(symbolSize: int, capacity: int) =
     let data: byte[] = GC.AllocateUninitializedArray(capacity * symbolSize)
     let metas: Meta[] = Array.zeroCreate capacity
+    let addedNs: int64[] = Array.zeroCreate capacity
     let mutable head = 0
     let mutable count = 0
 
@@ -19,17 +20,19 @@ type ParityHold(symbolSize: int, capacity: int) =
     member _.IsFull = count = capacity
 
     /// Keep a copy of a parity cell. The caller makes room first (IsFull).
-    member _.Add(m: Meta, symbol: ReadOnlySpan<byte>) =
+    member _.Add(m: Meta, nowNs: int64, symbol: ReadOnlySpan<byte>) =
         let i = (head + count) % capacity
         metas.[i] <- m
+        addedNs.[i] <- nowNs
         symbol.CopyTo(Span(data, i * symbolSize, symbolSize))
         count <- count + 1
 
     /// The oldest parity; valid until the next Add.
-    member _.TryPeek(m: byref<Meta>, symbol: byref<ReadOnlySpan<byte>>) =
+    member _.TryPeek(m: byref<Meta>, nowNs: byref<int64>, symbol: byref<ReadOnlySpan<byte>>) =
         if count = 0 then false
         else
             m <- metas.[head]
+            nowNs <- addedNs.[head]
             symbol <- ReadOnlySpan(data, head * symbolSize, symbolSize)
             true
 

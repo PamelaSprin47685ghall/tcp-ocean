@@ -11,6 +11,7 @@
   </PropertyGroup>
   <ItemGroup>
     <Compile Include="Common.fs" />
+    <Compile Include="AsyncMode.fs" />
     <Compile Include="Client.fs" />
     <Compile Include="Server.fs" />
     <Compile Include="Program.fs" />
@@ -20,5 +21,6 @@
     <ProjectReference Include="../Tbt.Crypto/Tbt.Crypto.fsproj" />
     <ProjectReference Include="../Tbt.Session/Tbt.Session.fsproj" />
     <ProjectReference Include="../Tbt.Carrier/Tbt.Carrier.fsproj" />
+    <ProjectReference Include="../Tbt.Async/Tbt.Async.fsproj" />
   </ItemGroup>
 </Project>

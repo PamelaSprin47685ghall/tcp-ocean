@@ -1,0 +1,30 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <AllowUnsafeBlocks>true</AllowUnsafeBlocks>
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <Compile Include="SPSCQueue.fs" />
+    <Compile Include="MPMCQueue.fs" />
+    <Compile Include="AsyncSocket.fs" />
+    <Compile Include="ComputePool.fs" />
+    <Compile Include="IOThread.fs" />
+    <Compile Include="FrameAdapter.fs" />
+    <Compile Include="AsyncCodec.fs" />
+    <Compile Include="AsyncPathLink.fs" />
+    <Compile Include="AsyncFlowBridge.fs" />
+    <Compile Include="AsyncSession.fs" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Tbt.Contracts\Tbt.Contracts.fsproj" />
+    <ProjectReference Include="..\Tbt.Wire\Tbt.Wire.fsproj" />
+    <ProjectReference Include="..\Tbt.Codec\Tbt.Codec.fsproj" />
+    <ProjectReference Include="..\Tbt.Session\Tbt.Session.fsproj" />
+    <ProjectReference Include="..\Tbt.Carrier\Tbt.Carrier.fsproj" />
+  </ItemGroup>
+
+</Project>

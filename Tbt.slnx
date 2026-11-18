@@ -11,6 +11,8 @@
     <Project Path="src/Tbt.Wire/Tbt.Wire.fsproj" />
   </Folder>
   <Folder Name="/tests/">
+    <Project Path="tests/Tbt.Async.Tests/Tbt.Async.Tests.fsproj" />
     <Project Path="tests/Tbt.Tests/Tbt.Tests.fsproj" />
+    <Project Path="tests/Tbt.Session.Tests/Tbt.Session.Tests.fsproj" />
   </Folder>
 </Solution>

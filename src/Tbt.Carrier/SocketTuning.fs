@@ -41,7 +41,6 @@ module SocketTuning =
     /// bottleneck cannot grow past it.
     [<Literal>]
     let WindowClamp = 600000
-
     /// Default txqueuelen on the server TUN (SIOCSIFTXQLEN). Sized so a 64-path
     /// burst can sit in the qdisc while userspace is in a budgeted Receive / Service
     /// turn (~20k × ~1.5 KiB). The server sets this itself at startup; the testbed
@@ -97,6 +96,18 @@ module SocketTuning =
 
     /// Settings for a local flow socket.
     let local (socket: Socket) = socket.NoDelay <- true
+
+    /// Linux TCP_FASTOPEN_CONNECT (30). No-op where the kernel rejects client TFO.
+    let fastOpenConnect (socket: Socket) =
+        if OperatingSystem.IsLinux() then
+            try socket.SetRawSocketOption(6, 30, ReadOnlySpan(BitConverter.GetBytes 1))
+            with :? SocketException -> ()
+
+    /// Linux TCP_FASTOPEN (23) queue. Must run before Listen.
+    let fastOpenListen (socket: Socket, queue: int) =
+        if OperatingSystem.IsLinux() then
+            try socket.SetRawSocketOption(6, 23, ReadOnlySpan(BitConverter.GetBytes queue))
+            with :? SocketException -> ()
 
     /// Linux TCP_INFO.tcpi_bytes_acked (offset 120), or -1 when unavailable.
     /// RFC 4898 thru octets acked: payload the peer has cumulatively ACKed.

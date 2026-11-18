@@ -1,41 +1,122 @@
-# TODO
+# TODO — 剩余问题清单
 
-State as of 2026-11-17: `main` = aae7b18 (server-stall RTT guard on top of 5234d97).
-Merge rule: bulk/iperf on the testbed must be no worse than `main`; echo/ping only need to stay usable.
-Testbed noise note: a comment-only rebuild of `main` moves 20/200 5% bulk down by -0.9..+5.6 Mbit and
-up(2) by -9..+13 Mbit per seed, so small freeze-free samples cannot settle a 1-2% difference.
+更新时间：2026-11-18
+项目路径：`~/tcp-ocean`（本地）、`/root/tcp-ocean`（HND0）
 
-## Open, ordered by value
+## P0：异步架构（方案 B）未落地
 
-1. **64-path `-R -P4` after a6b8ede (repair identity accounting).** A/B suggests about -8..-9 Mbit
-   (61 vs 70 Mbit mean, n=5..7), still inside the older main's range. Mechanism not found. Every build caps
-   near 4 MB inflight after ~5 s on this test; look there first.
-2. **PR #5 (repair range history).** Rebased with the per-session 384 KiB table replaced by a small
-   dictionary keyed by (tLo, span), pruned below the custody frontier; 386 tests pass on top of aae7b18.
-   Held: 20/200 5% bulk down averages -1.3 Mbit (won 2 of 7 seeds), `-P4` -2.0. Needs more seeds or a cause.
-3. **AEGIS-128L as default when hardware AES is present.** Wire format works, saves server CPU, fine on
-   64-path, but 20/200 5% downlink loses 1.5-2.5% on every seed. Find out why before enabling by default.
-4. **PR #3 (arrival evidence / shadow estimator), draft.** Cap bit 0x0800 (Reserved now 0xF000), evidence in
-   WIN_ACK bytes 80-95 (decision D14), wire-identity digest test proves default-off is byte-identical to main.
-   No controller yet. Shadow traces: the cumulative counter is accurate; the per-sample rate overestimates
-   downlink by 5-80% under loss. A controller should use the counter's delta over a fixed window.
-5. **Tail-repair timer has no backoff.** If RTT is ever underestimated for another reason, Karn's rule can
-   lock it in (the stall fix only covers clock jumps). Prototype "stuck path -> double timer up to 16x"
-   works in unit tests but fires in normal 64-path runs and gave no gain; needs a narrower trigger.
-6. **Spurious repairs in 64-path upload phases.** ~600 per run on main, almost all unneeded: client ACKs
-   queue behind its own upload (up to 1.86 s late in `-P64`). Prototype (original-copy RTT samples +
-   RTT+4*RTTVAR floor) halves them but costs `-P64` upload -8 Mbit. No measurable cost today; low priority.
-   Real fix needs reverse-direction queueing awareness.
-7. **8-path slow-class ACK queueing** (fast-echo down1 slightly low after direction switch). Deferred.
-8. **Android.** `android` branch builds a bionic NativeAOT `tbt.so` + VpnService APK; host e2e ok, never run
-   on a device.
-9. **Interactive latency** (deadline scheduling, lanes). Deferred to the end by design.
+### 1. Tbt.Async 编译不通过
+现象：`dotnet build src/Tbt.Async/Tbt.Async.fsproj` 约 20 个错误。
+位置与原因：
+- `AsyncCodec.fs`：`Decoder.OfferData` 不存在（现有 API 是 `OfferSource` / `OfferParity`）；`CodeField` 未导入；`OfferParity` 返回 `EquationResult` 而非 `bool`。
+- `FrameAdapter.fs`：`Cell` / `Meta` 是占位解析，未接 `Tbt.Wire` 的真实帧格式与 Meta 布局。
+- `IOThread.fs`：`handleReceive` / `handleSend` 递归引用的作用域问题；`Thread` 可空性（F# nullness）。
+- `ComputePool.fs` / `AsyncSession.fs`：`WorkerStats` / `IOThreadStats` / `AsyncSessionStats` 的 struct 字段可变性。
+- `SPSCQueue.fs`：`CachePadding` 已改为 class，但 `Volatile` 读写与泛型约束仍需复查。
+验收：`dotnet build src/Tbt.Async/Tbt.Async.fsproj -p:PublishAot=false` 零错误。
 
-## Not planned
-Windows/macOS ports, CAPACITY_CHANGE auto-trigger, ChaCha8/X25519 as defaults, chasing <1% gaps on 20/200.
+### 2. 异步路径未接入生产入口
+现象：`AsyncMode.fs` 与 `AsyncSessionCoordinator` 未被 `Server.fs` / `Client.fs` 调用；`TBTUN_ASYNC_MODE` 环境变量目前没有效果。
+待办：
+- 在 `Server.run` / `Client.run` 中按特性开关创建 `IOThreadPool` + `ComputePool` + `AsyncSessionCoordinator`。
+- 用协调器替换 `carrier.Service poller` 主循环；保留同步路径作为回退。
+- 将 `Tbt.Async` 加入 `Tbt.Cli.fsproj` 的 ProjectReference。
+验收：设置 `TBTUN_ASYNC_MODE=true` 时日志出现 async 启动行，且能建立 256 路会话。
 
-## Testbed tips
-- Short mode for 64-path: `SKIP_ECHO=1 SKIP_REF=1` (~104 s instead of ~410 s). Keep 20/200 runs full.
-- The VM freezes for 100-120 ms now and then; wanem records them and runs are tagged `freeze_affected`.
-  Compare freeze-free segments, but beware the small sample.
-- One testbed run at a time (shared netns lock).
+### 3. FrameAdapter 需要真实帧解析
+待办：
+- 按 `Tbt.Wire` 的 40B Meta 布局解析 `CellType`、`StepId`、`Slot`、`StepUsed`、`Flags`。
+- 接入 `CellOpener` 做认证；坏帧计数。
+- 覆盖 DATA / PARITY / BOOSTER / WIN_ACK / CTRL / FLOW_STATE 分派。
+验收：异步模式下收发 1000 帧无认证错误。
+
+### 4. 无锁结构与线程池无单元测试
+待办：
+- SPSCQueue：单生产单消费 100 万次，顺序与计数一致。
+- WorkStealingQueue：多窃取者下不丢任务、不重复执行。
+- ComputePool：高/普通/低优先级顺序；工作窃取生效。
+- BufferPool：租借/归还无泄漏。
+验收：测试可重复通过，含并发压力用例。
+
+## P1：生产速度仍未达标
+
+### 5. 单流速率不稳
+现状：短测 19.06 Mbit/s，连续 3 次 8.57 → 7.71 → 3.29 Mbit/s；重启后 8.52 Mbit/s。
+待查：
+- 状态累积点（hold 队列、decoder 前沿、encoder 历史、未释放 reserve）。
+- 每次测试前是否被前一次会话残留影响。
+- 长连接下 `HeldParities` / `rx_base` / `recovered` 的增长曲线。
+验收：连续 5 次 15 秒单流测试，吞吐标准差 < 20%。
+
+### 6. 多流并发反而变慢
+现状：3 流并行总吞吐 7.72 Mbit/s，低于单流 19.06 Mbit/s。
+待查：
+- 当前 mihomo `max-connections: 1` 下，多流是否被 smux 串行化。
+- `FlowBridge.Read` 在多个 slot 间是否公平；单轮是否只读一遍。
+- 会话级窗口与 per-flow 信用是否互相挤压。
+验收：3 流总吞吐 ≥ 单流 1.5 倍。
+
+### 7. SRTT < minRTT 不变式违反
+现象：服务端 `srtt_ms` 152–242，`minrtt_ms` 310–318；`rtt_skipped` 高达 140。
+待查：
+- `TxHalf.OnPeerAck` 的 seal-custody 采样与 10 秒窗口重置时序。
+- 高 BOOSTER 场景下“找不到干净步骤”导致 SRTT 长期不更新。
+- 时钟源一致性（`CachedClock` / `FreshNs`）。
+验收：任意时刻 `SrttNs >= MinRttNs`，`rtt_skipped` 增速 < 1/秒。
+
+### 8. FEC 恢复率偏高
+现象：客户端某些秒 `recovered / frames_in` 达 15–47%；服务端 BOOSTER 1574。
+待查：
+- 是真的丢包，还是 20 ms `stallNs` 把 330 ms RTT 下的乱序误判为丢包。
+- 256 路中是否存在少数慢路径拖累整体。
+- `rho=0.25` 与实际丢包是否匹配（产品策略保持 0.25，不改码）。
+验收：稳态下行 `recovered / frames_in < 10%`。
+
+### 9. 服务循环峰值需持续观察
+现状：Read budget 16→4096 后 `csvc_us` 从 978 ms 降到 20–24 ms。
+待办：在 30 分钟持续传输下采样 `csvc_us`、`iter_us_max`，确认无长尾。
+验收：`csvc_us` p99 < 100 ms。
+
+## P2：环境与部署
+
+### 10. HND0 SSE2 GF(16) 收益未验证
+现状：`Gf16.sse2MulX` 已实现并部署；HND0 只有 SSE2、无 SSSE3。
+待办：在真实上行负载下对比启用/禁用 SSE2 路径的 `csvc_us` 与吞吐。
+验收：有明确的启用收益数据，或确认无收益并记录。
+
+### 11. 测试工程编译异常慢
+现象：`Tbt.Tests` 的 fsc 跑 8 分钟以上未完成（1.6 GB RSS），已多次超时。
+待办：
+- 拆分 `SessionTests.fs` / `TunTests.fs` 的大文件。
+- 检查是否有病态类型推断（大数组 + inline + 泛型）。
+- 或为 CI 单独建最小测试工程。
+验收：测试工程 5 分钟内完成编译。
+
+### 12. 路由绕过规则的健壮性
+现状：本地单元 `ExecStartPre` 用 `ip rule del/add pref 8890` 保证承载走 `enp8s0`。
+待办：
+- 验证 mihomo 重启、系统重启后规则仍在。
+- 确认 `ip rule add` 重复执行不报错（已用 `-` 前缀忽略失败）。
+验收：重启后 `ip route get 45.11.1.62` 仍指向 `enp8s0`。
+
+### 13. 临时文件与备份清理
+待办：
+- 确认 `/run/hnd0tbt4.yaml`、`/run/hnd0tbt4.pid`、`/run/hnd0tbt4.log` 是否还需保留。
+- 保留 `/opt/mihomo/config.yaml.bak-smux1` 作为回滚点，记录保留期限。
+- HND0 上 `/root/tcp-ocean` 与本地 `~/tcp-ocean` 的差异需明确（Async 代码是否同步）。
+
+### 14. 文档补齐
+待办：
+- `docs/cases/slow-consumer-cpu-stall.md` 增补 SSE2 路径验证结果。
+- `docs/async-rewrite/` 的集成状态与真实编译状态对齐（当前标注 80%，实际编译未过）。
+- 记录 `-p:PublishAot=false` 的既有约束（NU1903 + TreatWarningsAsErrors）。
+
+## 已知约束（不要改）
+
+- TBT4 = IPv4，路径数 256；不要降路径数来换速度。
+- 承载只走 TCP；UDP 必须留在 TCP 隧道内。
+- 公网面只暴露 tbtun，`:39443` 对探测保持静默；内层 `127.0.0.1`。
+- 不引入 TLS/REALITY 到 `:18443`。
+- 保留 TFO；保留 BBR 与 `/etc/sysctl.d/99-bbr-tfo.conf`。
+- smux 永久 `max-connections: 1`、`min-streams: 1`；不关闭 smux。
+- 不改变既定产品策略（`rho=0.25`、256 路、GF(16) 上行）。

@@ -24,6 +24,7 @@ type PathLink(socket: Socket, probe: INotSentProbe) =
     let mutable headDone = false
     let mutable owner = Unchecked.defaultof<IPathOwner>
     let mutable alive = true
+    let mutable detached = false
 
     member _.Socket = socket
     member val PathId = 0us with get, set
@@ -32,6 +33,7 @@ type PathLink(socket: Socket, probe: INotSentProbe) =
     member val FrameLength = Layout.BootFrameLength with get, set
     member _.Buffered = rxEnd - rxStart
     member _.TxIdle = txStart = txEnd
+    member this.HasBufferedFrame = alive && (rxEnd - rxStart) >= this.FrameLength
     /// Bytes actually handed to the kernel on this path (partial Send counts).
     member val BytesWritten = 0L with get, set
     /// Peer cumulative ACK of this socket's payload (tcpi_bytes_acked), or -1.
@@ -102,7 +104,40 @@ type PathLink(socket: Socket, probe: INotSentProbe) =
 
     member _.Close() =
         alive <- false
-        socket.Dispose()
+        if not detached then socket.Dispose()
+
+    /// Hand the socket and the bytes already read to an async IO thread. The
+    /// link must not be used afterwards; the receiver owns the socket.
+    member _.Detach() =
+        if detached then invalidOp "path already detached"
+        detached <- true
+        alive <- false
+        headDone <- true
+        struct (socket, rx, rxStart, rxEnd, probe)
+
+    /// Drain up to `budget` frames (decrementing `budget`); returns true when more
+    /// buffered frames remain or the socket hit the budget while readable.
+    member this.ReceiveBudgeted(poller: Poller, budget: byref<int>) =
+        if alive && this.Send() = IoResult.Closed then this.Close()
+        if not alive then false
+        else
+            let mutable f = Span<byte>.Empty
+            while budget > 0 && alive && this.TryTakeFrame(&f) do
+                owner.OnFrame(this.PathId, f) |> ignore
+                budget <- budget - 1
+            let mutable closed = false
+            if budget > 0 && alive && poller.IsReadable socket then
+                if TraceGate.On then Trace.record Trace.Readable (uint64 socket.Available) this.PathId 0
+                let r = this.Receive()
+                while budget > 0 && alive && this.TryTakeFrame(&f) do
+                    owner.OnFrame(this.PathId, f) |> ignore
+                    budget <- budget - 1
+                if r = IoResult.Closed && (rxEnd - rxStart) < this.FrameLength then closed <- true
+            if closed then
+                this.Close()
+                false
+            else
+                alive && ((rxEnd - rxStart) >= this.FrameLength || (budget = 0 && poller.IsReadable socket))
 
     interface IPath with
         member this.PathId with get () = this.PathId and set v = this.PathId <- v

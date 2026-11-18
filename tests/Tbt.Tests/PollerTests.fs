@@ -11,7 +11,7 @@ let private pair () =
     listener.Bind(IPEndPoint(IPAddress.Loopback, 0))
     listener.Listen 1
     let a = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp)
-    a.Connect(IPEndPoint(IPAddress.Loopback, (listener.LocalEndPoint :?> IPEndPoint | null |> nonNull).Port))
+    a.Connect(IPEndPoint(IPAddress.Loopback, (listener.LocalEndPoint :?> IPEndPoint).Port))
     let b = listener.Accept()
     a, b
 

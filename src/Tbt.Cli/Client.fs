@@ -12,6 +12,7 @@ open Tbt.Contracts
 open Tbt.Session
 open Tbt.Session.Handshake
 open Tbt.Carrier
+open Tbt.Async
 open Tbt.Cli.Common
 
 /// Connect, send head and bootstrap frame, wait for the reply head and bootstrap frame.
@@ -25,6 +26,7 @@ let private bootstrap (server: IPEndPoint) (host: string) (boot: byte[]) (window
         // small; a queue overflow, if any, is on the host path and shows up as
         // kernel retranmissions, not as a userspace virtual ACK.
         SocketTuning.path(socket, windowClamp)
+        SocketTuning.fastOpenConnect socket
         socket.ReceiveTimeout <- timeoutMs
         socket.SendTimeout <- timeoutMs
         let connect = socket.ConnectAsync server
@@ -49,6 +51,7 @@ let private bootstrap (server: IPEndPoint) (host: string) (boot: byte[]) (window
         reraise()
 
 let run (o: Options) =
+    let asyncMode = AsyncMode.isEnabled ()
     let server = endpoint (o.Text "server")
     let host = if o.Has "host" then o.Text "host" else server.Address.ToString()
     let listenAt = endpoint (o.Text "listen")
@@ -56,7 +59,11 @@ let run (o: Options) =
     let pathCount = o.Int("paths", 4)
     let mss = o.Int("mss", 1448)
     let windowClamp = o.Int("window-clamp", SocketTuning.WindowClamp)
-    let config = { SessionConfig.defaults with WindowSteps = o.Int("window", 1024); NewRepair = o.Int("new-repair", 0) <> 0 }
+    let fecAdaptive =
+        match System.Environment.GetEnvironmentVariable "TBTUN_FEC_ADAPTIVE" with
+        | null -> true
+        | v -> v <> "0"
+    let config = { SessionConfig.defaults with WindowSteps = o.Int("window", 1024); NewRepair = o.Int("new-repair", 0) <> 0; FecAdaptive = fecAdaptive }
     let entropy = SystemEntropy()
     let struct (offerAegis, offerChaCha8, offerChaCha20, offerX25519) = offerFromOptions o
     let rttMs = max 1 (o.Int("rtt-ms", JoinBootstrap.DefaultRttMs))
@@ -87,7 +94,15 @@ let run (o: Options) =
         bridge.Attach session
         let pace = o.Int("uplink-pace", 0) <> 0
         let tupleMbit = if pace then max 0.0 (o.Float("tuple-mbit", 0.0)) else 0.0
-        let carrier = SessionCarrier(session, bridge, uplinkPace=pace, tupleMbit=tupleMbit)
+        let rxChannel = if asyncMode then Some (new RxChannel()) else None
+        let ioGroup =
+            if asyncMode then
+                let group = AsyncPollerGroup(4)
+                group.Start()
+                Some group
+            else None
+        let carrier = SessionCarrier(session, bridge, uplinkPace=pace, tupleMbit=tupleMbit,
+                                     ?rxChannel=rxChannel, ?asyncIo=ioGroup)
         carrier.AddPath link0
         let maxPaths = int hello.MaxPaths
         // Forward as soon as path 0 is up; remaining JOINs run with bounded
@@ -126,6 +141,7 @@ let run (o: Options) =
         attachJoined ()
         let listener = new Socket(listenAt.AddressFamily, SocketType.Stream, ProtocolType.Tcp)
         listener.Bind listenAt
+        SocketTuning.fastOpenListen(listener, 512)
         listener.Listen 128
         listener.Blocking <- false
         use poller = new Poller()
@@ -134,7 +150,11 @@ let run (o: Options) =
         // SIGINT/SIGTERM (or Ctrl-C on Windows): close the session with SESSION_CLOSE (spec 6.10a), at most 2 s.
         let mutable stopAt = 0L
         use _interrupt = onInterrupt (fun () -> if stopAt = 0L then stopAt <- Environment.TickCount64 + 2000L)
-        while carrier.Alive && not (stopAt > 0L && Environment.TickCount64 > stopAt) do
+        // Registration must happen before Wait: a WatchRead after Wait clears
+        // the readiness Wait just filled. Accept runs after Wait, where the
+        // listener's readiness is still visible.
+        let watchListener (pl: Poller) = pl.WatchRead listener
+        let serve (pl: Poller) =
             attachJoined ()
             if stopAt > 0L && session.CloseState = CloseState.Open then
                 log "closing the session"
@@ -143,19 +163,38 @@ let run (o: Options) =
                 lastStats <- Environment.TickCount64
                 log ("stats " + carrier.Describe() + " rss_kib=" + string (rssKiB ()))
                 Tbt.Contracts.Trace.flush ()
-            poller.WatchRead listener
-            carrier.Watch poller
-            poller.Wait(carrier.WaitMs())
-            clock.Tick() |> ignore
-            if poller.IsReadable listener then
+            if pl.IsReadable listener then
                 let mutable go = true
                 while go do
                     match tryAccept listener with
                     | null -> go <- false
                     | s -> if not (bridge.TryAdd s) then s.Dispose()
-            carrier.Service poller
+        let cycle (pl: Poller) =
+            watchListener pl
+            serve pl
+
+        if asyncMode then
+            log "async mode: session loop on its own thread (TBTUN_ASYNC_MODE)"
+            let coordinator =
+                match ioGroup, rxChannel with
+                | Some group, Some rx -> AsyncSessionCoordinator.createWith carrier clock group rx
+                | _ -> AsyncSessionCoordinator.create carrier clock
+            coordinator.BeforeWait <- watchListener
+            coordinator.BeforeService <- serve
+            coordinator.Start()
+            while coordinator.Alive && carrier.Alive
+                  && not (stopAt > 0L && Environment.TickCount64 > stopAt) do
+                Thread.Sleep 50
+            coordinator.Stop()
+        else
+            while carrier.Alive && not (stopAt > 0L && Environment.TickCount64 > stopAt) do
+                cycle poller
+                carrier.Watch poller
+                poller.Wait(carrier.WaitMs())
+                clock.Tick() |> ignore
+                carrier.Service poller
         log (if session.Closed then "session closed" else "all paths closed")
         try joinTask.Wait 2000 |> ignore with _ -> ()
-        attachJoined ()
+        if not asyncMode then attachJoined ()
         carrier.Close()
         if session.Closed then 0 else 1

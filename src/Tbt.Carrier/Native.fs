@@ -49,6 +49,12 @@ extern int sysClose(int fd)
 [<DllImport("libc", EntryPoint = "socket", SetLastError = true)>]
 extern int sysSocket(int domain, int typ, int protocol)
 
+[<DllImport("libc", EntryPoint = "eventfd", SetLastError = true)>]
+extern int sysEventFd(uint32 initval, int flags)
+
+/// Linux eventfd with EFD_NONBLOCK. -1 when the call fails.
+let eventFd () = sysEventFd (0u, 0x800)
+
 let read (fd: int) (buffer: Span<byte>) =
     use p = fixed &MemoryMarshal.GetReference buffer
     int (sysRead(fd, NativePtr.toNativeInt p, unativeint buffer.Length))

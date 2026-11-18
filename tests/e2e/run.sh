@@ -57,6 +57,9 @@ fi
 window=${WINDOW:-1024}
 window_clamp=${WINDOW_CLAMP:-600000}
 max_paths=${MAX_PATHS:-64}
+# iperf3 caps parallel streams at 128. Path count and iperf stream count are
+# independent, so a 256-path session still exercises the tunnel with 128 streams.
+iperf_par=$(( paths < 128 ? paths : 128 ))
 # Per-5-tuple cap on the *client* uplink pacer (0 = off). Independent of UPLINK_PACE
 # and of wanem's own tuple_mbit (the network model). Do not set this on the 20 ms /
 # 200 Mbit matrix: a default 4 Mbit/path cap would destroy it.
@@ -182,7 +185,7 @@ if (( paths > max_paths )); then
 fi
 user=$(id -un)
 dotnet_root=${DOTNET_ROOT:-$(dirname "$(readlink -f "$(command -v dotnet)")")}
-in_ns() { local ns=$1; shift; sudo ip netns exec "tbe_$ns" sudo -u "$user" env DOTNET_ROOT="$dotnet_root" TBT_TRACE="${TBT_TRACE:-}" PING_TRACE="${PING_TRACE:-}" ECHO_PROBE_LOG="${ECHO_PROBE_LOG:-}" "$@"; }
+in_ns() { local ns=$1; shift; sudo ip netns exec "tbe_$ns" sudo -u "$user" env DOTNET_ROOT="$dotnet_root" TBT_TRACE="${TBT_TRACE:-}" PING_TRACE="${PING_TRACE:-}" ECHO_PROBE_LOG="${ECHO_PROBE_LOG:-}" TBTUN_ASYNC_MODE="${TBTUN_ASYNC_MODE:-}" TBTUN_FEC_ADAPTIVE="${TBTUN_FEC_ADAPTIVE:-}" DOTNET_EnableHWIntrinsic="${DOTNET_EnableHWIntrinsic:-}" "$@"; }
 
 # Processes whose executable is under the work directory (or iperf3/python3 started here).
 pids_of() {
@@ -258,8 +261,15 @@ if [[ -n ${TBT_BIN:-} ]]; then
     ln -s "$(cd "$TBT_BIN/jit" && pwd)" "$work/jit"
     stamp "bins_from: TBT_BIN=$TBT_BIN (script_commit may differ from binary build_commit)"
 else
-    dotnet publish "$repo/src/Tbt.Cli" -c Release -r linux-x64 -o "$work/aot" >"$work/publish.log"
-    dotnet build "$repo/src/Tbt.Cli" -c Release -o "$work/jit" >"$work/build.log"
+    # Two toolchain-only conditions block an AOT publish here:
+    #   NU1903  ILCompiler 10.0.12 carries a high-severity audit advisory;
+    #   IL2104  FSharp.Core still emits trim-analysis warnings even with
+    #           --reflectionfree on our own assemblies.
+    # Both are about the toolchain, not the product image, so only the e2e
+    # AOT build relaxes them; product builds keep warnings as errors.
+    dotnet publish "$repo/src/Tbt.Cli" -c Release -r linux-x64 -o "$work/aot" \
+        -p:NuGetAudit=false -p:SuppressTrimAnalysisWarnings=true >"$work/publish.log"
+    dotnet build "$repo/src/Tbt.Cli" -c Release -o "$work/jit" -p:NuGetAudit=false >"$work/build.log"
     git -C "$repo" rev-parse HEAD > "$work/aot/build-commit"
     git -C "$repo" rev-parse HEAD > "$work/jit/build-commit"
     if [[ -n $(git -C "$repo" status --porcelain) ]]; then
@@ -287,6 +297,24 @@ stamp_bin server_bin "$work/aot/tbtun"
 # JIT: the assembly is tbtun.dll; the launcher (tbtun) is a host script / apphost.
 stamp_bin client_bin "$work/jit/tbtun.dll"
 stamp_bin client_apphost "$work/jit/tbtun"
+# The far side runs the AOT binary and the near side the JIT one. Rebuilding only
+# one of them makes the two ends run different code, which silently invalidates
+# every measurement (adaptive FEC looked broken for hours because of exactly this).
+if [[ ${ALLOW_STALE_BIN:-0} != 1 ]]; then
+    a=$(stat -Lc %Y "$work/aot/tbtun" 2>/dev/null || echo 0)
+    j=$(stat -Lc %Y "$work/jit/tbtun.dll" 2>/dev/null || echo 0)
+    skew=$(( a > j ? a - j : j - a ))
+    if (( skew > 300 )); then
+        echo "refuse: aot and jit binaries are ${skew}s apart; rebuild both or set ALLOW_STALE_BIN=1" >&2
+        # No namespace exists yet; only the freeze probe is running. Clean those up
+        # directly so a refused run returns 2 at once instead of waiting for the full
+        # EXIT trap, which finalizes stamps and tears down the testbed.
+        stop_freeze
+        trap - EXIT INT TERM
+        rm -rf "$work"
+        exit 2
+    fi
+fi
 # The launcher assembly alone does not identify the JIT carrier/session code.
 # Include all runtime assemblies and configuration in a stable manifest.
 python3 - "$work/jit" "$work/client-bundle.sha256" <<'PY'
@@ -454,7 +482,7 @@ goodput() { python3 -c 'import json,sys; d=json.load(sys.stdin); print("%.1f" % 
 
 status=0
 if [[ ${SKIP_REF:-0} != 1 ]]; then
-echo "reference, plain TCP without tunnel: 1 flow $(in_ns near iperf3 -c 10.200.2.2 -p 5201 -t "$seconds" -J | goodput) Mbit/s, $paths flows $(in_ns near iperf3 -c 10.200.2.2 -p 5201 -t "$seconds" -P "$paths" -J | goodput) Mbit/s"
+echo "reference, plain TCP without tunnel: 1 flow $(in_ns near iperf3 -c 10.200.2.2 -p 5201 -t "$seconds" -J | goodput) Mbit/s, $iperf_par flows $(in_ns near iperf3 -c 10.200.2.2 -p 5201 -t "$seconds" -P "$iperf_par" -J | goodput) Mbit/s"
 echo "reference, plain TCP without tunnel: $(in_ns near python3 "$work/echo.py" ping 10.200.2.2 7000 100)"
 fi
 
@@ -500,7 +528,7 @@ if [[ ${SKIP_IPERF:-0} != 1 ]]; then
 # Session 2: iperf3 cases back to back on one session (control flow idles while data runs).
 tunnel bulk 10.200.2.2:5201
 iperf_index=0
-for args in "" "-R" "-P $paths" "-R -P $paths" ""; do
+for args in "" "-R" "-P $iperf_par" "-R -P $iperf_par" ""; do
     # shellcheck disable=SC2086
     sleep 2  # iperf3 -s takes one test at a time: let the last one finish on the far side
     iperf_index=$((iperf_index + 1))

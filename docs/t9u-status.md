@@ -43,3 +43,14 @@ cr(CR-2 + 旧跟踪开关)对 main 5 + 5:负载下 ping p99 在噪声内,服务�
 组在途上限 1.25 BDP、修补副本计入组节拍、速率样本以发送速率为上界、0.75 相位排空即止、巡航增益 1.05
 (docs/cases/rate-group-cap.md)。A/B:down 135.0 对 133.4,up 150.1 对 139.2,负载下 p99 114.5 对 133.7,
 下载中 RTT 42–46 ms(原 60–120)。交互延迟相关工作(lane、CR、交互修补)按用户要求暂缓,放到最后。
+
+## 更新:异步模式落地(2026-11-18)
+
+P0-1/P0-2/P0-4 达成:`Tbt.Async` 零错误编译;`TBTUN_ASYNC_MODE` 在 Server/Client 生效,
+日志有 `async mode` 启动行;`tests/Tbt.Async.Tests` 8/8 可重复通过(SPSC 100 万、四窃取者、
+ComputePool 优先级、BufferPool、FrameAdapter)。路径 IO 拆成 4 个 IO 线程 + 每会话一个状态机线程,
+`AsyncPathLink` 的跨线程协议见 docs/async-rewrite/06-verification-log.md。
+
+已修四个数据面缺陷:路径 socket 未设非阻塞(IO 线程在 `Send` 里阻塞整组路径)、tx 槽位未记录
+每帧提交长度、槽位复用未清 `txSent`、以及接收环 accept 缺陷(`BeforeService` 在 `Wait` 之后
+注册 listener,清空本轮 `Revents`,导致 `flows=0`)。完整 4 路与 256 路的吞吐数据待补。

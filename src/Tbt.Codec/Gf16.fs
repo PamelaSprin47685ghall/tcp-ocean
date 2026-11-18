@@ -66,6 +66,55 @@ let private mulAddScalar (c: int) (src: ReadOnlySpan<byte>) (dst: Span<byte>) (s
     for i in start .. src.Length - 1 do
         dst.[i] <- dst.[i] ^^^ MulByte.[row + int src.[i]]
 
+/// Multiply each nibble by x in GF(16), polynomial x^4 + x + 1. SSE2 has no
+/// byte shuffle, so this is the shift-and-reduce, not a weaker field.
+let private sse2MulX (n: Vector128<byte>) =
+    let shift = Sse2.ShiftLeftLogical(n.AsInt16(), 1uy).AsByte() &&& Vector128.Create(0x1Euy)
+    let top = shift &&& Vector128.Create(0x10uy)
+    let red =
+        Sse2.ShiftRightLogical(top.AsInt16(), 4uy).AsByte()
+        ^^^ Sse2.ShiftRightLogical(top.AsInt16(), 3uy).AsByte()
+        ^^^ top
+    (shift ^^^ red) &&& Vector128.Create(0x0Fuy)
+
+/// Each byte of n is a nibble. Result is c * nibble, still in the low nibble.
+let private sse2MulNibbles (c: int) (n: Vector128<byte>) =
+    let mutable p = n
+    let mutable acc = Vector128<byte>.Zero
+    if c &&& 1 <> 0 then acc <- p
+    if c > 1 then
+        p <- sse2MulX p
+        if c &&& 2 <> 0 then acc <- acc ^^^ p
+    if c > 3 then
+        p <- sse2MulX p
+        if c &&& 4 <> 0 then acc <- acc ^^^ p
+    if c > 7 then
+        p <- sse2MulX p
+        if c &&& 8 <> 0 then acc <- acc ^^^ p
+    acc
+
+let private sse2MulByte (c: int) (x: Vector128<byte>) =
+    let nib = Vector128.Create(0x0Fuy)
+    let lo = sse2MulNibbles c (x &&& nib)
+    let hi = sse2MulNibbles c (Sse2.ShiftRightLogical(x.AsInt16(), 4uy).AsByte() &&& nib)
+    lo ^^^ Sse2.ShiftLeftLogical(hi.AsInt16(), 4uy).AsByte()
+
+let private sse2MulAdd (c: int) (src: ReadOnlySpan<byte>) (dst: Span<byte>) =
+    let sv = MemoryMarshal.Cast<byte, Vector128<byte>>(src)
+    let dv = MemoryMarshal.Cast<byte, Vector128<byte>>(dst)
+    for j in 0 .. sv.Length - 1 do
+        dv.[j] <- dv.[j] ^^^ sse2MulByte c sv.[j]
+    mulAddScalar c src dst (sv.Length * 16)
+
+let private sse2Scale (c: int) (dst: Span<byte>) =
+    let dv = MemoryMarshal.Cast<byte, Vector128<byte>>(dst)
+    for j in 0 .. dv.Length - 1 do
+        dv.[j] <- sse2MulByte c dv.[j]
+    let start = dv.Length * 16
+    let row = c * 256
+    for i in start .. dst.Length - 1 do
+        dst.[i] <- MulByte.[row + int dst.[i]]
+
 /// dst <- dst + c * src (GF(16) multiply-add on both nibbles). Lengths must be equal.
 let mulAddInto (c: byte) (src: ReadOnlySpan<byte>) (dst: Span<byte>) =
     if src.Length <> dst.Length then invalidArg "src" "length mismatch"
@@ -90,12 +139,16 @@ let mulAddInto (c: byte) (src: ReadOnlySpan<byte>) (dst: Span<byte>) =
                 let h = AdvSimd.Arm64.VectorTableLookup(hi, Vector128.ShiftRightLogical(x, 4) &&& nib)
                 dv.[j] <- dv.[j] ^^^ l ^^^ h
         mulAddScalar (int c) src dst (sv.Length * 16)
+    elif Sse2.IsSupported then sse2MulAdd (int c) src dst
     else
         mulAddScalar (int c) src dst 0
 
 /// dst <- c * dst.
 let scaleInPlace (c: byte) (dst: Span<byte>) =
     if c = 0uy then dst.Clear()
+    elif c = 1uy then ()
+    elif Sse2.IsSupported && not Ssse3.IsSupported && not AdvSimd.Arm64.IsSupported then
+        sse2Scale (int c) dst
     elif c <> 1uy then
         let row = int c * 256
         for i in 0 .. dst.Length - 1 do

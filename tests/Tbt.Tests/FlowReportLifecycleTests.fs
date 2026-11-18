@@ -8,6 +8,7 @@ open Tbt.Wire
 open Tbt.Session
 open Tbt.Session.Handshake
 open Tbt.Tests.SessionTests
+open Tbt.Tests.SessionTestsB
 
 type private Lifecycle() =
     let clock = ManualClock()

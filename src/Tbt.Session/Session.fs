@@ -48,12 +48,25 @@ type SessionConfig =
       /// Per-flow byte credit; it is on only when caps bit8 and bit9 are both negotiated.
       Credit: CreditPolicy
       /// Per-step / evidence-driven repair scheduler (default off = main's span OnNack).
-      NewRepair: bool }
+      NewRepair: bool
+      /// Parity ratio follows the cell loss this direction measures (NACK deficit
+      /// over acked first copies). Off keeps the fixed `Rho`.
+      FecAdaptive: bool
+      /// Bounds and law of the adaptive ratio:
+      /// target = clamp(RhoMin, RhoMax, RhoGain * loss / (1 - loss)).
+      RhoMin: float
+      RhoMax: float
+      RhoFloor: float
+      RhoGain: float
+      /// EWMA time constant, in received frames, for the peer's erasure report.
+      FecWindowCells: int }
 
 module SessionConfig =
     let defaults =
         { Rho = 0.25; WindowSteps = 4096; MaxRows = 16384; MaxPaths = 288; TxQueueCells = 256
-          Credit = CreditPolicy.defaults; NewRepair = false }
+          Credit = CreditPolicy.defaults; NewRepair = false
+          FecAdaptive = false; RhoMin = 0.01; RhoMax = 0.50; RhoFloor = 0.02; RhoGain = 3.0
+          FecWindowCells = 64 }
 
 /// The negotiated result of the main handshake that a session needs.
 [<Struct>]
@@ -91,7 +104,10 @@ type Session(role: Role, p: SessionParams, port: IFlowPort, clock: IClock, confi
     let opener = CellOpener(rxDir, s, rxKeys, mask (if client then keys.HpDown else keys.HpUp))
     let encoder = Encoder((if client then keys.GraphSeedUp else keys.GraphSeedDown), s, config.WindowSteps)
     let decoder = Decoder((if client then keys.GraphSeedDown else keys.GraphSeedUp), s, config.WindowSteps, config.MaxRows)
-    let tx = TxHalf(txDir, s, fieldOf txDir, encoder, sealer, config.Rho, config.MaxPaths, config.TxQueueCells, clock)
+    let tx =
+        TxHalf(txDir, s, fieldOf txDir, encoder, sealer, config.Rho, config.FecAdaptive,
+               config.RhoMin, config.RhoMax, config.RhoFloor, config.RhoGain,
+               config.FecWindowCells, config.MaxPaths, config.TxQueueCells, clock)
     do
         // The new per-step / evidence / tail-timer scheduler is opt-in. Off is
         // main's span OnNack exactly. When on, the server also uses RACK evidence.

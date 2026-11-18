@@ -49,10 +49,19 @@ internal static class ClientHost
             d.MaxPaths,
             d.TxQueueCells,
             d.Credit,
-            false);
+            false,
+            // Adaptive FEC is on by default in the CLI; the native host follows it.
+            true,
+            d.RhoMin,
+            d.RhoMax,
+            d.RhoFloor,
+            d.RhoGain,
+            d.FecWindowCells);
         var session = new Tbt.Session.Session(Role.Client, p, bridge, clock, config);
         bridge.Attach(session);
-        var carrier = new SessionCarrier(session, bridge, null, null);
+        // F# optional arguments surface to C# as required FSharpOption slots.
+        // The native host keeps the synchronous path, so both async hooks stay null.
+        var carrier = new SessionCarrier(session, bridge, null, null, null, null);
         carrier.AddPath(link0);
 
         int want = Math.Max(1, o.PathCount);

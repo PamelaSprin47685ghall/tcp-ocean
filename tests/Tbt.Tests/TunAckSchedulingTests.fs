@@ -6,6 +6,7 @@ open Tbt.Carrier
 open Tbt.Contracts
 open Tbt.Tests.SessionTests
 open Tbt.Tests.TunTests
+open Tbt.Tests.TunTestsC
 
 type private AckOwner() =
     member val Frontier = 0UL with get, set

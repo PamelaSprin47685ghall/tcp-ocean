@@ -1,0 +1,50 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <IsPackable>false</IsPackable>
+    <Nullable>disable</Nullable>
+    <UseMicrosoftTestingPlatformRunner>true</UseMicrosoftTestingPlatformRunner>
+    <TestingPlatformDotnetTestSupport>true</TestingPlatformDotnetTestSupport>
+    <Optimize>false</Optimize>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="../Tbt.Tests/Vectors.fs" Link="Vectors.fs" />
+    <Compile Include="../Tbt.Tests/SessionTests.fs" Link="SessionTests.fs" />
+    <Compile Include="../Tbt.Tests/SessionTestsB.fs" Link="SessionTestsB.fs" />
+    <Compile Include="../Tbt.Tests/SessionTestsC.fs" Link="SessionTestsC.fs" />
+    <Compile Include="../Tbt.Tests/SessionTestsD.fs" Link="SessionTestsD.fs" />
+    <Compile Include="../Tbt.Tests/UniqueRepairTests.fs" Link="UniqueRepairTests.fs" />
+    <Compile Include="../Tbt.Tests/HandshakeCryptoTests.fs" Link="HandshakeCryptoTests.fs" />
+    <Compile Include="../Tbt.Tests/JoinTests.fs" Link="JoinTests.fs" />
+    <Compile Include="../Tbt.Tests/BootstrapTests.fs" Link="BootstrapTests.fs" />
+    <Compile Include="../Tbt.Tests/TunTests.fs" Link="TunTests.fs" />
+    <Compile Include="../Tbt.Tests/TunTestsB.fs" Link="TunTestsB.fs" />
+    <Compile Include="../Tbt.Tests/TunTestsC.fs" Link="TunTestsC.fs" />
+    <Compile Include="../Tbt.Tests/TunTestsD.fs" Link="TunTestsD.fs" />
+    <Compile Include="../Tbt.Tests/TunAckSchedulingTests.fs" Link="TunAckSchedulingTests.fs" />
+    <Compile Include="../Tbt.Tests/RtoEnvelopeTests.fs" Link="RtoEnvelopeTests.fs" />
+    <Compile Include="../Tbt.Tests/PaceTests.fs" Link="PaceTests.fs" />
+    <Compile Include="../Tbt.Tests/FuzzTests.fs" Link="FuzzTests.fs" />
+    <Compile Include="../Tbt.Tests/GovernorTests.fs" Link="GovernorTests.fs" />
+    <Compile Include="../Tbt.Tests/ControlTests.fs" Link="ControlTests.fs" />
+    <Compile Include="../Tbt.Tests/CliTests.fs" Link="CliTests.fs" />
+    <Compile Include="../Tbt.Tests/BridgeTests.fs" Link="BridgeTests.fs" />
+    <Compile Include="../Tbt.Tests/FlowReportLifecycleTests.fs" Link="FlowReportLifecycleTests.fs" />
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="../vectors/*.json" CopyToOutputDirectory="PreserveNewest" LinkBase="vectors" />
+  </ItemGroup>
+  <ItemGroup>
+    <PackageReference Include="xunit.v3" Version="3.2.2" />
+  </ItemGroup>
+  <ItemGroup>
+    <ProjectReference Include="../../src/Tbt.Contracts/Tbt.Contracts.fsproj" />
+    <ProjectReference Include="../../src/Tbt.Codec/Tbt.Codec.fsproj" />
+    <ProjectReference Include="../../src/Tbt.Wire/Tbt.Wire.fsproj" />
+    <ProjectReference Include="../../src/Tbt.Crypto/Tbt.Crypto.fsproj" />
+    <ProjectReference Include="../../src/Tbt.Session/Tbt.Session.fsproj" />
+    <ProjectReference Include="../../src/Tbt.Carrier/Tbt.Carrier.fsproj" />
+    <ProjectReference Include="../../src/Tbt.Cli/Tbt.Cli.fsproj" />
+    <ProjectReference Include="../../src/Tbt.Async/Tbt.Async.fsproj" />
+  </ItemGroup>
+</Project>

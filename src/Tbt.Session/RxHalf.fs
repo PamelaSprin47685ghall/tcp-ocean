@@ -30,6 +30,9 @@ type RxHalf(symbolSize: int, field: CodeField, decoder: Decoder, opener: CellOpe
     let pathSeenNs: int64[] = Array.zeroCreate maxPaths
     /// A path counts for the loss evidence while it gave a cell this recently.
     let pathActiveNs = 50_000_000L
+    /// Last time any path gave a cell; approximates "now" inside foldEstimate, which has
+    /// no clock argument of its own.
+    let mutable lastCellNs = 0L
     /// The frontier may wait this long for late cells before held parities are used.
     let stallNs = 20_000_000L
     let mutable frontierSince = 0L
@@ -41,8 +44,17 @@ type RxHalf(symbolSize: int, field: CodeField, decoder: Decoder, opener: CellOpe
     /// Cells expected (k + m from meta) and received per step, for the erasure estimate.
     let expected: byte[] = Array.zeroCreate capacitySteps
     let received: byte[] = Array.zeroCreate capacitySteps
+    /// Which step the two arrays above currently describe. The ring reuses a slot long
+    /// before the estimate folds it; without this tag a late cell of step t overwrote the
+    /// counters of whatever step shared its slot, and a clean link reported one third lost.
+    let expectedStep: uint64[] = Array.create capacitySteps UInt64.MaxValue
     let mutable estimateFloor = 0UL
     let mutable erasure = 0.0
+    /// Last folded sample, exposed through Describe while the erasure estimate is suspect.
+    let mutable lastFoldedStep = 0UL
+    let mutable lastFoldedExpected = 0
+    let mutable lastFoldedReceived = 0
+    let mutable folds = 0L
     let mutable flows: FlowTable = Unchecked.defaultof<_>
     let index (t: uint64) = int (t % uint64 capacitySteps)
 
@@ -51,20 +63,41 @@ type RxHalf(symbolSize: int, field: CodeField, decoder: Decoder, opener: CellOpe
             let r = CodeGraph.Strides.[i]
             if t >= r then decoder.NoteStepUsed(t - r, Meta.kHistAt kHist i) |> ignore
 
+    /// Erasure is the source-cell loss rate: rho is parity per source, so the
+    /// estimate must not mix in parity cells. `Aux` also means different things
+    /// on DATA and PARITY frames, so adding it made every step whose parity had
+    /// not arrived look one third lost.
     let count (m: Meta) =
         let i = index m.StepId
-        if m.StepId >= estimateFloor && m.StepId < estimateFloor + uint64 capacitySteps then
-            if expected.[i] = 0uy then expected.[i] <- byte (int m.StepUsed + int (min m.Aux 48us))
-            if received.[i] < 255uy then received.[i] <- received.[i] + 1uy
+        if expectedStep.[i] <> m.StepId then
+            expectedStep.[i] <- m.StepId
+            expected.[i] <- m.StepUsed
+            received.[i] <- 1uy
+        elif received.[i] < 255uy then
+            received.[i] <- received.[i] + 1uy
 
-    /// Fold steps below the frontier into the erasure estimate (EWMA over about 256 steps).
+    /// Fold steps whose fate is settled into the erasure estimate (EWMA over about 256 steps).
+    /// Cells of one step ride different paths, and TCP keeps order only inside one path.
+    /// A path that already showed a later step cannot still deliver an earlier one, so the
+    /// smallest `pathStep` over live paths is a safe folding line. A fixed reorder margin is
+    /// not: at 165 Mbit/s and 40 ms RTT one path holds about 600 steps, and treating those
+    /// cells as lost made a clean link report 33 % erasure and inflate rho to its ceiling.
     let foldEstimate () =
         let f = decoder.Frontier
-        while estimateFloor < f do
+        let mutable stable = f
+        for p in 0 .. maxPaths - 1 do
+            if lastCellNs - pathSeenNs.[p] <= pathActiveNs && pathStep.[p] < stable then
+                stable <- pathStep.[p]
+        while estimateFloor < stable do
             let i = index estimateFloor
-            if expected.[i] > 0uy then
+            if expectedStep.[i] = estimateFloor && expected.[i] > 0uy then
                 let e = 1.0 - min 1.0 (float received.[i] / float expected.[i])
                 erasure <- erasure + (e - erasure) / 256.0
+                lastFoldedStep <- estimateFloor
+                lastFoldedExpected <- int expected.[i]
+                lastFoldedReceived <- int received.[i]
+                folds <- folds + 1L
+            expectedStep.[i] <- UInt64.MaxValue
             expected.[i] <- 0uy
             received.[i] <- 0uy
             estimateFloor <- estimateFloor + 1UL
@@ -105,15 +138,19 @@ type RxHalf(symbolSize: int, field: CodeField, decoder: Decoder, opener: CellOpe
             lastFrontier <- f
             frontierSince <- now
         let mutable m = Unchecked.defaultof<Meta>
+        let mutable addedNs = 0L
         let mutable symbol = ReadOnlySpan<byte>.Empty
-        while hold.TryPeek(&m, &symbol) && m.StepId < f do
-            counters.ParitiesUnused <- counters.ParitiesUnused + 1L
-            hold.Drop()
-        if hold.Count > 0 && f < decoder.SeenEnd && (force || now - frontierSince >= stallNs || lossEvident now) then
-            while hold.TryPeek(&m, &symbol) do
-                if m.StepId >= decoder.Frontier then offerParity m symbol
-                else counters.ParitiesUnused <- counters.ParitiesUnused + 1L
+        let mutable go = true
+        while go && hold.TryPeek(&m, &addedNs, &symbol) do
+            let curF = decoder.Frontier
+            if m.StepId < curF then
+                counters.ParitiesUnused <- counters.ParitiesUnused + 1L
                 hold.Drop()
+            elif curF < decoder.SeenEnd && (force || now - addedNs >= stallNs || (m.StepId = curF && (now - frontierSince >= stallNs || lossEvident now))) then
+                offerParity m symbol
+                hold.Drop()
+            else
+                go <- false
 
     member _.Counters = counters
     member _.Decoder = decoder
@@ -131,6 +168,12 @@ type RxHalf(symbolSize: int, field: CodeField, decoder: Decoder, opener: CellOpe
         if limit <= ack then 0us else uint16 (min 65535UL (limit - ack))
 
     member _.ErasureQ16 = uint16 (min 65535.0 (erasure * 65536.0))
+
+    member _.EstimateFloor = estimateFloor
+    member _.EstimateFolds = folds
+    member _.LastFoldedStep = lastFoldedStep
+    member _.LastFoldedExpected = lastFoldedExpected
+    member _.LastFoldedReceived = lastFoldedReceived
 
     /// Delivery accounting from the flow table.
     member _.StepUndelivered(t: uint64, delta: int) =
@@ -171,6 +214,7 @@ type RxHalf(symbolSize: int, field: CodeField, decoder: Decoder, opener: CellOpe
     /// is known. A parity waits in the hold while the decoder has no work for it.
     member _.OnCoded(m: Meta, symbol: ReadOnlySpan<byte>, path: uint16, now: int64) =
         let p = int path
+        lastCellNs <- now
         if TraceGate.On && (m.Type = CellType.Booster || m.Flags.HasFlag MetaFlags.EndOfBurst) then
             Trace.record Trace.Arrive m.StepId path (if m.Type = CellType.Data then 0 elif m.Type = CellType.Parity then 1 else 2)
         if p < maxPaths && (m.Type = CellType.Data || m.Type = CellType.Parity) then
@@ -182,18 +226,27 @@ type RxHalf(symbolSize: int, field: CodeField, decoder: Decoder, opener: CellOpe
             noteHistory m.StepId m.KHist
             decoder.OfferSource(m.StepId, int m.Slot, int m.StepUsed, symbol) |> ignore
         | CellType.Parity ->
-            count m
             if decoder.NoteStepUsed(m.StepId, int m.StepUsed) then
                 noteHistory m.StepId m.KHist
                 if m.StepId < decoder.Frontier then counters.ParitiesUnused <- counters.ParitiesUnused + 1L
-                elif decoder.PendingRows > 0 then offerParity m symbol
-                elif hold.IsFull then offerParity m symbol
-                else hold.Add(m, symbol)
+                else
+                    if hold.IsFull then
+                        let mutable hm = Unchecked.defaultof<Meta>
+                        let mutable hns = 0L
+                        let mutable hs = ReadOnlySpan<byte>.Empty
+                        if hold.TryPeek(&hm, &hns, &hs) then
+                            if hm.StepId < decoder.Frontier then counters.ParitiesUnused <- counters.ParitiesUnused + 1L
+                            else offerParity hm hs
+                            hold.Drop()
+                    hold.Add(m, now, symbol)
         | CellType.Booster -> decoder.OfferBooster(m.StepId, int m.StepUsed, int m.Slot, symbol) |> ignore
         | _ -> counters.Unsupported <- counters.Unsupported + 1L
         drainKnown ()
         serviceHold now false
         drainKnown ()
+        // Release() is the only other caller and runs on its own slow cadence; folding here
+        // keeps the estimate advancing even when Release is skipped or rare.
+        foldEstimate ()
 
     /// Timer: held parities go to the decoder once the frontier waited too long.
     member _.Service(now: int64) =

@@ -7,6 +7,7 @@
     <Compile Include="Poller.fs" />
     <Compile Include="Path.fs" />
     <Compile Include="PathLink.fs" />
+    <Compile Include="AsyncPaths.fs" />
     <Compile Include="FlowBridge.fs" />
     <Compile Include="Packet.fs" />
     <Compile Include="RateGroup.fs" />

@@ -57,6 +57,8 @@ type Decoder(graphSeed: uint64, symbolSize: int, capacitySteps: int, maxRows: in
     let rows = List<Row>(maxRows)
     let freeRows = Stack<Row>(maxRows)
     let pivots = Dictionary<uint64, Row>(maxRows)
+    let colRows = Dictionary<uint64, List<Row>>(maxRows * 4)
+    let rowScratch = List<Row>(64)
     let solvedQueue = Stack<Row>()
     let knownQueue = Queue<struct (uint64 * byte * bool)>()
     let mutable kConflicts = 0L
@@ -104,8 +106,32 @@ type Decoder(graphSeed: uint64, symbolSize: int, capacitySteps: int, maxRows: in
         r.Count <- 0
         freeRows.Push r
 
+    let addColIndex (col: uint64) (r: Row) =
+        match colRows.TryGetValue col with
+        | true, list -> list.Add r
+        | _ ->
+            let list = List<Row>(4)
+            list.Add r
+            colRows.[col] <- list
+
+    let removeColIndex (col: uint64) (r: Row) =
+        match colRows.TryGetValue col with
+        | true, list ->
+            list.Remove r |> ignore
+            if list.Count = 0 then colRows.Remove col |> ignore
+        | _ -> ()
+
+    let addRowIndex (r: Row) =
+        for i in 0 .. r.Count - 1 do
+            addColIndex r.Cols.[i] r
+
+    let removeRowIndex (r: Row) =
+        for i in 0 .. r.Count - 1 do
+            removeColIndex r.Cols.[i] r
+
     /// q <- q + c * r. Both rows sorted; zero sums are dropped.
     let addScaled (q: Row) (c: byte) (r: Row) =
+        let indexed = q.Index >= 0
         let need = q.Count + r.Count
         if mergeCols.Length < need then
             mergeCols <- Array.zeroCreate (2 * need)
@@ -120,16 +146,21 @@ type Decoder(graphSeed: uint64, symbolSize: int, capacitySteps: int, maxRows: in
                 n <- n + 1
                 i <- i + 1
             elif i >= q.Count || r.Cols.[j] < q.Cols.[i] then
-                mergeCols.[n] <- r.Cols.[j]
+                let col = r.Cols.[j]
+                if indexed then addColIndex col q
+                mergeCols.[n] <- col
                 mergeCoefs.[n] <- Gf16.mul c r.Coefs.[j]
                 n <- n + 1
                 j <- j + 1
             else
+                let col = q.Cols.[i]
                 let v = q.Coefs.[i] ^^^ Gf16.mul c r.Coefs.[j]
                 if v <> 0uy then
-                    mergeCols.[n] <- q.Cols.[i]
+                    mergeCols.[n] <- col
                     mergeCoefs.[n] <- v
                     n <- n + 1
+                elif indexed then
+                    removeColIndex col q
                 i <- i + 1
                 j <- j + 1
         q.EnsureCapacity n
@@ -151,13 +182,19 @@ type Decoder(graphSeed: uint64, symbolSize: int, capacitySteps: int, maxRows: in
             for i in 0 .. r.Count - 1 do
                 r.Coefs.[i] <- Gf16.mul ic r.Coefs.[i]
             Gf16.scaleInPlace ic (Span<byte>(r.Payload))
-        for qi in 0 .. rows.Count - 1 do
-            let q = rows.[qi]
-            let at = q.Find p
-            if at >= 0 then addScaled q q.Coefs.[at] r
+        match colRows.TryGetValue p with
+        | true, list ->
+            rowScratch.Clear()
+            rowScratch.AddRange list
+            for qi in 0 .. rowScratch.Count - 1 do
+                let q = rowScratch.[qi]
+                let at = q.Find p
+                if at >= 0 then addScaled q q.Coefs.[at] r
+        | _ -> ()
         r.Index <- rows.Count
         rows.Add r
         pivots.[p] <- r
+        addRowIndex r
         if r.Count = 1 then solvedQueue.Push r
 
     /// Report a known source. Sources of a step with unknown k are reported when k arrives.
@@ -182,17 +219,24 @@ type Decoder(graphSeed: uint64, symbolSize: int, capacitySteps: int, maxRows: in
         | true, r ->
             pivots.Remove col |> ignore
             detach r
+            removeRowIndex r
             if not v.IsEmpty then Gf16.xorInto v (Span<byte>(r.Payload))
             r.RemoveAt(r.Find col)
             if r.Count = 0 then recycle r else addPivot r
         | _ ->
-            for qi in 0 .. rows.Count - 1 do
-                let q = rows.[qi]
-                let at = q.Find col
-                if at >= 0 then
-                    if not v.IsEmpty then Gf16.mulAddInto q.Coefs.[at] v (Span<byte>(q.Payload))
-                    q.RemoveAt at
-                    if q.Count = 1 then solvedQueue.Push q
+            match colRows.TryGetValue col with
+            | true, list ->
+                rowScratch.Clear()
+                rowScratch.AddRange list
+                for qi in 0 .. rowScratch.Count - 1 do
+                    let q = rowScratch.[qi]
+                    let at = q.Find col
+                    if at >= 0 then
+                        if not v.IsEmpty then Gf16.mulAddInto q.Coefs.[at] v (Span<byte>(q.Payload))
+                        q.RemoveAt at
+                        if q.Count = 1 then solvedQueue.Push q
+                colRows.Remove col |> ignore
+            | _ -> ()
 
     let advanceFrontier () =
         while ring.Contains frontier && ring.IsComplete frontier do
@@ -208,6 +252,7 @@ type Decoder(graphSeed: uint64, symbolSize: int, capacitySteps: int, maxRows: in
                 let s = slotOfCol col
                 pivots.Remove col |> ignore
                 detach r
+                removeColIndex col r
                 r.Payload.AsSpan().CopyTo(ring.Symbol(t, s))
                 markKnown t s true
                 recycle r

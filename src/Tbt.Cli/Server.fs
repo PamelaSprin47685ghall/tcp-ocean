@@ -11,6 +11,7 @@ open Tbt.Contracts
 open Tbt.Session
 open Tbt.Session.Handshake
 open Tbt.Carrier
+open Tbt.Async
 open Tbt.Cli.Common
 
 /// A path before its bootstrap is classified.
@@ -22,12 +23,25 @@ type private Pending(link: PathLink, since: int64) =
     member val Silent = false with get, set
 
 [<Sealed>]
-type private Entry(carrier: SessionCarrier, maxPaths: int, admission: JoinAdmission) =
+type private Entry(carrier: SessionCarrier, maxPaths: int, admission: JoinAdmission, coordinator: AsyncSessionCoordinator option) =
     member _.Carrier = carrier
     member _.MaxPaths = maxPaths
     member _.Admission = admission
+    member _.Coordinator = coordinator
 
 let run (o: Options) =
+    let asyncMode = AsyncMode.isEnabled ()
+    if asyncMode then log "async mode: one poller and one thread per session (TBTUN_ASYNC_MODE)"
+    let mutable asyncGroup: AsyncPollerGroup option = None
+    let ensureIoPool () =
+        match asyncGroup with
+        | Some group -> group
+        | None ->
+            let group = AsyncPollerGroup(4)
+            group.Start()
+            log ("async IO pool: " + string group.ThreadCount + " threads")
+            asyncGroup <- Some group
+            group
     let listenAt = if o.Has "listen" then ValueSome(endpoint (o.Text "listen")) else ValueNone
     let target = endpoint (o.Text "target")
     let psks = readPsks (o.Text "psk-file")
@@ -57,7 +71,11 @@ let run (o: Options) =
     // (applied when the session comes up); >0 = that many bytes. Default is
     // TunSndBuf (2 MB).
     let sndBufMode = o.Int("tun-sndbuf", SocketTuning.TunSndBuf)
-    let config = { SessionConfig.defaults with WindowSteps = o.Int("window", 1024); MaxPaths = maxPaths; NewRepair = o.Int("new-repair", 0) <> 0 }
+    let fecAdaptive =
+        match System.Environment.GetEnvironmentVariable "TBTUN_FEC_ADAPTIVE" with
+        | null -> true
+        | v -> v <> "0"
+    let config = { SessionConfig.defaults with WindowSteps = o.Int("window", 1024); MaxPaths = maxPaths; NewRepair = o.Int("new-repair", 0) <> 0; FecAdaptive = fecAdaptive }
     let entropy = SystemEntropy()
     let clock = CachedClock(SystemClock())
     let probe = SocketTuning.probe ()
@@ -74,6 +92,7 @@ let run (o: Options) =
             let l = new Socket(at.AddressFamily, SocketType.Stream, ProtocolType.Tcp)
             l.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true)
             l.Bind at
+            SocketTuning.fastOpenListen(l, 512)
             l.Listen 512
             l.Blocking <- false
             log ("server on " + at.ToString() + " (kernel TCP) -> " + target.ToString())
@@ -156,7 +175,9 @@ let run (o: Options) =
             let bridge = FlowBridge(ValueSome(target :> EndPoint))
             let session = Session(Role.Server, a.Params, bridge, clock, config)
             bridge.Attach session
-            let carrier = SessionCarrier(session, bridge)
+            let channel = if asyncMode && isNull tun then Some (new RxChannel()) else None
+            let ioGroup = if channel.IsSome then Some (ensureIoPool ()) else None
+            let carrier = SessionCarrier(session, bridge, ?rxChannel = channel, ?asyncIo = ioGroup)
             link.PathId <- 0us
             reply link a.Reply
             carrier.AddPath link
@@ -164,7 +185,17 @@ let run (o: Options) =
             let admission =
                 JoinAdmission(a.Params.Keys.PathKey, entropy, clock, a.Params.Keys.SessionId, a.Params.Symbol, a.Params.Caps,
                               paths, mss, config.MaxPaths, a.Params.Keys.Suite)
-            sessions.Add(Entry(carrier, paths, admission))
+            // A session gets its own epoll set and thread when the mode is on and
+            // the shared TUN stack is not in play; the TUN stays single-threaded.
+            let coordinator =
+                match ioGroup, channel with
+                | Some group, Some rx ->
+                    let co = AsyncSessionCoordinator.createWith carrier clock group rx
+                    co.Start()
+                    log ("session " + a.Params.Keys.SessionId.ToString() + " on an async coordinator thread")
+                    Some co
+                | _ -> None
+            sessions.Add(Entry(carrier, paths, admission, coordinator))
             if sndBufMode < 0 then
                 match tun with
                 | null -> ()
@@ -256,13 +287,15 @@ let run (o: Options) =
         | null -> ()
         | t -> poller.WatchFd t.Fd
         for p in pending do poller.WatchRead p.Link.Socket
-        for e in sessions do e.Carrier.Watch poller
+        for e in sessions do
+            if e.Coordinator.IsNone then e.Carrier.Watch poller
         let tunBusy =
             match tun with
             | null -> false
             | t -> t.Busy
+        let rxPending = sessions.Exists(fun e -> e.Carrier.HasPendingRx)
         let busy = tunBusy || sessions.Exists(fun e -> e.Carrier.Session.WantsToSend)
-        poller.Wait(if busy then 1000 elif sessions.Count > 0 then 10_000 else 100_000)
+        poller.Wait(if rxPending then 0 elif busy then 1000 elif sessions.Count > 0 then 10_000 else 100_000)
         clock.Tick() |> ignore
         let iterA = stamp ()
         let now = Environment.TickCount64
@@ -291,12 +324,16 @@ let run (o: Options) =
         let mutable i = sessions.Count - 1
         let csvcA = stamp ()
         while i >= 0 do
-            let c = sessions.[i].Carrier
-            // Last resort: an exception fails this session only (causes are fixed where found).
-            try c.Service poller
-            with ex ->
-                faults <- faults + 1L
-                c.Session.Fail(ex.GetType().Name + ": " + ex.Message)
+            let entry = sessions.[i]
+            let c = entry.Carrier
+            match entry.Coordinator with
+            | None ->
+                // Last resort: an exception fails this session only (causes are fixed where found).
+                try c.Service poller
+                with ex ->
+                    faults <- faults + 1L
+                    c.Session.Fail(ex.GetType().Name + ": " + ex.Message)
+            | Some _ -> ()
             if not c.Alive then
                 if c.Session.Faulted then failed <- failed + 1L
                 let why =
@@ -304,7 +341,9 @@ let run (o: Options) =
                     elif c.Session.PeerCloseReason >= 0 then " closed by peer (reason " + string c.Session.PeerCloseReason + ")"
                     else " closed"
                 log ("session " + c.Session.Keys.SessionId.ToString() + why)
-                c.Close()
+                match entry.Coordinator with
+                | Some co -> co.Stop()
+                | None -> c.Close()
                 sessions.RemoveAt i
             i <- i - 1
         winCsvcUs <- winCsvcUs + toUs (stamp () - csvcA)

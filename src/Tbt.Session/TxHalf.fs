@@ -42,7 +42,9 @@ module SmallStep =
 
 [<Sealed>]
 type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder, sealer: CellSealer,
-            rho: float, maxPaths: int, queueLimit: int, clock: IClock) =
+            rho0: float, fecAdaptive: bool, rhoMin: float, rhoMax: float, rhoFloor: float,
+            rhoGain: float, fecWindowCells: int,
+            maxPaths: int, queueLimit: int, clock: IClock) =
     let capacity = 1 <<< 16
     let stepParities: byte[] = Array.zeroCreate capacity
     let stepFlags: MetaFlags[] = Array.zeroCreate capacity
@@ -68,6 +70,27 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
     let mutable erasure = 0.05
     let smallParities = Array.init 17 (fun k -> if k = 0 then 0 else SmallStep.parities k 0.05)
     let mutable cellsSent = 0L
+    /// Adaptive parity ratio (spec 5.7). Each direction owns its TxHalf, so the
+    /// uplink and the downlink estimate their loss from their own NACKs and never
+    /// copy each other's ratio.
+    let mutable rho = rho0
+    /// The peer's own measurement of this direction's cell loss. `RxHalf` counts
+    /// every missing cell, including those FEC repaired, so this signal is
+    /// unbiased: raising rho does not hide loss from the estimator.
+    let mutable peerErasure = 0.05
+    let smooth = 1.0 / float (max 1 fecWindowCells)
+
+    /// Track rho = safety * loss / (1 - loss): the parity ratio that covers the
+    /// measured loss, floored so a quiet path still carries protection. Each
+    /// direction owns its TxHalf, so uplink and downlink never copy each other.
+    let adaptRho (e: float) =
+        peerErasure <- peerErasure + (e - peerErasure) * smooth
+        if fecAdaptive then
+            let target =
+                min rhoMax (max rhoFloor (rhoGain * peerErasure / max 0.05 (1.0 - peerErasure)))
+            if target > rho + 0.01 then rho <- min target (rho + 0.02)
+            elif target < rho - 0.01 then rho <- max target (rho - 0.005)
+        erasure <- max 1e-4 (min 0.9 peerErasure)
     /// First-copy DATA/PARITY cells per step (not BOOSTERs), still in the window.
     let uniqueCells: int[] = Array.zeroCreate capacity
     // DATA can be selected from either the original queue or a repair fallback.
@@ -119,6 +142,18 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
     let mutable minPrevNs = Int64.MaxValue
     let mutable minSinceNs = 0L
     let mutable rttSkipped = 0L
+    /// SRTT estimates the path RTT, so it cannot sit below the smallest RTT
+    /// actually observed. The 100 ms initial value otherwise stayed under a
+    /// first 300 ms sample for many acks (rtt_skipped stays high), and every
+    /// deadline derived from SRTT was short.
+    let clampSrttToObservedMin () =
+        let observed = min minCurNs minPrevNs
+        // Before the first 10 s min-window rolls, minPrevNs is still unset and the
+        // EWMA is climbing from its initial value. Raising it to the first sample
+        // there would erase that smoothing (a single 400 ms sample must leave SRTT
+        // near 137.5 ms, not 400 ms). Clamp only once a previous window exists.
+        if minPrevNs <> Int64.MaxValue && observed <> Int64.MaxValue && srttNs < float observed then
+            srttNs <- float observed
     let mutable repairRepeats = 0L
     /// BOOSTERs sent for a step whose first copy later arrived (ack sooner than minRTT after the repair).
     let mutable spuriousRepairs = 0L
@@ -189,6 +224,10 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
         t
 
     member _.Direction = dir
+    /// Current parity ratio; changes only when `FecAdaptive` is on.
+    member _.Rho = rho
+    /// The peer's reported erasure rate of this direction (0..1).
+    member _.CellLoss = peerErasure
     member _.SymbolSize = symbolSize
     member _.PeerAck = peerAck
     member _.GrantLimit = grantLimit
@@ -342,24 +381,54 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
                             minCurNs <- Int64.MaxValue
                             minSinceNs <- now
                         if sample < minCurNs then minCurNs <- sample
+                        clampSrttToObservedMin ()
                 else
-                    // Main Karn: a step held behind a repair round started after its
-                    // seal measures the wait, not the path. Only the newest covered
-                    // step (ack - 1) enters SRTT. No RTTVAR (the wait does not use it).
-                    let sealAt = sealNs.[int ((ack - 1UL) % uint64 sealNs.Length)]
-                    let sample = now - sealAt
-                    if repairLo < ack && repairNs >= sealAt then rttSkipped <- rttSkipped + 1L
-                    elif sample > 0L then
-                        let m = min minCurNs minPrevNs
-                        let used =
-                            if m = Int64.MaxValue then sample
-                            else min sample (3L * m)
-                        srttNs <- srttNs + (float used - srttNs) / 8.0
-                        if now - minSinceNs >= 10_000_000_000L then
-                            minPrevNs <- minCurNs
-                            minCurNs <- Int64.MaxValue
-                            minSinceNs <- now
-                        if sample < minCurNs then minCurNs <- sample
+                    // Main Karn: only a step that was never repaired measures the
+                    // path. Of a jump, use the newest never-repaired step: a repair
+                    // of a neighbour must not silence sampling globally. Checking
+                    // only ack - 1 did exactly that under four-path bulk, where a
+                    // BOOSTER covers the newest step most of the time and
+                    // rtt_skipped ran at ~95/s while SRTT froze.
+                    let mutable tSamp = ack
+                    let mutable back = 0
+                    let mutable foundClean = false
+                    let mutable sealAt = 0L
+                    // Bound the walk to the sixteen newest steps. A BOOSTER covers the
+                    // newest step and occasionally its neighbour, so a two-step walk
+                    // skipped nearly every ack under four-path bulk. Sixteen steps still
+                    // cannot reach past a blackout (where every step was repaired and
+                    // the sample would measure the gap), but leaves enough room to find
+                    // a clean step when a bulk ack advances many steps at once.
+                    while tSamp > peerAck && back < 16 && not foundClean do
+                        tSamp <- tSamp - 1UL
+                        back <- back + 1
+                        let si = int (tSamp % uint64 lastRepairNs.Length)
+                        if lastRepairNs.[si] = 0L then
+                            foundClean <- true
+                            sealAt <- sealNs.[int (tSamp % uint64 sealNs.Length)]
+                    let newestSeal =
+                        if ack > 0UL then sealNs.[int ((ack - 1UL) % uint64 sealNs.Length)]
+                        else 0L
+                    // Karn over the newest step: only "every step in the walk was
+                    // repaired" makes the ack unusable. Comparing repairNs with the
+                    // newest seal cannot work: a NACK in this same WIN_ACK stamps
+                    // repairNs to now, so that test fires on every ack that also
+                    // reports a hole.
+                    if not foundClean then rttSkipped <- rttSkipped + 1L
+                    else
+                        let sample = now - sealAt
+                        if sample > 0L then
+                            let m = min minCurNs minPrevNs
+                            let used =
+                                if m = Int64.MaxValue then sample
+                                else min sample (3L * m)
+                            srttNs <- srttNs + (float used - srttNs) / 8.0
+                            if now - minSinceNs >= 10_000_000_000L then
+                                minPrevNs <- minCurNs
+                                minCurNs <- Int64.MaxValue
+                                minSinceNs <- now
+                            if sample < minCurNs then minCurNs <- sample
+                            clampSrttToObservedMin ()
                 peerAck <- ack
                 if ack > 0UL then peerSeenHi <- max peerSeenHi (ack - 1UL)
                 refreshUniqueArrived ()
@@ -375,8 +444,9 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
     /// The peer's report of its erasure rate of our cells.
     member _.OnPeerErasure(q16: uint16) =
         let e = float q16 / 65536.0
-        if abs (e - erasure) > 0.01 then
-            erasure <- max 0.01 e
+        let before = erasure
+        adaptRho e
+        if abs (erasure - before) > 0.01 then
             for k in 1 .. 16 do smallParities.[k] <- SmallStep.parities k erasure
 
     member _.SrttNs = srttNs
@@ -540,17 +610,40 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
                         repairSeq <- 0
                     repairDeficit <- deficit
                     repairNs <- now
-                    let n = min 64 (int (ceil (float (deficit + 2) / (1.0 - min 0.9 erasure))))
-                    if repairSeq + n <= 256 then
-                        for i in 0 .. n - 1 do
-                            repairs.Enqueue { Kind = CellType.Booster; Step = tLo; Index = byte (repairSeq + i)
-                                              Span = byte span; Round = byte n }
-                        repairSeq <- repairSeq + n
+                    // One NACK names a range; repair every step in it so a tail of several
+                    // holes recovers in one round trip instead of one round trip per hole.
+                    // Each step keeps its own 256-seed budget; the guarded step only falls
+                    // back to DATA after its seeds are exhausted (spec 5.8 contract).
+                    let room = max 0 (256 - repairs.Count)
+                    let per = max 1 (int (ceil (float deficit / float span)))
+                    let want = min 64 (int (ceil (float (per + 2) / (1.0 - min 0.9 erasure))))
+                    let n = min room want
+                    if room = 0 || n < 1 then ()
                     else
                         for j in 0 .. span - 1 do
                             let t = tLo + uint64 j
-                            for s in 0 .. encoder.StepUsed t - 1 do
-                                repairs.Enqueue { Kind = CellType.Data; Step = t; Index = byte s; Span = 0uy; Round = 0uy }
+                            let si = int (t % uint64 repairCount.Length)
+                            if repairs.Count < 256 && encoder.StepUsed t > 0 then
+                                let before = repairs.Count
+                                if repairCount.[si] + n <= 256 then
+                                    for i in 0 .. n - 1 do
+                                        if repairs.Count < 256 then
+                                            repairs.Enqueue
+                                                { Kind = CellType.Booster; Step = t
+                                                  Index = byte (repairCount.[si] + i)
+                                                  Span = 1uy; Round = byte n }
+                                    repairCount.[si] <- repairCount.[si] + n
+                                else
+                                    for s in 0 .. encoder.StepUsed t - 1 do
+                                        if repairs.Count < 256 then
+                                            repairs.Enqueue
+                                                { Kind = CellType.Data; Step = t; Index = byte s
+                                                  Span = 0uy; Round = 0uy }
+                                // Karn: this step was retransmitted, so its seal-to-ack
+                                // time no longer measures the path. Marking per step is
+                                // what lets the sampler skip only the repaired newest
+                                // steps instead of every ack that carried a NACK.
+                                if repairs.Count > before then lastRepairNs.[si] <- now
 
     /// Tail rule (spec 5.8): input paused for 50 ms and the peer lacks steps: a HEARTBEAT
     /// every 50 ms carries tx_head_step.
