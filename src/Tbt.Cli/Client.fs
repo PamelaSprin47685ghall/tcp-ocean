@@ -200,7 +200,8 @@ let run (o: Options) =
             while carrier.Alive && not (stopAt > 0L && Environment.TickCount64 > stopAt) do
                 beforeWait poller
                 carrier.Watch poller
-                poller.Wait(carrier.WaitMs())
+                // WaitMs() is milliseconds; Poller.Wait takes microseconds.
+                poller.Wait(carrier.WaitMs() * 1000)
                 clock.Tick() |> ignore
                 acceptNow poller
                 carrier.Service poller

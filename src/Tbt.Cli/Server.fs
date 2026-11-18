@@ -191,6 +191,8 @@ let run (o: Options) =
                 match ioGroup, channel with
                 | Some group, Some rx ->
                     let co = AsyncSessionCoordinator.createWith carrier clock group rx
+                    co.StatsEveryMs <- statsMs
+                    co.OnStats <- (fun () -> log ("stats " + carrier.Describe()))
                     co.Start()
                     log ("session " + a.Params.Keys.SessionId.ToString() + " on an async coordinator thread")
                     Some co
@@ -397,7 +399,10 @@ let run (o: Options) =
                  + " tun_drain=" + drainMode)
             winRecvUs <- 0L; winRecvUsMax <- 0L; winSvcUs <- 0L; winSvcUsMax <- 0L
             winCsvcUs <- 0L; winIterN <- 0; winIterUsMax <- 0L; winSvcGapMax <- 0L
-            for e in sessions do log ("stats " + e.Carrier.Describe())
+            // An async session's carrier belongs to its coordinator thread; walking
+            // it here would race with that thread's path joins and drops.
+            for e in sessions do
+                if e.Coordinator.IsNone then log ("stats " + e.Carrier.Describe())
             match tun with
             | null -> ()
             | t -> log ("stats " + t.Describe())

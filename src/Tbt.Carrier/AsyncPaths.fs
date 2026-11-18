@@ -132,8 +132,11 @@ type AsyncPollerGroup(threadCount: int) =
         let mine = pending.[index]
         let wake = threadWakes.[index]
         let wakeBuffer = Array.zeroCreate<byte> 8
-        if wake >= 0 then poller.WatchFd wake
         while Volatile.Read(&running.contents) = 1 do
+            // Register the wake descriptor every round: the poller rebuilds its watch
+            // set each round, so a one-time registration would be dropped by the first
+            // Wait and WakeThread would write into an eventfd nobody watches.
+            if wake >= 0 then poller.WatchFd wake
             let mutable path = Unchecked.defaultof<IPathIo>
             while mine.TryDequeue(&path) do
                 if not path.Closed then local.Add path

@@ -4,6 +4,7 @@ namespace Tbt.Carrier
 
 open System
 open System.Collections.Generic
+open System.Collections.Concurrent
 open Tbt.Contracts
 open Tbt.Session
 
@@ -39,6 +40,14 @@ type private SessionRateMember(session: Session, frameOf: unit -> int, uniqueOut
                 lastNs <- session.Clock.NowNs()
             lastNs
 
+/// A path change posted to the thread that owns SessionCarrier.paths.
+/// The accept loop joins and replaces paths from its own thread while an async
+/// session enumerates `paths` in Watch/Service; mutating the list from both
+/// threads made the enumerator throw InvalidOperation_EnumFailedVersion.
+type private PathOp =
+    | PathAdd of IPath
+    | PathRemove of uint16
+
 [<Sealed>]
 type SessionCarrier(session: Session, bridge: FlowBridge, ?uplinkPace: bool, ?tupleMbit: float,
                     ?rxChannel: RxChannel, ?asyncIo: AsyncPollerGroup) =
@@ -47,6 +56,9 @@ type SessionCarrier(session: Session, bridge: FlowBridge, ?uplinkPace: bool, ?tu
     let channel = rxChannel
     let io = asyncIo
     let paths = List<IPath>()
+    /// Posted from a watching thread; applied by the thread that owns `paths`.
+    let pathOps = ConcurrentQueue<PathOp>()
+    let pathOpsInline = io.IsNone
     let mutable next = 0
     let mutable rxNext = 0
     let mutable rxMore = false
@@ -292,7 +304,7 @@ type SessionCarrier(session: Session, bridge: FlowBridge, ?uplinkPace: bool, ?tu
     member _.SlotVisits = slotVisits
     /// One Q-3 batch (tests): at most 4 frames per path.
     member _.WriteBatch(budget: int) = writeBatch budget
-    member _.Alive = paths.Count > 0 && not session.Faulted && not session.Closed
+    member _.Alive = (paths.Count > 0 || not pathOps.IsEmpty) && not session.Faulted && not session.Closed
     member _.HasPendingRx = rxMore
     member _.UplinkPace = pace
     member _.TupleMbit = tupleMbit
@@ -409,6 +421,10 @@ type SessionCarrier(session: Session, bridge: FlowBridge, ?uplinkPace: bool, ?tu
 
     /// Add a path whose bootstrap is done; frames it already holds come in at once.
     member this.AddPath(link: IPath) =
+        if pathOpsInline then this.AddPathNow link
+        else pathOps.Enqueue(PathAdd link)
+
+    member private this.AddPathNow(link: IPath) =
         // A JOIN of a path_id whose PATH_CLOSE transaction has ended must clear the
         // session block (spec 6.10a). A path still in Closing is not reusable.
         session.NotePathJoined link.PathId |> ignore
@@ -432,10 +448,16 @@ type SessionCarrier(session: Session, bridge: FlowBridge, ?uplinkPace: bool, ?tu
             | Some asyncPath, Some group -> group.Add asyncPath
             | _ -> ()
 
-    member _.HasPath(pathId: uint16) = paths.Exists(fun p -> p.PathId = pathId)
+    member _.HasPath(pathId: uint16) =
+        paths.Exists(fun p -> p.PathId = pathId)
+        || (pathOps |> Seq.exists (function PathAdd p -> p.PathId = pathId | _ -> false))
 
     /// Close and drop the path with pathId (replaced by a higher incarnation).
-    member _.RemovePath(pathId: uint16) =
+    member this.RemovePath(pathId: uint16) =
+        if pathOpsInline then this.RemovePathNow pathId
+        else pathOps.Enqueue(PathRemove pathId)
+
+    member private this.RemovePathNow(pathId: uint16) =
         let i = paths.FindIndex(fun p -> p.PathId = pathId)
         if i >= 0 then
             let id = paths.[i].PathId
@@ -444,7 +466,16 @@ type SessionCarrier(session: Session, bridge: FlowBridge, ?uplinkPace: bool, ?tu
             pathVersion <- pathVersion + 1L
             pacers.Remove id |> ignore
 
-    member _.Watch(poller: Poller) =
+    /// Apply posted path changes on the thread that owns `paths`.
+    member private this.ApplyPathOps() =
+        let mutable op = Unchecked.defaultof<PathOp>
+        while pathOps.TryDequeue(&op) do
+            match op with
+            | PathAdd p -> this.AddPathNow p
+            | PathRemove id -> this.RemovePathNow id
+
+    member this.Watch(poller: Poller) =
+        this.ApplyPathOps()
         let sending =
             if not pace then session.WantsToSend
             elif session.ControlWaiting then true
@@ -521,6 +552,11 @@ type SessionCarrier(session: Session, bridge: FlowBridge, ?uplinkPace: bool, ?tu
     /// Close every path and local socket.
     member _.Close() =
         for link in paths do link.Close()
+        let mutable pendingOp = Unchecked.defaultof<PathOp>
+        while pathOps.TryDequeue(&pendingOp) do
+            match pendingOp with
+            | PathAdd p -> p.Close()
+            | PathRemove _ -> ()
         paths.Clear()
         bridge.CloseAll()
 

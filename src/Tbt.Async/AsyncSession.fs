@@ -36,6 +36,9 @@ type AsyncSessionCoordinator(carrier: SessionCarrier, clock: CachedClock, ?polle
     let mutable beforeWait: Poller -> unit = fun _ -> ()
     let mutable beforeService: Poller -> unit = fun _ -> ()
     let stoppedSignal = new ManualResetEventSlim(false)
+    let mutable statsEveryMs = 0L
+    let mutable onStats: unit -> unit = ignore
+    let mutable lastStatsTick = 0L
 
     let toUs (ticks: int64) = ticks * 1_000_000L / Stopwatch.Frequency
 
@@ -49,12 +52,14 @@ type AsyncSessionCoordinator(carrier: SessionCarrier, clock: CachedClock, ?polle
                 match channel with
                 | Some rx when rx.WakeFd >= 0 -> pl.WatchFd rx.WakeFd
                 | _ -> ()
-                // With the IO pool the session poller no longer sees socket
-                // writability, so a pending send must shorten the 5 s idle wait.
-                // A pending send needs an immediate pass, not a 1 ms sleep:
-                // zero makes epoll return at once and Service drains a batch.
-                let waitMs = if carrier.Session.WantsToSend then 0 else carrier.WaitMs()
-                pl.Wait waitMs
+                // WaitMs() is milliseconds; Poller.Wait takes microseconds.  Passing
+                // the millisecond value straight through made every timeout 1000x
+                // shorter (2 ms became 2 us), so a session with no paths spun at ~86%
+                // CPU.  WantsToSend no longer forces a zero timeout: WaitMs already
+                // returns 0 when a receive batch is pending, and a send with no window
+                // gets its own short backoff.
+                let waitMs = carrier.WaitMs()
+                pl.Wait(waitMs * 1000)
                 stats.WaitUs <- stats.WaitUs + toUs (Stopwatch.GetTimestamp() - waitStart)
                 match channel with
                 | Some rx when rx.WakeFd >= 0 && pl.IsFdReadable rx.WakeFd -> rx.ClearWake ()
@@ -70,6 +75,15 @@ type AsyncSessionCoordinator(carrier: SessionCarrier, clock: CachedClock, ?polle
                 stats.Cycles <- stats.Cycles + 1L
                 stats.ServiceUs <- stats.ServiceUs + us
                 if us > stats.ServiceUsMax then stats.ServiceUsMax <- us
+                // Stats that walk the carrier's collections must run here, on the
+                // thread that owns them. A watcher thread calling Describe() while
+                // this thread joins or drops a path made the enumerator throw
+                // InvalidOperation_EnumFailedVersion.
+                if statsEveryMs > 0L then
+                    let tick = Environment.TickCount64
+                    if tick - lastStatsTick >= statsEveryMs then
+                        lastStatsTick <- tick
+                        try onStats () with _ -> ()
             with ex ->
                 // One session fails alone; the server keeps its other sessions.
                 stats.Faults <- stats.Faults + 1L
@@ -81,6 +95,15 @@ type AsyncSessionCoordinator(carrier: SessionCarrier, clock: CachedClock, ?polle
     member _.Alive = Volatile.Read(&running)
     /// Set once the session loop has exited; lets a caller block instead of spin.
     member _.Stopped = stoppedSignal
+
+    /// Emit a stats line every N ms, on the session thread.
+    member _.StatsEveryMs
+        with get () = statsEveryMs
+        and set (value: int64) = statsEveryMs <- value
+
+    member _.OnStats
+        with get () = onStats
+        and set (value: unit -> unit) = onStats <- value
 
     /// Runs on the coordinator thread after Watch and before Wait. A descriptor
     /// registered here takes part in the wait that is about to start; a watch
