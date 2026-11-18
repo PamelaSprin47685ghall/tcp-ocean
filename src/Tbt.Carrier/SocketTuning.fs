@@ -36,6 +36,20 @@ module SocketTuning =
     [<Literal>]
     let NotSentLimit = 16384
 
+    /// Pass 1 of the write gate admits a path whose unsent queue is at most this.
+    /// Zero was too strict for a long-RTT bundle: with 256 paths alive, every path
+    /// almost always has a few hundred bytes unsent, so only one or two passed and
+    /// the rest waited for their turn in the `next` rotation (about 6 frames per
+    /// second per path). A probe that cannot tell (-1) also passes.
+    [<Literal>]
+    let GatePass1Limit = 4096
+
+    /// Pass 2 relaxes the gate to this. The planning BDP at 310 ms and 200 Mbit/s
+    /// is 7.75 MB, so 256 KiB is about 3 % of it: enough to drain a burst without
+    /// letting the queue at a bottleneck grow.
+    [<Literal>]
+    let GatePass2Limit = 262144
+
     /// Per-path receive window (spec ch. 9: TCP_WINDOW_CLAMP 600 000 B, 3 x BDP of the planning
     /// path). It also bounds what the peer may have in flight on one path, so a queue at the
     /// bottleneck cannot grow past it.
@@ -118,9 +132,9 @@ module SocketTuning =
 
 /// Two-pass write gating for the client uplink (spec 3.14).
 module WriteGate =
-    /// Pass 1 admits only notsent = 0. Pass 2, used when pass 1 is empty, admits
-    /// notsent ≤ 16 KiB, and also a probe that cannot tell (-1).
+    /// Pass 1 admits notsent ≤ 4 KiB (or a probe that cannot tell). Pass 2, run
+    /// whenever pass 1 gated a path, admits notsent ≤ 256 KiB.
     let admits (pass: int) (notSent: int) =
-        if pass <= 1 then notSent = 0
+        if pass <= 1 then notSent >= 0 && notSent <= SocketTuning.GatePass1Limit
         elif notSent < 0 then true
-        else notSent <= SocketTuning.NotSentLimit
+        else notSent <= SocketTuning.GatePass2Limit

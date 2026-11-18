@@ -289,7 +289,16 @@ internal static class ClientHost
                     return new BootGot { Error = TbtErr.Handshake };
                 }
                 else if (r == IoResult.WouldBlock)
-                    Thread.Sleep(5);
+                {
+                    // Block in the kernel for readability instead of waking
+                    // every 5 ms. The deadline is still checked each pass.
+                    long left = deadline - Environment.TickCount64;
+                    if (left > 0)
+                    {
+                        int waitUs = (int)Math.Min(left * 1000L, 1_000_000L);
+                        socket.Poll(waitUs, SelectMode.SelectRead);
+                    }
+                }
             }
             return new BootGot { Error = 0, Link = link, Reply = result };
         }

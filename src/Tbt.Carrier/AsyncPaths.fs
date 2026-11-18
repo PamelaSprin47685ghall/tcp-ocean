@@ -90,6 +90,10 @@ type AsyncPollerGroup(threadCount: int) =
         Array.init width (fun _ -> ConcurrentQueue<IPathIo>())
     let locals: ResizeArray<IPathIo>[] = Array.init width (fun _ -> ResizeArray())
     let wakeFd = try Native.eventFd () with _ -> -1
+    // One eventfd per IO thread. A new path wakes exactly the thread that owns
+    // it, and the thread blocks in epoll instead of timing out every millisecond.
+    let threadWakes: int[] =
+        Array.init width (fun _ -> try Native.eventFd () with _ -> -1)
 
     member _.ThreadCount = width
     /// Shared eventfd; -1 when the platform has none, in which case session
@@ -101,6 +105,8 @@ type AsyncPollerGroup(threadCount: int) =
     member _.Add(path: IPathIo) =
         let i = ((path.ThreadIndex % width) + width) % width
         pending.[i].Enqueue path
+        if threadWakes.[i] >= 0 then
+            Native.write threadWakes.[i] (ReadOnlySpan<byte> wakeToken) |> ignore
 
     /// Wake every session thread waiting on the shared descriptor.
     member _.Wake() =
@@ -116,6 +122,9 @@ type AsyncPollerGroup(threadCount: int) =
         let poller = polls.[index]
         let local = locals.[index]
         let mine = pending.[index]
+        let wake = threadWakes.[index]
+        let wakeBuffer = Array.zeroCreate<byte> 8
+        if wake >= 0 then poller.WatchFd wake
         while Volatile.Read(&running.contents) = 1 do
             let mutable path = Unchecked.defaultof<IPathIo>
             while mine.TryDequeue(&path) do
@@ -125,7 +134,8 @@ type AsyncPollerGroup(threadCount: int) =
                 if local.[i].Closed then local.RemoveAt i
                 i <- i - 1
             for path in local do path.WatchForIo poller
-            poller.Wait 1000
+            poller.Wait -1
+            if wake >= 0 then Native.read wake (Span<byte> wakeBuffer) |> ignore
             for path in local do path.PumpRx poller
             for path in local do path.PumpTx()
 
@@ -140,8 +150,12 @@ type AsyncPollerGroup(threadCount: int) =
 
     member _.Stop() =
         Volatile.Write(&running.contents, 0)
+        for fd in threadWakes do
+            if fd >= 0 then Native.write fd (ReadOnlySpan<byte> wakeToken) |> ignore
         for t in threads do t.Join 2000 |> ignore
         for p in polls do (p :> IDisposable).Dispose()
+        for fd in threadWakes do
+            if fd >= 0 then Native.sysClose fd |> ignore
         if wakeFd >= 0 then Native.sysClose wakeFd |> ignore
 
 /// One TCP path whose socket is driven by an IO thread.

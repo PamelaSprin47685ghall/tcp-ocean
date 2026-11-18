@@ -35,6 +35,7 @@ type AsyncSessionCoordinator(carrier: SessionCarrier, clock: CachedClock, ?polle
     let mutable stopped = 0
     let mutable beforeWait: Poller -> unit = fun _ -> ()
     let mutable beforeService: Poller -> unit = fun _ -> ()
+    let stoppedSignal = new ManualResetEventSlim(false)
 
     let toUs (ticks: int64) = ticks * 1_000_000L / Stopwatch.Frequency
 
@@ -50,7 +51,9 @@ type AsyncSessionCoordinator(carrier: SessionCarrier, clock: CachedClock, ?polle
                 | _ -> ()
                 // With the IO pool the session poller no longer sees socket
                 // writability, so a pending send must shorten the 5 s idle wait.
-                let waitMs = if carrier.Session.WantsToSend then min 1 (carrier.WaitMs()) else carrier.WaitMs()
+                // A pending send needs an immediate pass, not a 1 ms sleep:
+                // zero makes epoll return at once and Service drains a batch.
+                let waitMs = if carrier.Session.WantsToSend then 0 else carrier.WaitMs()
                 pl.Wait waitMs
                 stats.WaitUs <- stats.WaitUs + toUs (Stopwatch.GetTimestamp() - waitStart)
                 match channel with
@@ -71,10 +74,13 @@ type AsyncSessionCoordinator(carrier: SessionCarrier, clock: CachedClock, ?polle
                 // One session fails alone; the server keeps its other sessions.
                 stats.Faults <- stats.Faults + 1L
                 carrier.Session.Fail(ex.GetType().Name + ": " + ex.Message)
+        stoppedSignal.Set()
 
     member _.Poller = pl
     member _.Stats = stats
     member _.Alive = Volatile.Read(&running)
+    /// Set once the session loop has exited; lets a caller block instead of spin.
+    member _.Stopped = stoppedSignal
 
     /// Runs on the coordinator thread after Watch and before Wait. A descriptor
     /// registered here takes part in the wait that is about to start; a watch
@@ -112,6 +118,7 @@ type AsyncSessionCoordinator(carrier: SessionCarrier, clock: CachedClock, ?polle
                 t.Join 5000 |> ignore
                 thread <- None
             carrier.Close()
+            stoppedSignal.Set()
             (pl :> IDisposable).Dispose()
 
     interface IDisposable with

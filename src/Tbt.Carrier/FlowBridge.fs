@@ -28,6 +28,12 @@ type FlowBridge(target: EndPoint voption) =
     let armed = ReadySet()
     let failures = ReadySet()
     let peekBuf = Array.zeroCreate 1
+    /// Read-side diagnostics: how often a slot's Read ran, how many bytes it moved, and
+    /// how often the local socket had nothing to give. These separate "the socket is
+    /// empty" from "Read is called too rarely" without changing data-path behaviour.
+    let mutable readCalls = 0L
+    let mutable readBytes = 0L
+    let mutable wouldBlock = 0L
 
     let wantsRead (slot: int) =
         not (isNull locals.[slot]) && not connecting.[slot] && session.FlowSending slot
@@ -77,6 +83,9 @@ type FlowBridge(target: EndPoint voption) =
 
     member _.Attach(s: Session) = session <- s
     member _.Active = active
+    member _.ReadCalls = readCalls
+    member _.ReadBytes = readBytes
+    member _.WouldBlock = wouldBlock
     member _.Local(slot: int) = locals.[slot]
     member _.Opened = opened
     member _.Writers = writers
@@ -109,6 +118,7 @@ type FlowBridge(target: EndPoint voption) =
         match locals.[slot] with
         | null -> ()
         | socket ->
+            readCalls <- readCalls + 1L
             let mutable budget = 4096
             let mutable app = Span<byte>.Empty
             let mutable go = true
@@ -117,7 +127,9 @@ type FlowBridge(target: EndPoint voption) =
                     let mutable err = SocketError.Success
                     let room = session.FlowRoom slot
                     let n = socket.Receive((if room < app.Length then app.Slice(0, room) else app), SocketFlags.None, &err)
-                    if err = SocketError.WouldBlock then go <- false
+                    if err = SocketError.WouldBlock then
+                        wouldBlock <- wouldBlock + 1L
+                        go <- false
                     elif err <> SocketError.Success then
                         session.FailFlow slot
                         go <- false
@@ -126,6 +138,7 @@ type FlowBridge(target: EndPoint voption) =
                         localReadClosed slot socket
                         go <- false
                     else
+                        readBytes <- readBytes + int64 n
                         session.CommitSource(slot, n, false)
                         budget <- budget - 1
                 else
