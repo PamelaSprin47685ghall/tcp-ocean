@@ -52,14 +52,15 @@ type AsyncSessionCoordinator(carrier: SessionCarrier, clock: CachedClock, ?polle
                 match channel with
                 | Some rx when rx.WakeFd >= 0 -> pl.WatchFd rx.WakeFd
                 | _ -> ()
-                // WaitMs() is milliseconds; Poller.Wait takes microseconds.  Passing
-                // the millisecond value straight through made every timeout 1000x
-                // shorter (2 ms became 2 us), so a session with no paths spun at ~86%
-                // CPU.  WantsToSend no longer forces a zero timeout: WaitMs already
-                // returns 0 when a receive batch is pending, and a send with no window
-                // gets its own short backoff.
+                // WaitMs() is milliseconds; Poller.Wait takes microseconds.  The unit
+                // fix alone is not enough: a server runs with pace=false, so WaitMs()
+                // returns 5000 and a true 5 s block starved the target socket (ss
+                // showed app_limited with rwnd_limited 3.2%) until download collapsed
+                // from 16 to 0.2 Mbit/s.  Capping one round at 50 ms keeps 20 rounds
+                // per second (idle CPU stays ~0) and bounds the cost of a missed wake
+                // to a single round.
                 let waitMs = carrier.WaitMs()
-                pl.Wait(waitMs * 1000)
+                pl.Wait((min 50 waitMs) * 1000)
                 stats.WaitUs <- stats.WaitUs + toUs (Stopwatch.GetTimestamp() - waitStart)
                 match channel with
                 | Some rx when rx.WakeFd >= 0 && pl.IsFdReadable rx.WakeFd -> rx.ClearWake ()
