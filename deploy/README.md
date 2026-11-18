@@ -9,7 +9,7 @@ mihomo 的 tbt4 vless 入站会在大流量持续约 30 分钟后停止读取 tb
 - `local=127.0.0.1:18443` 且 `ESTAB`：累加 `Recv-Q`（mihomo 未读）
 - `peer=127.0.0.1:18443` 且 `ESTAB`：累加 `Send-Q`（tbtun 未发出）
 
-任一超过 `MIHOMO_WATCHDOG_BYTES`（默认 262144，即 256 KiB）就 `systemctl restart`
+任一超过 `MIHOMO_WATCHDOG_BYTES`（默认 4194304，即 4 MiB）就 `systemctl restart`
 对应的 mihomo 单元，并写 syslog（`logger -t mihomo-watchdog`）。两次重启至少间隔 120 秒。
 
 ## 文件
@@ -61,10 +61,13 @@ ssh root@45.11.1.62 'journalctl -t mihomo-watchdog --no-pager | tail'
 
 ## 阈值调整
 
-环境变量 `MIHOMO_WATCHDOG_BYTES` 可覆盖默认值。改 `/etc/systemd/system/mihomo-watchdog@.service`：
+环境变量 `MIHOMO_WATCHDOG_BYTES` 可覆盖默认值。默认 4 MiB 是有依据的下限：
+一次 30 MiB 的正常上传会让 18443 的队列自然积压到 6–11 MB，阈值低于这个量级就会
+把健康传输误判成卡死（256 KiB 曾造成这种误判，重启又把链路推进高 RTT 窗口）。
+真卡死时观测到的积压是 3–20 MB。改 `/etc/systemd/system/mihomo-watchdog@.service`：
 
 ```ini
-Environment=MIHOMO_WATCHDOG_BYTES=524288
+Environment=MIHOMO_WATCHDOG_BYTES=8388608
 ```
 
 然后 `systemctl daemon-reload`。
@@ -73,3 +76,4 @@ Environment=MIHOMO_WATCHDOG_BYTES=524288
 
 看门狗只是自动恢复，不是根本修复。根本修复在 mihomo 侧：限制单连接缓冲、升级版本，
 或给 vless 入站加读超时。在这些完成前，不要用“控制面 204”判断链路可用。
+阈值不要为了“更灵敏”而调小：正常大流量上传的队列深度会高于任何小阈值。

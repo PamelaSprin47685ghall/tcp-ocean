@@ -8,11 +8,17 @@
 # `Restart=always` does not help: the process never exits.
 #
 # Usage: mihomo-watchdog.sh <mihomo-unit>
-# Env:   MIHOMO_WATCHDOG_BYTES   backlog threshold, default 262144 (256 KiB)
+# Env:   MIHOMO_WATCHDOG_BYTES   backlog threshold, default 4194304 (4 MiB)
+#
+# The default used to be 256 KiB, which mistook normal traffic for a stall: a
+# 30 MiB upload pushes the 18443 queues to 6-11 MB, so the watchdog restarted
+# mihomo in the middle of a healthy transfer, and the restart left the link in a
+# high-RTT window (download fell from 19 to 4 Mbit/s).  Real stalls have shown
+# 3-20 MB of backlog, so 4 MiB still catches them and leaves room for bursts.
 set -eu
 
 unit="${1:-mihomo-hnd0tbt4}"
-limit="${MIHOMO_WATCHDOG_BYTES:-262144}"
+limit="${MIHOMO_WATCHDOG_BYTES:-4194304}"
 stamp="/run/mihomo-watchdog.${unit}.stamp"
 now=$(date +%s)
 
