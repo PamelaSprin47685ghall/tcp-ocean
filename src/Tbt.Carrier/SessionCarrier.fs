@@ -454,17 +454,19 @@ type SessionCarrier(session: Session, bridge: FlowBridge, ?uplinkPace: bool, ?tu
                 group.Service(session.Clock.NowNs())
                 groupAllows fl false false || groupAllows fl true false
         for link in paths do link.Watch(poller, sending)
-        let fill = session.CanFill
-        let fillInteractive = session.CanFillInteractive
-        if fill || fillInteractive then
-            let armed = bridge.Armed
-            let mutable slot = armed.NextUp -1
-            while slot >= 0 do
-                slotVisits <- slotVisits + 1L
-                match bridge.Local slot with
-                | null -> ()
-                | s -> if fill || session.IsInteractive slot then poller.WatchRead s
-                slot <- armed.NextUp slot
+        // Always arm the local sockets. The old code skipped them while the bulk
+        // queue was full (`CanFill` false). The session thread then woke only on
+        // tunnel RX frames, so a download read about one cell per wake and ran at
+        // 1.5 Mbit/s instead of 10. Read still backs off inside
+        // TryBeginSourceFor, so arming a socket costs one WouldBlock, not a stall.
+        let armed = bridge.Armed
+        let mutable slot = armed.NextUp -1
+        while slot >= 0 do
+            slotVisits <- slotVisits + 1L
+            match bridge.Local slot with
+            | null -> ()
+            | s -> poller.WatchRead s
+            slot <- armed.NextUp slot
         let writers = bridge.Writers
         let mutable slot = writers.NextUp -1
         while slot >= 0 do
