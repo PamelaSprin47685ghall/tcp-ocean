@@ -188,3 +188,19 @@ systemctl restart tbtun-hnd0   # 再本地
 
 - `http://speedtest.tele2.net/upload.php`：15 秒稳定 **8.39 Mbit/s**，可用。
 - `https://speed.cloudflare.com/__up`：多次返回 0 字节，端点不可靠，不要用它做验收。
+
+## 已知外部风险：mihomo 会在约 30 分钟量级卡死
+
+2026-11-18 的两次实测都出现同一模式：mihomo 连续运行约 33 分钟后，vless 入站不再读取
+tbtun 送来的数据，`ss -tn` 里 18443 一侧的 `Recv-Q` 涨到 MB 级、tbtun 侧 `Send-Q` 同步积压，
+此时控制面仍可能返回 204，但大流量为 0。两端 tbtun 自身 `tx_head = peer_ack`、
+`csvc_us` 极低，不是产品侧瓶颈。
+
+缓解：
+
+- 已给 hnd0tbt4 与 HND0 的 tbt4 都配了持久 systemd 单元（`Restart=always`、`RestartSec=3`），
+  崩溃会自动拉起；但“进程活着却不读”不属于崩溃，`Restart=always` 不会触发。
+- 需要一个外部看门狗：每 1–2 分钟采样 `ss -tn | grep 18443` 的 `Recv-Q`，超过阈值（如 256 KiB）
+  就 `systemctl restart mihomo-hnd0tbt4`（本地）或 `mihomo-tbt4`（HND0）。
+- 根本修复在 mihomo 侧：限制单连接缓冲、升级版本，或给 vless 入站加读超时。
+  在这些完成前，**不要把“控制面 204”当成链路可用**。
