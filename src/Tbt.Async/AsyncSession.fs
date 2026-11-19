@@ -63,7 +63,7 @@ type AsyncSessionCoordinator(carrier: SessionCarrier, clock: CachedClock, ?polle
 
     let loop () =
         Thread.CurrentThread.Name <- "AsyncSession"
-        while Volatile.Read(&running) do
+        while Volatile.Read(&running) && carrier.Alive do
             try
                 let waitStart = Stopwatch.GetTimestamp()
                 carrier.Watch pl
@@ -71,15 +71,21 @@ type AsyncSessionCoordinator(carrier: SessionCarrier, clock: CachedClock, ?polle
                 match channel with
                 | Some rx when rx.WakeFd >= 0 -> pl.WatchFd rx.WakeFd
                 | _ -> ()
-                // WaitMs() is milliseconds; Poller.Wait takes microseconds.  The unit
-                // fix alone is not enough: a server runs with pace=false, so WaitMs()
-                // returns 5000 and a true 5 s block starved the target socket (ss
-                // showed app_limited with rwnd_limited 3.2%) until download collapsed
-                // from 16 to 0.2 Mbit/s.  Capping one round at 50 ms keeps 20 rounds
-                // per second (idle CPU stays ~0) and bounds the cost of a missed wake
-                // to a single round.
-                let waitMs = carrier.WaitMs()
-                pl.Wait((min 50 waitMs) * 1000)
+                // WaitUs names the one event this thread is waiting for: descriptor
+                // readiness, a path drain that frees the write gate, a frame from the
+                // IO pool, or the next protocol timer. -1 blocks until one arrives.
+                // A fixed cap here was a poll: 22 rounds per second at idle, and a
+                // 50 ms ceiling on every wait even when data was ready.
+                let waitUs = carrier.WaitUs()
+                // The stats line is the one deadline this thread owns, so an
+                // otherwise unlimited wait must still end there; that is a timer,
+                // not a poll interval.
+                let waitUs =
+                    if statsEveryMs <= 0L then waitUs
+                    else
+                        let statsUs = max 1L ((lastStatsTick + statsEveryMs - Environment.TickCount64) * 1000L)
+                        if waitUs < 0 then int statsUs else int (min (int64 waitUs) statsUs)
+                pl.Wait(waitUs)
                 stats.WaitUs <- stats.WaitUs + toUs (Stopwatch.GetTimestamp() - waitStart)
                 match channel with
                 | Some rx when rx.WakeFd >= 0 && pl.IsFdReadable rx.WakeFd -> rx.ClearWake ()
@@ -108,6 +114,9 @@ type AsyncSessionCoordinator(carrier: SessionCarrier, clock: CachedClock, ?polle
                 // One session fails alone; the server keeps its other sessions.
                 stats.Faults <- stats.Faults + 1L
                 carrier.Session.Fail(ex.GetType().Name + ": " + ex.Message)
+        // The server's main poller may be blocked with no descriptor of its own to
+        // watch for this exit; wake it so the dead session is reaped at once.
+        ioGroup |> Option.iter (fun g -> g.Wake())
         stoppedSignal.Set()
 
     member _.Poller = pl

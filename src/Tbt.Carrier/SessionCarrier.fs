@@ -64,6 +64,9 @@ type SessionCarrier(session: Session, bridge: FlowBridge, ?uplinkPace: bool, ?tu
     let mutable rxMore = false
     let mutable framesIn = 0L
     let mutable framesOut = 0L
+    /// Frames the last writeRound put out, against its 256-frame budget. A full
+    /// budget means data still waits; a short one means every path refused.
+    let mutable lastRoundSent = 0
     /// Bytes of DATA/PARITY/BOOSTER put on the wire (not WIN_ACK/CTRL/heartbeat).
     let mutable wireOut = 0L
     /// First successfully rendered DATA/initial PARITY bytes on charged submissions.
@@ -295,6 +298,7 @@ type SessionCarrier(session: Session, bridge: FlowBridge, ?uplinkPace: bool, ?tu
                     if session.IsInteractive slot then
                         if bridge.WantsRead slot then bridge.Read slot
                     slot <- hot.NextUp slot
+        lastRoundSent <- 256 - budget
 
     member _.Session = session
     member _.Bridge = bridge
@@ -318,6 +322,32 @@ type SessionCarrier(session: Session, bridge: FlowBridge, ?uplinkPace: bool, ?tu
             group.Service(session.Clock.NowNs())
             if groupAllows fl false false || groupAllows fl true false then 5000
             else 2
+
+    /// Microseconds to block before the next Watch/Service; -1 blocks until a
+    /// descriptor fires. Every event that can let this thread send again has a
+    /// signal of its own: a path drain wakes the RxChannel eventfd, a local socket
+    /// reports readiness, and each protocol timer reports its deadline. 0 means
+    /// work is already runnable. This is an event wait; a fixed interval here
+    /// would wake an idle session and add latency to a busy one.
+    member _.WaitUs() =
+        // No path can carry anything: a socket or listener event is the only thing
+        // that can change this, so do not spin on a control cell that has nowhere to
+        // go. A join posted from another thread also wakes this loop.
+        if paths.Count = 0 then -1
+        elif rxMore then 0
+        elif session.ControlWaiting then 0
+        elif lastRoundSent >= 256 then 0
+        else
+            let timerUs = session.NextTimerUs()
+            if not session.WantsToSend then int timerUs
+            elif not pace then int timerUs
+            else
+                let fl = session.FrameLength
+                group.Service(session.Clock.NowNs())
+                if groupAllows fl false false || groupAllows fl true false then 0
+                else
+                    let paceUs = max 1L ((group.TokenWaitNs fl + 999L) / 1000L)
+                    if timerUs < 0L then int paceUs else int (min timerUs paceUs)
 
     /// One line of counters for the log.
     member _.Describe() =

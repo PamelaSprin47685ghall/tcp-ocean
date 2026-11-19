@@ -285,6 +285,15 @@ type RateGroup(clock: IClock) =
     member _.LastSampleRate = sampleRate
     member _.LastSendRate = measuredSendRate
     member _.PacingRate = gain () * bw
+    /// Nanoseconds until the bucket holds one more frame of l bytes; 0 when it does
+    /// now. Refills first, like TryTake, so the answer is for the current instant.
+    /// A wait can then block exactly until the pacer allows a send instead of
+    /// retrying on a fixed interval.
+    member this.TokenWaitNs(l: int) =
+        this.Refill l |> ignore
+        let rate = gain () * bw
+        if rate <= 0.0 || tokens >= float l then 0L
+        else int64 (Math.Ceiling ((float l - tokens) / rate))
     member _.Phase = phase ()
     member _.FullPipeRounds = fullCount
     member _.DeliveryRounds = deliveryRounds

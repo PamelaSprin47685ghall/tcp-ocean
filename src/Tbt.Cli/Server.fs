@@ -293,6 +293,11 @@ let run (o: Options) =
         match tun with
         | null -> ()
         | t -> poller.WatchFd t.Fd
+        // A coordinator that exits wakes the shared pool descriptor, so the main
+        // loop can reap a dead session at once instead of waking on a timer.
+        match asyncGroup with
+        | Some g when g.WakeFd >= 0 -> poller.WatchFd g.WakeFd
+        | _ -> ()
         for p in pending do poller.WatchRead p.Link.Socket
         for e in sessions do
             if e.Coordinator.IsNone then e.Carrier.Watch poller
@@ -310,6 +315,15 @@ let run (o: Options) =
         let busy =
             tunBusy
             || sessions.Exists(fun e -> e.Coordinator.IsNone && e.Carrier.Session.WantsToSend)
+        // The nearest deadline the main loop owns: a pending handshake timeout and
+        // the stats line. Everything else is a descriptor event.
+        let timerMs =
+            let mutable m = Int64.MaxValue
+            if pending.Count > 0 then m <- 15_000L
+            if statsMs > 0L then
+                let due = lastStats + statsMs - Environment.TickCount64
+                m <- min m (max 1L due)
+            m
         // A socket accepted in this round joins `pending` after this round's Wait, so
         // the poller has not registered it yet.  Waiting for an event on it would stall
         // the bootstrap head until the 10 s / 100 s timeout, which the peer sees as a
@@ -317,8 +331,10 @@ let run (o: Options) =
         poller.Wait(
             if rxPending then 0
             elif busy then 1000
-            elif sessions.Count > 0 then 10_000
-            else 100_000
+            elif sessions.Count > 0 || pending.Count > 0 then
+                if timerMs = Int64.MaxValue then -1 else int timerMs
+            else
+                if timerMs = Int64.MaxValue then 100_000 else int (min 100_000L timerMs)
         )
         clock.Tick() |> ignore
         let iterA = stamp ()
