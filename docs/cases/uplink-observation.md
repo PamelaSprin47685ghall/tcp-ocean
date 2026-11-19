@@ -85,3 +85,36 @@ path_id@incarnation:cwnd_b/ssthresh_b/unacked_b/send_window_b/notsent_b/rtt_us/r
 另见 [`rate-group-idle.md`](rate-group-idle.md)、
 [`measurement-validity.md`](measurement-validity.md) 与
 [`rto-envelope.md`](rto-envelope.md)。
+
+## 离线逐段取证（不改测量判定或产品默认）
+
+对保留了 `stamp.txt`、`segments/`、两侧会话日志与主机证据的官方工作目录：
+
+```sh
+python3 tests/e2e/uplink_evidence.py /path/to/official-work > uplink-evidence.json
+python3 tests/e2e/test_uplink_evidence.py
+```
+
+工具只读原始目录，复用 `measure_segments.analyze` 的有效性判定，不重写
+`segments.json`。无效或未知段保留判定和原因，但不计算诊断增量；mux 与 bulk
+各自读取所属客户端日志。默认 kernel 与可选 group 控制保留标签，不能混为一类。
+输出保留应用 goodput、来源戳、协商路径数、开始前同向快照、段内前 3 秒轨迹
+以及段内相邻快照的计数增量。没有快照不补零，不把服务端下行带宽拿来补上行。
+
+`observed_window` 明确给出实际覆盖范围；增量只覆盖段内相邻观察点，通常不含
+首尾不足一秒的部分，**不是全段总量**。开始前快照仅供比较初始 cwnd/ssthresh，
+不并入段内计数。代际缺失/变化、路径身份或数量变化、控制模式切换、非正时间
+或日志间隔超过 2.5 秒都阻止跨界相减。累计值缺失或下降（包括 16 位 total_rto
+回绕）输出 null，绝不当成零事件。每路径 retrans/rto 也按 incarnation 独立计算。
+`rwnd/sndbuf_per_busy` 是同一观察区间的累计受限时间/忙碌时间，不是墙钟占比。
+
+使用方法：先按相同二进制、种子、profile、路径数与发送控制模式对齐官方有效
+样本，再对照低档和高档的初始窗口、逐秒 retrans/rto、rwnd/sndbuf 增量和每路径
+状态，沿上表验证候选机制。工具没有自动根因判决或吞吐通过标记；计数关联也不
+证明因果。仍需两侧每段至少两个有效样本、两个不同种子及既定全矩阵；8 路下行
+仍由原脚本按快/慢 echo 残留分类。本次只增加离线工具，不修改运行时日志或热路径。
+
+顶层 `status=observed` 仅表示段内至少有两个快照，不保证相邻区间均可相减；
+必须逐项检查 `intervals[].status` 及 null 字段。当前工具未解析逐路径写入量，
+也不输出整段窗口轨迹，因此不能单凭该报告完成路径负载不均或信用阻塞的诊断；
+这些仍须回看原始 `path_tx`、queued/credit 和后续窗口日志。
