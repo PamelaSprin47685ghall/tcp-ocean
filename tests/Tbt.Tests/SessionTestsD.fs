@@ -408,3 +408,47 @@ let ``offered caps follow D4 and D5: FLOWSTATE only with FLOWSTATE2, no LANE`` (
     Assert.True(c &&& Caps.HpMask <> 0us)
     Assert.True(c &&& Caps.StraddleOk <> 0us)
     Assert.True(c &&& Caps.JoinAck2 <> 0us)
+
+[<Fact>]
+let ``a step queued before send is not counted as path RTT`` () =
+    // Production 256-path downlinks queue cells in the sender for seconds. The RTT
+    // sample must run from the first time the step went to a path socket, not from
+    // its seal: a seal-to-ack sample grows with the queue, and the windowed minimum
+    // then ratchets and drags the group's sample interval, cwnd and pacing down.
+    let config = { SessionConfig.defaults with Credit = { CreditPolicy.defaults with Enabled = false } }
+    let pair = Pair(config, 1, 0.0, 4)
+    let c = pair.Client
+    let clock = pair.Clock
+    c.Tx.InitialGrant 10_000UL
+    let mutable slot = -1
+    Assert.True(c.TryOpenFlow(&slot))
+    let chunk = Array.create 65536 7uy
+    let frame = Array.zeroCreate<byte> c.FrameLength
+    // Establish a 400 ms path minimum with an immediate send.
+    let mutable guard = 64
+    while c.Tx.Head < 2UL && guard > 0 do
+        pair.Feed(c, slot, ReadOnlySpan chunk, false) |> ignore
+        c.Tx.Flush()
+        guard <- guard - 1
+    let mutable n = 0
+    while n < 64 && c.Tx.TryRenderNext(Span frame, 0us, 10UL, 100us, 0us, true) do
+        n <- n + 1
+    clock.Now <- clock.Now + 400_000_000L
+    c.Tx.OnPeerAck(1UL, 100us)
+    Assert.Equal(400_000_000L, c.Tx.MinRttNs)
+    // Six rounds: a cell waits 3 s in the sender's queue, then crosses a 400 ms path.
+    for _ in 1 .. 6 do
+        let before = c.Tx.Head
+        guard <- 64
+        while c.Tx.Head < before + 1UL && guard > 0 do
+            pair.Feed(c, slot, ReadOnlySpan chunk, false) |> ignore
+            c.Tx.Flush()
+            guard <- guard - 1
+        clock.Now <- clock.Now + 3_000_000_000L
+        n <- 0
+        while n < 64 && c.Tx.TryRenderNext(Span frame, 0us, 10UL, 100us, 0us, true) do
+            n <- n + 1
+        clock.Now <- clock.Now + 400_000_000L
+        c.Tx.OnPeerAck(before + 1UL, 100us)
+    Assert.Equal(400_000_000L, c.Tx.MinRttNs)
+    Assert.True(c.Tx.SrttNs < 600_000_000.0, sprintf "srtt %g" c.Tx.SrttNs)

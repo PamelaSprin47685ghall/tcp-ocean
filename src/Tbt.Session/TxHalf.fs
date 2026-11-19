@@ -124,6 +124,13 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
     /// Seal time per step, for the round-trip estimate (seal to ack) and per-step
     /// expected arrival (seal + RepairWait).
     let sealNs: int64[] = Array.zeroCreate encoder.Capacity
+    /// First time a first-copy DATA cell of this step went to a path socket; 0 while the
+    /// step has not rendered one. The RTT sample runs from here, not from sealNs: a cell
+    /// can wait seconds in the sender's own pacing queue on a 256-path downlink, and
+    /// counting that queue as path RTT ratcheted the windowed minimum, after which the
+    /// group's sample interval, cwnd and pacing collapsed with it. Repair deadlines keep
+    /// sealNs, which is the right clock for "expected arrival".
+    let firstSendNs: int64[] = Array.zeroCreate encoder.Capacity
     /// Last BOOSTER (or DATA-repair) send time for the step; 0 if never repaired.
     let lastRepairNs: int64[] = Array.zeroCreate encoder.Capacity
     /// BOOSTER seeds already used for this generation of the step (0..256).
@@ -210,6 +217,7 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
         spillPending <- false
         renderedData.[si] <- 0us
         sealNs.[si] <- clock.FreshNs()
+        firstSendNs.[si] <- 0L
         lastRepairNs.[si] <- 0L
         repairCount.[si] <- 0
         pendingDeficit.[si] <- 0
@@ -380,7 +388,8 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
                             sealAt <- sealNs.[int (tSamp % uint64 sealNs.Length)]
                     if not foundClean then rttSkipped <- rttSkipped + 1L
                     elif now - sealAt > 0L then
-                        let sample = now - sealAt
+                        let sentAt = firstSendNs.[int (tSamp % uint64 firstSendNs.Length)]
+                        let sample = now - (if sentAt > 0L then sentAt else sealAt)
                         let m = min minCurNs minPrevNs
                         // A step sealed before the handshake finished can be acked
                         // tens of seconds later. That seal-to-ack gap is not a path
@@ -405,7 +414,13 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
                                 minPrevNs <- minCurNs
                                 minCurNs <- Int64.MaxValue
                                 minSinceNs <- now
-                            if sample < minCurNs then minCurNs <- sample
+                            if m <> Int64.MaxValue && sample > 3L * m then
+                                // Far above the established minimum: the sender's own
+                                // queue or a stall, not path RTT. Do not raise the
+                                // windowed minimum, so a stretch of queueing samples
+                                // cannot ratchet it (and the group's timers with it).
+                                ()
+                            elif sample < minCurNs then minCurNs <- sample
                             clampSrttToObservedMin ()
                 else
                     // Main Karn: only a step that was never repaired measures the
@@ -441,7 +456,8 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
                     // reports a hole.
                     if not foundClean then rttSkipped <- rttSkipped + 1L
                     else
-                        let sample = now - sealAt
+                        let sentAt = firstSendNs.[int (tSamp % uint64 firstSendNs.Length)]
+                        let sample = now - (if sentAt > 0L then sentAt else sealAt)
                         if sample > 0L then
                             let m = min minCurNs minPrevNs
                             if m = Int64.MaxValue && sample > 2_000_000_000L then
@@ -461,7 +477,10 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
                                     minPrevNs <- minCurNs
                                     minCurNs <- Int64.MaxValue
                                     minSinceNs <- now
-                                if sample < minCurNs then minCurNs <- sample
+                                if m <> Int64.MaxValue && sample > 3L * m then
+                                    // Same guard as the repair branch above.
+                                    ()
+                                elif sample < minCurNs then minCurNs <- sample
                                 clampSrttToObservedMin ()
                 peerAck <- ack
                 if ack > 0UL then peerSeenHi <- max peerSeenHi (ack - 1UL)
@@ -828,6 +847,9 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
                                 renderedData.[si] <- renderedData.[si] ||| bit
                                 true
                     if first then
+                        let fsi = int (t % uint64 firstSendNs.Length)
+                        if c.Kind = CellType.Data && firstSendNs.[fsi] = 0L then
+                            firstSendNs.[fsi] <- clock.FreshNs()
                         uniqueCells.[index t] <- uniqueCells.[index t] + 1
                         uniqueRendered <- uniqueRendered + 1L
                     ok <- true
