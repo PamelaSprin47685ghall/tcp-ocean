@@ -32,6 +32,8 @@
 #   PAUSE=stop_s/every_s (e.g. 5/12: SIGSTOP server and client together for stop_s every every_s
 #   while a session is up, like a suspended machine; both clocks jump. Log: pause.log.
 #   docs/cases/clock-jump-cwnd.md).
+#   KEEP_WORK=1 makes the run directory world-readable after the run. Logs are
+#   always kept under /tmp/tbtun-e2e.*; this only removes the root-only 0700 mode.
 # Needs sudo, gcc, python3, iperf3, .NET 10 SDK. Logs go to a temporary directory.
 #
 # Concurrent workers serialize on /tmp/tbtun-netns.lock (flock, held for the whole run,
@@ -80,6 +82,7 @@ host_quiet_s=${HOST_QUIET_S:-60}
 host_min_mem_mib=${HOST_MIN_MEM_MIB:-2560}
 host_quiet_bypass=${HOST_QUIET_BYPASS:-0}
 stats_gap_s=${STATS_GAP_S:-2.5}
+keep_work=${KEEP_WORK:-0}
 # Freezes: wanem logs every packet it writes >=50 ms late (the emulated link stopped) to
 # wanem.stats.freeze; measure_segments marks a segment freeze_affected when such a freeze
 # is >= FREEZE_MS and longer than the RTT. freeze_probe.py adds evidence only: a timer-gap
@@ -174,6 +177,14 @@ FREEZE_MS FREEZE_ICMP""".split()
 Path(sys.argv[1]).write_text(json.dumps({name: os.environ.get(name) for name in names}, indent=2) + "\n")
 PY
 stamp() { echo "$*" | tee -a "$work/stamp.txt"; }
+dump_logs() {
+    local name=$1 f
+    for f in "$work/client-$name.log" "$work/server-$name.log"; do
+        [[ -f $f ]] || continue
+        echo "--- $(basename "$f") (tail -60) ---"
+        tail -60 "$f" || true
+    done
+}
 run_started_s=$(date +%s)
 run_started_iso=$(date --iso-8601=seconds)
 # Host dmesg snapshot at the start of the window (best-effort; never fatal).
@@ -248,7 +259,19 @@ finalize_stamp() {
         stamp "segments: analysis_failed=yes (no validity verdict)"
         if (( status == 0 )); then status=2; fi
     fi
+    if (( status != 0 )); then
+        local f
+        for f in "$work"/client-*.log "$work"/server-*.log; do
+            [[ -f $f ]] || continue
+            echo "--- $(basename "$f") (tail -40) ---"
+            tail -40 "$f" || true
+        done
+    fi
     echo "logs: $work"
+    if [[ ${keep_work:-0} == 1 ]]; then
+        chmod -R a+rX "$work" 2>/dev/null || true
+        echo "kept: $work (KEEP_WORK=1, readable)"
+    fi
     date +%s > "$work/stamp-finalized"
     if (( status != rc )); then exit "$status"; fi
 }
@@ -412,7 +435,7 @@ tunnel() {
     done
     t_up=$(date +%s%N)
     stamp "session_up($name): $(awk -v t0="$t0" -v t1="$t_up" 'BEGIN{printf "%.2f", (t1-t0)/1e9}')s"
-    grep -q "session up" "$work/client-$name.log" || { echo "handshake failed in ${handshake_s} s"; cat "$work/client-$name.log"; exit 1; }
+    grep -q "session up" "$work/client-$name.log" || { echo "handshake failed in ${handshake_s} s"; dump_logs "$name"; exit 1; }
     while :; do
         grep -q "paths ready:" "$work/client-$name.log" && break
         if [[ -z $(pids_of "$work/jit/tbtun") ]] && (( seen_client )); then
@@ -425,7 +448,7 @@ tunnel() {
     done
     t1=$(date +%s%N)
     stamp "handshake($name): $(awk -v t0="$t0" -v t1="$t1" 'BEGIN{printf "%.2f", (t1-t0)/1e9}')s (limit ${handshake_s}s)"
-    grep -q "paths ready:" "$work/client-$name.log" || { echo "paths not ready in ${handshake_s} s"; cat "$work/client-$name.log"; exit 1; }
+    grep -q "paths ready:" "$work/client-$name.log" || { echo "paths not ready in ${handshake_s} s"; dump_logs "$name"; exit 1; }
     # "paths ready: paths=N" is the negotiated count. Window is a local --window
     # on both sides (not a distinct handshake field besides SERVER_INIT
     # rx_win_grant0 = server WindowSteps).
@@ -436,6 +459,7 @@ tunnel() {
     stamp "negotiated($name): paths=$neg_paths window=$window window_clamp=$window_clamp (requested paths=$paths window=$window window_clamp=$window_clamp; server_max_paths=$max_paths)"
     if [[ "$neg_paths" != "$paths" ]]; then
         echo "FAILED: negotiated paths=$neg_paths != requested $paths (server --max-paths default 64; set MAX_PATHS if you asked for more than the server allows)"
+        dump_logs "$name"
         status=1
         return 1
     fi

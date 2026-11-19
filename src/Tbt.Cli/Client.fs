@@ -135,7 +135,12 @@ let run (o: Options) =
             while pending.TryDequeue(&link) do
                 carrier.AddPath link
                 log ("path " + string link.PathId + " joined, paths=" + string carrier.Paths.Count)
-            if not readyLogged && joinTask.IsCompleted && pending.IsEmpty then
+            // In async mode AddPath posts to the carrier and the session thread
+            // applies it. Paths.Count read before that queue drains reported
+            // paths=1 in the e2e handshake check while the session already had
+            // every path. Report readiness only after the posted adds are applied.
+            if not readyLogged && joinTask.IsCompleted && pending.IsEmpty
+               && carrier.PathOpsPending = 0 then
                 readyLogged <- true
                 log ("paths ready: paths=" + string carrier.Paths.Count)
         attachJoined ()

@@ -59,6 +59,9 @@ type SessionCarrier(session: Session, bridge: FlowBridge, ?uplinkPace: bool, ?tu
     /// Posted from a watching thread; applied by the thread that owns `paths`.
     let pathOps = ConcurrentQueue<PathOp>()
     let pathOpsInline = io.IsNone
+    /// Posted path ops not yet applied. The client logs "paths ready" only when
+    /// this reaches zero: Paths.Count read before the queue drains is stale.
+    let mutable pathOpsPending = 0
     let mutable next = 0
     let mutable rxNext = 0
     let mutable rxMore = false
@@ -303,6 +306,8 @@ type SessionCarrier(session: Session, bridge: FlowBridge, ?uplinkPace: bool, ?tu
     member _.Session = session
     member _.Bridge = bridge
     member _.Paths = paths
+    /// Path adds/removes posted but not yet applied by the session thread.
+    member _.PathOpsPending = System.Threading.Interlocked.CompareExchange(&pathOpsPending, 0, 0)
     member _.FramesIn = framesIn
     member _.FramesOut = framesOut
     member _.SlotVisits = slotVisits
@@ -452,7 +457,9 @@ type SessionCarrier(session: Session, bridge: FlowBridge, ?uplinkPace: bool, ?tu
     /// Add a path whose bootstrap is done; frames it already holds come in at once.
     member this.AddPath(link: IPath) =
         if pathOpsInline then this.AddPathNow link
-        else pathOps.Enqueue(PathAdd link)
+        else
+            System.Threading.Interlocked.Increment(&pathOpsPending) |> ignore
+            pathOps.Enqueue(PathAdd link)
 
     member private this.AddPathNow(link: IPath) =
         // A JOIN of a path_id whose PATH_CLOSE transaction has ended must clear the
@@ -485,7 +492,9 @@ type SessionCarrier(session: Session, bridge: FlowBridge, ?uplinkPace: bool, ?tu
     /// Close and drop the path with pathId (replaced by a higher incarnation).
     member this.RemovePath(pathId: uint16) =
         if pathOpsInline then this.RemovePathNow pathId
-        else pathOps.Enqueue(PathRemove pathId)
+        else
+            System.Threading.Interlocked.Increment(&pathOpsPending) |> ignore
+            pathOps.Enqueue(PathRemove pathId)
 
     member private this.RemovePathNow(pathId: uint16) =
         let i = paths.FindIndex(fun p -> p.PathId = pathId)
@@ -500,9 +509,12 @@ type SessionCarrier(session: Session, bridge: FlowBridge, ?uplinkPace: bool, ?tu
     member private this.ApplyPathOps() =
         let mutable op = Unchecked.defaultof<PathOp>
         while pathOps.TryDequeue(&op) do
-            match op with
-            | PathAdd p -> this.AddPathNow p
-            | PathRemove id -> this.RemovePathNow id
+            try
+                match op with
+                | PathAdd p -> this.AddPathNow p
+                | PathRemove id -> this.RemovePathNow id
+            finally
+                System.Threading.Interlocked.Decrement(&pathOpsPending) |> ignore
 
     member this.Watch(poller: Poller) =
         this.ApplyPathOps()
@@ -587,6 +599,7 @@ type SessionCarrier(session: Session, bridge: FlowBridge, ?uplinkPace: bool, ?tu
             match pendingOp with
             | PathAdd p -> p.Close()
             | PathRemove _ -> ()
+        pathOpsPending <- 0
         paths.Clear()
         bridge.CloseAll()
 
