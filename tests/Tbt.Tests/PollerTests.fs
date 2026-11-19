@@ -93,3 +93,35 @@ let ``poller: a socket left out of a round is not reported`` () =
         Assert.False(waitRead p d)
         Assert.False(p.IsReadable b)
         Assert.True(Diagnostics.Stopwatch.GetElapsedTime(t0).TotalMilliseconds >= 150.0)
+
+[<Fact>]
+let ``rx channel: repeated wakes are cleared then observed again`` () =
+    // A session wakes once per round. A reused read buffer must drain the
+    // descriptor completely each time, so the next wake stays observable;
+    // otherwise a stale clear would swallow a later real wake.
+    let ch = new Tbt.Carrier.RxChannel()
+    try
+        if ch.WakeFd >= 0 then
+            use p = new Poller()
+            // Native.read reaches libc through P/Invoke. Its first call fixes up
+            // the thunk and allocates ~32 bytes once; measure the steady state,
+            // which is what the per-round Array.zeroCreate in ClearWake broke.
+            ch.Wake()
+            ch.ClearWake()
+            let mutable clearAlloc = 0L
+            for _ in 1 .. 1000 do
+                ch.Wake()
+                p.WatchFd ch.WakeFd
+                Assert.True(p.Wait 0 |> ignore; p.IsFdReadable ch.WakeFd)
+                let before = GC.GetAllocatedBytesForCurrentThread()
+                ch.ClearWake()
+                clearAlloc <- clearAlloc + (GC.GetAllocatedBytesForCurrentThread() - before)
+                // Wait a full round after the clear: a leftover count here would
+                // mean ClearWake left the descriptor readable and spun the loop.
+                Assert.False(p.Wait 0 |> ignore; p.IsFdReadable ch.WakeFd)
+            // Native.read uses a stack Span and the 8-byte buffer belongs to the
+            // channel, so clearing a wake must allocate nothing. This is what the
+            // per-round Array.zeroCreate in the old code violated.
+            Assert.Equal(0L, clearAlloc)
+    finally
+        (ch :> IDisposable).Dispose()

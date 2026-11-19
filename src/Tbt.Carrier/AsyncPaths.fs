@@ -33,6 +33,10 @@ type RxChannel() =
     // One descriptor per session: a shared one loses wakes when two session
     // threads race to consume the same eventfd count.
     let wakeFd = try Native.eventFd () with _ -> -1
+    // The session thread is the only caller of ClearWake, so the 8-byte read
+    // buffer is reused instead of allocated on every wake. AsyncPollerGroup.Loop
+    // keeps the same kind of per-owner buffer for its own eventfd.
+    let wakeBuffer = Array.zeroCreate<byte> 8
 
     member _.HasItems = Volatile.Read(&count) > 0
     member _.Count = Volatile.Read(&count)
@@ -53,8 +57,7 @@ type RxChannel() =
     /// Consume the wake token on the session thread.
     member _.ClearWake() =
         if wakeFd >= 0 then
-            let buffer = Array.zeroCreate<byte> 8
-            Native.read wakeFd (Span<byte> buffer) |> ignore
+            Native.read wakeFd (Span<byte> wakeBuffer) |> ignore
 
     /// Deliver every queued frame on the calling (session) thread and return the
     /// pooled buffers. `owner` must be the session that owns this channel.
