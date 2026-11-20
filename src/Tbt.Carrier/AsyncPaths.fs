@@ -119,6 +119,7 @@ type AsyncPollerGroup(threadCount: int) =
     // it, and the thread blocks in epoll instead of timing out every millisecond.
     let threadWakes: int[] =
         Array.init width (fun _ -> try Native.eventFd () with _ -> -1)
+    let threadArmed: int[] = Array.zeroCreate width
 
     member _.ThreadCount = width
     /// Shared eventfd; -1 when the platform has none, in which case session
@@ -140,9 +141,16 @@ type AsyncPollerGroup(threadCount: int) =
     /// Wake one IO thread. A path with a newly committed frame must wake its
     /// owner: the owner blocks in epoll, and a socket that is only writable
     /// produces no event, so PumpTx would otherwise never run.
+    ///
+    /// Coalesced per thread: while a wake is outstanding (written, not yet read by
+    /// the IO thread) later commits skip the syscall. The IO thread re-arms right
+    /// after reading its eventfd and only then pumps its paths, so a commit that
+    /// raced with the read is sent in that same round. With gathered sends the
+    /// path queue drains at once, so nearly every commit found it idle and paid
+    /// an eventfd write (~6% of server CPU).
     member _.WakeThread(index: int) =
         let i = ((index % width) + width) % width
-        if threadWakes.[i] >= 0 then
+        if threadWakes.[i] >= 0 && Interlocked.Exchange(&threadArmed.[i], 1) = 0 then
             Native.write threadWakes.[i] (ReadOnlySpan<byte> wakeToken) |> ignore
 
     /// Consume the wake token.
@@ -175,7 +183,9 @@ type AsyncPollerGroup(threadCount: int) =
             // wait would keep a dead path in `local` forever. One second is
             // enough to notice and cheap enough for 256 idle paths.
             poller.Wait 1_000_000
-            if wake >= 0 then Native.read wake (Span<byte> wakeBuffer) |> ignore
+            if wake >= 0 && poller.IsFdReadable wake then
+                Native.read wake (Span<byte> wakeBuffer) |> ignore
+                Volatile.Write(&threadArmed.[index], 0)
             for path in local do path.PumpRx poller
             for path in local do path.PumpTx()
             // CheckAlive is one poll(2) per path. Run every round it cost a syscall
