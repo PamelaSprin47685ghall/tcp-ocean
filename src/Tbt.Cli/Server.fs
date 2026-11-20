@@ -37,7 +37,9 @@ let run (o: Options) =
         match asyncGroup with
         | Some group -> group
         | None ->
-            let group = AsyncPollerGroup(4)
+            // One IO thread per vCPU, at most four. Four threads on the 2-vCPU
+            // HND0 host only added context switches and split each wakeup's batch.
+            let group = AsyncPollerGroup(o.Int("io-threads", min 4 (max 1 Environment.ProcessorCount)))
             group.Start()
             log ("async IO pool: " + string group.ThreadCount + " threads")
             asyncGroup <- Some group

@@ -110,7 +110,7 @@ let run (o: Options) =
         let mutable poolRef = Unchecked.defaultof<PathPool>
         let ioGroup =
             if asyncMode then
-                let group = AsyncPollerGroup(4)
+                let group = AsyncPollerGroup(o.Int("io-threads", min 4 (max 1 Environment.ProcessorCount)))
                 group.Start()
                 Some group
             else None
