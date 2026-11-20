@@ -436,3 +436,8 @@ server_max_paths 64；两侧各一轮，全部 segment `validity=valid`，0 inva
 - CASE-8 慢消费长尾：未做。
 - CASE-11：只有模型与单流观测，无 64 路实测。
 - CASE-6：只覆盖 4 路无丢包，16 路 5% 丢包未跑。
+- WINDOW_CLAMP 对照未跑成：psk 可读（root 从 `/etc/tbtun/psk` 复制到 `/tmp/tbt-psk`，65 B），
+  但 `unshare -rn` 回环床内客户端日志为 `session up … paths=0` 后立刻 `all paths closed`，
+  服务端 `sessions=0`，`curl` 0.04 s 拿到 0 字节。疑为命名空间内 tun 承载不可用，而 CLI
+  没有 `--carrier` 开关可切；在主机 lo 上加 netem 会拖慢生产隧道，不可接受。故该对照
+  留给后继在可用的测试床（`tests/e2e/run.sh`）里做。
