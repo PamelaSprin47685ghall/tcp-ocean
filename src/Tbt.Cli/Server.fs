@@ -205,8 +205,13 @@ let run (o: Options) =
                     let n = SocketTuning.tunSndBufFor(windowClamp, paths)
                     t.SetSndBuf n
                     log ("tun_sndbuf=auto " + string n + " (window_clamp x paths=" + string paths + ")")
+            let rmem = SocketTuning.rmemMax ()
+            let flowBuf = SocketTuning.flowRecvBufFor rmem
             log ("session " + a.Params.Keys.SessionId.ToString() + " up, S=" + string a.Params.Symbol
-                 + " " + describeOffer a.Params.Keys.Suite a.Params.Caps)
+                 + " " + describeOffer a.Params.Keys.Suite a.Params.Caps
+                 + " flow_rcvbuf_req=" + string flowBuf
+                 + " flow_rcvbuf_eff=" + string (SocketTuning.flowRecvWinFor flowBuf)
+                 + " rmem_max=" + string rmem)
             true
         | ValueNone -> tryJoinAny link frame
 

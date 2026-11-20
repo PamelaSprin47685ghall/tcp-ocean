@@ -119,8 +119,35 @@ module SocketTuning =
             try socket.SendBufferSize <- 384 * 1024
             with :? SocketException -> ()
 
-    /// Settings for a local flow socket.
-    let local (socket: Socket) = socket.NoDelay <- true
+    /// Bytes a flow socket asks for. The kernel clamps SO_RCVBUF to net.core.rmem_max,
+    /// so a host whose ceiling is smaller silently gets a smaller window; rmemMax and
+    /// flowRecvBufFor keep the startup log honest about which value was used.
+    [<Literal>]
+    let FlowRecvBuf = 4_000_000
+
+    /// The kernel ceiling for SO_RCVBUF, or -1 when it cannot be read (non-Linux).
+    let rmemMax () =
+        try
+            match Int32.TryParse((System.IO.File.ReadAllText "/proc/sys/net/core/rmem_max").Trim()) with
+            | true, v -> v
+            | _ -> -1
+        with _ -> -1
+
+    /// The SO_RCVBUF request the kernel will accept. A larger request is clamped to
+    /// net.core.rmem_max silently, so ask for the smaller of the two.
+    let flowRecvBufFor (ceiling: int) =
+        if ceiling > 0 && ceiling < FlowRecvBuf then ceiling else FlowRecvBuf
+
+    /// What Linux stores in sk_rcvbuf for a request: twice the requested value. The
+    /// doubled number, not the request, is the receive window the flow may advertise.
+    let flowRecvWinFor (request: int) = if request > 0 then request * 2 else request
+
+    /// Settings for a local flow socket. Its receive buffer must cover one BDP of the
+    /// session path: kernel autotuning grows too slowly on a long RTT, and a single flow
+    /// is then capped at rcvbuf / RTT regardless of how many carrier paths exist.
+    let local (socket: Socket) =
+        socket.NoDelay <- true
+        try socket.ReceiveBufferSize <- flowRecvBufFor (rmemMax ()) with :? SocketException -> ()
 
     /// Linux TCP_FASTOPEN_CONNECT (30). No-op where the kernel rejects client TFO.
     let fastOpenConnect (socket: Socket) =

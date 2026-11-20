@@ -151,3 +151,21 @@ let ``reading a live kernel socket leaves its byte stream and options intact`` (
         Assert.True(after.Value.CwndBytes > 0L)
         Assert.True(after.Value.BytesAcked >= first.Value.BytesAcked)
         Assert.Equal(before, sender.NoDelay)
+
+[<Fact>]
+let ``a small kernel ceiling lowers the flow receive request`` () =
+    Assert.Equal(212_992, SocketTuning.flowRecvBufFor 212_992)
+    Assert.Equal(1_000_000, SocketTuning.flowRecvBufFor 1_000_000)
+
+[<Fact>]
+let ``an unknown or ample ceiling keeps the full receive request`` () =
+    Assert.Equal(SocketTuning.FlowRecvBuf, SocketTuning.flowRecvBufFor -1)
+    Assert.Equal(SocketTuning.FlowRecvBuf, SocketTuning.flowRecvBufFor 0)
+    Assert.Equal(SocketTuning.FlowRecvBuf, SocketTuning.flowRecvBufFor SocketTuning.FlowRecvBuf)
+    Assert.Equal(SocketTuning.FlowRecvBuf, SocketTuning.flowRecvBufFor 4_194_304)
+
+[<Fact>]
+let ``linux stores twice the requested receive buffer`` () =
+    Assert.Equal(8_000_000, SocketTuning.flowRecvWinFor SocketTuning.FlowRecvBuf)
+    Assert.Equal(425_984, SocketTuning.flowRecvWinFor 212_992)
+    Assert.Equal(0, SocketTuning.flowRecvWinFor 0)
