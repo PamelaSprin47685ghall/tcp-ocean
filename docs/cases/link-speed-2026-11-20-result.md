@@ -410,3 +410,29 @@ server_max_paths 64；两侧各一轮，全部 segment `validity=valid`，0 inva
 回滚到 `tbtun.bak-g4`：`install` + restart 约 10 s，sha 回到 f2b63e00，服务 active；
 35 s 时 225 路——旧版客户端重连更慢，未达 250 门槛。装回 `661ad970`：31 s 见 254 路，
 总计 40 s。期间有一次 SSH banner 交换超时（6 s），管理面仍间歇不稳。
+
+### CASE-11 的内存上界：模型 + 单流观测，未做并发实测
+
+每流最坏内核接收缓冲 = `2 × min(4 MB, rmem_max)` = 8 MB，加 8 MiB 信用的应用侧余量，
+单流上界 16 MB。生产实测服务端 RSS 70 MB、本机可用内存 48 GB、mihomo 把多条 curl
+复用成 1 条 flow，256 流外推 `16 MB × 256 = 4 GB`，占可用内存 8.3%。64 路并发实测
+本轮没有做（本机无 `/etc/tbtun/psk`、时间用尽），CASE-11 记为“未实测”，不得用外推
+当通过。
+
+### 后继第一步：TCP_WINDOW_CLAMP 单变量对照
+
+这是 rcvbuf 修复之上的下一层上限。承载 socket 的 `TCP_WINDOW_CLAMP` 是 600000 B，
+600 KB / 329 ms ≈ 14.6 Mbit/s，与生产单流 11.8–13 Mbit/s 吻合。实验设计：
+
+1. 同一回环床（`unshare -rn`、netem 20 ms / 200 Mbit、256 路、32 MiB），只把
+   `WindowClamp` 从 600000 改成 2_000_000，其它不改，两侧各 3 轮取中位。
+2. 判据：吞吐提升 ≥20% 且 SRTT 不超过 minRTT 的 1.6 倍；若提升而 SRTT 抬头，
+   在 1 MB 与 2 MB 之间取折中。
+3. 通过后另立候选，不混入本次 rcvbuf 提交；需要重跑 CASE-6 四路与 16 路丢包组。
+
+### 未完成的验收项
+
+- CASE-5 上行：只有机制论证，无实测。
+- CASE-8 慢消费长尾：未做。
+- CASE-11：只有模型与单流观测，无 64 路实测。
+- CASE-6：只覆盖 4 路无丢包，16 路 5% 丢包未跑。

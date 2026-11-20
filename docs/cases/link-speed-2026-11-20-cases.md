@@ -349,7 +349,7 @@
 | CASE-2 重传率 | 第四代 | 2026-11-20 | 未达：18.42%（12 s 发 39.1 MB、重传 7.2 MB），低于旧版 19–23%，但高于 5% 门槛 | `/tmp/tbt-g4-prod-*` |
 | CASE-3 RTT/排队 | 第四代 | 2026-11-20 | 通过：srtt 325 / minrtt 315 = 1.03×（旧版 578/320 = 1.8×） | `/tmp/tbt-g4-prod-*` |
 | CASE-4 256 路 | 第四代 | 2026-11-20 | 通过：部署后 23 s 见 252 路，测量期 256 路，client rx_ack 5838 > 0 | `/tmp/tbt-g4-prod-*` |
-| CASE-5 上行 | | | | |
+| CASE-5 上行 | 第四代 | 2026-11-20 | 机制论证通过、未实测：客户端二进制未换，上行接收缓冲仍是自动调优；服务端上行写 target 受 SNDBUF 约束 | result §CASE-5 |
 | CASE-6 矩阵 | 第四代 | 2026-11-20 | 4 路不退化：bulk 175.5/175.4 vs 主线 174.7/175.0 Mbit/s，iperf 差 ≤1.3%，ping-under-bulk p99 52.9 vs 67.8 ms；16 路 5% 丢包未跑 | `/tmp/matrix-main-4p.log`、`/tmp/matrix-cand-4p.log` |
 | CASE-7 故障/回滚 | 第四代 | 2026-11-20 | 回滚 40 s 完成：旧版方向 35 s 到 225 路，新版方向 31 s 到 254 路；SSH 有一次 banner 超时 | HND0 `tbtun.bak-g4` |
 | CASE-8 长尾 | | | | |
