@@ -37,6 +37,7 @@ type RxChannel() =
     // buffer is reused instead of allocated on every wake. AsyncPollerGroup.Loop
     // keeps the same kind of per-owner buffer for its own eventfd.
     let wakeBuffer = Array.zeroCreate<byte> 8
+    let mutable wakeArmed = 0
 
     member _.HasItems = Volatile.Read(&count) > 0
     member _.Count = Volatile.Read(&count)
@@ -46,8 +47,15 @@ type RxChannel() =
     /// socket buffer makes the write gate admit again, but the kernel reports no
     /// readiness for bytes that merely left the send queue, so the drain itself is
     /// the event. Costs one eventfd write, no allocation.
+    ///
+    /// Coalesced: while one wake is outstanding (written and not yet consumed by
+    /// ClearWake) further wakes skip the syscall. Every frame enqueue and every tx
+    /// drain used to write the eventfd, one syscall per 1.3 KiB frame on both IO
+    /// and session sides. The session drains the queue and runs Service after
+    /// ClearWake, so anything that raced with the clear is still picked up.
     member _.Wake() =
-        if wakeFd >= 0 then Native.write wakeFd (ReadOnlySpan<byte> wakeToken) |> ignore
+        if wakeFd >= 0 && Interlocked.Exchange(&wakeArmed, 1) = 0 then
+            Native.write wakeFd (ReadOnlySpan<byte> wakeToken) |> ignore
 
     member this.Enqueue(frame: RxFrame) =
         queue.Enqueue frame
@@ -58,6 +66,9 @@ type RxChannel() =
     member _.ClearWake() =
         if wakeFd >= 0 then
             Native.read wakeFd (Span<byte> wakeBuffer) |> ignore
+            // Re-arm after the read: a wake that lands between the read and this
+            // write is skipped, but the caller drains and services right after.
+            Volatile.Write(&wakeArmed, 0)
 
     /// Deliver every queued frame on the calling (session) thread and return the
     /// pooled buffers. `owner` must be the session that owns this channel.
@@ -146,6 +157,7 @@ type AsyncPollerGroup(threadCount: int) =
         let mine = pending.[index]
         let wake = threadWakes.[index]
         let wakeBuffer = Array.zeroCreate<byte> 8
+        let mutable lastAliveCheck = 0L
         while Volatile.Read(&running.contents) = 1 do
             // Register the wake descriptor every round: the poller rebuilds its watch
             // set each round, so a one-time registration would be dropped by the first
@@ -166,7 +178,16 @@ type AsyncPollerGroup(threadCount: int) =
             if wake >= 0 then Native.read wake (Span<byte> wakeBuffer) |> ignore
             for path in local do path.PumpRx poller
             for path in local do path.PumpTx()
-            for path in local do path.CheckAlive() |> ignore
+            // CheckAlive is one poll(2) per path. Run every round it cost a syscall
+            // per path per wakeup (64 per round with 256 paths on 4 threads), which
+            // profiled at ~30% of the server's CPU on a 2-vCPU host. A dead socket
+            // already shows up as EPOLLERR/EPOLLHUP on the read watch; this sweep only
+            // catches the rare descriptor that produces no event, so once a second is
+            // enough (the same cadence as the 1 s wait cap above).
+            let nowMs = Environment.TickCount64
+            if nowMs - lastAliveCheck >= 1000L then
+                lastAliveCheck <- nowMs
+                for path in local do path.CheckAlive() |> ignore
 
     member this.Start() =
         if Interlocked.Exchange(&started.contents, 1) = 0 then

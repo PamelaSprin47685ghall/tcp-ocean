@@ -348,14 +348,24 @@ let run (o: Options) =
         // the poller has not registered it yet.  Waiting for an event on it would stall
         // the bootstrap head until the 10 s / 100 s timeout, which the peer sees as a
         // dead path.  With pending work, poll without blocking and service it at once.
-        poller.Wait(
-            if rxPending then 0
-            elif busy then 1000
+        // Poller.Wait takes microseconds; every deadline above is milliseconds.
+        // Passing the milliseconds straight through made a 1 s stats timer a 1 ms
+        // poll (about 900 idle rounds per second on the main thread).
+        let waitMs =
+            if rxPending then 0L
+            elif busy then 1L
             elif sessions.Count > 0 || pending.Count > 0 then
-                if timerMs = Int64.MaxValue then -1 else int timerMs
+                if timerMs = Int64.MaxValue then -1L else timerMs
             else
-                if timerMs = Int64.MaxValue then 100_000 else int (min 100_000L timerMs)
-        )
+                if timerMs = Int64.MaxValue then 100_000L else min 100_000L timerMs
+        poller.Wait(if waitMs < 0L then -1 else int (min 100_000_000L (waitMs * 1000L)))
+        // The pool's shared eventfd is level-triggered: a coordinator that exits
+        // writes it once, and unless it is read here every later Wait returns at
+        // once. Left unread it pinned the main thread at 100% CPU from the first
+        // session close until the process restarted.
+        match asyncGroup with
+        | Some g when g.WakeFd >= 0 && poller.IsFdReadable g.WakeFd -> g.ClearWake()
+        | _ -> ()
         clock.Tick() |> ignore
         let iterA = stamp ()
         let now = Environment.TickCount64
