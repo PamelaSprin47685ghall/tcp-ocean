@@ -80,6 +80,10 @@ type IPathIo =
     abstract WatchForIo: poller: Poller -> unit
     abstract PumpRx: poller: Poller -> unit
     abstract PumpTx: unit -> unit
+    /// Detect a socket the kernel destroyed under us (SOCK_DESTROY, RST after
+    /// close). epoll drops such a descriptor silently, so a readable-event
+    /// driven PumpRx never runs; this probe runs once per idle timeout.
+    abstract CheckAlive: unit -> bool
     abstract Closed: bool
 
 /// Fixed-size IO thread pool shared by every session of one server or client.
@@ -155,10 +159,14 @@ type AsyncPollerGroup(threadCount: int) =
                 if local.[i].Closed then local.RemoveAt i
                 i <- i - 1
             for path in local do path.WatchForIo poller
-            poller.Wait -1
+            // A destroyed descriptor produces no event at all, so an infinite
+            // wait would keep a dead path in `local` forever. One second is
+            // enough to notice and cheap enough for 256 idle paths.
+            poller.Wait 1_000_000
             if wake >= 0 then Native.read wake (Span<byte> wakeBuffer) |> ignore
             for path in local do path.PumpRx poller
             for path in local do path.PumpTx()
+            for path in local do path.CheckAlive() |> ignore
 
     member this.Start() =
         if Interlocked.Exchange(&started.contents, 1) = 0 then
@@ -186,11 +194,11 @@ type AsyncPollerGroup(threadCount: int) =
 /// advances the tail. Receive frames are copied into pooled buffers and queued.
 [<Sealed>]
 type AsyncPathLink private (socket: Socket, probe: INotSentProbe, group: AsyncPollerGroup,
-                            channel: RxChannel, rx: byte[], rxStart0: int, rxEnd0: int) =
+                            channel: RxChannel, rx: byte[], rxStart0: int, rxEnd0: int, slots: int) =
     static let bufferLength = 65536
-    static let slotCount = 16
-    // The session frame is about 1.3 KiB at the default MSS; 2 KiB per slot
-    // keeps 16 slots at 32 KiB per path, so 256 paths stay near 24 MiB.
+    let slotCount = if slots < 1 then 16 else slots
+    // The session frame is about 1.3 KiB at the default MSS; 2 KiB per slot.
+    // The product default is 16 slots (32 KiB per path); --tx-slots widens it.
     static let maxFrame = max 2048 Layout.BootFrameLength
     let mutable pathId = 0us
     let mutable frameLength = Layout.BootFrameLength
@@ -215,13 +223,13 @@ type AsyncPathLink private (socket: Socket, probe: INotSentProbe, group: AsyncPo
 
     /// Take the socket and the bytes already read from a synchronous link.
     /// The source link must not be used again.
-    static member TakeOver(link: PathLink, group: AsyncPollerGroup, channel: RxChannel) =
+    static member TakeOver(link: PathLink, group: AsyncPollerGroup, channel: RxChannel, slots: int) =
         let struct (socket, rx, rxStart, rxEnd, probe) = link.Detach()
         // The session thread never blocks on a socket: the IO thread must get
         // WouldBlock back instead of sleeping inside Send/Receive with the
         // whole path group behind it.
         try socket.Blocking <- false with _ -> ()
-        let path = AsyncPathLink(socket, probe, group, channel, rx, rxStart, rxEnd)
+        let path = AsyncPathLink(socket, probe, group, channel, rx, rxStart, rxEnd, slots)
         path.Id <- link.PathId
         path.Length <- link.FrameLength
         path.Incarnation <- link.Incarnation
@@ -314,6 +322,18 @@ type AsyncPathLink private (socket: Socket, probe: INotSentProbe, group: AsyncPo
                 rounds <- rounds + 1
                 this.QueueFrames()
 
+    member this.CheckAlive() =
+        if Volatile.Read(&alive) = 1 then
+            try
+                if socket.Poll(0, SelectMode.SelectError) then
+                    this.Close()
+                    false
+                else true
+            with _ ->
+                this.Close()
+                false
+        else false
+
     member this.Close() =
         if Interlocked.Exchange(&alive, 0) = 1 then
             try socket.Dispose () with _ -> ()
@@ -326,6 +346,7 @@ type AsyncPathLink private (socket: Socket, probe: INotSentProbe, group: AsyncPo
                 if Volatile.Read(&txTail) < Volatile.Read(&txHead) then poller.WatchWrite socket
         member this.PumpRx(poller) = this.PumpRx poller
         member this.PumpTx() = this.PumpTx()
+        member this.CheckAlive() = this.CheckAlive()
         member _.Closed = Volatile.Read(&alive) = 0
 
     interface IPath with

@@ -8,6 +8,7 @@ open System.Net.Sockets
 open System.Threading
 open System.Threading.Tasks
 open System.Collections.Concurrent
+open System.Collections.Generic
 open Tbt.Contracts
 open Tbt.Session
 open Tbt.Session.Handshake
@@ -15,17 +16,23 @@ open Tbt.Carrier
 open Tbt.Async
 open Tbt.Cli.Common
 
+/// A finished background JOIN, delivered to the session thread. The background
+/// task never touches `SessionCarrier`; only this event crosses threads.
+type private PathEvent =
+    | PathJoined of uint16 * PathLink
+    | PathFailed of uint16 * string
+
 /// Connect, send head and bootstrap frame, wait for the reply head and bootstrap frame.
 /// `timeoutMs` is used for Connect, Send, and Receive so TCP can retransmit a JOIN
 /// inside one attempt. The socket is disposed if this throws.
-let private bootstrap (server: IPEndPoint) (host: string) (boot: byte[]) (windowClamp: int) (timeoutMs: int) =
+let private bootstrap (server: IPEndPoint) (host: string) (boot: byte[]) (windowClamp: int) (notsentLowat: int) (userTimeoutMs: int) (timeoutMs: int) =
     let socket = new Socket(server.AddressFamily, SocketType.Stream, ProtocolType.Tcp)
     try
         // The client carrier is kernel TCP, not a TUN: there is no tbt0-style qdisc
         // this process owns. Write gating (TCP_NOTSENT_LOWAT) keeps unsent bytes
         // small; a queue overflow, if any, is on the host path and shows up as
         // kernel retranmissions, not as a userspace virtual ACK.
-        SocketTuning.path(socket, windowClamp)
+        SocketTuning.pathWith(socket, windowClamp, notsentLowat, userTimeoutMs)
         SocketTuning.fastOpenConnect socket
         socket.ReceiveTimeout <- timeoutMs
         socket.SendTimeout <- timeoutMs
@@ -59,6 +66,9 @@ let run (o: Options) =
     let pathCount = o.Int("paths", 4)
     let mss = o.Int("mss", 1448)
     let windowClamp = o.Int("window-clamp", SocketTuning.WindowClamp)
+    let notsentLowat = SocketTuning.notsentLowatFor (o.Int("notsent-lowat", SocketTuning.NotSentLimit))
+    let userTimeoutMs = SocketTuning.userTimeoutMsFor (o.Int("user-timeout-ms", SocketTuning.UserTimeoutMs))
+    let txSlots = SocketTuning.txSlotsFor (o.Int("tx-slots", 16))
     let fecAdaptive =
         match System.Environment.GetEnvironmentVariable "TBTUN_FEC_ADAPTIVE" with
         | null -> true
@@ -77,7 +87,7 @@ let run (o: Options) =
         let offer = ClientOffer(psk, Guid.NewGuid(), entropy, uint64 (unixMs ()), mss, max 1 pathCount,
                                   offerX25519 = offerX25519, offerChaCha8 = offerChaCha8,
                                   offerAegis = offerAegis, offerChaCha20 = offerChaCha20)
-        let struct (link0, reply) = bootstrap server host offer.Frame windowClamp timeoutMs
+        let struct (link0, reply) = bootstrap server host offer.Frame windowClamp notsentLowat userTimeoutMs timeoutMs
         match offer.TryAccept(ReadOnlySpan reply) with
         | ValueNone ->
             link0.Close()
@@ -94,7 +104,10 @@ let run (o: Options) =
         bridge.Attach session
         let pace = o.Int("uplink-pace", 0) <> 0
         let tupleMbit = if pace then max 0.0 (o.Float("tuple-mbit", 0.0)) else 0.0
+        let gatePass2 = max 4096 (o.Int("gate-pass2", SocketTuning.GatePass2Limit))
         let rxChannel = if asyncMode then Some (new RxChannel()) else None
+        // The keepalive predicate needs the pool, which is built below.
+        let mutable poolRef = Unchecked.defaultof<PathPool>
         let ioGroup =
             if asyncMode then
                 let group = AsyncPollerGroup(4)
@@ -102,7 +115,11 @@ let run (o: Options) =
                 Some group
             else None
         let carrier = SessionCarrier(session, bridge, uplinkPace=pace, tupleMbit=tupleMbit,
-                                     ?rxChannel=rxChannel, ?asyncIo=ioGroup)
+                                     ?rxChannel=rxChannel, ?asyncIo=ioGroup, gatePass2=gatePass2, txSlots=txSlots)
+        carrier.KeepAlive <-
+            Some (fun () ->
+                not (isNull (box poolRef)) && not session.Closed
+                && carrier.Paths.Count < poolRef.Target)
         carrier.AddPath link0
         let maxPaths = int hello.MaxPaths
         // Forward as soon as path 0 is up; remaining JOINs run with bounded
@@ -110,40 +127,96 @@ let run (o: Options) =
         log ("session up: S=" + string p.Symbol + " paths=" + string carrier.Paths.Count
              + " window_clamp=" + string windowClamp + " " + describeOffer p.Keys.Suite p.Caps)
         let concurrency = JoinBootstrap.clampConcurrency (o.Int("join-concurrency", JoinBootstrap.DefaultConcurrency))
-        let pending = ConcurrentQueue<PathLink>()
+        let mutable stopAt = 0L
+        let targetPaths = min pathCount maxPaths
+        let pool = PathPool(targetPaths, concurrency, 100_000_000L, 2_000_000_000L, max 1 attempts)
+        poolRef <- pool
+        let events = ConcurrentQueue<PathEvent>()
+        let pending = ResizeArray<PathLink>()
+        let applying = HashSet<uint16>()
         let mutable readyLogged = false
-        let joinOne (id: int) =
+        let mutable batch = Task.CompletedTask
+        // One JOIN with one incarnation. Refusal throws, so tryRepeated retries
+        // it with the next incarnation.
+        let joinOnce (id: uint16) (inc: uint32) =
+            let join = JoinOffer(p.Keys.PathKey, entropy, p.Keys.SessionId, p.Symbol, p.Caps, maxPaths, id, inc, mss, p.Keys.Suite)
+            let struct (link, ack) = bootstrap server host join.Frame windowClamp notsentLowat userTimeoutMs timeoutMs
+            if (join.TryAccept(ReadOnlySpan ack)).IsSome then
+                link.PathId <- id
+                link.Incarnation <- inc
+                link
+            else
+                link.Close()
+                failwith "join refused"
+        // Each attempt takes the next incarnation inside the stride the pool
+        // reserved, so an accepted-then-lost reply still cannot replay.
+        let joinOne (id: uint16) (baseInc: uint32) =
             match JoinBootstrap.tryRepeated attempts backoff Thread.Sleep (fun i ->
-                let inc = uint32 (i + 1)
-                let join = JoinOffer(p.Keys.PathKey, entropy, p.Keys.SessionId, p.Symbol, p.Caps, maxPaths, uint16 id, inc, mss, p.Keys.Suite)
-                let struct (link, ack) = bootstrap server host join.Frame windowClamp timeoutMs
-                if (join.TryAccept(ReadOnlySpan ack)).IsSome then
-                    link.PathId <- uint16 id
-                    link.Incarnation <- inc
-                    pending.Enqueue link
-                else
-                    link.Close()
-                    failwith "join refused") with
+                let link = joinOnce id (baseInc + uint32 i)
+                events.Enqueue(PathJoined(id, link))) with
             | JoinBootstrap.Joined -> ()
-            | JoinBootstrap.GaveUp msg -> log ("path " + string id + ": " + msg)
-        let ids = [| 1 .. min pathCount maxPaths - 1 |]
-        let joinTask =
-            if ids.Length = 0 then Task.CompletedTask
-            else Task.Run(fun () -> JoinBootstrap.runBounded concurrency ids joinOne)
+            | JoinBootstrap.GaveUp msg -> events.Enqueue(PathFailed(id, msg))
+        let drainEvents () =
+            let mutable ev = Unchecked.defaultof<PathEvent>
+            while events.TryDequeue(&ev) do
+                match ev with
+                | PathJoined(id, link) ->
+                    pool.Joined id
+                    if session.Closed || stopAt > 0L then link.Close()
+                    else pending.Add link
+                | PathFailed(id, msg) ->
+                    pool.Failed(id, clock.FreshNs())
+                    log ("path " + string id + ": " + msg)
         let attachJoined () =
-            let mutable link = Unchecked.defaultof<PathLink>
-            while pending.TryDequeue(&link) do
-                carrier.AddPath link
-                log ("path " + string link.PathId + " joined, paths=" + string carrier.Paths.Count)
+            if pending.Count > 0 then
+                for link in pending do
+                    carrier.AddPath link
+                    applying.Add link.PathId |> ignore
+                    log ("path " + string link.PathId + " joined, paths=" + string carrier.Paths.Count)
+                pending.Clear()
             // In async mode AddPath posts to the carrier and the session thread
             // applies it. Paths.Count read before that queue drains reported
             // paths=1 in the e2e handshake check while the session already had
             // every path. Report readiness only after the posted adds are applied.
-            if not readyLogged && joinTask.IsCompleted && pending.IsEmpty
-               && carrier.PathOpsPending = 0 then
+            if carrier.PathOpsPending = 0 then applying.Clear()
+            if not readyLogged && pool.InFlight = 0 && pending.Count = 0
+               && carrier.PathOpsPending = 0 && carrier.Paths.Count >= pool.Target then
                 readyLogged <- true
                 log ("paths ready: paths=" + string carrier.Paths.Count)
+        let presentIds () =
+            let s = HashSet<uint16>()
+            // Path 0 is the one the handshake itself created. While its first
+            // PathAdd is still queued nothing for it is in `carrier.Paths`, so
+            // hide it: otherwise the first pass would JOIN a second path 0
+            // beside the handshake path. Once the add is applied, `Paths`
+            // reports it and, after a loss, the pool rebuilds it.
+            if carrier.PathOpsPending > 0 then s.Add 0us |> ignore
+            for link in carrier.Paths do s.Add link.PathId |> ignore
+            for link in pending do s.Add link.PathId |> ignore
+            for id in applying do s.Add id |> ignore
+            s
+        // Wake the session loop once while a JOIN is in flight. The sync loop
+        // caps its poll wait instead; the async coordinator needs an event.
+        let wakeLater () =
+            match rxChannel with
+            | Some ch ->
+                Task.Run(fun () ->
+                    Thread.Sleep 50
+                    ch.Wake()) |> ignore
+            | None -> ()
+        let plan () =
+            if not session.Closed && stopAt = 0L then
+                let work = pool.Request(clock.FreshNs(), presentIds ())
+                if work.Length > 0 then
+                    batch <- Task.Run(fun () ->
+                        JoinBootstrap.runBounded concurrency work (fun (struct (id, baseInc)) -> joinOne id baseInc))
+                if pool.InFlight > 0 then wakeLater ()
+        let closePool () =
+            drainEvents ()
+            for link in pending do link.Close()
+            pending.Clear()
         attachJoined ()
+        plan ()
         let listener = new Socket(listenAt.AddressFamily, SocketType.Stream, ProtocolType.Tcp)
         listener.Bind listenAt
         SocketTuning.fastOpenListen(listener, 512)
@@ -153,14 +226,22 @@ let run (o: Options) =
         let statsMs = int64 (o.Int("stats-s", 0)) * 1000L
         let mutable lastStats = Environment.TickCount64
         // SIGINT/SIGTERM (or Ctrl-C on Windows): close the session with SESSION_CLOSE (spec 6.10a), at most 2 s.
-        let mutable stopAt = 0L
         use _interrupt = onInterrupt (fun () -> if stopAt = 0L then stopAt <- Environment.TickCount64 + 2000L)
         // Registration must happen before Wait: a WatchRead after Wait clears
         // the readiness Wait just filled. Accept runs after Wait, where the
         // listener's readiness is still visible.
         let watchListener (pl: Poller) = pl.WatchRead listener
         let housekeeping () =
+            drainEvents ()
             attachJoined ()
+            plan ()
+            // Every path is gone but the pool still wants paths: the handshake
+            // session itself died, and a JOIN cannot rebuild it in this process.
+            // Exit so the service manager starts a fresh handshake.
+            if stopAt = 0L && not session.Closed && pool.Target > 0
+               && carrier.PathOpsPending = 0 && carrier.Paths.Count = 0 then
+                log "session lost: no path remains, exiting for restart"
+                Environment.Exit 75
             if stopAt > 0L && session.CloseState = CloseState.Open then
                 log "closing the session"
                 session.Close 0uy |> ignore
@@ -216,12 +297,17 @@ let run (o: Options) =
                 beforeWait poller
                 carrier.Watch poller
                 // WaitMs() is milliseconds; Poller.Wait takes microseconds.
-                poller.Wait(carrier.WaitMs() * 1000)
+                // While a JOIN is in flight, cap the wait so the result reaches
+                // this thread without a second event source.
+                let waitUs = carrier.WaitMs() * 1000
+                let waitUs = if pool.InFlight > 0 then min waitUs 50_000 else waitUs
+                poller.Wait waitUs
                 clock.Tick() |> ignore
                 acceptNow poller
                 carrier.Service poller
         log (if session.Closed then "session closed" else "all paths closed")
-        try joinTask.Wait 2000 |> ignore with _ -> ()
+        try batch.Wait 2000 |> ignore with _ -> ()
         if not asyncMode then attachJoined ()
+        closePool ()
         carrier.Close()
         if session.Closed then 0 else 1

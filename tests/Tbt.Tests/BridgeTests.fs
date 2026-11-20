@@ -219,6 +219,38 @@ let ``write gate: first pass admits up to 4 KiB, second up to 256 KiB, unknown o
     Assert.True(WriteGate.admits 2 -1)
 
 [<Fact>]
+let ``write gate: a session pass-2 limit is honoured and pass 1 stays at 4 KiB`` () =
+    Assert.True(WriteGate.admitsWith 32768 1 4096)
+    Assert.False(WriteGate.admitsWith 32768 1 4097)
+    Assert.True(WriteGate.admitsWith 32768 2 32768)
+    Assert.False(WriteGate.admitsWith 32768 2 32769)
+    Assert.True(WriteGate.admitsWith 32768 2 -1)
+    Assert.True(WriteGate.admitsWith 262144 2 262144)
+
+[<Fact>]
+let ``send-side supply: notsent lowat and tx slots clamp to the product range`` () =
+    // Defaults stay the product values; the switches only widen the experiment range.
+    Assert.Equal(SocketTuning.NotSentLimit, SocketTuning.notsentLowatFor SocketTuning.NotSentLimit)
+    Assert.Equal(4096, SocketTuning.notsentLowatFor 1)
+    Assert.Equal(262144, SocketTuning.notsentLowatFor 999999)
+    Assert.Equal(32768, SocketTuning.notsentLowatFor 32768)
+    Assert.Equal(16, SocketTuning.txSlotsFor 1)
+    Assert.Equal(32, SocketTuning.txSlotsFor 32)
+    Assert.Equal(64, SocketTuning.txSlotsFor 999)
+
+[<Fact>]
+let ``user timeout: zero disables and requests clamp to the supported range`` () =
+    // Zero is the rollback switch: the option is never set, which is the old behaviour.
+    Assert.Equal(0, SocketTuning.userTimeoutMsFor 0)
+    Assert.Equal(0, SocketTuning.userTimeoutMsFor -1)
+    Assert.Equal(1000, SocketTuning.userTimeoutMsFor 1)
+    Assert.Equal(1000, SocketTuning.userTimeoutMsFor 999)
+    Assert.Equal(SocketTuning.UserTimeoutMs, SocketTuning.userTimeoutMsFor SocketTuning.UserTimeoutMs)
+    Assert.Equal(300000, SocketTuning.userTimeoutMsFor 300001)
+    // The product default must stay the value the design names.
+    Assert.Equal(30000, SocketTuning.UserTimeoutMs)
+
+[<Fact>]
 let ``write batch prefers empty paths and only then those with notsent at most 256 KiB`` () =
     use listener = listen ()
     let struct (session, bridge) = clientOnBridge ()

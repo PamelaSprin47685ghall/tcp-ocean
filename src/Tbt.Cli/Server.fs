@@ -49,6 +49,19 @@ let run (o: Options) =
     let maxPaths = o.Int("max-paths", 64)
     let windowClamp = o.Int("window-clamp", SocketTuning.WindowClamp)
     let statsMs = int64 (o.Int("stats-s", 0)) * 1000L
+    // Downlink group pacing: 0 (default) keeps the pre-existing unpaced write
+    // gate; 1 charges the session RateGroup so a 256-path burst cannot outrun
+    // the bottleneck. Direction-neutral: the client has the same switch as
+    // --uplink-pace.
+    let pace = o.Int("pace", 0) <> 0
+    // Pass-2 write-gate queue per path. The default stays SocketTuning.GatePass2Limit;
+    // the switch exists so a smaller queue can be compared as one variable.
+    let gatePass2 = max 4096 (o.Int("gate-pass2", SocketTuning.GatePass2Limit))
+    // Send-side supply: TCP_NOTSENT_LOWAT and async tx slots. Defaults are the
+    // product values; the switches exist so the two can be compared alone.
+    let notsentLowat = SocketTuning.notsentLowatFor (o.Int("notsent-lowat", SocketTuning.NotSentLimit))
+    let userTimeoutMs = SocketTuning.userTimeoutMsFor (o.Int("user-timeout-ms", SocketTuning.UserTimeoutMs))
+    let txSlots = SocketTuning.txSlotsFor (o.Int("tx-slots", 16))
     // "full" = always-read + read-after-Service, each Receive capped at
     // TunRecvBudget so Service / downlink / ACKs interleave (virtual-ACK grace).
     // "adaptive" = same always-read, but each Receive runs until EAGAIN and
@@ -177,7 +190,8 @@ let run (o: Options) =
             bridge.Attach session
             let channel = if asyncMode && isNull tun then Some (new RxChannel()) else None
             let ioGroup = if channel.IsSome then Some (ensureIoPool ()) else None
-            let carrier = SessionCarrier(session, bridge, ?rxChannel = channel, ?asyncIo = ioGroup)
+            let carrier = SessionCarrier(session, bridge, uplinkPace = pace, ?rxChannel = channel, ?asyncIo = ioGroup,
+                                         gatePass2 = gatePass2, txSlots = txSlots)
             link.PathId <- 0us
             reply link a.Reply
             carrier.AddPath link
@@ -211,7 +225,8 @@ let run (o: Options) =
                  + " " + describeOffer a.Params.Keys.Suite a.Params.Caps
                  + " flow_rcvbuf_req=" + string flowBuf
                  + " flow_rcvbuf_eff=" + string (SocketTuning.flowRecvWinFor flowBuf)
-                 + " rmem_max=" + string rmem)
+                 + " rmem_max=" + string rmem
+                 + " pace=" + (if pace then "on" else "off"))
             true
         | ValueNone -> tryJoinAny link frame
 
@@ -353,7 +368,7 @@ let run (o: Options) =
                     match tryAccept l with
                     | null -> go <- false
                     | s ->
-                        SocketTuning.path(s, windowClamp)
+                        SocketTuning.pathWith(s, windowClamp, notsentLowat, userTimeoutMs)
                         s.Blocking <- false
                         pending.Add(Pending(PathLink(s, probe), now))
         match tun with

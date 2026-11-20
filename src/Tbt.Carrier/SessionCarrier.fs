@@ -50,9 +50,11 @@ type private PathOp =
 
 [<Sealed>]
 type SessionCarrier(session: Session, bridge: FlowBridge, ?uplinkPace: bool, ?tupleMbit: float,
-                    ?rxChannel: RxChannel, ?asyncIo: AsyncPollerGroup) =
+                    ?rxChannel: RxChannel, ?asyncIo: AsyncPollerGroup, ?gatePass2: int, ?txSlots: int) =
     let pace = defaultArg uplinkPace false
     let tupleMbit = defaultArg tupleMbit 0.0
+    let gatePass2 = defaultArg gatePass2 SocketTuning.GatePass2Limit
+    let txSlots = SocketTuning.txSlotsFor (defaultArg txSlots 16)
     let channel = rxChannel
     let io = asyncIo
     let paths = List<IPath>()
@@ -144,6 +146,11 @@ type SessionCarrier(session: Session, bridge: FlowBridge, ?uplinkPace: bool, ?tu
         elif group.Ready && group.TryTake(fl, bulk) then true
         else uniqueInflight fl + fl <= startupCap fl
 
+    /// One half-open probe per second. `Poll` is a syscall; a peer that closed
+    /// must not keep a dead slot or `PathPool` can never rejoin that id. Async
+    /// paths already have their own `CheckAlive`.
+    let mutable lastHalfOpenProbeNs = 0L
+
     let prune () =
         let mutable i = paths.Count - 1
         while i >= 0 do
@@ -211,7 +218,7 @@ type SessionCarrier(session: Session, bridge: FlowBridge, ?uplinkPace: bool, ?tu
                     let eligible = pass = 1 || notSent <> 0
                     let admitted =
                         if not eligible then false
-                        elif WriteGate.admits pass notSent then
+                        elif WriteGate.admitsWith gatePass2 pass notSent then
                             if pass = 1 then gate1Pass <- gate1Pass + 1L
                             else gate2Pass <- gate2Pass + 1L
                             true
@@ -313,7 +320,13 @@ type SessionCarrier(session: Session, bridge: FlowBridge, ?uplinkPace: bool, ?tu
     member _.SlotVisits = slotVisits
     /// One Q-3 batch (tests): at most 4 frames per path.
     member _.WriteBatch(budget: int) = writeBatch budget
-    member _.Alive = (paths.Count > 0 || not pathOps.IsEmpty) && not session.Faulted && not session.Closed
+    /// Optional owner predicate: the session stays alive with no path while the
+    /// owner is still rebuilding its path pool. None keeps the old rule.
+    member val KeepAlive: (unit -> bool) option = None with get, set
+    member this.Alive =
+        (paths.Count > 0 || not pathOps.IsEmpty
+         || (match this.KeepAlive with Some f -> f () | None -> false))
+        && not session.Faulted && not session.Closed
     member _.HasPendingRx = rxMore
     member _.UplinkPace = pace
     member _.TupleMbit = tupleMbit
@@ -472,7 +485,7 @@ type SessionCarrier(session: Session, bridge: FlowBridge, ?uplinkPace: bool, ?tu
                 | Some group, Some rx ->
                     match link with
                     | :? PathLink as pl ->
-                        let asyncPath = AsyncPathLink.TakeOver(pl, group, rx)
+                        let asyncPath = AsyncPathLink.TakeOver(pl, group, rx, txSlots)
                         asyncPath :> IPath, Some asyncPath
                     | _ -> link, None
                 | _ -> link, None
@@ -569,6 +582,13 @@ type SessionCarrier(session: Session, bridge: FlowBridge, ?uplinkPace: bool, ?tu
                 j <- j + 1
             rxNext <- (start + 1) % n
         rxMore <- more
+        let nowNs = session.Clock.NowNs()
+        if nowNs - lastHalfOpenProbeNs >= 1_000_000_000L then
+            lastHalfOpenProbeNs <- nowNs
+            for link in paths do
+                match link with
+                | :? PathLink as pl -> pl.CheckAlive() |> ignore
+                | _ -> ()
         prune ()
         let writers = bridge.Writers
         let mutable slot = writers.NextUp -1

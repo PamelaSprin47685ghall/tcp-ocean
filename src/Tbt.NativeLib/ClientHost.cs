@@ -61,7 +61,9 @@ internal static class ClientHost
         bridge.Attach(session);
         // F# optional arguments surface to C# as required FSharpOption slots.
         // The native host keeps the synchronous path, so both async hooks stay null.
-        var carrier = new SessionCarrier(session, bridge, null, null, null, null);
+        var carrier = new SessionCarrier(session, bridge, null, null, null, null,
+                                        Microsoft.FSharp.Core.FSharpOption<int>.None,
+                                        Microsoft.FSharp.Core.FSharpOption<int>.None);
         carrier.AddPath(link0);
 
         int want = Math.Max(1, o.PathCount);

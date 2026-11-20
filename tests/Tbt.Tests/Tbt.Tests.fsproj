@@ -17,6 +17,8 @@
     <Compile Include="WireTests.fs" />
     <Compile Include="CryptoTests.fs" />
     <Compile Include="RateGroupTests.fs" />
+    <Compile Include="PathPoolTests.fs" />
+    <Compile Include="PathLinkHalfOpenTests.fs" />
     <Compile Include="KernelTcpInfoTests.fs" />
     <Compile Include="PollerTests.fs" />
     <Compile Include="PlatformTests.fs" />

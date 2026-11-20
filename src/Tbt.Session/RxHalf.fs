@@ -34,6 +34,9 @@ type RxHalf(symbolSize: int, field: CodeField, decoder: Decoder, opener: CellOpe
     /// no clock argument of its own.
     let mutable lastCellNs = 0L
     /// The frontier may wait this long for late cells before held parities are used.
+    /// The value is 20 ms. A 2026-11-20 experiment tried 2 ms: it raised the step rate
+    /// 1.36x but moved neither the delivered bytes nor the stall rate, so it was rolled
+    /// back. Keep this comment equal to the code.
     let stallNs = 20_000_000L
     let mutable frontierSince = 0L
     let mutable lastFrontier = 0UL

@@ -32,7 +32,11 @@ type PlatformCapabilities =
       /// The option number to use with IPPROTO_TCP when HasTcpNotsentLowat is set.
       TcpNotsentLowatOption: int
       /// setsockopt TCP_WINDOW_CLAMP (Linux 10) is accepted.
-      HasTcpWindowClamp: bool }
+      HasTcpWindowClamp: bool
+      /// setsockopt TCP_USER_TIMEOUT (Linux 18) is accepted. Linux closes a
+      /// socket whose sent data stays unacknowledged this long, which is the
+      /// only kernel signal a half-open carrier path ever produces.
+      HasTcpUserTimeout: bool }
 
 module Platform =
     let private tryCall (f: unit -> bool) =
@@ -83,6 +87,7 @@ module Platform =
                 elif trySetOption s 0x201 16384 then 0x201, true
                 else 0, false) (0, false)
         let clamp = withTcpSocket (fun s -> trySetOption s 10 600000) false
+        let userTimeout = withTcpSocket (fun s -> trySetOption s 18 30000) false
         { HasLibc = libc
           HasEpoll = epoll
           HasPoll = poll
@@ -93,7 +98,8 @@ module Platform =
           HasTcpInfoNotSent = infoLen >= 148
           HasTcpNotsentLowat = hasLowat
           TcpNotsentLowatOption = lowatOpt
-          HasTcpWindowClamp = clamp }
+          HasTcpWindowClamp = clamp
+          HasTcpUserTimeout = userTimeout }
 
     let current = lazy (probe ())
 
@@ -110,4 +116,5 @@ module Platform =
                flag "tcp_info" c.HasLinuxTcpInfo
                flag "tcp_info_notsent" c.HasTcpInfoNotSent
                flag "tcp_notsent_lowat" c.HasTcpNotsentLowat
-               flag "tcp_window_clamp" c.HasTcpWindowClamp |]
+               flag "tcp_window_clamp" c.HasTcpWindowClamp
+               flag "tcp_user_timeout" c.HasTcpUserTimeout |]

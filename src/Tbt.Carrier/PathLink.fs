@@ -106,6 +106,22 @@ type PathLink(socket: Socket, probe: INotSentProbe) =
         alive <- false
         if not detached then socket.Dispose()
 
+    /// Half-open probe. The peer sent FIN and the kernel has no bytes left:
+    /// `SelectRead` is true while `Available` is 0. A path with buffered bytes
+    /// is not condemned, and a healthy idle path reports `SelectRead` false.
+    /// Closing here lets `prune` drop the slot and `PathPool` rejoin that id.
+    member this.CheckAlive() =
+        if alive then
+            try
+                if socket.Poll(0, SelectMode.SelectRead) && socket.Available = 0 then
+                    this.Close()
+                    false
+                else true
+            with _ ->
+                this.Close()
+                false
+        else false
+
     /// Hand the socket and the bytes already read to an async IO thread. The
     /// link must not be used afterwards; the receiver owns the socket.
     member _.Detach() =

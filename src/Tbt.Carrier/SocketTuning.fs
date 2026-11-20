@@ -37,6 +37,33 @@ module SocketTuning =
     [<Literal>]
     let NotSentLimit = 16384
 
+    /// Accepted request range for the experiment switch; the product default is unchanged.
+    let notsentLowatFor (requested: int) =
+        if requested < 4096 then 4096
+        elif requested > 262144 then 262144
+        else requested
+
+    /// Async tx slots per path: 16 keeps the historical 32 KiB at 2 KiB/frame.
+    let txSlotsFor (requested: int) =
+        if requested < 16 then 16
+        elif requested > 64 then 64
+        else requested
+
+    /// A carrier path whose sent data stays unacknowledged this long is dead.
+    /// Linux RTO starts near 200 ms and backs off; 30 s is five to six retries,
+    /// which the live 314 ms / 18-27 % loss path can still recover, while a
+    /// half-open path (peer process gone, FIN/RST lost) produces nothing.
+    [<Literal>]
+    let UserTimeoutMs = 30000
+
+    /// Requested TCP_USER_TIMEOUT, clamped. Zero disables the option and keeps
+    /// the pre-2026-11-20-16 behaviour exactly.
+    let userTimeoutMsFor (requested: int) =
+        if requested <= 0 then 0
+        elif requested < 1000 then 1000
+        elif requested > 300000 then 300000
+        else requested
+
     /// Pass 1 of the write gate admits a path whose unsent queue is at most this.
     /// Zero was too strict for a long-RTT bundle: with 256 paths alive, every path
     /// almost always has a few hundred bytes unsent, so only one or two passed and
@@ -94,7 +121,8 @@ module SocketTuning =
 
     /// Settings for a path socket: no Nagle, small unsent queue (Linux TCP_NOTSENT_LOWAT).
     /// clamp is TCP_WINDOW_CLAMP in bytes (default WindowClamp, spec ch. 9).
-    let path (socket: Socket, clamp: int) =
+    let pathWith (socket: Socket, clamp: int, notsentLowat: int, userTimeoutMs: int) =
+        let notsentLowat = if notsentLowat <= 0 then NotSentLimit else notsentLowat
         socket.NoDelay <- true
         // Linux TCP_CONGESTION (level 6, option 13). Some hosts default to cubic;
         // on a path carrying a 14-19 % retransmit rate cubic collapsed cwnd to
@@ -108,7 +136,13 @@ module SocketTuning =
             with :? SocketException -> ()
         let c = Platform.current.Value
         if c.HasTcpNotsentLowat then
-            try socket.SetRawSocketOption(6, c.TcpNotsentLowatOption, ReadOnlySpan(BitConverter.GetBytes NotSentLimit))
+            try socket.SetRawSocketOption(6, c.TcpNotsentLowatOption, ReadOnlySpan(BitConverter.GetBytes notsentLowat))
+            with :? SocketException -> ()
+        if c.HasTcpUserTimeout && userTimeoutMs > 0 then
+            // A path with sent bytes but no ACK closes with ETIMEDOUT; the
+            // carrier then prunes it and PathPool rejoins the id. An idle path
+            // has nothing unacknowledged and is never touched.
+            try socket.SetRawSocketOption(6, 18, ReadOnlySpan(BitConverter.GetBytes userTimeoutMs))
             with :? SocketException -> ()
         if c.HasTcpWindowClamp then
             // TCP_WINDOW_CLAMP; autotuning stays on (no SO_RCVBUF, spec 3.6).
@@ -118,6 +152,9 @@ module SocketTuning =
             // Coarse send-queue cap when SIO_TCP_INFO / notsent is not implemented (D13).
             try socket.SendBufferSize <- 384 * 1024
             with :? SocketException -> ()
+
+    /// Product settings: the historical 16 KiB unsent queue.
+    let path (socket: Socket, clamp: int) = pathWith (socket, clamp, NotSentLimit, UserTimeoutMs)
 
     /// Bytes a flow socket asks for. The kernel clamps SO_RCVBUF to net.core.rmem_max,
     /// so a host whose ceiling is smaller silently gets a smaller window; rmemMax and
@@ -171,8 +208,14 @@ module SocketTuning =
 /// Two-pass write gating for the client uplink (spec 3.14).
 module WriteGate =
     /// Pass 1 admits notsent ≤ 4 KiB (or a probe that cannot tell). Pass 2, run
-    /// whenever pass 1 gated a path, admits notsent ≤ 256 KiB.
-    let admits (pass: int) (notSent: int) =
+    /// whenever pass 1 gated a path, admits notsent ≤ pass2Limit. The limit is a
+    /// parameter, not a constant, so a session can compare a smaller queue
+    /// without changing the product default.
+    let admitsWith (pass2Limit: int) (pass: int) (notSent: int) =
         if pass <= 1 then notSent >= 0 && notSent <= SocketTuning.GatePass1Limit
         elif notSent < 0 then true
-        else notSent <= SocketTuning.GatePass2Limit
+        else notSent <= pass2Limit
+
+    /// Pass 2 admits notsent ≤ 256 KiB: the product default.
+    let admits (pass: int) (notSent: int) =
+        admitsWith SocketTuning.GatePass2Limit pass notSent
