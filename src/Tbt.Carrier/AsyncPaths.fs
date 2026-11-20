@@ -233,6 +233,9 @@ type AsyncPathLink private (socket: Socket, probe: INotSentProbe, group: AsyncPo
     let txLen: int[] = Array.zeroCreate slotCount
     let mutable txHead = 0
     let mutable txTail = 0
+    // Gather buffer for PumpTx: up to 8 frames go out in one send(2).
+    static let gatherLength = 8 * maxFrame
+    let gather: byte[] = GC.AllocateUninitializedArray<byte> gatherLength
 
     member _.Id with get () = pathId and set value = pathId <- value
     member _.Length
@@ -299,10 +302,58 @@ type AsyncPathLink private (socket: Socket, probe: INotSentProbe, group: AsyncPo
             true
         else false
 
+    /// Send every committed slot from txTail in one syscall: copy them into the
+    /// gather buffer and hand the kernel one write. Returns false when the socket
+    /// would block or failed. One send(2) per 1.3 KiB frame was ~20% of the
+    /// server's CPU; with NoDelay each frame also left as its own short segment.
+    member private this.SendGathered(head: int, progress: byref<bool>) =
+        let mutable used = 0
+        let mutable k = txTail
+        while k < head && used + maxFrame <= gatherLength do
+            let slot = k % slotCount
+            let offset = txSent.[slot]
+            let length = txLen.[slot] - offset
+            if length > 0 then
+                Buffer.BlockCopy(txSlots.[slot], offset, gather, used, length)
+                used <- used + length
+            k <- k + 1
+        if used = 0 then
+            // Only empty slots: retire them.
+            while txTail < k do
+                txSent.[txTail % slotCount] <- 0
+                txTail <- txTail + 1
+            true
+        else
+            let mutable err = SocketError.Success
+            let n = socket.Send(ReadOnlySpan<byte>(gather, 0, used), SocketFlags.None, &err)
+            if err = SocketError.WouldBlock then false
+            elif err <> SocketError.Success then
+                Volatile.Write(&alive, 0)
+                false
+            elif n <= 0 then false
+            else
+                bytesWritten <- bytesWritten + int64 n
+                progress <- true
+                // Retire whole slots; a partial one keeps its offset.
+                let mutable left = n
+                while left > 0 && txTail < k do
+                    let slot = txTail % slotCount
+                    let remaining = txLen.[slot] - txSent.[slot]
+                    if left >= remaining then
+                        left <- left - remaining
+                        txSent.[slot] <- 0
+                        txTail <- txTail + 1
+                    else
+                        txSent.[slot] <- txSent.[slot] + left
+                        left <- 0
+                n = used
+
     member private this.PumpTx() =
         if Volatile.Read(&alive) = 1 then
             let mutable go = true
             let mutable progress = false
+            while go && Volatile.Read(&txHead) - txTail >= 2 do
+                go <- this.SendGathered(Volatile.Read(&txHead), &progress)
             while go && txTail < Volatile.Read(&txHead) do
                 let slot = txTail % slotCount
                 let offset = txSent.[slot]
