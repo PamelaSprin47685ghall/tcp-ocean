@@ -65,6 +65,18 @@ type Options(args: string[]) =
 /// CLI offer flags. Default (no --suites / --x25519): suite 0x02 only, no X25519.
 /// --suites is a comma-separated list (aegis, chacha8, chacha20). --x25519 is a
 /// bare flag, or --x25519 0 to turn it off explicitly.
+/// Per-flow receive credit (what this end lets the peer have in flight per flow).
+/// --flow-window-mib caps one flow's window; --credit-pool-mib is the session's
+/// receive budget, which includes C0 for all 256 slots (16 MiB). Defaults are the
+/// spec values (8 / 32 MiB). The window only binds when in-order delivery lags
+/// receipt by window / rate: 8 MiB at 60 Mbit/s is ~1.1 s, which the lossy CN->JP
+/// uplink (kernel retransmits on single paths) reaches.
+let creditFromOptions (o: Options) =
+    let d = Tbt.Session.CreditPolicy.defaults
+    let win = max 1 (o.Int("flow-window-mib", d.FlowWindowMax >>> 20)) <<< 20
+    let pool = max ((256 * Tbt.Session.CreditPolicy.C0) + win) (o.Int("credit-pool-mib", d.PoolBytes >>> 20) <<< 20)
+    { d with FlowWindowMax = win; PoolBytes = pool }
+
 let offerFromOptions (o: Options) =
     let struct (aegis, chacha8, chacha20) =
         if o.Has "suites" then Suite.parseOfferList (o.TextOr("suites", ""))

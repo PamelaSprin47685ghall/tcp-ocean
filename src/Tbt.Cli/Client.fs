@@ -73,7 +73,7 @@ let run (o: Options) =
         match System.Environment.GetEnvironmentVariable "TBTUN_FEC_ADAPTIVE" with
         | null -> true
         | v -> v <> "0"
-    let config = { SessionConfig.defaults with WindowSteps = o.Int("window", 1024); NewRepair = o.Int("new-repair", 0) <> 0; FecAdaptive = fecAdaptive }
+    let config = { SessionConfig.defaults with Credit = creditFromOptions o; WindowSteps = o.Int("window", 1024); NewRepair = o.Int("new-repair", 0) <> 0; FecAdaptive = fecAdaptive }
     let entropy = SystemEntropy()
     let struct (offerAegis, offerChaCha8, offerChaCha20, offerX25519) = offerFromOptions o
     let rttMs = max 1 (o.Int("rtt-ms", JoinBootstrap.DefaultRttMs))
