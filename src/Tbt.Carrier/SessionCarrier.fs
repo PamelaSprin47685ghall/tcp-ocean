@@ -598,6 +598,8 @@ type SessionCarrier(session: Session, bridge: FlowBridge, ?uplinkPace: bool, ?tu
             | null -> ()
             | s -> if poller.IsWritable s then bridge.OnWritable slot
             slot <- writers.NextUp slot
+        // Deliveries staged while the RxChannel was drained go out now.
+        bridge.Flush()
         bridge.Settle()
         // Interactive flows read first (spec 16.3 Q-3: bulk input after the interactive queue).
         hot.Clear()
@@ -609,6 +611,8 @@ type SessionCarrier(session: Session, bridge: FlowBridge, ?uplinkPace: bool, ?tu
             primeSample ()
             group.Service(session.Clock.NowNs())
         writeRound ()
+        bridge.Flush()
+        bridge.Settle()
         prune ()
 
     /// Close every path and local socket.

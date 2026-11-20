@@ -28,6 +28,16 @@ type FlowBridge(target: EndPoint voption) =
     let armed = ReadySet()
     let failures = ReadySet()
     let peekBuf = Array.zeroCreate 1
+    // Delivery coalescing. The session hands decoded data to Write one cell
+    // (~1.3 KiB) at a time; one send(2) per cell was ~18% of the server session
+    // thread on uplink (the single thread that also decrypts and decodes). Small
+    // writes are staged per slot and flushed when the stage is half full and at
+    // the end of every Service round, so no byte waits longer than one round.
+    static let stageCap = 65536
+    let stage: byte[][] = Array.init slotCount (fun _ -> Array.Empty<byte>())
+    let stageLen: int[] = Array.zeroCreate slotCount
+    let finishAfterStage: bool[] = Array.zeroCreate slotCount
+    let staged = ReadySet()
     /// Read-side diagnostics: how often a slot's Read ran, how many bytes it moved, and
     /// how often the local socket had nothing to give. These separate "the socket is
     /// empty" from "Read is called too rarely" without changing data-path behaviour.
@@ -44,7 +54,47 @@ type FlowBridge(target: EndPoint voption) =
         failed.[slot] <- true
         failures.Add slot
 
+    /// Send the staged bytes of slot. True when the stage is empty afterwards.
+    let flushSlot (slot: int) =
+        let len = stageLen.[slot]
+        if len = 0 then true
+        else
+            match locals.[slot] with
+            | null ->
+                stageLen.[slot] <- 0
+                staged.Remove slot
+                true
+            | socket ->
+                let mutable err = SocketError.Success
+                let n = socket.Send(ReadOnlySpan<byte>(stage.[slot], 0, len), SocketFlags.None, &err)
+                if err = SocketError.WouldBlock then
+                    wantWrite.[slot] <- true
+                    writers.Add slot
+                    false
+                elif err <> SocketError.Success then
+                    stageLen.[slot] <- 0
+                    staged.Remove slot
+                    fail slot
+                    true
+                else
+                    if n < len then
+                        Buffer.BlockCopy(stage.[slot], n, stage.[slot], 0, len - n)
+                        stageLen.[slot] <- len - n
+                        wantWrite.[slot] <- true
+                        writers.Add slot
+                        false
+                    else
+                        stageLen.[slot] <- 0
+                        staged.Remove slot
+                        if finishAfterStage.[slot] then
+                            finishAfterStage.[slot] <- false
+                            try socket.Shutdown SocketShutdown.Send with :? SocketException -> ()
+                        true
+
     let drop (slot: int) =
+        stageLen.[slot] <- 0
+        finishAfterStage.[slot] <- false
+        staged.Remove slot
         match locals.[slot] with
         | null -> ()
         | s ->
@@ -161,9 +211,18 @@ type FlowBridge(target: EndPoint voption) =
                 connecting.[slot] <- false
                 if code <> 0 then fail slot
             wantWrite.[slot] <- false
-            if not failed.[slot] then session.PumpFlow slot
+            let empty = flushSlot slot
+            if empty && not failed.[slot] then session.PumpFlow slot
             rewrite slot
             rearm slot
+
+    /// Send every staged delivery (end of a Service round).
+    member _.Flush() =
+        let mutable slot = staged.NextUp -1
+        while slot >= 0 do
+            let next = staged.NextUp slot
+            flushSlot slot |> ignore
+            slot <- next
 
     /// Report failures seen inside callbacks to the session.
     member _.Settle() =
@@ -210,23 +269,46 @@ type FlowBridge(target: EndPoint voption) =
                 writers.Add slot
                 0
             | socket ->
-                let mutable err = SocketError.Success
-                let n = socket.Send(data, SocketFlags.None, &err)
-                if err = SocketError.WouldBlock then
-                    wantWrite.[slot] <- true
-                    writers.Add slot
-                    0
-                elif err <> SocketError.Success then -1
+                let len = stageLen.[slot]
+                if len + data.Length <= stageCap then
+                    // Stage it; flush once half full, the rest at the end of the round.
+                    if stage.[slot].Length = 0 then stage.[slot] <- GC.AllocateUninitializedArray<byte> stageCap
+                    data.CopyTo(Span<byte>(stage.[slot], len, data.Length))
+                    stageLen.[slot] <- len + data.Length
+                    staged.Add slot
+                    if stageLen.[slot] >= stageCap / 2 then flushSlot slot |> ignore
+                    data.Length
+                elif not (flushSlot slot) then
+                    // The socket is full: take what still fits in the stage.
+                    let room = stageCap - stageLen.[slot]
+                    let take = min room data.Length
+                    if take > 0 then
+                        data.Slice(0, take).CopyTo(Span<byte>(stage.[slot], stageLen.[slot], take))
+                        stageLen.[slot] <- stageLen.[slot] + take
+                    take
+                elif failed.[slot] then -1
                 else
-                    if n < data.Length then
+                    let mutable err = SocketError.Success
+                    let n = socket.Send(data, SocketFlags.None, &err)
+                    if err = SocketError.WouldBlock then
                         wantWrite.[slot] <- true
                         writers.Add slot
-                    n
+                        0
+                    elif err <> SocketError.Success then -1
+                    else
+                        if n < data.Length then
+                            wantWrite.[slot] <- true
+                            writers.Add slot
+                        n
 
         member _.Finish(slot) =
             match locals.[slot] with
             | null -> ()
-            | socket -> try socket.Shutdown SocketShutdown.Send with :? SocketException -> ()
+            | socket ->
+                // FIN goes after the staged bytes.
+                if flushSlot slot then
+                    try socket.Shutdown SocketShutdown.Send with :? SocketException -> ()
+                else finishAfterStage.[slot] <- true
 
         member _.Reset(slot) =
             match locals.[slot] with
