@@ -149,10 +149,41 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
     let mutable srttNs = 100_000_000.0
     /// Jacobson/Karels EWMA of |sample − SRTT|; used with SRTT for the repair deadline.
     let mutable rttvarNs = 0.0
-    /// Windowed minimum of clean RTT samples: the min of this and the last 10 s bucket.
+    /// Windowed minimum of clean RTT samples: the min of this bucket and minPrevNs.
     let mutable minCurNs = Int64.MaxValue
     let mutable minPrevNs = Int64.MaxValue
     let mutable minSinceNs = 0L
+    /// Minima of the five 10 s buckets before the current one: minPrevNs is their min,
+    /// so the window is 60 s. It used to be one previous bucket (10-20 s), and that
+    /// window ratcheted on a bulk downlink: samples are seal-to-cumulative-ack, so
+    /// head-of-line waits behind a slow path inflate them; any bucket whose samples
+    /// all sat under 3 x min became the new minimum one rotation later, and an idle gap
+    /// of two buckets reset the minimum to unknown, after which the first (inflated)
+    /// burst sample re-seeded it. Live link: minrtt 310 -> 1499/1646 ms within a few
+    /// minutes while TCP RTT stayed ~330 ms; the 1.05 x minRTT repair wait grew with
+    /// it, holes took seconds to repair, and the credit window stalled behind them.
+    let minOlder: int64[] = Array.create 5 Int64.MaxValue
+    let mutable minOlderAt = 0
+    /// Start a new 10 s bucket. Only buckets that saw samples enter the window, so an
+    /// idle link (whose RTT has not changed) neither forgets the minimum nor lets a few
+    /// burst-start samples replace it: it rises only after five sampled buckets
+    /// (50+ s with samples) all sat above it, e.g. a real route change.
+    let mutable minLastSampleNs = 0L
+    let rotateMin (now: int64) =
+        // Buckets measure time with samples: an idle gap (> 2 s without one) does not
+        // age the window, else each short burst after a pause filled a whole bucket.
+        let gap = now - minLastSampleNs
+        if minLastSampleNs > 0L && gap > 2_000_000_000L then minSinceNs <- minSinceNs + gap
+        minLastSampleNs <- now
+        if now - minSinceNs >= 10_000_000_000L then
+            if minCurNs <> Int64.MaxValue then
+                minOlder.[minOlderAt] <- minCurNs
+                minOlderAt <- (minOlderAt + 1) % minOlder.Length
+                let mutable p = Int64.MaxValue
+                for v in minOlder do p <- min p v
+                minPrevNs <- p
+            minCurNs <- Int64.MaxValue
+            minSinceNs <- now
     let mutable rttSkipped = 0L
     /// SRTT estimates the path RTT, so it cannot sit below the smallest RTT
     /// actually observed. The 100 ms initial value otherwise stayed under a
@@ -410,10 +441,7 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
                                 let err = float used - srttNs
                                 rttvarNs <- rttvarNs + (abs err - rttvarNs) / 4.0
                                 srttNs <- srttNs + (float used - srttNs) / 8.0
-                            if now - minSinceNs >= 10_000_000_000L then
-                                minPrevNs <- minCurNs
-                                minCurNs <- Int64.MaxValue
-                                minSinceNs <- now
+                            rotateMin now
                             if m <> Int64.MaxValue && sample > 3L * m then
                                 // Far above the established minimum: the sender's own
                                 // queue or a stall, not path RTT. Do not raise the
@@ -473,10 +501,7 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
                                     let err = float used - srttNs
                                     rttvarNs <- rttvarNs + (abs err - rttvarNs) / 4.0
                                     srttNs <- srttNs + (float used - srttNs) / 8.0
-                                if now - minSinceNs >= 10_000_000_000L then
-                                    minPrevNs <- minCurNs
-                                    minCurNs <- Int64.MaxValue
-                                    minSinceNs <- now
+                                rotateMin now
                                 if m <> Int64.MaxValue && sample > 3L * m then
                                     // Same guard as the repair branch above.
                                     ()

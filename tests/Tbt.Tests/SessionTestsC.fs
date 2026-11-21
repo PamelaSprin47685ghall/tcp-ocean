@@ -406,3 +406,53 @@ let ``adaptive FEC raises rho when the uplink loses cells`` () =
     Assert.True(pair.Dropped > 0, "the pair must actually drop cells")
     Assert.True(pair.Client.Tx.Rho > 0.02, sprintf "lossy rho %f" pair.Client.Tx.Rho)
 
+
+/// Run ms rounds (1 ms each) with one-way delay owMs, feeding a little data per round.
+let private runFor (pair: Pair) (c: Session) (slot: int) (owMs: int64) (ms: int) =
+    pair.Delay <- owMs * 1_000_000L
+    let data = Array.zeroCreate<byte> 2_000
+    for _ in 1 .. ms do
+        pair.Feed(c, slot, ReadOnlySpan data, false) |> ignore
+        pair.Round() |> ignore
+
+let private minRttPair () =
+    let config = { SessionConfig.defaults with Credit = { CreditPolicy.defaults with Enabled = false } }
+    let pair = Pair(config, 1, 0.0, 4)
+    let c = pair.Client
+    let mutable slot = -1
+    Assert.True(c.TryOpenFlow(&slot))
+    pair, c, slot
+
+let private near (want: int64) (got: int64) =
+    Assert.True(got >= want && got < want + 20_000_000L, sprintf "min rtt %d ms, want ~%d ms" (got / 1_000_000L) (want / 1_000_000L))
+
+[<Fact>]
+let ``minRTT survives idle gaps and is not re-seeded by inflated burst samples`` () =
+    // Live downlink: minrtt 310 -> 1499 ms across idle gaps between downloads; the
+    // samples of each burst are seal-to-ack behind head-of-line waits, not path RTT.
+    // Old window: one idle gap moved the true minimum to the previous bucket, the next
+    // dropped it, and the burst's 900 ms became minRTT (and 1.05 x it the repair wait).
+    let pair, c, slot = minRttPair ()
+    runFor pair c slot 165L 3_000
+    near 330_000_000L c.Tx.MinRttNs
+    for _ in 1 .. 6 do
+        pair.Clock.Now <- pair.Clock.Now + 25_000_000_000L
+        runFor pair c slot 450L 3_000
+        near 330_000_000L c.Tx.MinRttNs
+    Assert.True(c.Tx.RepairWaitNs < 400e6, sprintf "repair wait %g" c.Tx.RepairWaitNs)
+
+[<Fact>]
+let ``minRTT does not ratchet up during 45 s of inflated samples`` () =
+    let pair, c, slot = minRttPair ()
+    runFor pair c slot 165L 3_000
+    // 2.4 x min: inflated, but under the 3 x guard. The old window adopted it after 20 s.
+    runFor pair c slot 400L 45_000
+    near 330_000_000L c.Tx.MinRttNs
+
+[<Fact>]
+let ``minRTT follows a lasting RTT increase after about a minute`` () =
+    let pair, c, slot = minRttPair ()
+    runFor pair c slot 50L 3_000
+    near 100_000_000L c.Tx.MinRttNs
+    runFor pair c slot 125L 75_000
+    near 250_000_000L c.Tx.MinRttNs
