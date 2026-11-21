@@ -59,7 +59,7 @@
 - **接收侧证据**：客户端 `rx_ack` 每秒只推进 20–60 步，`flow_credit` 长期只剩
   22–24 KB（8 MiB 窗口），`recovered` 持续增长。信用按解码前沿回收，前沿一停，
   服务端在窗口用尽后无法再发，这比发送侧 pace 更能解释“发送队列空 + 新连接 0 字节”。
-  `opened=1 closed=0` 不是泄漏：mihomo smux `max-connections: 1` 把多条 curl 复用为
+  `opened=1 closed=0` 不是泄漏：本地代理 smux `max-connections: 1` 把多条 curl 复用为
   一条 VLESS 长连接，tbtun 只看到一个 flow。
 - **传输通道**：直接 scp 3.9 MB 仍在 38 s 后远端 0 字节；本机到 HND0 的 1400 B
   `ping -M do` 正常、短 SSH 命令正常，所以不是 MTU 黑洞。已改 256 KB 分块逐块传输。
@@ -184,7 +184,7 @@
 上行 3/3 把 5 MB 全部送出，速率约 **4.0 Mbit/s**，与同期下行好轮同量级；
 `flow_credit` 从 55,260 涨到 14,876,833 B，上行信用在推进，不是上行退化。
 两轮 `code=100` 是上传完成后等响应超过 10 s，即同一停摆出现在响应（下行）方向；
-这与「停摆在 mihomo 内部而非某一方向」一致，也说明 CASE-5 的「不退化」成立。
+这与「停摆在本地代理内部而非某一方向」一致，也说明 CASE-5 的「不退化」成立。
 
 ### 判定
 
@@ -224,7 +224,7 @@
 对照 4 路无丢包（同工作树）：bulk 175 Mbit/s、ping-under-bulk p99 67.8 ms。
 16 路 5% 丢包下吞吐降约 15%、有载 p99 升到 121 ms，属预期退化而非缺陷；
 `echo.py` 出现过一次 `OSError 107`（第 3 轮 echo 8 流），与前两轮结果无关。
-该样本只覆盖 tbtun 两侧，不经 mihomo，因此不能用来说明生产下行。
+该样本只覆盖 tbtun 两侧，不经本地代理，因此不能用来说明生产下行。
 
 - **H1（下行无组级 pace）不成立**：`queued=0`、`tx_head − peer_ack = 0`，
   承载 TCP 被内核标记 `app_limited`（无数据可发），不存在 256 路聚合同步突发。
@@ -468,7 +468,7 @@ server_max_paths 64；两侧各一轮，全部 segment `validity=valid`，0 inva
 ### CASE-11 的内存上界：模型 + 单流观测，未做并发实测
 
 每流最坏内核接收缓冲 = `2 × min(4 MB, rmem_max)` = 8 MB，加 8 MiB 信用的应用侧余量，
-单流上界 16 MB。生产实测服务端 RSS 70 MB、本机可用内存 48 GB、mihomo 把多条 curl
+单流上界 16 MB。生产实测服务端 RSS 70 MB、本机可用内存 48 GB、本地代理把多条 curl
 复用成 1 条 flow，256 流外推 `16 MB × 256 = 4 GB`，占可用内存 8.3%。64 路并发实测
 本轮没有做（本机无 `/etc/tbtun/psk`、时间用尽），CASE-11 记为“未实测”，不得用外推
 当通过。
@@ -510,7 +510,7 @@ server_max_paths 64；两侧各一轮，全部 segment `validity=valid`，0 inva
 | 本机裸连该 URL | 44.9 |
 | HND0 裸连该 URL | 41.9 |
 
-- **C1 mihomo 消费慢：排除。** 18443 的 `Recv-Q/Send-Q` 18 次快照全 `0/0`。
+- **C1 本地代理消费慢：排除。** 18443 的 `Recv-Q/Send-Q` 18 次快照全 `0/0`。
 - **C2 解码/前沿排队：排除。** `rx_ack 101.6 步/s × 18.1 KiB = 1.84 MB/s`，
   与交付 1.63 MB/s 一致；`srtt = minrtt = 314 ms`，`queued=0`。
 - **服务端不缺口：** `tx_head/peer_ack/grant_limit = 2785/2582/3286`、`queued=0`、
@@ -519,9 +519,9 @@ server_max_paths 64；两侧各一轮，全部 segment `validity=valid`，0 inva
 
 ### 结论
 
-服务端 `--target` 是 `127.0.0.1:18443`，即 HND0 的 mihomo。其配置只有 VLESS 入站
+服务端 `--target` 是 `127.0.0.1:18443`，即 HND0 的本地代理。其配置只有 VLESS 入站
 与 `MATCH,DIRECT`，没有 proxies。服务端已把 target socket 读空，而 HND0 裸连同一
-OCA 有 41.9 Mbit/s：**13 Mbit/s 的限制在 mihomo 的 VLESS 入站 → DIRECT 这一跳，
+OCA 有 41.9 Mbit/s：**13 Mbit/s 的限制在本地代理的 VLESS 入站 → DIRECT 这一跳，
 在单条 flow 的窗口上**（`13.05 × 0.314 ≈ 512 KB`，与 smux 流窗口、600 KB clamp
 同量级），不在 tbtun 的承载、解码或信用。
 
@@ -535,9 +535,9 @@ CASE-9 的「flow_credit < 1 MiB」判定口径也从一开始就错了，应改
 
 ### 下一步
 
-1. 读本机 mihomo 的 `HND0TBT4` 出站 smux 窗口；若约 512 KB，调到 2–4 MB 做单变量
+1. 读本机本地代理的 `HND0TBT4` 出站 smux 窗口；若约 512 KB，调到 2–4 MB 做单变量
    A/B（tbtun 不动），判据：中位 ≥ 1.5× 且 HND0 侧 WouldBlock 占比下降。
-2. 若 mihomo 侧无可调窗口，替换本机 tbtun 客户端（仍是 `f2b63e00`），把同样的
+2. 若本地代理侧无可调窗口，替换本机 tbtun 客户端（仍是 `f2b63e00`），把同样的
    4 MB 接收缓冲补到客户端侧，作为独立变量复测。
 3. Tokyo OCA 上重采 CASE-1 基线，替代本轮 42–45 Mbit/s 上限的欧洲 URL。
 
@@ -548,7 +548,7 @@ CASE-9 的「flow_credit < 1 MiB」判定口径也从一开始就错了，应改
 | 路径 | 结果 |
 |---|---|
 | HND0 裸连（curl 100 MB 完整） | 6.6–8.0 s，**105–127 Mbit/s** |
-| HND0 本机 mihomo 客户端 → HND0 VLESS 入站 → DIRECT（RTT <1 ms） | 29 / 71 / 74 Mbit/s（后两轮完整 100 MB） |
+| HND0 本机本地代理客户端 → HND0 VLESS 入站 → DIRECT（RTT <1 ms） | 29 / 71 / 74 Mbit/s（后两轮完整 100 MB） |
 | 经隧道 17893，smux 开（默认窗口） | 0 / 0 / 0.91 MB/s（12 s 轮） |
 | 经隧道 17893，`max-stream-receive-window: 4194304` | 0 / 0.41 / 0 / 0.63 / 0.14 MB/s |
 | 经隧道 17893，`smux.enabled: false` | 0.50 / 0 / 0.57 / 0.58 / 0.34 MB/s（中位 0.50） |
@@ -556,7 +556,7 @@ CASE-9 的「flow_credit < 1 MiB」判定口径也从一开始就错了，应改
 ### 判定
 
 1. **供数不是瓶颈**：HND0 裸连 105–127 Mbit/s。
-2. **mihomo 的 VLESS+smux 本身不是 13 Mbit/s 的硬上限**：HND0 本机同一入站可跑
+2. **本地代理的 VLESS+smux 本身不是 13 Mbit/s 的硬上限**：HND0 本机同一入站可跑
    71–74 Mbit/s；单流实现能到约 9 MB/s。
 3. **`max-stream-receive-window` 字段存在且被接受，但 4 MiB 未观察到收益**（该 A/B
    在基准崩塌期完成，单轮结果不能排除时段性停摆；见第七代节）：
@@ -570,7 +570,7 @@ CASE-9 的「flow_credit < 1 MiB」判定口径也从一开始就错了，应改
 
 - 关闭 smux 后**短连接不可用**：5 次 `generate_204` 的前 3 次全部 `code=000`，
   ttfb 10 s 超时。大文件吞吐的约 2× 以短连接可用性为代价，不可接受。
-- 已回滚到 `smux.enabled: true`（sha `fe5dab8b…`），`mihomo-hnd0tbt4` active、
+- 已回滚到 `smux.enabled: true`（sha `fe5dab8b…`），`proxy-hnd0tbt4` active、
   256 路 ESTAB；回滚后 3 次 `generate_204` 均 `204`，ttfb 1.07–1.71 s。
 - tbtun 两端二进制未改，仍是 `661ad970`。
 
@@ -614,8 +614,8 @@ cwnd:10 bytes_sent:148,792,364 bytes_acked:148,792,364 bytes_received:44,223
 snd_wnd:29,881,344 rcv_wnd:82,944 app_limited busy:1499ms
 ```
 
-`bytes_sent = bytes_acked = 148.79 MB`、`Send-Q = 0`：tbtun 交付给 mihomo 的数据
-全部被 ACK，没有内核积压；`snd_wnd` 29.8 MB，mihomo 一直在读。
+`bytes_sent = bytes_acked = 148.79 MB`、`Send-Q = 0`：tbtun 交付给本地代理的数据
+全部被 ACK，没有内核积压；`snd_wnd` 29.8 MB，本地代理一直在读。
 
 ### 三条候选的结果
 
@@ -624,11 +624,11 @@ snd_wnd:29,881,344 rcv_wnd:82,944 app_limited busy:1499ms
 | S1 接收前沿停 | 停摆窗口 `rx_ack` 增量 = 0 | **排除**：R3→R4 期间 `rx_ack` +282→+382 步/10 s，`RxDelivered` +5.7→+8.0 MB/10 s |
 | S2 smux 单流窗口 | `flowread` 增量 ≈ 0、HND0 直连正常 | **排除**：tbtun 仍在 18443 写入 6–11 MB/10 s；窗口不是发送侧限制 |
 | S3 FlowBridge 读节奏 | 成功 Read 字节 < 一轮预算 | **排除**：服务端读到的数据已经流到本机并写入 18443 |
-| S4（新）smux 流层积压/HOL | 数据进入 mihomo 后未交付给 curl；一条连接上的旧 stream 阻塞新 stream | **成立候选**：`bytes_acked` 全清、`Send-Q=0`，而 curl 0 字节 |
+| S4（新）smux 流层积压/HOL | 数据进入本地代理后未交付给 curl；一条连接上的旧 stream 阻塞新 stream | **成立候选**：`bytes_acked` 全清、`Send-Q=0`，而 curl 0 字节 |
 
-### 隔离实例对照（不碰生产 mihomo）
+### 隔离实例对照（不碰生产本地代理）
 
-在 `/tmp/mihomo-g7` 起第二个 mihomo（mixed-port 17895，其余同生产），只把
+在 `/tmp/proxy-g7` 起第二个本地代理（mixed-port 17895，其余同生产），只把
 `smux.max-connections` 从 1 改为 4，与生产 17893 交错 3 轮 × 8 s：
 
 | 轮 | max-connections=4 | max-connections=1（生产） |
@@ -643,11 +643,11 @@ snd_wnd:29,881,344 rcv_wnd:82,944 app_limited busy:1499ms
 
 ### 四个窗口字段同时设置（隔离实例 17896）
 
-`strings /opt/mihomo/mihomo` 确认存在两组字段：
+`strings /opt/proxy/本地代理` 确认存在两组字段：
 `MaxStreamReceiveWindow` / `MaxConnectionReceiveWindow`（tag 为
 `max-stream-receive-window` / `max-connection-receive-window`）与
 `recv-window` / `recv-window-conn`。隔离实例把四个字段全部设为 4,194,304，
-`mihomo -t` 通过，与生产 17893 交错 3 轮 × 10 s：
+`本地代理 -t` 通过，与生产 17893 交错 3 轮 × 10 s：
 
 | 轮 | 四窗口 4 MiB | 生产默认 |
 |---|---|---|
@@ -662,16 +662,16 @@ snd_wnd:29,881,344 rcv_wnd:82,944 app_limited busy:1499ms
 ### 判定
 
 **tbtun 的下行数据面在本轮是健康的**：接收前沿推进、信用回收、18443 写入都正常，
-速率 5–9 Mbit/s 量级。停摆发生在 mihomo 内部：数据已从 18443 读入，但未交给 curl
+速率 5–9 Mbit/s 量级。停摆发生在本地代理内部：数据已从 18443 读入，但未交给 curl
 的 HTTP 连接。S4 是唯一与全部观测一致的候选。
 
 ### 未完成
 
-- mihomo 不暴露 smux stream 级指标，无法直接读单 stream 的接收缓冲与丢帧计数。
+- 本地代理不暴露 smux stream 级指标，无法直接读单 stream 的接收缓冲与丢帧计数。
   下一次可用 `curl --http1.1` 单连接、`smux.enabled: false` 加长首包超时、
   或换一个 smux 客户端做对照，但这些都改生产配置，需单独窗口。
 - 隔离实例 `17895` 仍在运行（本轮 bash 预算耗尽未能清理），下次进入生产窗口
-  必须先 `pkill -f /tmp/mihomo-g7`。
+  必须先 `pkill -f /tmp/proxy-g7`。
 - 10 轮基线为 0 字节轮 5/10，CASE-12 判失败；但根因不在 tbtun 代码。
 
 ## 第八代：停摆层级、HND0 证据与三个配置证伪（2026-11-20 17:20–17:35）
@@ -687,11 +687,11 @@ snd_wnd:29,881,344 rcv_wnd:82,944 app_limited busy:1499ms
 - 0 字节轮内 18443 `bytes_sent` 208,841,171→215,340,063（+6.5 MB/15 s）；
   17893 的 accept socket `bytes_sent` 恒 39 B（仅 CONNECT 响应），Recv-Q/Send-Q=0。
 - 停摆轮 `opened=22 closed=21 local_fail=12 stale=27356` 前后不变 → 排除 flow 重建触发。
-- 好轮：18443 单条 flow 5 s 写 1.09 MB，curl 收 1.33 MB，匹配；mihomo accept socket 0/0。
+- 好轮：18443 单条 flow 5 s 写 1.09 MB，curl 收 1.33 MB，匹配；本地代理 accept socket 0/0。
 
 ### 8.2 goroutine 现场
 
-停摆窗口内对 mihomo 发 SIGQUIT（systemd 3 s 自愈），`/run/hnd0tbt4.log:515-780`：
+停摆窗口内对本地代理发 SIGQUIT（systemd 3 s 自愈），`/run/hnd0tbt4.log:515-780`：
 Relay 下行阻塞在 `smux.(*stream).Read → waitRead`；`recvLoop` 在 `io.ReadFull`；
 `sendLoop` select；Relay 上行阻塞在 curl accept 的 `RawRead`。实现是
 `metacubex/smux@v0.0.0-20260105030934` + `sing-mux@v0.3.12`。curl 以
@@ -713,7 +713,7 @@ Relay 下行阻塞在 `smux.(*stream).Read → waitRead`；`recvLoop` 在 `io.Re
 
 ### 8.5 判定
 
-停摆不是 tbtun 数据面缺陷（`rx_ack`/`RxDelivered`/18443 写入健康），也不是 mihomo 的
+停摆不是 tbtun 数据面缺陷（`rx_ack`/`RxDelivered`/18443 写入健康），也不是本地代理的
 per-session smux bug（三实例同步、`min-streams` 与窗口均无效），而是隧道承载在 16.3%
 cell loss 与 726 ms RTT 下把字节流延迟/丢弃数秒；smux 的 `recvLoop` 在等被延迟的帧。
 好轮吞吐 ≈ smux 有效窗口 / RTT。
@@ -727,7 +727,7 @@ cell loss 与 726 ms RTT 下把字节流延迟/丢弃数秒；smux 的 `recvLoop
   属敏感默认，需机制说明 + 单测 + 矩阵。
 - 时段：全程 0–4 Mbit/s，窗口/停摆 A/B 不可判定；只有同一时段好轮 ≥10 Mbit/s 时才可
   下窗口结论。
-- 生产未改：`/run/hnd0tbt4.yaml` 仍 `fe5dab8b`、mihomo/tbtun active、256 路。
+- 生产未改：`/run/hnd0tbt4.yaml` 仍 `fe5dab8b`、本地代理/tbtun active、256 路。
 
 ### 8.7 服务端组级 pace：实现与 256 路床对照（本代）
 
@@ -794,10 +794,10 @@ CASE-8（慢消费，`--limit-rate 200k`，4 MiB）：
 
 ## 第九代：`--pace` 生产判定与客户端路径池缺陷（2026-11-20 12:06–12:25 UTC）
 
-### 9.1 上传通道（用户授权的唯一 mihomo 用途）
+### 9.1 上传通道（用户授权的唯一本地代理用途）
 
-用户明确：mihomo 只作上传二进制的通道，不得当实验对象。通道成立：HND0 临时
-python3 接收器监听 `127.0.0.1:19601`（mihomo 入站 `MATCH,DIRECT` 到 loopback），
+用户明确：本地代理只作上传二进制的通道，不得当实验对象。通道成立：HND0 临时
+python3 接收器监听 `127.0.0.1:19601`（本地代理入站 `MATCH,DIRECT` 到 loopback），
 本机 `curl --proxy http://127.0.0.1:17893 -X POST --data-binary`。1 MB 与 3.9 MB
 两次 sha256 均相符，3.9 MB 耗时 5.94 s（约 5.3 Mbit/s）。同一时段 SSH scp 仍不可用
 （11 KB/s、三次截断）。CASE-0 的大文件形态据此改为「经 17893 上传 + sha256 相符 +
@@ -884,7 +884,7 @@ HND0 回到 `3f05c4a0`、pace off、drop-in 仅 `stats.conf`。
 ### 10.4 生产状态与回滚
 
 本机 `7c48936e`（新）、备份 `tbtun.bak-g10` = `f2b63e00`；HND0 `3f05c4a0` pace off；
-`mihomo-hnd0tbt4` 与 `tbtun-hnd0` active；两端 256 路。
+`proxy-hnd0tbt4` 与 `tbtun-hnd0` active；两端 256 路。
 回滚：`install /usr/local/bin/tbtun.bak-g10` 加 `systemctl restart tbtun-hnd0`，<30 s。
 
 ---
@@ -953,8 +953,8 @@ HND0 从 `3f05c4a0` 升级到与本机同代的 `7c48936e`（备份 `tbtun.bak-g
 
 判定：未达「停摆 ≤1/10 或好轮中位 ≥1.25 MB/s」，已 `install tbtun.bak-g11` 回滚到
 `3f05c4a0`，45 s 到 256 路。两组停摆都发生在 `rho=0.03`、`cell_loss≈0`、256 路、
-`beginfail=0` 的健康状态下，与第七、八代的 SIGQUIT 栈证据一致：停摆落在 mihomo
-的 smux stream 投递层，不在 tbtun 数据面。用户已限定 mihomo 只作上传通道，
+`beginfail=0` 的健康状态下，与第七、八代的 SIGQUIT 栈证据一致：停摆落在本地代理
+的 smux stream 投递层，不在 tbtun 数据面。用户已限定本地代理只作上传通道，
 本代不设计该层实验。
 
 ### 11.5 join-concurrency 64：保留
@@ -974,13 +974,13 @@ CASE-13 仍未稳定达「30 s 内 250」，且单路断开不自愈，门禁不
 ### 11.6 生产状态
 
 本机 `/usr/local/bin/tbtun` = `7c48936e`；HND0 = `3f05c4a0`，备份 `tbtun.bak-g11`；
-`mihomo-hnd0tbt4` 与 `tbtun-hnd0` active；两端 256 路；
+`proxy-hnd0tbt4` 与 `tbtun-hnd0` active；两端 256 路；
 `/run/hnd0tbt4.yaml` = `fe5dab8b`（原始 smux 开启配置）；
 `tbtun-hnd0.service.d/join64.conf` 已装。
 
 ### 11.7 未达与残余风险
 
-1. 停摆 5/10 未改善；机制证据指向 mihomo smux stream 投递，用户禁止在该层实验。
+1. 停摆 5/10 未改善；机制证据指向本地代理 smux stream 投递，用户禁止在该层实验。
 2. 恒定 ~285 KB 有效在途窗口未定位、未修复；这是生产 6–9 Mbit/s 的定量上限来源。
 3. 单路断开不自愈（sync 模式缺半开检测），修复需改 `SessionCarrier`/`PathLink`
    健康判定，属敏感改动，本代未动。
@@ -1015,10 +1015,10 @@ CASE-13 仍未稳定达「30 s 内 250」，且单路断开不自愈，门禁不
 ### 12.3 生产三分账
 
 短窗口（12 s）：`RxDelivered` +6,252,876 B，curl 6,209,518 B，差 0.7%；
-18443 `bytes_sent=bytes_acked`、Send-Q=0，mihomo 读取跟得上。
+18443 `bytes_sent=bytes_acked`、Send-Q=0，本地代理读取跟得上。
 
 长窗口（10 轮）：`RxDelivered` +121,381,553 B，curl 47.7 MB，差 73.7 MB；
-`Reserve=0`。积压在 mihomo 层，且与停摆轮同步出现。
+`Reserve=0`。积压在本地代理层，且与停摆轮同步出现。
 
 ### 12.4 stallNs 修复与回滚
 
@@ -1039,7 +1039,7 @@ CASE-13 仍未稳定达「30 s 内 250」，且单路断开不自愈，门禁不
 
 ### 12.6 残余风险
 
-1. 生产下行 0.4–1.4 MB/s 的主导限制在 mihomo smux/转发层（长窗口 73.7 MB 积压）；
+1. 生产下行 0.4–1.4 MB/s 的主导限制在本地代理 smux/转发层（长窗口 73.7 MB 积压）；
    用户禁止在该层实验，只记录。
 2. `stallNs` 不是用户可见瓶颈：步率升 1.36×，吞吐不变。
 3. 单路半开自愈仍未实现（CASE-13）。
@@ -1124,7 +1124,7 @@ CASE-13 仍为未通过。下一步读 `Client.fs` 的 `drainEvents/attachJoined
 ### 13.6 吞吐：本代不声称提升
 
 第十二代的长窗口三分账仍是主导证据：tbtun 写入 18443 121.4 MB，curl 只收
-47.7 MB，差额在 mihomo 的 smux/转发层；用户已禁止把 mihomo 当实验对象。本代只修
+47.7 MB，差额在本地代理的 smux/转发层；用户已禁止把本地代理当实验对象。本代只修
 自愈，未改发送侧、协议、信用或 FEC，也不改变下行速度结论。
 
 ### 13.7 回滚
@@ -1135,7 +1135,7 @@ CASE-13 仍为未通过。下一步读 `Client.fs` 的 `drainEvents/attachJoined
 
 1. async 小池启动缺陷（`--paths` 很小且无其它路径兜底时）。
 2. CASE-8 仍无证据；CASE-2 重传率仍未同窗口重测。
-3. 下行速度限制仍在 mihomo 层；tbtun 侧可验证的修复面本轮收敛到自愈。
+3. 下行速度限制仍在本地代理层；tbtun 侧可验证的修复面本轮收敛到自愈。
 
 ## 第十五代：GatePass2 证伪、发送侧供给与一次被客户端冻结打断的 V1（2026-11-20 14:00–14:27 UTC）
 
@@ -1145,7 +1145,7 @@ CASE-13 仍为未通过。下一步读 `Client.fs` 的 `drainEvents/attachJoined
   HND0 = `3f05c4a0`（g11 服务端）。交接报告“生产二进制 1547a466”只对本机成立。
 - HND0 上不存在 `.bak-g13` / `.bak-g14`；本机 `.bak-g14` 与现役同 hash，
   真实回滚目标仍是 `.bak-g13` = `7c48936e`。
-- 两端 `:39443` 各 256 条 ESTAB，`tbtun-hnd0` 与 `mihomo-hnd0tbt4` 均 active；
+- 两端 `:39443` 各 256 条 ESTAB，`tbtun-hnd0` 与 `proxy-hnd0tbt4` 均 active；
   HND0 `rmem_max = 16777216`。
 - GatePass2 代码与单测与第十四代报告一致（`GatePass2Limit = 262144`、
   `admitsWith` 边界 4 例、`?gatePass2` 默认不变、两端 CLI 各暴露
@@ -1363,7 +1363,7 @@ AOT 候选 `734318db`（4,001,144 B）已部署本机，备份 `tbtun.bak-g16`�
 - 半开路径（FIN/RST 丢失）只有进程级 `SIGSTOP` 实验与代码路径支撑。
   原计划的 netns 丢包版本未执行：它与进程级实验测的是同一个内核行为，且需要
   `iptables`/`nft` 与一次 256 路建池，本代按经济性判为重复，未冒充为已执行。
-- 本代**没有**任何吞吐提速声明。用户可见下行仍受第七/十二代定位的 mihomo
+- 本代**没有**任何吞吐提速声明。用户可见下行仍受第七/十二代定位的本地代理
   转发层限制（tbtun 长窗口写入 121 MB、curl 收 47.7 MB），而该层用户已禁止实验。
 - 发送侧供给 A/B（`--notsent-lowat 32768 --tx-slots 32`）本代未执行：
   前置缺陷刚修完，HND0 仍需再部署一次服务端候选；判据与切片已固定在

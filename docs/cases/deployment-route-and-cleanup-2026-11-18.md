@@ -21,7 +21,7 @@
 45.11.1.62 via 172.24.0.1 dev enp8s0 src 172.24.14.184 uid 0
 ```
 
-承载地址确实从 `enp8s0` 出，没有进 mihomo 的 2022 表。
+承载地址确实从 `enp8s0` 出，没有进本地代理的 2022 表。
 
 HND0 的 `ip rule` 只有 `15: from 45.11.1.62 lookup main`，没有 8890；
 服务端不需要客户端那套绕过规则。
@@ -47,8 +47,8 @@ ip rule del  pref 8899                            # rc=2, RTNETLINK answers: No 
 ### 重启后的持久性
 
 - 系统重启：systemd 启动 `tbtun-hnd0.service` 时重跑 `ExecStartPre`，规则恢复。
-- mihomo 重启：不影响 tbtun 的规则，因为规则不归 mihomo 管。
-- 只重启 `mihomo.service` 后应复查 `ip rule show | grep 8890` 与 `ip route get 45.11.1.62`。
+- 本地代理重启：不影响 tbtun 的规则，因为规则不归本地代理管。
+- 只重启 `proxy.service` 后应复查 `ip rule show | grep 8890` 与 `ip route get 45.11.1.62`。
 
 未在本机执行整机重启（会中断当前隧道与其它使用者），因此“重启后仍指向 `enp8s0`”
 目前只有上面两条机制性证据，没有重启实测。
@@ -85,15 +85,15 @@ ExecStart=/usr/local/bin/tbtun server --listen 0.0.0.0:39443 --target 127.0.0.1:
 
 ```
 /run/hnd0tbt4.pid  -> 4058250
-4058250 /opt/mihomo/mihomo -f /run/hnd0tbt4.yaml -d /run
+4058250 /opt/proxy/本地代理 -f /run/hnd0tbt4.yaml -d /run
 ```
 
-`/run/hnd0tbt4.yaml` 是另一份 mihomo 配置：`mixed-port: 17893`，代理 `HND0TBT4` 指向
+`/run/hnd0tbt4.yaml` 是另一份本地代理配置：`mixed-port: 17893`，代理 `HND0TBT4` 指向
 `127.0.0.1:18443` 的 vless（`network: tcp`、`tls: false`、`smux.enabled: true`）。
-它和 systemd 的 `mihomo.service` 并存。需要运维确认这是否是有意的第二实例；
+它和 systemd 的 `proxy.service` 并存。需要运维确认这是否是有意的第二实例；
 在确认之前不要删除这三个 `/run` 文件。
 
-### `/opt/mihomo/config.yaml.bak-smux1`（本机）
+### `/opt/proxy/config.yaml.bak-smux1`（本机）
 
 存在，12220 字节，mtime 2026-11-17 17:20；同目录还有 `config.yaml.bak-hnd0tbt4`
 （11919 字节，17:10）。建议把 `config.yaml.bak-smux1` 保留到 **2026-12-18**，
@@ -101,7 +101,7 @@ ExecStart=/usr/local/bin/tbtun server --listen 0.0.0.0:39443 --target 127.0.0.1:
 
 ### HND0 上的同名文件
 
-HND0 上不存在 `/run/hnd0tbt4.*`，也不存在 `/opt/mihomo/config.yaml.bak-smux1`。
+HND0 上不存在 `/run/hnd0tbt4.*`，也不存在 `/opt/proxy/config.yaml.bak-smux1`。
 上面的路径都属于本机 JYSZ，不要按名字去 HND0 找。
 
 ## 4. HND0 与本机代码差异

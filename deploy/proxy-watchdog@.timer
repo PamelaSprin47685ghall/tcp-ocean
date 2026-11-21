@@ -1,5 +1,5 @@
 [Unit]
-Description=Watch the tbt4 mihomo vless inbound backlog
+Description=Watch the tbt4 proxy vless inbound backlog
 
 [Timer]
 OnBootSec=90

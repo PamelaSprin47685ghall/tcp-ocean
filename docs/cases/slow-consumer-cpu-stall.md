@@ -105,7 +105,7 @@ Single-stream fast.com download measured 11 Mbit/s with 98.9% `kernel_rwnd_limit
 server target socket. The root cause: `FlowBridge.Read` had a budget of 16 sources per call
 (~21.5 KB), and `SessionCarrier.Service` called Read once per cycle. With Service averaging
 50 ms and peaking at 978 ms, the server read only ~430 KB/s from the target socket, far below
-fast.com's 6-8 MB/s push rate. The target socket receive buffer filled, blocking mihomo's
+fast.com's 6-8 MB/s push rate. The target socket receive buffer filled, blocking 本地代理's
 write, starving the sender, causing 3812 BOOSTER repairs and 20-38% FEC recovery rate.
 
 **Fix:** Increased `FlowBridge.Read` budget from 16 to 4096 sources (~5.5 MB per Service cycle).

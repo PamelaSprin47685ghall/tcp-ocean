@@ -14,16 +14,16 @@
 # every large upload.  So the rule is: backlog over the limit AND no progress on
 # any backlogged socket across a sampling interval.
 #
-# Usage: mihomo-watchdog.sh <unit>
-# Env:   MIHOMO_WATCHDOG_BYTES    backlog threshold, default 4194304 (4 MiB)
-#        MIHOMO_WATCHDOG_SAMPLE_S progress sampling interval, default 5
+# Usage: proxy-watchdog.sh <unit>
+# Env:   PROXY_WATCHDOG_BYTES    backlog threshold, default 4194304 (4 MiB)
+#        PROXY_WATCHDOG_SAMPLE_S progress sampling interval, default 5
 set -eu
 
-unit="${1:-mihomo-hnd0tbt4}"
-limit="${MIHOMO_WATCHDOG_BYTES:-4194304}"
-gap="${MIHOMO_WATCHDOG_SAMPLE_S:-5}"
-port="${MIHOMO_WATCHDOG_PORT:-18443}"
-stamp="/run/mihomo-watchdog.${unit}.stamp"
+unit="${1:?usage: proxy-watchdog.sh <unit>}"
+limit="${PROXY_WATCHDOG_BYTES:-4194304}"
+gap="${PROXY_WATCHDOG_SAMPLE_S:-5}"
+port="${PROXY_WATCHDOG_PORT:-18443}"
+stamp="/run/proxy-watchdog.${unit}.stamp"
 now=$(date +%s)
 
 # Do not restart more often than every 120 s, even if the backlog rebuilds.
@@ -73,7 +73,7 @@ if [ "$moved" -gt 0 ]; then
     exit 0
 fi
 
-logger -t mihomo-watchdog \
+logger -t proxy-watchdog \
     "restarting ${unit}: ${port} backlog ${b1}->${b2} with no progress in ${gap}s (limit=${limit})"
 echo "$now" >"$stamp"
 systemctl restart "$unit"

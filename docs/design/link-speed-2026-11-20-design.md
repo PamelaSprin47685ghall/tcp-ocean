@@ -201,7 +201,7 @@ CASE-9 口径的实测证伪（`stallNs` 20→2 ms 无变化）；§1.2、§1.3 
 `SO_RCVBUF` 是每流上限，内核按实际到达数据记账，空闲时不占满。单流最坏内核接收
 缓冲 = `2 × min(FlowRecvBuf, rmem_max)` = 8 MB；8 MiB 单流信用仍由 `FlowRoom` 把关，
 读循环在信用耗尽时停止读，所以 rcvbuf 不会放大应用侧在途。并发上界因此是
-`8 MB × 活跃流数`。实测生产 server RSS 70 MB，因为 mihomo `max-connections: 1` 把
+`8 MB × 活跃流数`。实测生产 server RSS 70 MB，因为本地代理 `max-connections: 1` 把
 多条 curl 复用成一条 VLESS/smux 长连接，tbtun 只看到 1 条 flow。若并发流数上升，
 按此顺序收边界：把 `FlowRecvBuf` 收到 1.25 BDP、按流数缩容、或只在接收侧设 rcvbuf
 （`local` 只用于 flow socket，不用于 256 条承载路径）。这条上界由 CASE-11 验证。
@@ -228,7 +228,7 @@ RTT 下达到基线 2 倍以上（实测 3.4×），同时不让 SRTT 自致倍�
 > §2–§4 中以 `pace` 为主线的表述已作废，只保留为历史。
 
 非目标：
-- 不改 256 路、`:39443`、TCP-only、TFO/BBR、mihomo `max-connections/min-streams`。
+- 不改 256 路、`:39443`、TCP-only、TFO/BBR、本地代理 `max-connections/min-streams`。
 - 不改 `rho=0.25`、GF(16)、8 MiB 单流信用、32 MiB 池、32 槽/路。
 - 不改上行 `RateGroup` 的增益、采样与修复储备规则。`SessionCarrier.fs:64-67` 在
   `pace` 开启时设 `group.ProtectRecovery <- true`，这与既有上行 pace 是同一行为，
@@ -401,12 +401,12 @@ socket」这一段。这是可证伪的：若这 5 s 真在 Reserve，`Reserve.C
 
 | 候选 | 机制 | 判据（同一 15 s 窗口内采） |
 |---|---|---|
-| C1 mihomo 消费慢 | tbtun 把数据写 18443 的 socket，mihomo 不读或读得慢，`Send` 短写、`RxDelivered` 停 | 18443 的 `send-q` 长期 > 256 KB；`bytes_acked` 增量 < 隧道 egress 需求；客户端 `flow_credit` 低位与 `Reserve.Count` 高位同时出现 |
+| C1 本地代理消费慢 | tbtun 把数据写 18443 的 socket，本地代理不读或读得慢，`Send` 短写、`RxDelivered` 停 | 18443 的 `send-q` 长期 > 256 KB；`bytes_acked` 增量 < 隧道 egress 需求；客户端 `flow_credit` 低位与 `Reserve.Count` 高位同时出现 |
 | C2 RxHalf 交付排队 | 解码前沿推进慢，数据到不了 Reserve，信用也不回收 | `rx_ack` 步/s × 每步字节 > 实际交付字节率；`Reserve.Count` 低位而 `rx_base` 落后 `rx_ack` |
-| C3 smux 单连接限速 | mihomo 的 VLESS/smux 单连接自身封顶，18443 读写都很快 | 18443 `send-q` ≈ 0、tbtun 的 Write 不阻塞，但 mihomo 出站吞吐低于目标；需 mihomo 侧指标或换 `max-connections` 对照 |
+| C3 smux 单连接限速 | 本地代理的 VLESS/smux 单连接自身封顶，18443 读写都很快 | 18443 `send-q` ≈ 0、tbtun 的 Write 不阻塞，但本地代理出站吞吐低于目标；需本地代理侧指标或换 `max-connections` 对照 |
 
 判定顺序：先取 C1 所需的 `send-q` 与 `bytes_acked`。若 C1 不成立，再看 C2 的
-`Reserve.Count` 与 `rx_ack` 步/s。只有前两者都被排除才需要 C3 的 mihomo 侧证据。
+`Reserve.Count` 与 `rx_ack` 步/s。只有前两者都被排除才需要 C3 的本地代理侧证据。
 
 ### 9.5 判定的最小测量（≤60 s）
 
@@ -422,8 +422,8 @@ socket」这一段。这是可证伪的：若这 5 s 真在 Reserve，`Reserve.C
 
 ### 10.1 作用点
 
-下行数据的 smux stream 接收方是**本机 mihomo 的出站会话**。smux 的流控由接收方
-通告窗口，发送方（HND0 mihomo）按通告值发送；本机配置的 `max-stream-receive-window`
+下行数据的 smux stream 接收方是**本机本地代理的出站会话**。smux 的流控由接收方
+通告窗口，发送方（HND0 本地代理）按通告值发送；本机配置的 `max-stream-receive-window`
 就是本机通告的单流窗口。它不是 HND0 侧参数，也不受 `max-connections` 影响。
 
 ### 10.2 证据与量纲
@@ -435,29 +435,29 @@ socket」这一段。这是可证伪的：若这 5 s 真在 Reserve，`Reserve.C
 | 在途量 | 1.63 MB/s × 0.314 s ≈ **512 KB** | 与 smux 单流窗口同量级 |
 | 服务端 `flowread` | 5019 次 Read / 52.56 MB / 4869 次 WouldBlock（**97%**） | target socket 被读空，缺数据 |
 | 服务端 `queued` / `flow_credit` 余 | 0 / 8.39 MB | 发送端不缺窗口，缺上游供数 |
-| 18443 `send-q` | 18 次快照全 0 | 排除“mihomo 消费慢” |
+| 18443 `send-q` | 18 次快照全 0 | 排除“本地代理消费慢” |
 
 ### 10.3 变更与契约
 
 - `proxies[].smux.max-stream-receive-window: 4194304`（4 MiB）。
-- mihomo v1.19.33 接受该字段：把配置写到 `/tmp/tbt-mihomo-test.yaml` 后
-  `/opt/mihomo/mihomo -t -f` 输出 `test is successful`。
+- 本地代理 v1.19.33 接受该字段：把配置写到 `/tmp/tbt-本地代理-test.yaml` 后
+  `/opt/proxy/本地代理 -t -f` 输出 `test is successful`。
 - 不关 smux、不改 `max-connections: 1` / `min-streams: 1`，不违反 CASE 集的
   “不可改约束”。
-- tbtun 二进制、协议、信用、编码、路径数全部不动；tbtun 对 mihomo 只是透明 TCP 承载。
+- tbtun 二进制、协议、信用、编码、路径数全部不动；tbtun 对本地代理只是透明 TCP 承载。
 
 ### 10.4 失败隔离与回滚
 
-1. 写回前 `mihomo -t` 预检；任一字段错误即停止，不重启。
+1. 写回前 `本地代理 -t` 预检；任一字段错误即停止，不重启。
 2. 备份 `/run/hnd0tbt4.yaml` 到 `/run/hnd0tbt4.yaml.bak-g6`，记录 sha256。
-3. `systemctl restart mihomo-hnd0tbt4`（Restart=always，中断 < 2 s）。
+3. `systemctl restart proxy-hnd0tbt4`（Restart=always，中断 < 2 s）。
 4. 30 s 内必须满足：服务 `active`、`ss -tan '( dport = :39443 )'` ≥ 250 路、
    经 17893 一次 HTTPS 请求成功；任一不满足即 `install` 备份 + restart，60 s 内回到旧值。
 5. 配置是唯一变更，回滚不需要重新部署任何二进制。
 
 ### 10.5 内存上界
 
-每流窗口 4 MiB 是**通告值**，实际驻留受 mihomo 的 smux 总接收缓冲（默认值）钳制。
+每流窗口 4 MiB 是**通告值**，实际驻留受本地代理的 smux 总接收缓冲（默认值）钳制。
 并发 N 条 stream 的最坏驻留 ≤ `N × 4 MiB`，但总缓冲先到上限；因此并发场景必须看
 `RSS` 而不只看单流。CASE-11 的单流增量 ≤16 MB 仍是上界判据。
 
@@ -480,7 +480,7 @@ socket」这一段。这是可证伪的：若这 5 s 真在 Reserve，`Reserve.C
 
 | 位置 | 原写法 | 事实 |
 |---|---|---|
-| `s7.md` 第七节第 1 条 | 「mihomo 不暴露 smux 流缓冲、窗口不可调」 | 与文末第六代更正矛盾：v1.19.33 接受 `max-stream-receive-window`，`mihomo -t` 通过。以更正为准 |
+| `s7.md` 第七节第 1 条 | 「本地代理不暴露 smux 流缓冲、窗口不可调」 | 与文末第六代更正矛盾：v1.19.33 接受 `max-stream-receive-window`，`本地代理 -t` 通过。以更正为准 |
 | `s7.md` §5、`§10.2` | 用 `flowread=2958/52561777/2808` 推出「每次 Read 17.8 KiB、95% WouldBlock、读到空」 | 这是**会话累计**，不是该轮瞬时。可用于跨轮对比，不能用来描述单轮行为；瞬时必须取轮前后增量 |
 | `result.md` 第六代 | 「4 MiB 窗口无收益」 | 该 A/B 的基准本身在崩塌（新配置 2/5 轮 0 字节、旧配置 2/3 轮 0 字节）。只能记「未观察到收益」，不能记「证明无效」 |
 
@@ -515,7 +515,7 @@ socket」这一段。这是可证伪的：若这 5 s 真在 Reserve，`Reserve.C
 | 候选 | 机制 | 成立判据 | 反证判据 |
 |---|---|---|---|
 | S1 接收前沿停 | 解码前沿不推进，数据到不了 Reserve，信用也不回收 | 停摆窗口内 `rx_ack` 增量 = 0，`rx_base − rx_ack` 不变，而服务端 `tx_head − peer_ack > 0` 或 `queued > 0` | 服务端 `tx_head = peer_ack` 且 `flowread` 增量 = 0 ⇒ 不是 S1，转 S2/S3 |
-| S2 单流窗口 | mihomo 的 VLESS/smux 单流接收窗口把在途钉在 `窗口 / RTT` | 停摆窗口内服务端 `flowread` 增量 ≈ 0（target 无数据可读），同时 HND0 裸连同 URL 正常；客户端 18443 `send-q ≈ 0` | `flowread` 增量正常而客户端 `rx_ack` 不动 ⇒ 回到 S1 |
+| S2 单流窗口 | 本地代理的 VLESS/smux 单流接收窗口把在途钉在 `窗口 / RTT` | 停摆窗口内服务端 `flowread` 增量 ≈ 0（target 无数据可读），同时 HND0 裸连同 URL 正常；客户端 18443 `send-q ≈ 0` | `flowread` 增量正常而客户端 `rx_ack` 不动 ⇒ 回到 S1 |
 | S3 读节奏 | 服务端每轮只读一次，`WouldBlock` 后等定时器，成功读的字节数远小于一轮预算 | 成功 Read 的字节数 < 256 帧的一半，且轮次频率 ≈ `1 / NextTimerUs` | 成功 Read 接近整轮供给 ⇒ 不是 S3 |
 
 设计上**不预设** S1/S2/S3 哪条成立。S2 的配置级修复（4 MiB 窗口）已在基准崩塌期
@@ -578,7 +578,7 @@ socket」这一段。这是可证伪的：若这 5 s 真在 Reserve，`Reserve.C
 
 停摆窗口内对 pid 2235045 发 SIGQUIT（systemd `Restart=always` 3 s 自愈）。栈：
 
-- goroutine 73：`mihomo/common/net.Relay.func2 → sing/common/bufio.Copy →
+- goroutine 73：`本地代理/common/net.Relay.func2 → sing/common/bufio.Copy →
   sing-mux.clientConn.Read → wrapStream.Read → smux.(*stream).Read →
   smux.(*stream).waitRead`（select，等数据）。
 - goroutine 39：`smux.(*Session).recvLoop → io.ReadFull`（读底层 frame）。
@@ -593,7 +593,7 @@ socket」这一段。这是可证伪的：若这 5 s 真在 Reserve，`Reserve.C
 
 recvLoop 读入并解析 frame（tbtun 的 18443 有字节流动），但没有唤醒 curl 连接对应
 stream 的 `waitRead`。数据被投递到另一条 stream，或投递到 `min-streams` 预开的池
-stream 而池 stream 没有下游读者。这解释了「tbtun 交付健康、mihomo 内存活、curl
+stream 而池 stream 没有下游读者。这解释了「tbtun 交付健康、本地代理内存活、curl
 收 0」三者同时成立。
 
 ### 12.4 修复候选与契约
@@ -604,10 +604,10 @@ stream 而池 stream 没有下游读者。这解释了「tbtun 交付健康、mi
 | R2 | `smux.enabled: false` + 短请求建立优化 | 第六代大文件提升、短请求 3/3 超时，原因未查 | 改回 true |
 | R3 | R1/R2 均无效：记录并保持生产 | 不部署 | — |
 
-契约：只改 mihomo 配置 `/run/hnd0tbt4.yaml`；tbtun 二进制、256 路、TCP-only、
+契约：只改本地代理配置 `/run/hnd0tbt4.yaml`；tbtun 二进制、256 路、TCP-only、
 8 MiB 信用、`rho=0.25`、GF(16) 全部不动。生产改动前备份
 `/run/hnd0tbt4.yaml.bak-g8` 并记 sha256；回滚
-`cp .bak-g8 /run/hnd0tbt4.yaml && systemctl restart mihomo-hnd0tbt4`，<60 s。
+`cp .bak-g8 /run/hnd0tbt4.yaml && systemctl restart proxy-hnd0tbt4`，<60 s。
 
 ### 12.5 CASE 映射
 
@@ -707,7 +707,7 @@ pending.Count` 与目标路径数；不足时后台补建缺失 id。三条必�
 ### 14.1 主线与修复面
 
 已证伪的三条不再投入：下行组级 pace（§12.7，开/关差 0.01%；生产 `--pace 1` 反而触发
-本缺陷）、smux 单流窗口（§10，4 MiB 无收益）、mihomo 转发层（用户明确禁止作为实验对象）。
+本缺陷）、smux 单流窗口（§10，4 MiB 无收益）、本地代理转发层（用户明确禁止作为实验对象）。
 `SocketTuning.local` 的 `SO_RCVBUF` 已在 HEAD。剩下的缺陷是可用性而非算法：路径池从
 256 掉到 1，会话仍 `Alive`（`paths.Count > 0`），聚合承载能力按路径数比例消失，
 而 `rx_ack`/`frames_in` 因为剩余那条路径不承载任何内容而冻结。
@@ -909,7 +909,7 @@ path0Held = carrier.PathOpsPending > 0 || carrier.Paths 中存在 PathId = 0
 
 第十二代的三分账（`RxDelivered` 121.4 MB 对 curl 47.7 MB）与第七代 SIGQUIT
 （`smux.(*stream).Read → waitRead`、18443 `Send-Q=0`、`bytes_acked` 增长）指向
-mihomo 的 smux 投递层。用户已限定 mihomo 只作上传通道、禁止作为实验对象，
+本地代理的 smux 投递层。用户已限定本地代理只作上传通道、禁止作为实验对象，
 因此本代不新增该层用例、不改其配置；tbtun 侧不再为吞吐做无证据的改动。
 本代对下行的唯一承诺是路径数不退化，停摆与中位按 CASE-12/1 如实记录。
 

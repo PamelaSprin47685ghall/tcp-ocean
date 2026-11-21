@@ -139,7 +139,7 @@ poller.Wait(
 - 两端 drop-in 可随时重建：`Environment=TBTUN_ASYNC_MODE=0`，`daemon-reload && restart`。
 - 同步回退保留，用于对照与故障定位。
 
-## 代理 204 但大流量为 0：先查 mihomo，而不是 tbtun
+## 代理 204 但大流量为 0：先查本地代理，而不是 tbtun
 
 现象：`curl -x http://127.0.0.1:17893 http://www.gstatic.com/generate_204` 返回 204，
 但 30 秒下载只有 0–3 Mbit/s，`flowread` 的 `calls` 猛涨而 `bytes` 几乎不动。
@@ -148,32 +148,32 @@ poller.Wait(
 
 ```sh
 ss -tn | grep 18443
-# ESTAB 1682545 0     127.0.0.1:18443 127.0.0.1:55638   ← mihomo Recv-Q 不读
+# ESTAB 1682545 0     127.0.0.1:18443 127.0.0.1:55638   ←本地代理 Recv-Q 不读
 # FIN-WAIT-1 0 14280658 127.0.0.1:55638 127.0.0.1:18443 ← tbtun Send-Q 发不出
 ```
 
-两侧积压说明 mihomo 的 vless 入站已经不读 tbtun 送来的数据。tbtun 自身
+两侧积压说明本地代理的 vless 入站已经不读 tbtun 送来的数据。tbtun 自身
 `tx_head = peer_ack`、`csvc_us` 极低，不是瓶颈。
 
 确认 18443 的主人：
 
 ```sh
-ss -lntp | grep 18443     # 必须是 mihomo-tbt4 的 pid，不是 mihomo-090 等其它实例
-systemctl is-active mihomo-tbt4
+ss -lntp | grep 18443     # 必须是本地代理-tbt4 的 pid，不是本地代理-090 等其它实例
+systemctl is-active 本地代理-tbt4
 ```
 
 恢复（两端各一次，按“先 HND0、等 3 秒、再本地”的顺序，避免旧半开连接抢在新建之前）：
 
 ```sh
 # HND0
-kill -TERM <mihomo-tbt4 pid>
-systemd-run --unit=mihomo-tbt4 --property=Restart=on-failure \
-  /usr/local/bin/mihomo -d /etc/mihomo-tbt4
+kill -TERM <本地代理-tbt4 pid>
+systemd-run --unit=本地代理-tbt4 --property=Restart=on-failure \
+  /usr/local/bin/本地代理 -d /etc/本地代理-tbt4
 
 # 本地
 kill -TERM <hnd0tbt4 pid>
-systemd-run --unit=mihomo-hnd0tbt4 --property=Restart=on-failure \
-  /opt/mihomo/mihomo -f /run/hnd0tbt4.yaml -d /run
+systemd-run --unit=proxy-hnd0tbt4 --property=Restart=on-failure \
+  /opt/proxy/本地代理 -f /run/hnd0tbt4.yaml -d /run
 
 # 然后依次重启两端 tbtun
 systemctl restart tbtun-hnd0   # 先 HND0
@@ -189,9 +189,9 @@ systemctl restart tbtun-hnd0   # 再本地
 - `http://speedtest.tele2.net/upload.php`：15 秒稳定 **8.39 Mbit/s**，可用。
 - `https://speed.cloudflare.com/__up`：多次返回 0 字节，端点不可靠，不要用它做验收。
 
-## 已知外部风险：mihomo 会在约 30 分钟量级卡死
+## 已知外部风险：本地代理会在约 30 分钟量级卡死
 
-2026-11-18 的两次实测都出现同一模式：mihomo 连续运行约 33 分钟后，vless 入站不再读取
+2026-11-18 的两次实测都出现同一模式：本地代理连续运行约 33 分钟后，vless 入站不再读取
 tbtun 送来的数据，`ss -tn` 里 18443 一侧的 `Recv-Q` 涨到 MB 级、tbtun 侧 `Send-Q` 同步积压，
 此时控制面仍可能返回 204，但大流量为 0。两端 tbtun 自身 `tx_head = peer_ack`、
 `csvc_us` 极低，不是产品侧瓶颈。
@@ -201,6 +201,6 @@ tbtun 送来的数据，`ss -tn` 里 18443 一侧的 `Recv-Q` 涨到 MB 级、tb
 - 已给 hnd0tbt4 与 HND0 的 tbt4 都配了持久 systemd 单元（`Restart=always`、`RestartSec=3`），
   崩溃会自动拉起；但“进程活着却不读”不属于崩溃，`Restart=always` 不会触发。
 - 需要一个外部看门狗：每 1–2 分钟采样 `ss -tn | grep 18443` 的 `Recv-Q`，超过阈值（如 256 KiB）
-  就 `systemctl restart mihomo-hnd0tbt4`（本地）或 `mihomo-tbt4`（HND0）。
-- 根本修复在 mihomo 侧：限制单连接缓冲、升级版本，或给 vless 入站加读超时。
+  就 `systemctl restart proxy-hnd0tbt4`（本地）或 `本地代理-tbt4`（HND0）。
+- 根本修复在本地代理侧：限制单连接缓冲、升级版本，或给 vless 入站加读超时。
   在这些完成前，**不要把“控制面 204”当成链路可用**。

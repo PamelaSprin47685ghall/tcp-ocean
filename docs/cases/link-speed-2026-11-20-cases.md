@@ -20,7 +20,7 @@
 > |---|---|---|
 > | H1 发送侧无组级速率控制 | 256 路聚合同步突发越过瓶颈 BDP，尾丢转成重传与 cwnd 减半 | 开 `--pace` 后 CASE-2 重传 ≤5% 且 CASE-1 中位不升 ⇒ H1 不充分 |
 > | H2 接收前沿与信用回收 | 前沿步进慢 ⇒ `RxDelivered` 不推进 ⇒ 信用按本地应用写入回收，服务端 TxLimit 停在已交付处 | CASE-9 中 `rx_ack` 步/s 与交付字节率偏差 >50%，或 `RxDelivered` 停滞 >2 s 且 `tx_head − peer_ack` 不为 0 ⇒ H2 成立 |
-> | H3 外层供数与 smux 复用 | mihomo `max-connections: 1` 把多请求复用到一条 VLESS 长连接，HND0 直连 219 Mbit/s 而隧道 8–10 Mbit/s | HND0 直连与隧道同 URL 比值 >5×，且两端 stats 显示发送队列空 ⇒ H3 至少是共同成因 |
+> | H3 外层供数与 smux 复用 | 本地代理 `max-connections: 1` 把多请求复用到一条 VLESS 长连接，HND0 直连 219 Mbit/s 而隧道 8–10 Mbit/s | HND0 直连与隧道同 URL 比值 >5×，且两端 stats 显示发送队列空 ⇒ H3 至少是共同成因 |
 >
 > 已有一组反证必须写进判定：同一影子服务、同一 OCA，开节拍 8.52 Mbit/s
 > （15 s 收 15,974,400 B）、关节拍 18.11 Mbit/s（11.58 s 收齐 25 MiB），开节拍时
@@ -84,8 +84,8 @@
 
 ## CASE-1 生产下行吞吐持续性
 
-- **path**：本机 `17893` → 本地 mihomo HND0TBT4（VLESS）→ 本地 tbtun client → 隧道 →
-  HND0 tbtun server → `127.0.0.1:18443` mihomo-tbt4 → fast.com IPv4 OCA。
+- **path**：本机 `17893` → 本地本地代理 HND0TBT4（VLESS）→ 本地 tbtun client → 隧道 →
+  HND0 tbtun server → `127.0.0.1:18443` 本地代理-tbt4 → fast.com IPv4 OCA。
 - **threshold**：80。
 - **steps**
   1. 在 HND0 取新 targets，并固定一个 IPv4 OCA URL：
@@ -232,7 +232,7 @@
   1. 目标无响应：用一个会超时的 URL 跑一轮，确认只有该 curl 失败，隧道与 256 路保持。
   2. 单路断开：在 HND0 `ss` 找到一条承载并 `ss -K` 关闭，确认会话在本轮内补到 256 路
      或至少不丢应用字节。
-  3. 看门狗：正常 25 MiB 下载不触发 `mihomo-watchdog` 重启；人为把阈值临时降到
+  3. 看门狗：正常 25 MiB 下载不触发 `proxy-watchdog` 重启；人为把阈值临时降到
      1 KiB 的独立实例（不影响生产）应触发一次并自动恢复。
   4. 回滚演练：把候选二进制换回 `f2b63e00…`，确认服务与 256 路恢复，再换回候选。
   5. 整机重启（可延后）：记录新引导标识、`8890` 规则、`ip route get 45.11.1.62`
@@ -350,14 +350,14 @@
   - 0–60：单流 > 24 MB，或外推 > 80%，或出现 OOM/`sk_rcvbuf` 回落到自动调优。
   - 硬失败：用 `RSS` 代替 `skmem` 记账；不记录流数；只测单流就外推。
   - 扣分：未读 `/proc/net/sockstat` −10；未做 64 路 −15。
-- **备注**：mihomo `max-connections: 1` 会把多条 curl 复用成一条 flow，所以“并发流”
+- **备注**：本地代理 `max-connections: 1` 会把多条 curl 复用成一条 flow，所以“并发流”
   必须由独立 smux 连接或直连 tbtun 产生，否则测到的仍是单流。
 
 ---
 
 ## CASE-12 下行间歇停摆
 
-- **path**：本机 `17893` → 本地 mihomo `HND0TBT4` → 本地 tbtun client → 隧道 →
+- **path**：本机 `17893` → 本地本地代理 `HND0TBT4` → 本地 tbtun client → 隧道 →
   HND0 tbtun server → `127.0.0.1:18443` → 固定源（proof.ovh 100 MB 或 fast.com OCA）。
 - **threshold**：85。
 - **steps**
@@ -383,7 +383,7 @@
     只看 `code` 不看 `size`；未记录 18443 增量就断言根因在 tbtun。
   - 扣分：未取恢复时间 −10；未保留停摆轮原始输出 −10；未记录双端连接数 −5。
 - **备注**：第七代实测 5/10 停摆，且停摆轮内 tbtun 向 18443 写入 6–11 MB 而 curl 收 0，
-  说明停摆在 mihomo 内部而非 tbtun 数据面（result 第七代节）。
+  说明停摆在本地代理内部而非 tbtun 数据面（result 第七代节）。
   停摆率与稳态中位必须分开报告；CASE-1 的中位数只在停摆率达标后才有意义。
 
 ---
@@ -498,12 +498,12 @@
 
 | CASE-9 口径更正 | 第五代 | 2026-11-20 | `flow_credit` 打印的是 `TxOffset/TxLimit`（上行方向），第四代「剩 9.8 KB」是误读，「信用耗尽」未发生。CASE-9 的 PASS 线应改为「下行 `RxDelivered` 的推进速率与交付字节率偏差 ≤20%」，不再用 flow_credit 余量 | `docs/cases/link-speed-2026-11-20-s7.md` |
 | CASE-5 上行不退化 | 第七代 | 2026-11-20 | 通过：5,000,000 B 上传 3/3 全部送出，约 4.0 Mbit/s；2/3 响应超时属同一停摆（下行方向） | `/tmp/up5mb.bin` |
-| CASE-9 下行停摆口径 | 第七代 | 2026-11-20 | 停摆轮内 `rx_ack` 仍 +282…+382 步/10 s、`RxDelivered` +5.7…+8.0 MB，H2 被证伪；停摆发生在 mihomo 内部 | `/tmp/tbt-g7-1795165621` |
-| CASE-12 下行间歇停摆 | 第七代 | 2026-11-20 | 失败：10 轮 0 字节 5/10；停摆轮 tbtun 向 18443 写入 6–11 MB 而 curl 收 0；四窗口字段与 `max-connections: 4` 均无效 | `/tmp/tbt-g7-1795165621`、`/tmp/mihomo-g7b` |
+| CASE-9 下行停摆口径 | 第七代 | 2026-11-20 | 停摆轮内 `rx_ack` 仍 +282…+382 步/10 s、`RxDelivered` +5.7…+8.0 MB，H2 被证伪；停摆发生在本地代理内部 | `/tmp/tbt-g7-1795165621` |
+| CASE-12 下行间歇停摆 | 第七代 | 2026-11-20 | 失败：10 轮 0 字节 5/10；停摆轮 tbtun 向 18443 写入 6–11 MB 而 curl 收 0；四窗口字段与 `max-connections: 4` 均无效 | `/tmp/tbt-g7-1795165621`、`/tmp/proxy-g7b` |
 | CASE-6 16 路 5% 丢包 | 第七代 | 2026-11-20 | 部分：bulk up/down/再 down = 144.8/148.3/147.8 Mbit/s，ping-under-bulk p99 121.4 ms；iperf 段被 180 s 上限截断 | `/tmp/tbt-g7-16p-loss.log` |
 | GatePass2Limit 床 | 第七代 | 2026-11-20 | 未执行：官方床每路 BDP≈250 KiB 与 256 KiB 同量级，降 32768 只会提前停发；正确床需每路 1 Mbit/s×314 ms | result 第七代节 |
-| S-7 细采样 | 第五代 | 2026-11-20 | 隧道 13.05 / 本机直连 44.9 / HND0 直连 41.9 Mbit/s（同一 URL）；18443 send-q 全 0；服务端 `flowread=2958/52561777/2808`、`queued=0`、grant 剩 501 步、flow credit 剩 3.85 MB。结论：限制在 mihomo VLESS 入站→DIRECT 的单流窗口，不在 tbtun 的承载、解码或信用 | `/tmp/tbt-s7-1795164088`、`/tmp/tbt-s7-server-1795164210` |
-| 第六代 smux 窗口 A/B | 第六代 | 2026-11-20 | 未通过：`max-stream-receive-window: 4194304` 5 轮 0/0.41/0/0.63/0.14 MB/s，无收益；已回滚。字段存在且 `mihomo -t` 通过，但不是限制 | result 第六代节 |
+| S-7 细采样 | 第五代 | 2026-11-20 | 隧道 13.05 / 本机直连 44.9 / HND0 直连 41.9 Mbit/s（同一 URL）；18443 send-q 全 0；服务端 `flowread=2958/52561777/2808`、`queued=0`、grant 剩 501 步、flow credit 剩 3.85 MB。结论：限制在本地代理 VLESS 入站→DIRECT 的单流窗口，不在 tbtun 的承载、解码或信用 | `/tmp/tbt-s7-1795164088`、`/tmp/tbt-s7-server-1795164210` |
+| 第六代 smux 窗口 A/B | 第六代 | 2026-11-20 | 未通过：`max-stream-receive-window: 4194304` 5 轮 0/0.41/0/0.63/0.14 MB/s，无收益；已回滚。字段存在且 `本地代理 -t` 通过，但不是限制 | result 第六代节 |
 | 第六代 关闭 smux | 第六代 | 2026-11-20 | 不可用：大文件单流中位 0.43–0.50 MB/s、0 字节轮 1/8（smux 开 2/3），但短请求 3/3 `code=000`、ttfb 10 s 超时；已回滚 smux 开 | result 第六代节 |
 | CASE-12 第八代复测 | 第八代 | 2026-11-20 | 复现：0 字节轮内 18443 +6.5 MB/15 s、17893 accept `bytes_sent` 恒 39 B；HND0 `cell_loss 16.3%`、`srtt 1412/minrtt 726`、`tx_head=peer_ack` | `/tmp/tbt-g8-audit-1795166455`、`/tmp/tbt-g8-flow-1795166514` |
 | H7 `min-streams=0` | 第八代 | 2026-11-20 | 证伪：17901(min0)/17902(min1)/17893 三路同步停摆，3 轮无区分 | `/tmp/tbt-g8-p2-1795166731` |
@@ -518,7 +518,7 @@
 | CASE-12/1 第十代 | 第十代 | 2026-11-20 | 10 轮 2.19/0.79/3.47/0/3.06/6.60/0/0/0/13.43 MB，停摆 5/10，中位约 1.1 Mbit/s；时段整体低，不可与第九代峰值比较 | bg_46、bg_47 |
 | CASE-0 部署通道复核 | 第十二代 | 2026-11-20 | 通过：本机客户端 `install` + `restart`，旧版备份 `tbtun.bak-g12`；回滚后 sha=7c48936e、`tbtun-hnd0` active、`ss -tn state established \| grep -c ':39443'` = 256 | `/tmp/tbt-g12-ab3-1795181126` |
 | CASE-12/1 第十二代 | 第十二代 | 2026-11-20 | 未通过：10 轮 16.61/5.08/0/7.41/0.18/8.18/0/7.11/0/3.11 MB，停摆 3/10，好轮中位 0.605 MB/s；修复（`stallNs` 20→2 ms）无用户可见收益，已回滚 | `/tmp/tbt-g12-ab3-1795181126` |
-| CASE-9 三分账 | 第十二代 | 2026-11-20 | 部分：短窗口 `RxDelivered` 6,252,876 B 对 curl 6,209,518 B（差 0.7%）；长窗口 10 轮 `RxDelivered` 121.4 MB 对 curl 47.7 MB（差 73.7 MB），积压在 mihomo 层 | `/tmp/tbt-g12-ab3-1795181126`、第十二代 result 节 |
+| CASE-9 三分账 | 第十二代 | 2026-11-20 | 部分：短窗口 `RxDelivered` 6,252,876 B 对 curl 6,209,518 B（差 0.7%）；长窗口 10 轮 `RxDelivered` 121.4 MB 对 curl 47.7 MB（差 73.7 MB），积压在本地代理层 | `/tmp/tbt-g12-ab3-1795181126`、第十二代 result 节 |
 | CASE-13 半开检测 | 第十二代 | 2026-11-20 | 检测生效、补建缺失：回环 `ss -K` 后两端 512→510、客户端 `paths=256→255` 并 60 s 恒定；两端 stats 的 `path_tx` 列表从 1 开始、不含 0，说明丢失的是握手路径 path 0，而 `PathPool` 只补 id 1..255 | `/tmp/tbt-g12-loop`（`client2.log`、`server.log`） |
 | 测量陷阱 | 第十二代 | 2026-11-20 | `ss -tn state established '( dport = :39443 )'` 在本机恒返 0；路径计数须用 `ss -tn state established \| grep -c ':39443'`（实测 256） | 本代 |
 | CASE-13 路径池自愈 | 第十三代 | 2026-11-20 | 部分通过：单路自愈（杀非 0 0.52 s、杀 path 0 1.55 s 回到 256；回环 `path 0 joined, paths=256`；部署后 9 s 建池 256）。**3 次服务端 restart 未在本代重测**，沿用 g11 的 28–35 s（其中一次 >30 s），不得写成 3/3 | `/tmp/tbt-g13-loop`、`/tmp/tbt-g13-prod-result.json` |
@@ -532,7 +532,7 @@
 ## 不可改的约束（验收前提）
 
 - 256 路 TCP、TCP-only、`:39443` 静默、无 TLS/REALITY、TFO/BBR 保留。
-- mihomo `max-connections: 1`、`min-streams: 1` 不变；不关 smux。
+- 本地代理 `max-connections: 1`、`min-streams: 1` 不变；不关 smux。
 - `rho=0.25` 语义保留（自适应关闭时）；GF(16) 上行不改。
 - 8 MiB 单流信用、32 MiB 池为当前基线；若要改，必须另有单变量生产对照，不在本用例
   集的“通过”条件里。

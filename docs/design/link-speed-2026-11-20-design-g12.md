@@ -99,7 +99,7 @@ while go && budget > 0 && session.FlowSending slot do
 ## 6 失败隔离与契约
 
 - 每个候选只改一个变量；同一批不夹带敏感默认（`GatePass2Limit`、`roundCap`、FEC 默认）。
-- 回环床先验证（`unshare -rn` + netem，无需 sudo，不碰生产与 mihomo）。
+- 回环床先验证（`unshare -rn` + netem，无需 sudo，不碰生产与本地代理）。
 - 生产部署前备份 + sha256；部署后 30 s 内必须见 256 路，否则 60 s 内回滚。
 - 服务端改动只能经 17893 隧道 HTTP 上传（CASE-0 步骤 4c），上传后 `sha256sum` 必须相符。
 - 测量单轮 ≤15 s、单条命令 ≤60 s；原始目录保留。
@@ -108,7 +108,7 @@ while go && budget > 0 && session.FlowSending slot do
 
 1. 三个命题可能同时成立一部分；届时按「先 P1（最便宜、可静态确认）→ 再 P3（单点）→ 最后 P2（轮序）」顺序做，不并批。
 2. P2 的「立即再跑」会提高空转 CPU；必须以 `rx_ack`/`cpu` 双指标判，不能只看吞吐。
-3. 生产时段停摆率 5/10 属 mihomo 层，不在本设计修复面；任何生产判定必须先把停摆轮单列。
+3. 生产时段停摆率 5/10 属本地代理层，不在本设计修复面；任何生产判定必须先把停摆轮单列。
 4. 回环床的 target 是 python http.server，单线程；若 P2 修复后床内吞吐受 target 限制，需换 `iperf3 -s` 或 `nginx` 复测，且必须在结果文档声明更换。
 
 ## 8 判定结果（第十二代实测，2026-11-20 13:29 UTC）
@@ -117,6 +117,6 @@ while go && budget > 0 && session.FlowSending slot do
 （256 对 1）均无关，差 <1%；flow socket `rb=8,000,000`。P1、P2、P3 全部证伪。
 `stallNs 20→2 ms` 使 `rx_ack` 步率从 42.4 升到 57.6 步/s（1.36×），
 但 10 轮生产 A/B 的好轮中位 0.605 MB/s、停摆 3/10，均无改善，已回滚。
-长窗口三分账显示 `RxDelivered` 121.4 MB 对 curl 47.7 MB，积压在 mihomo 层；
+长窗口三分账显示 `RxDelivered` 121.4 MB 对 curl 47.7 MB，积压在本地代理层；
 该层被用户禁止实验，只记录。**在现有约束下，tbtun 侧没有可验证的吞吐修复面。**
 后继入口：CASE-13 单路半开检测、CASE-8 慢消费长尾、CASE-2 同窗口重传重测。

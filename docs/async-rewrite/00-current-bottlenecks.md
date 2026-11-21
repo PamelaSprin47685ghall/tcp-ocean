@@ -50,7 +50,7 @@ Main Thread (100% CPU):
 > 而且「多流更慢」本身不是要解决的问题：tbtun 的职责就是把一条本地 TCP 流拆成
 > 256 条公网路径，单流即已占满 256 路，多流倍率推不出瓶颈。
 
-With `max-connections: 1` in mihomo, 3 streams multiplex over one smux connection.
+With `max-connections: 1` in 本地代理, 3 streams multiplex over one smux connection.
 But tbtun processes flows sequentially in FlowBridge.Read():
 ```fsharp
 while slot >= 0 do

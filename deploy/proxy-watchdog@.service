@@ -1,0 +1,8 @@
+[Unit]
+Description=Restart tbt4 proxy when its vless inbound stalls
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+ExecStart=/usr/local/libexec/proxy-watchdog.sh %i

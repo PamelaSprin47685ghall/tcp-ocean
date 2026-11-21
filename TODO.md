@@ -17,7 +17,7 @@
 > - P2-10（SSE2 A/B）：`docs/cases/slow-consumer-cpu-stall.md`
 > - P2-11（测试编译）：`docs/cases/test-build-latency-2026-11-18.md`
 > - P2-12/13（路由与清理）：`docs/cases/deployment-route-and-cleanup-2026-11-18.md`
-> - 异步默认、事件驱动与 mihomo 诊断：`docs/async-rewrite/12-event-driven-default.md`
+> - 异步默认、事件驱动与本地代理诊断：`docs/async-rewrite/12-event-driven-default.md`
 > - 生产看门狗：`deploy/README.md`
 >
 > 约束均未改：256 路、TCP-only、`:39443` 静默、无 TLS/REALITY、TFO/BBR、smux 配置；
@@ -74,7 +74,7 @@
 ### 6. 多流并发反而变慢
 现状：3 流并行总吞吐 7.72 Mbit/s，低于单流 19.06 Mbit/s。
 待查：
-- 当前 mihomo `max-connections: 1` 下，多流是否被 smux 串行化。
+- 当前本地代理 `max-connections: 1` 下，多流是否被 smux 串行化。
 - `FlowBridge.Read` 在多个 slot 间是否公平；单轮是否只读一遍。
 - 会话级窗口与 per-flow 信用是否互相挤压。
 验收：3 流总吞吐 ≥ 单流 1.5 倍。
@@ -118,14 +118,14 @@
 ### 12. 路由绕过规则的健壮性
 现状：本地单元 `ExecStartPre` 用 `ip rule del/add pref 8890` 保证承载走 `enp8s0`。
 待办：
-- 验证 mihomo 重启、系统重启后规则仍在。
+- 验证本地代理重启、系统重启后规则仍在。
 - 确认 `ip rule add` 重复执行不报错（已用 `-` 前缀忽略失败）。
 验收：重启后 `ip route get 45.11.1.62` 仍指向 `enp8s0`。
 
 ### 13. 临时文件与备份清理
 待办：
 - 确认 `/run/hnd0tbt4.yaml`、`/run/hnd0tbt4.pid`、`/run/hnd0tbt4.log` 是否还需保留。
-- 保留 `/opt/mihomo/config.yaml.bak-smux1` 作为回滚点，记录保留期限。
+- 保留 `/opt/proxy/config.yaml.bak-smux1` 作为回滚点，记录保留期限。
 - HND0 上 `/root/tcp-ocean` 与本地 `~/tcp-ocean` 的差异需明确（Async 代码是否同步）。
 
 ### 14. 文档补齐
