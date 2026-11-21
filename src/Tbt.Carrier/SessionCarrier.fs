@@ -434,6 +434,7 @@ type SessionCarrier(session: Session, bridge: FlowBridge, ?uplinkPace: bool, ?tu
         statsAck <- if ackKnown then consAck else -1L
         statsPathVersion <- pathVersion
         "paths=" + string paths.Count + " frames_in=" + string framesIn + " frames_out=" + string framesOut
+        + (match channel with Some rx -> " preopened=" + string rx.PreOpenedCount | None -> "")
         + " tx_direction=" + (if session.Role = Role.Client then "up" else "down")
         + " send_control=" + (if pace then "group" elif kernel.Count > 0 then "kernel" else "tun")
         + " tx_head=" + string tx.Head + " peer_ack=" + string tx.PeerAck + " grant_limit=" + string tx.GrantLimit

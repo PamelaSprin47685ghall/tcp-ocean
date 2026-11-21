@@ -93,11 +93,36 @@ let private sse2MulNibbles (c: int) (n: Vector128<byte>) =
         if c &&& 8 <> 0 then acc <- acc ^^^ p
     acc
 
-let private sse2MulByte (c: int) (x: Vector128<byte>) =
+/// Reference form: split the nibbles, multiply each, merge (kept for the tests).
+let sse2MulByteSplit (c: int) (x: Vector128<byte>) =
     let nib = Vector128.Create(0x0Fuy)
     let lo = sse2MulNibbles c (x &&& nib)
     let hi = sse2MulNibbles c (Sse2.ShiftRightLogical(x.AsInt16(), 4uy).AsByte() &&& nib)
     lo ^^^ Sse2.ShiftLeftLogical(hi.AsInt16(), 4uy).AsByte()
+
+/// Multiply both nibbles of every byte by x at once (x^4 = x + 1 per nibble):
+/// shift left inside each nibble, then fold each nibble's carried-out top bit back
+/// in as 0b0011. Same field and same output as the split form, about half the ops:
+/// the split form ran this whole chain twice plus the split and merge.
+let private sse2MulX2 (x: Vector128<byte>) =
+    let t = x &&& Vector128.Create(0x88uy)
+    let s = Sse2.ShiftLeftLogical(x.AsInt16(), 1uy).AsByte() &&& Vector128.Create(0xEEuy)
+    s ^^^ Sse2.ShiftRightLogical(t.AsInt16(), 3uy).AsByte() ^^^ Sse2.ShiftRightLogical(t.AsInt16(), 2uy).AsByte()
+
+let sse2MulByte (c: int) (x: Vector128<byte>) =
+    let mutable p = x
+    let mutable acc = Vector128<byte>.Zero
+    if c &&& 1 <> 0 then acc <- p
+    if c > 1 then
+        p <- sse2MulX2 p
+        if c &&& 2 <> 0 then acc <- acc ^^^ p
+    if c > 3 then
+        p <- sse2MulX2 p
+        if c &&& 4 <> 0 then acc <- acc ^^^ p
+    if c > 7 then
+        p <- sse2MulX2 p
+        if c &&& 8 <> 0 then acc <- acc ^^^ p
+    acc
 
 let private sse2MulAdd (c: int) (src: ReadOnlySpan<byte>) (dst: Span<byte>) =
     let sv = MemoryMarshal.Cast<byte, Vector128<byte>>(src)

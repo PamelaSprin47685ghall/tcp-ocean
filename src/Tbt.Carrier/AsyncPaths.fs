@@ -45,6 +45,7 @@ type RxChannel() =
     let wakeBuffer = Array.zeroCreate<byte> 8
     let mutable wakeArmed = 0
     let mutable disposed = 0
+    let mutable preOpened = 0L
     /// Wake/ClearWake calls inside the fd; Dispose waits for zero before closing.
     let mutable inFd = 0
 
@@ -54,6 +55,8 @@ type RxChannel() =
     member val PreOpenerFactory: Func<RxPreOpener> | null = null with get, set
     member val OnPreOpened: PreOpenedHandler | null = null with get, set
 
+    /// Frames the session received already opened (session thread only).
+    member _.PreOpenedCount = preOpened
     member _.HasItems = Volatile.Read(&count) > 0
     member _.Count = Volatile.Read(&count)
     member _.WakeFd = wakeFd
@@ -102,7 +105,9 @@ type RxChannel() =
             match pre with
             | null -> owner.OnFrame(frame.PathId, Span(frame.Data, 0, frame.Length)) |> ignore
             | h ->
-                if frame.Opened then h.Invoke(frame.PathId, Span(frame.Data, 0, frame.Length), frame.Counter) |> ignore
+                if frame.Opened then
+                    preOpened <- preOpened + 1L
+                    h.Invoke(frame.PathId, Span(frame.Data, 0, frame.Length), frame.Counter) |> ignore
                 else owner.OnFrame(frame.PathId, Span(frame.Data, 0, frame.Length)) |> ignore
             ArrayPool<byte>.Shared.Return frame.Data
             delivered <- delivered + 1

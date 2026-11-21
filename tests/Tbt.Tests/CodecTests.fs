@@ -277,3 +277,18 @@ let ``decoder never outputs an undetermined source`` () =
     Assert.Equal(EquationResult.Innovative, dec.OfferParity(0UL, 1, CodeField.Gf16, true, 16, ReadOnlySpan out))
     Assert.Equal(1UL, dec.Frontier)
     assertRecovered enc dec 1
+
+[<Fact>]
+let ``packed SSE2 GF16 multiply equals the table and the split kernel for every coefficient and byte`` () =
+    if System.Runtime.Intrinsics.X86.Sse2.IsSupported then
+        let all = Array.init 256 byte
+        for c in 0 .. 15 do
+            for block in 0 .. 15 do
+                let x = System.Runtime.Intrinsics.Vector128.Create<byte>(ReadOnlySpan<byte>(all, block * 16, 16))
+                let packed = Gf16.sse2MulByte c x
+                let split = Gf16.sse2MulByteSplit c x
+                Assert.Equal(split, packed)
+                let out = Array.zeroCreate<byte> 16
+                System.Runtime.Intrinsics.Vector128.CopyTo(packed, out)
+                for i in 0 .. 15 do
+                    Assert.Equal(Gf16.MulByte.[c * 256 + block * 16 + i], out.[i])
