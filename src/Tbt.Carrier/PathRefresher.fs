@@ -79,3 +79,59 @@ type PathRefresher(maxAgeNs: int64, perTick: int, perTickIdle: int, tickNs: int6
         failed <- failed + 1L
         inFlight.Remove id |> ignore
         joinedAt.[id] <- nowNs - maxAgeNs + retryNs
+
+/// Client exit rule for an empty path list. The handshake session may be dead
+/// (exit so the service manager starts a fresh one), or paths are still on their
+/// way: the initial JOINs right after the handshake, or rejoins after a mass reset
+/// (the server keeps the session --no-path-grace-s). Exiting while JOINs are in
+/// flight threw away a live session 3 s after "session up" (bench fr13 ERRs).
+/// Exit after exitNs with no path and no JOIN in flight, or after capNs with no path.
+[<Sealed>]
+type NoPathWatch(exitNs: int64, capNs: int64) =
+    let mutable watching = false
+    let mutable since = 0L
+    let mutable lastBusy = 0L
+    /// Call on every housekeeping pass; true when the client should exit.
+    member _.ShouldExit(nowNs: int64, noPath: bool, joinsInFlight: int) =
+        if not noPath then
+            watching <- false
+            false
+        else
+            if not watching then
+                watching <- true
+                since <- nowNs
+                lastBusy <- nowNs
+            if joinsInFlight > 0 then lastBusy <- nowNs
+            nowNs - lastBusy >= exitNs || (capNs > 0L && nowNs - since >= capNs)
+    /// True while the list is empty (the caller keeps a timer wake running).
+    member _.Watching = watching
+
+/// Rolling congestion-control re-init plan for carrier sockets (no reconnect):
+/// toggling TCP_CONGESTION re-runs the module's init, so BBR restarts in STARTUP.
+/// Each socket is nudged at most once per periodNs, spread evenly over ticks;
+/// pick "oldest" (longest since nudge/first seen) or "worst" (lowest score first).
+[<Sealed>]
+type CcNudgePlan<'k when 'k: not struct and 'k: not null and 'k: equality>(periodNs: int64, tickNs: int64, worst: bool) =
+    let last = System.Collections.Generic.Dictionary<'k, int64>(HashIdentity.Reference)
+    let mutable lastTick = 0L
+    let mutable nudged = 0L
+    member _.Enabled = periodNs > 0L
+    member _.Nudged = nudged
+    member _.Due(nowNs: int64, keys: 'k[], score: 'k -> int64) : 'k[] =
+        if periodNs <= 0L || nowNs - lastTick < tickNs then Array.empty
+        else
+            lastTick <- nowNs
+            let present = System.Collections.Generic.HashSet<'k>(keys, HashIdentity.Reference)
+            for k in Seq.toArray last.Keys do
+                if not (present.Contains k) then last.Remove k |> ignore
+            for k in keys do
+                if not (last.ContainsKey k) then last.[k] <- nowNs
+            let per = int ((int64 keys.Length * tickNs + periodNs - 1L) / periodNs)
+            let eligible = keys |> Array.filter (fun k -> nowNs - last.[k] >= periodNs)
+            let ordered =
+                if worst then eligible |> Array.sortBy (fun k -> score k, last.[k])
+                else eligible |> Array.sortBy (fun k -> last.[k])
+            let pick = Array.truncate per ordered
+            for k in pick do last.[k] <- nowNs
+            nudged <- nudged + int64 pick.Length
+            pick

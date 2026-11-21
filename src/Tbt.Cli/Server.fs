@@ -53,6 +53,12 @@ let run (o: Options) =
     let noPathGraceNs = int64 (max 0 (o.Int("no-path-grace-s", 30))) * 1_000_000_000L
     let windowClamp = o.Int("window-clamp", SocketTuning.WindowClamp)
     let statsMs = int64 (o.Int("stats-s", 0)) * 1000L
+    // Rolling congestion-control re-init of carrier sockets (0 = off): each socket
+    // is switched to --cc-nudge-via and back to bbr once per --cc-nudge-s seconds.
+    let ccNudge =
+        CcNudgePlan<System.Net.Sockets.Socket>(int64 (max 0 (o.Int("cc-nudge-s", 0))) * 1_000_000_000L,
+                                               1_000_000_000L, o.TextOr("cc-nudge-pick", "oldest") = "worst")
+    let ccNudgeVia = o.TextOr("cc-nudge-via", "reno")
     // Downlink group pacing: 0 (default) keeps the pre-existing unpaced write
     // gate; 1 charges the session RateGroup so a 256-path burst cannot outrun
     // the bottleneck. Direction-neutral: the client has the same switch as
@@ -348,6 +354,7 @@ let run (o: Options) =
             if statsMs > 0L then
                 let due = lastStats + statsMs - Environment.TickCount64
                 m <- min m (max 1L due)
+            if ccNudge.Enabled then m <- min m 1000L
             m
         // A socket accepted in this round joins `pending` after this round's Wait, so
         // the poller has not registered it yet.  Waiting for an event on it would stall
@@ -422,6 +429,14 @@ let run (o: Options) =
                 sessions.RemoveAt i
             i <- i - 1
         winCsvcUs <- winCsvcUs + toUs (stamp () - csvcA)
+        if ccNudge.Enabled && sessions.Count > 0 then
+            let socks = sessions |> Seq.collect (fun e -> e.Carrier.PathSockets) |> Seq.toArray
+            let score (sk: System.Net.Sockets.Socket) =
+                match KernelTcpInfo.tryRead sk with
+                | ValueSome i when i.DeliveryRate >= 0L -> i.DeliveryRate
+                | _ -> Int64.MaxValue
+            for sk in ccNudge.Due(now * 1_000_000L, socks, score) do
+                SocketTuning.reinitCongestion(sk, "bbr", ccNudgeVia) |> ignore
         match tun with
         | null -> ()
         | t ->
@@ -455,7 +470,7 @@ let run (o: Options) =
                  + " svc_us=" + string winSvcUs + " svc_us_max=" + string winSvcUsMax
                  + " csvc_us=" + string winCsvcUs + " iter_n=" + string winIterN + " iter_us_max=" + string winIterUsMax
                  + " svc_gap_us_max=" + string winSvcGapMax
-                 + " tun_drain=" + drainMode)
+                 + " tun_drain=" + drainMode + " cc_nudged=" + string ccNudge.Nudged)
             winRecvUs <- 0L; winRecvUsMax <- 0L; winSvcUs <- 0L; winSvcUsMax <- 0L
             winCsvcUs <- 0L; winIterN <- 0; winIterUsMax <- 0L; winSvcGapMax <- 0L
             // An async session's carrier belongs to its coordinator thread; walking

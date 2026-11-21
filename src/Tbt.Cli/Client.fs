@@ -312,30 +312,31 @@ let run (o: Options) =
         // listener's readiness is still visible.
         let watchListener (pl: Poller) = pl.WatchRead listener
         let noPathExitMs = int64 (max 0 (o.Int("no-path-exit-ms", 3000)))
-        let mutable noPathSince = 0L
+        let noPathWatch = NoPathWatch(noPathExitMs * 1_000_000L, int64 (max 0 (o.Int("no-path-cap-s", 30))) * 1_000_000_000L)
+        let mutable noPathWakePending = false
         let housekeeping () =
             drainEvents ()
             attachJoined ()
             plan ()
             // Every path is gone but the pool still wants paths: the handshake
             // session itself died, and a JOIN cannot rebuild it in this process.
-            // Exit so the service manager starts a fresh handshake.
-            // A mass reset can empty the list for a moment while JOINs into the same
-            // session (the server keeps it --no-path-grace-s) are already in flight:
-            // give them noPathExitMs before declaring the session lost.
+            // Exit so the service manager starts a fresh handshake. JOINs still in
+            // flight (initial joins right after the handshake, or rejoins after a
+            // mass reset into a session the server keeps --no-path-grace-s) hold the
+            // exit off; see NoPathWatch.
             let noPath = carrier.PathOpsPending = 0 && carrier.PathCount = 0 && pending.Count = 0
-            if not noPath then noPathSince <- 0L
-            elif noPathSince = 0L then
-                noPathSince <- Environment.TickCount64
-                // Nothing else may wake an empty session: come back when the wait is over.
+            let exitNow = noPathWatch.ShouldExit(clock.FreshNs(), noPath, pool.InFlight + events.Count)
+            if noPathWatch.Watching && not noPathWakePending then
+                // Nothing else may wake an empty session: come back every 250 ms.
                 match rxChannel with
                 | Some ch ->
+                    noPathWakePending <- true
                     Task.Run(fun () ->
-                        Thread.Sleep(int noPathExitMs + 50)
+                        Thread.Sleep 250
+                        noPathWakePending <- false
                         ch.Wake()) |> ignore
                 | None -> ()
-            if stopAt = 0L && not session.Closed && pool.Target > 0 && noPath
-               && Environment.TickCount64 - noPathSince >= noPathExitMs then
+            if stopAt = 0L && not session.Closed && pool.Target > 0 && exitNow then
                 log "session lost: no path remains, exiting for restart"
                 Environment.Exit 75
             if stopAt > 0L && session.CloseState = CloseState.Open then

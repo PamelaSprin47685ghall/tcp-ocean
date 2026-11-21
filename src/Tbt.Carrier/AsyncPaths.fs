@@ -477,6 +477,8 @@ type AsyncPathLink private (socket: Socket, probe: INotSentProbe, group: AsyncPo
                 false
         else false
 
+    member _.Socket = socket
+
     member this.Close() =
         if Interlocked.Exchange(&alive, 0) = 1 then
             try socket.Dispose () with _ -> ()

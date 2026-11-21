@@ -170,3 +170,66 @@ let ``PathRefresher works faster while the session is idle`` () =
     Assert.Equal(1, r.Due(61L * s, present, true, false).Length)
     Assert.Equal(4, r.Due(62L * s, present, true, true).Length)
     Assert.Equal(3, r.Due(63L * s, present, true, true).Length)
+
+[<Fact>]
+let ``NoPathWatch does not exit while initial joins are in flight`` () =
+    let ms = 1_000_000L
+    let w = NoPathWatch(3000L * ms, 30_000L * ms)
+    // "session up" with paths=0: 64 JOINs in flight for 10 s (slow server after restart).
+    for t in 0L .. 100L .. 10_000L do
+        Assert.False(w.ShouldExit(t * ms, true, 64), sprintf "exited at %d ms with joins in flight" t)
+    // The first path lands: the watch resets.
+    Assert.False(w.ShouldExit(10_100L * ms, false, 10))
+    Assert.False(w.Watching)
+
+[<Fact>]
+let ``NoPathWatch exits 3 s after the last join attempt, or at the cap`` () =
+    let ms = 1_000_000L
+    let w = NoPathWatch(3000L * ms, 30_000L * ms)
+    Assert.False(w.ShouldExit(0L, true, 4))
+    Assert.False(w.ShouldExit(1000L * ms, true, 0))   // backoff gap counts from the last busy look
+    Assert.False(w.ShouldExit(2900L * ms, true, 0))
+    Assert.True(w.ShouldExit(3000L * ms, true, 0))
+    let c = NoPathWatch(3000L * ms, 30_000L * ms)
+    for t in 0L .. 500L .. 29_500L do Assert.False(c.ShouldExit(t * ms, true, 1))
+    Assert.True(c.ShouldExit(30_000L * ms, true, 1))  // a dead session's JOINs never land
+
+[<Fact>]
+let ``CcNudgePlan spreads nudges over the period and skips young sockets`` () =
+    let s = 1_000_000_000L
+    let keys = Array.init 60 (fun i -> box i)
+    let p = CcNudgePlan<obj>(30L * s, s, false)
+    Assert.Empty(p.Due(s, keys, fun _ -> 0L))              // first seen: not yet eligible
+    Assert.Empty(p.Due(s + s / 2L, keys, fun _ -> 0L))     // within the tick
+    let picked = System.Collections.Generic.List<obj>()
+    for t in 31L .. 60L do picked.AddRange(p.Due(t * s, keys, fun _ -> 0L))
+    // 60 sockets over a 30 s period at 1 s ticks: 2 per tick, each exactly once.
+    Assert.Equal(60, picked.Count)
+    Assert.Equal(60, (System.Collections.Generic.HashSet<obj>(picked, HashIdentity.Reference)).Count)
+    Assert.Equal(60L, p.Nudged)
+
+[<Fact>]
+let ``CcNudgePlan worst pick takes the lowest score first`` () =
+    let s = 1_000_000_000L
+    let keys = Array.init 10 (fun i -> box i)
+    let p = CcNudgePlan<obj>(10L * s, s, true)
+    p.Due(0L + s, keys, fun _ -> 0L) |> ignore
+    let first = p.Due(11L * s, keys, fun k -> int64 (100 - unbox<int> k))
+    Assert.Equal<obj[]>([| box 9 |], first)
+    Assert.Empty(CcNudgePlan<obj>(0L, s, false).Due(100L * s, keys, fun _ -> 0L))
+
+[<Fact>]
+let ``reinitCongestion keeps the socket on its congestion module`` () =
+    if OperatingSystem.IsLinux()
+       && (System.IO.File.ReadAllText "/proc/sys/net/ipv4/tcp_available_congestion_control").Contains "reno" then
+        use l = new System.Net.Sockets.Socket(System.Net.Sockets.SocketType.Stream, System.Net.Sockets.ProtocolType.Tcp)
+        l.Bind(System.Net.IPEndPoint(System.Net.IPAddress.Loopback, 0)); l.Listen 1
+        use c = new System.Net.Sockets.Socket(System.Net.Sockets.SocketType.Stream, System.Net.Sockets.ProtocolType.Tcp)
+        c.Connect(l.LocalEndPoint)
+        let cc = (System.IO.File.ReadAllText "/proc/sys/net/ipv4/tcp_congestion_control").Trim()
+        Assert.True(SocketTuning.reinitCongestion(c, cc, "reno"))
+        let buf = Array.zeroCreate<byte> 16
+        let n = c.GetRawSocketOption(6, 13, Span buf)
+        Assert.Equal(cc, System.Text.Encoding.ASCII.GetString(buf, 0, n).TrimEnd('\000'))
+        c.Dispose()
+        Assert.False(SocketTuning.reinitCongestion(c, cc, "reno"))

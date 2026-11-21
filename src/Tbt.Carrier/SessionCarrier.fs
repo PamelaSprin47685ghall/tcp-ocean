@@ -64,11 +64,20 @@ type SessionCarrier(session: Session, bridge: FlowBridge, ?uplinkPace: bool, ?tu
     /// RemoveAt on the coordinator saw a null slot and killed the server
     /// (NullReferenceException in HasPath when a client reconnected).
     let mutable pathIds: uint16[] = Array.Empty<uint16>()
+    /// Kernel sockets of `paths`, published with pathIds (congestion-control nudges).
+    let mutable pathSockets: System.Net.Sockets.Socket[] = Array.Empty<System.Net.Sockets.Socket>()
     /// Clock time the path list became empty (0 while it has paths).
     let mutable noPathSinceNs = 0L
     let publishIds () =
         let a = Array.zeroCreate<uint16> paths.Count
         for i in 0 .. a.Length - 1 do a.[i] <- paths.[i].PathId
+        let socks = List<System.Net.Sockets.Socket>(paths.Count)
+        for p in paths do
+            match p with
+            | :? PathLink as l -> socks.Add l.Socket
+            | :? AsyncPathLink as l -> socks.Add l.Socket
+            | _ -> ()
+        System.Threading.Volatile.Write(&pathSockets, socks.ToArray())
         if a.Length > 0 then noPathSinceNs <- 0L
         elif noPathSinceNs = 0L then noPathSinceNs <- max 1L (session.Clock.NowNs())
         System.Threading.Volatile.Write(&pathIds, a)
@@ -349,6 +358,8 @@ type SessionCarrier(session: Session, bridge: FlowBridge, ?uplinkPace: bool, ?tu
     member _.PathIds = System.Threading.Volatile.Read(&pathIds)
     /// Path count as of the last change; safe from any thread.
     member _.PathCount = System.Threading.Volatile.Read(&pathIds).Length
+    /// Snapshot of path sockets; safe from any thread (a socket may be closed by then).
+    member _.PathSockets = System.Threading.Volatile.Read(&pathSockets)
     /// Path adds/removes posted but not yet applied by the session thread.
     member _.PathOpsPending = System.Threading.Interlocked.CompareExchange(&pathOpsPending, 0, 0)
     member _.FramesIn = framesIn

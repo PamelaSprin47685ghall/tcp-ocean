@@ -119,6 +119,19 @@ module SocketTuning =
         elif c.HasTcpInfoNotSent then TcpInfoNotSentProbe()
         else NoNotSentProbe()
 
+    /// Re-run the congestion module's init on a live socket (Linux): switch to
+    /// `via` and back to `cc`. BBR restarts in STARTUP; cwnd and the connection stay.
+    let reinitCongestion (socket: Socket, cc: string, via: string) =
+        if not (OperatingSystem.IsLinux()) then false
+        else
+            try
+                socket.SetRawSocketOption(6, 13, ReadOnlySpan<byte>(Encoding.ASCII.GetBytes via))
+                socket.SetRawSocketOption(6, 13, ReadOnlySpan<byte>(Encoding.ASCII.GetBytes cc))
+                true
+            with
+            | :? SocketException -> false
+            | :? ObjectDisposedException -> false
+
     /// Settings for a path socket: no Nagle, small unsent queue (Linux TCP_NOTSENT_LOWAT).
     /// clamp is TCP_WINDOW_CLAMP in bytes (default WindowClamp, spec ch. 9).
     let pathWith (socket: Socket, clamp: int, notsentLowat: int, userTimeoutMs: int) =
