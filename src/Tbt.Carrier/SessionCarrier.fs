@@ -64,9 +64,13 @@ type SessionCarrier(session: Session, bridge: FlowBridge, ?uplinkPace: bool, ?tu
     /// RemoveAt on the coordinator saw a null slot and killed the server
     /// (NullReferenceException in HasPath when a client reconnected).
     let mutable pathIds: uint16[] = Array.Empty<uint16>()
+    /// Clock time the path list became empty (0 while it has paths).
+    let mutable noPathSinceNs = 0L
     let publishIds () =
         let a = Array.zeroCreate<uint16> paths.Count
         for i in 0 .. a.Length - 1 do a.[i] <- paths.[i].PathId
+        if a.Length > 0 then noPathSinceNs <- 0L
+        elif noPathSinceNs = 0L then noPathSinceNs <- max 1L (session.Clock.NowNs())
         System.Threading.Volatile.Write(&pathIds, a)
     /// Posted from a watching thread; applied by the thread that owns `paths`.
     let pathOps = ConcurrentQueue<PathOp>()
@@ -355,9 +359,17 @@ type SessionCarrier(session: Session, bridge: FlowBridge, ?uplinkPace: bool, ?tu
     /// Optional owner predicate: the session stays alive with no path while the
     /// owner is still rebuilding its path pool. None keeps the old rule.
     member val KeepAlive: (unit -> bool) option = None with get, set
+    /// How long the session survives with no path at all (server side). A burst of
+    /// resets (middlebox, NAT rebind, ss -K) can take every path at once; the old
+    /// rule closed the session on the spot, the client's JOINs for it were refused,
+    /// and the client crawled down to "no path remains" and exited 37 s later.
+    /// With a grace the client rejoins into the same session. 0 keeps the old rule.
+    member val NoPathGraceNs = 0L with get, set
     member this.Alive =
-        (paths.Count > 0 || not pathOps.IsEmpty
-         || (match this.KeepAlive with Some f -> f () | None -> false))
+        let hasPath = System.Threading.Volatile.Read(&pathIds).Length > 0 || not pathOps.IsEmpty
+        (hasPath
+         || (match this.KeepAlive with Some f -> f () | None -> false)
+         || (this.NoPathGraceNs > 0L && session.Clock.NowNs() - noPathSinceNs < this.NoPathGraceNs))
         && not session.Faulted && not session.Closed
     member _.HasPendingRx = rxMore
     member _.UplinkPace = pace

@@ -12,6 +12,7 @@
     <Compile Include="Packet.fs" />
     <Compile Include="RateGroup.fs" />
     <Compile Include="PathPool.fs" />
+    <Compile Include="PathRefresher.fs" />
     <Compile Include="TunPath.fs" />
     <Compile Include="TunStack.fs" />
     <Compile Include="SessionCarrier.fs" />

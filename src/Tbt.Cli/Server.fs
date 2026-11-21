@@ -49,6 +49,8 @@ let run (o: Options) =
     let psks = readPsks (o.Text "psk-file")
     let mss = o.Int("mss", 1448)
     let maxPaths = o.Int("max-paths", 64)
+    /// A session whose every path dropped at once stays joinable this long (s).
+    let noPathGraceNs = int64 (max 0 (o.Int("no-path-grace-s", 30))) * 1_000_000_000L
     let windowClamp = o.Int("window-clamp", SocketTuning.WindowClamp)
     let statsMs = int64 (o.Int("stats-s", 0)) * 1000L
     // Downlink group pacing: 0 (default) keeps the pre-existing unpaced write
@@ -194,6 +196,7 @@ let run (o: Options) =
             let ioGroup = if channel.IsSome then Some (ensureIoPool ()) else None
             let carrier = SessionCarrier(session, bridge, uplinkPace = pace, ?rxChannel = channel, ?asyncIo = ioGroup,
                                          gatePass2 = gatePass2, txSlots = txSlots)
+            carrier.NoPathGraceNs <- noPathGraceNs
             link.PathId <- 0us
             reply link a.Reply
             carrier.AddPath link

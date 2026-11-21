@@ -473,6 +473,33 @@ let ``HasPath, PathIds and PathCount are safe from another thread while paths ch
     Assert.False(carrier.HasPath 7us)
     Assert.Equal(0, carrier.PathCount)
 
+[<Fact>]
+let ``a session whose every path dropped stays joinable for the no-path grace`` () =
+    // Bench: ss -K of all 256 server sockets closed the session at once; the client's
+    // rejoins had nothing to join and it exited "no path remains" 37 s later.
+    let pair = Pair(SessionConfig.defaults, 1, 0.0, 64)
+    let carrier = SessionCarrier(pair.Server, FlowBridge(ValueNone))
+    carrier.NoPathGraceNs <- 30_000_000_000L
+    carrier.AddPath(stubPath 3us)
+    Assert.True(carrier.Alive)
+    carrier.RemovePath 3us
+    Assert.Equal(0, carrier.PathCount)
+    Assert.True(carrier.Alive, "grace: the session must wait for rejoins")
+    pair.Clock.Now <- pair.Clock.Now + 20_000_000_000L
+    Assert.True(carrier.Alive)
+    // A rejoin resets the grace.
+    carrier.AddPath(stubPath 4us)
+    carrier.RemovePath 4us
+    pair.Clock.Now <- pair.Clock.Now + 20_000_000_000L
+    Assert.True(carrier.Alive, "grace restarts after a rejoin")
+    pair.Clock.Now <- pair.Clock.Now + 11_000_000_000L
+    Assert.False(carrier.Alive, "grace expired")
+    // Without a grace the old rule holds: no path, not alive.
+    let c0 = SessionCarrier(pair.Client, FlowBridge(ValueNone))
+    c0.AddPath(stubPath 5us)
+    c0.RemovePath 5us
+    Assert.False(c0.Alive)
+
 let private capacityBody (budget: uint64) =
     let b = Array.zeroCreate<byte> 8
     Ctrl.writeCapacityBody budget (Span b)

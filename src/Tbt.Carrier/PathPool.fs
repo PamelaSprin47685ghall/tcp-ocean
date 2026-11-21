@@ -49,6 +49,17 @@ type PathPool(target: int, concurrency: int, baseDelayNs: int64, capDelayNs: int
             id <- id + 1
         start.ToArray()
 
+    /// Reserve the next incarnation stride of a present id for a refresh JOIN (the
+    /// server replaces a live path on a higher incarnation). None when the id is
+    /// already joining or its incarnations are used up.
+    member _.Reserve(id: uint16) : uint32 voption =
+        let i = int id
+        if i >= slots || inFlight.Contains id || incarnation.[i] > UInt32.MaxValue - uint32 stride then ValueNone
+        else
+            incarnation.[i] <- incarnation.[i] + uint32 stride
+            inFlight.Add id |> ignore
+            ValueSome incarnation.[i]
+
     /// A JOIN succeeded: clear the backoff of this id.
     member _.Joined(id: uint16) =
         inFlight.Remove id |> ignore
