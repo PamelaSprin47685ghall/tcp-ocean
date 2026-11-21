@@ -67,7 +67,9 @@ type SessionCarrier(session: Session, bridge: FlowBridge, ?uplinkPace: bool, ?tu
     /// Kernel sockets of `paths`, published with pathIds (congestion-control nudges).
     let mutable pathSockets: System.Net.Sockets.Socket[] = Array.Empty<System.Net.Sockets.Socket>()
     /// Clock time the path list became empty (0 while it has paths).
-    let mutable noPathSinceNs = 0L
+    /// Starts at construction: a session whose first path is still in the coordinator's
+    /// queue (or not yet posted) must not look dead to the server's Alive check.
+    let mutable noPathSinceNs = max 1L (session.Clock.NowNs())
     let publishIds () =
         let a = Array.zeroCreate<uint16> paths.Count
         for i in 0 .. a.Length - 1 do a.[i] <- paths.[i].PathId

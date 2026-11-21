@@ -500,6 +500,18 @@ let ``a session whose every path dropped stays joinable for the no-path grace`` 
     c0.RemovePath 5us
     Assert.False(c0.Alive)
 
+[<Fact>]
+let ``a brand-new session is alive for the no-path grace before its first path lands`` () =
+    // Bench: the server logged "session up" and "closed" in the same millisecond when
+    // its main loop checked Alive before the coordinator applied the handshake path.
+    let pair = Pair(SessionConfig.defaults, 1, 0.0, 64)
+    pair.Clock.Now <- pair.Clock.Now + 100_000_000_000L
+    let carrier = SessionCarrier(pair.Server, FlowBridge(ValueNone))
+    carrier.NoPathGraceNs <- 30_000_000_000L
+    Assert.True(carrier.Alive, "new session with its first path still queued")
+    pair.Clock.Now <- pair.Clock.Now + 31_000_000_000L
+    Assert.False(carrier.Alive, "no path ever arrived")
+
 let private capacityBody (budget: uint64) =
     let b = Array.zeroCreate<byte> 8
     Ctrl.writeCapacityBody budget (Span b)
