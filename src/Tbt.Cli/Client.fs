@@ -119,12 +119,12 @@ let run (o: Options) =
         carrier.KeepAlive <-
             Some (fun () ->
                 not (isNull (box poolRef)) && not session.Closed
-                && carrier.Paths.Count < poolRef.Target)
+                && carrier.PathCount < poolRef.Target)
         carrier.AddPath link0
         let maxPaths = int hello.MaxPaths
         // Forward as soon as path 0 is up; remaining JOINs run with bounded
         // concurrency and are attached on this thread via `pending`.
-        log ("session up: S=" + string p.Symbol + " paths=" + string carrier.Paths.Count
+        log ("session up: S=" + string p.Symbol + " paths=" + string carrier.PathCount
              + " window_clamp=" + string windowClamp + " " + describeOffer p.Keys.Suite p.Caps)
         let concurrency = JoinBootstrap.clampConcurrency (o.Int("join-concurrency", JoinBootstrap.DefaultConcurrency))
         let mutable stopAt = 0L
@@ -172,7 +172,7 @@ let run (o: Options) =
                 for link in pending do
                     carrier.AddPath link
                     applying.Add link.PathId |> ignore
-                    log ("path " + string link.PathId + " joined, paths=" + string carrier.Paths.Count)
+                    log ("path " + string link.PathId + " joined, paths=" + string carrier.PathCount)
                 pending.Clear()
             // In async mode AddPath posts to the carrier and the session thread
             // applies it. Paths.Count read before that queue drains reported
@@ -180,9 +180,9 @@ let run (o: Options) =
             // every path. Report readiness only after the posted adds are applied.
             if carrier.PathOpsPending = 0 then applying.Clear()
             if not readyLogged && pool.InFlight = 0 && pending.Count = 0
-               && carrier.PathOpsPending = 0 && carrier.Paths.Count >= pool.Target then
+               && carrier.PathOpsPending = 0 && carrier.PathCount >= pool.Target then
                 readyLogged <- true
-                log ("paths ready: paths=" + string carrier.Paths.Count)
+                log ("paths ready: paths=" + string carrier.PathCount)
         let presentIds () =
             let s = HashSet<uint16>()
             // Path 0 is the one the handshake itself created. While its first
@@ -191,7 +191,7 @@ let run (o: Options) =
             // beside the handshake path. Once the add is applied, `Paths`
             // reports it and, after a loss, the pool rebuilds it.
             if carrier.PathOpsPending > 0 then s.Add 0us |> ignore
-            for link in carrier.Paths do s.Add link.PathId |> ignore
+            for id in carrier.PathIds do s.Add id |> ignore
             for link in pending do s.Add link.PathId |> ignore
             for id in applying do s.Add id |> ignore
             s
@@ -239,7 +239,7 @@ let run (o: Options) =
             // session itself died, and a JOIN cannot rebuild it in this process.
             // Exit so the service manager starts a fresh handshake.
             if stopAt = 0L && not session.Closed && pool.Target > 0
-               && carrier.PathOpsPending = 0 && carrier.Paths.Count = 0 then
+               && carrier.PathOpsPending = 0 && carrier.PathCount = 0 then
                 log "session lost: no path remains, exiting for restart"
                 Environment.Exit 75
             if stopAt > 0L && session.CloseState = CloseState.Open then

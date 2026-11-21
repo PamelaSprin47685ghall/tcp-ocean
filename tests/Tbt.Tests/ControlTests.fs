@@ -425,6 +425,54 @@ let ``path close: AddPath after PATH_CLOSED calls NotePathJoined and the id can 
     Assert.True(pair.Client.TryProduce(1us, Span frame) || not pair.Client.WantsToSend)
     Assert.True(carrier.HasPath 1us)
 
+let private stubPath (id: uint16) =
+    let mutable pathId = id
+    let mutable frameLength = 0
+    { new IPath with
+        member _.PathId with get () = pathId and set v = pathId <- v
+        member _.FrameLength with get () = frameLength and set v = frameLength <- v
+        member _.Alive = true
+        member _.Attach(_) = ()
+        member _.Backlog with set (_: int) = ()
+        member _.Watch(_, _) = ()
+        member _.Receive(_) = ()
+        member _.TryBeginFrame(_) = false
+        member _.CommitFrame() = ()
+        member _.Close() = ()
+        member _.UnsentBytes = 0 }
+
+[<Fact>]
+let ``HasPath, PathIds and PathCount are safe from another thread while paths change`` () =
+    // Live server: the accept loop's HasPath (List.Exists) raced the coordinator's
+    // RemoveAt, read a null slot and crashed with NullReferenceException.
+    let pair = Pair(SessionConfig.defaults, 1, 0.0, 63)
+    let carrier = SessionCarrier(pair.Client, FlowBridge(ValueNone))
+    let stop = ref false
+    let mutable failure: exn = null
+    let reader =
+        System.Threading.Thread(fun () ->
+            try
+                while not stop.Value do
+                    for id in 0us .. 40us do carrier.HasPath id |> ignore
+                    let ids = carrier.PathIds
+                    for id in ids do Assert.True(id <= 40us)
+                    Assert.True(carrier.PathCount >= 0)
+            with e -> failure <- e)
+    reader.Start()
+    let sw = System.Diagnostics.Stopwatch.StartNew()
+    while sw.ElapsedMilliseconds < 1500L do
+        for id in 1us .. 40us do carrier.AddPath(stubPath id)
+        for k in 40 .. -1 .. 1 do carrier.RemovePath(uint16 k)
+    stop.Value <- true
+    reader.Join()
+    Assert.Null(failure)
+    carrier.AddPath(stubPath 7us)
+    Assert.True(carrier.HasPath 7us)
+    Assert.Equal<uint16[]>([| 7us |], carrier.PathIds)
+    carrier.RemovePath 7us
+    Assert.False(carrier.HasPath 7us)
+    Assert.Equal(0, carrier.PathCount)
+
 let private capacityBody (budget: uint64) =
     let b = Array.zeroCreate<byte> 8
     Ctrl.writeCapacityBody budget (Span b)

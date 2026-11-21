@@ -58,6 +58,16 @@ type SessionCarrier(session: Session, bridge: FlowBridge, ?uplinkPace: bool, ?tu
     let channel = rxChannel
     let io = asyncIo
     let paths = List<IPath>()
+    /// Copy of the path ids in `paths`, republished by the owning thread after every
+    /// change. The accept loop (server JOIN admission, client PathPool) runs on another
+    /// thread in async mode and used to read `paths` directly: List.Exists racing a
+    /// RemoveAt on the coordinator saw a null slot and killed the server
+    /// (NullReferenceException in HasPath when a client reconnected).
+    let mutable pathIds: uint16[] = Array.Empty<uint16>()
+    let publishIds () =
+        let a = Array.zeroCreate<uint16> paths.Count
+        for i in 0 .. a.Length - 1 do a.[i] <- paths.[i].PathId
+        System.Threading.Volatile.Write(&pathIds, a)
     /// Posted from a watching thread; applied by the thread that owns `paths`.
     let pathOps = ConcurrentQueue<PathOp>()
     let pathOpsInline = io.IsNone
@@ -167,6 +177,7 @@ type SessionCarrier(session: Session, bridge: FlowBridge, ?uplinkPace: bool, ?tu
                 paths.[i].Close()
                 paths.RemoveAt i
                 pathVersion <- pathVersion + 1L
+                publishIds ()
             i <- i - 1
 
     let hot = ReadySet()
@@ -328,7 +339,12 @@ type SessionCarrier(session: Session, bridge: FlowBridge, ?uplinkPace: bool, ?tu
 
     member _.Session = session
     member _.Bridge = bridge
+    /// The live path list: only for the thread that owns it (the session thread).
     member _.Paths = paths
+    /// Path ids as of the last change; safe from any thread.
+    member _.PathIds = System.Threading.Volatile.Read(&pathIds)
+    /// Path count as of the last change; safe from any thread.
+    member _.PathCount = System.Threading.Volatile.Read(&pathIds).Length
     /// Path adds/removes posted but not yet applied by the session thread.
     member _.PathOpsPending = System.Threading.Interlocked.CompareExchange(&pathOpsPending, 0, 0)
     member _.FramesIn = framesIn
@@ -508,6 +524,7 @@ type SessionCarrier(session: Session, bridge: FlowBridge, ?uplinkPace: bool, ?tu
                 | _ -> link, None
             paths.Add path
             pathVersion <- pathVersion + 1L
+            publishIds ()
             // Attach drains the bytes already read. Only after that may an IO
             // thread pick the path up and touch its receive buffer.
             path.Attach this
@@ -516,7 +533,7 @@ type SessionCarrier(session: Session, bridge: FlowBridge, ?uplinkPace: bool, ?tu
             | _ -> ()
 
     member _.HasPath(pathId: uint16) =
-        paths.Exists(fun p -> p.PathId = pathId)
+        Array.contains pathId (System.Threading.Volatile.Read(&pathIds))
         || (pathOps |> Seq.exists (function PathAdd p -> p.PathId = pathId | _ -> false))
 
     /// Close and drop the path with pathId (replaced by a higher incarnation).
@@ -533,6 +550,7 @@ type SessionCarrier(session: Session, bridge: FlowBridge, ?uplinkPace: bool, ?tu
             paths.[i].Close()
             paths.RemoveAt i
             pathVersion <- pathVersion + 1L
+            publishIds ()
             pacers.Remove id |> ignore
 
     /// Apply posted path changes on the thread that owns `paths`.
@@ -642,6 +660,7 @@ type SessionCarrier(session: Session, bridge: FlowBridge, ?uplinkPace: bool, ?tu
             | PathRemove _ -> ()
         pathOpsPending <- 0
         paths.Clear()
+        publishIds ()
         bridge.CloseAll()
 
     interface IPathOwner with
