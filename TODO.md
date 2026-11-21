@@ -23,7 +23,12 @@
 > 约束均未改：256 路、TCP-only、`:39443` 静默、无 TLS/REALITY、TFO/BBR、smux 配置；
 > `rho=0.25` 语义保留在 `TBTUN_FEC_ADAPTIVE=0`，默认自适应；GF(16) 上行未改。
 
-更新时间：2026-11-19
+> **2026-11-21 生产轮（prod-hnd0 合入）**：会话老化下行衰减定位在载波 TCP 连接状态（长连接 BBR 退出 STARTUP 后带宽估计在约 20 % 丢包下持续缩小）。
+> 修复与改进：HasPath 跨线程 NRE（路径 id 快照）、minRTT 窗口不再棘轮、客户端滚动路径刷新（空闲优先）、服务端 `--cc-nudge-s` 滚动重置拥塞控制、
+> 大面积断路后会话保活（`--no-path-grace-s`）、初始 JOIN 未完成时不退出、新会话首条路径入队前不被判死。部署：两端 ChaCha8（`--suites chacha8,chacha20`）+ `--cc-nudge-s 30`。
+> 未解决：刷新年龄抖动（50 %）实测更慢，默认关闭；重排序相关 sysctl 无明确收益，已恢复。
+
+更新时间：2026-11-21
 项目路径：`~/tcp-ocean`（本地）、`/root/tcp-ocean`（HND0）
 
 ## P0：异步架构（方案 B）未落地
