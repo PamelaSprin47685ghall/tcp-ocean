@@ -142,9 +142,10 @@ let run (o: Options) =
                           int64 (max 50 (o.Int("path-refresh-tick-ms", 1000))) * 1_000_000L,
                           max 1 (o.Int("path-refresh-inflight", 12)),
                           10_000_000_000L)
-        // Per-join spread of the refresh age in percent (0 = fixed age): desyncs the
+        // Per-join spread of the refresh age in percent (default 0 = fixed age; 50 bench-tested
+        // worse: 13.7 vs 16.7 Mbit/s, paths refreshed from 30 s). Desyncs the
         // 256 paths of a new session so they do not all refresh in the same second.
-        refresher.Jitter <- float (max 0 (min 90 (o.Int("path-refresh-jitter-pct", 50)))) / 100.0
+        refresher.Jitter <- float (max 0 (min 90 (o.Int("path-refresh-jitter-pct", 0)))) / 100.0
         let events = ConcurrentQueue<PathEvent>()
         let pending = ResizeArray<PathLink>()
         let applying = HashSet<uint16>()
