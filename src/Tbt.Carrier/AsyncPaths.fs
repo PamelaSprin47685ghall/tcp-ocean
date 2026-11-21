@@ -17,12 +17,18 @@ open System.Threading
 open Tbt.Contracts
 open Tbt.Session
 
-/// One whole frame copied out of a path's receive buffer.
+/// One whole frame copied out of a path's receive buffer. Opened: the IO thread
+/// already authenticated and decrypted it in place (Counter is its cell_seq).
 [<Sealed>]
-type RxFrame(pathId: uint16, data: byte[], length: int) =
+type RxFrame(pathId: uint16, data: byte[], length: int, opened: bool, counter: uint64) =
     member _.PathId = pathId
     member _.Data = data
     member _.Length = length
+    member _.Opened = opened
+    member _.Counter = counter
+
+/// Session entry for a frame an IO thread already opened (see RxPreOpener).
+type PreOpenedHandler = delegate of uint16 * Span<byte> * uint64 -> uint64
 
 /// Frames read by IO threads for one session, drained by its session thread.
 [<Sealed>]
@@ -38,6 +44,15 @@ type RxChannel() =
     // keeps the same kind of per-owner buffer for its own eventfd.
     let wakeBuffer = Array.zeroCreate<byte> 8
     let mutable wakeArmed = 0
+    let mutable disposed = 0
+    /// Wake/ClearWake calls inside the fd; Dispose waits for zero before closing.
+    let mutable inFd = 0
+
+    /// Per-path pre-opener factory and the session entry for opened frames. Both set:
+    /// IO threads authenticate and decrypt cells in parallel, so the single session
+    /// thread no longer spends ~20% of its time in ChaCha20-Poly1305 on the uplink.
+    member val PreOpenerFactory: Func<RxPreOpener> | null = null with get, set
+    member val OnPreOpened: PreOpenedHandler | null = null with get, set
 
     member _.HasItems = Volatile.Read(&count) > 0
     member _.Count = Volatile.Read(&count)
@@ -55,7 +70,10 @@ type RxChannel() =
     /// ClearWake, so anything that raced with the clear is still picked up.
     member _.Wake() =
         if wakeFd >= 0 && Interlocked.Exchange(&wakeArmed, 1) = 0 then
-            Native.write wakeFd (ReadOnlySpan<byte> wakeToken) |> ignore
+            Interlocked.Increment(&inFd) |> ignore
+            if Volatile.Read(&disposed) = 0 then
+                Native.write wakeFd (ReadOnlySpan<byte> wakeToken) |> ignore
+            Interlocked.Decrement(&inFd) |> ignore
 
     member this.Enqueue(frame: RxFrame) =
         queue.Enqueue frame
@@ -65,25 +83,45 @@ type RxChannel() =
     /// Consume the wake token on the session thread.
     member _.ClearWake() =
         if wakeFd >= 0 then
-            Native.read wakeFd (Span<byte> wakeBuffer) |> ignore
+            Interlocked.Increment(&inFd) |> ignore
+            if Volatile.Read(&disposed) = 0 then
+                Native.read wakeFd (Span<byte> wakeBuffer) |> ignore
+            Interlocked.Decrement(&inFd) |> ignore
             // Re-arm after the read: a wake that lands between the read and this
             // write is skipped, but the caller drains and services right after.
             Volatile.Write(&wakeArmed, 0)
 
     /// Deliver every queued frame on the calling (session) thread and return the
     /// pooled buffers. `owner` must be the session that owns this channel.
-    member _.Drain(owner: IPathOwner) =
+    member this.Drain(owner: IPathOwner) =
         let mutable frame = Unchecked.defaultof<RxFrame>
         let mutable delivered = 0
+        let pre = this.OnPreOpened
         while queue.TryDequeue(&frame) do
             Interlocked.Decrement(&count) |> ignore
-            owner.OnFrame(frame.PathId, Span(frame.Data, 0, frame.Length)) |> ignore
+            match pre with
+            | null -> owner.OnFrame(frame.PathId, Span(frame.Data, 0, frame.Length)) |> ignore
+            | h ->
+                if frame.Opened then h.Invoke(frame.PathId, Span(frame.Data, 0, frame.Length), frame.Counter) |> ignore
+                else owner.OnFrame(frame.PathId, Span(frame.Data, 0, frame.Length)) |> ignore
             ArrayPool<byte>.Shared.Return frame.Data
             delivered <- delivered + 1
         delivered
 
     interface IDisposable with
-        member _.Dispose() = if wakeFd >= 0 then Native.sysClose wakeFd |> ignore
+        member _.Dispose() =
+            if Interlocked.Exchange(&disposed, 1) = 0 then
+                let mutable frame = Unchecked.defaultof<RxFrame>
+                while queue.TryDequeue(&frame) do
+                    ArrayPool<byte>.Shared.Return frame.Data
+                if wakeFd >= 0 then
+                    // An IO thread may be inside Wake. Every Wake counts itself in inFd
+                    // before it reads `disposed` (both full fences), so once inFd is zero
+                    // here no later Wake can still write: close without risking a write
+                    // to a reused descriptor number.
+                    let mutable spin = SpinWait()
+                    while Volatile.Read(&inFd) <> 0 do spin.SpinOnce()
+                    Native.sysClose wakeFd |> ignore
 
 /// What the IO pool needs from a path. Keeps the pool independent of IPath.
 type IPathIo =
@@ -178,7 +216,11 @@ type AsyncPollerGroup(threadCount: int) =
             while i >= 0 do
                 if local.[i].Closed then local.RemoveAt i
                 i <- i - 1
-            for path in local do path.WatchForIo poller
+            // A session thread may Close (dispose) a path's socket while this thread is
+            // between the alive check and the syscall: that path is simply done. Before
+            // this guard the ObjectDisposedException killed the whole server process.
+            for path in local do
+                try path.WatchForIo poller with :? ObjectDisposedException -> ()
             // A destroyed descriptor produces no event at all, so an infinite
             // wait would keep a dead path in `local` forever. One second is
             // enough to notice and cheap enough for 256 idle paths.
@@ -186,8 +228,10 @@ type AsyncPollerGroup(threadCount: int) =
             if wake >= 0 && poller.IsFdReadable wake then
                 Native.read wake (Span<byte> wakeBuffer) |> ignore
                 Volatile.Write(&threadArmed.[index], 0)
-            for path in local do path.PumpRx poller
-            for path in local do path.PumpTx()
+            for path in local do
+                try path.PumpRx poller with :? ObjectDisposedException -> ()
+            for path in local do
+                try path.PumpTx() with :? ObjectDisposedException -> ()
             // CheckAlive is one poll(2) per path. Run every round it cost a syscall
             // per path per wakeup (64 per round with 256 paths on 4 threads), which
             // profiled at ~30% of the server's CPU on a 2-vCPU host. A dead socket
@@ -235,6 +279,7 @@ type AsyncPathLink private (socket: Socket, probe: INotSentProbe, group: AsyncPo
     let mutable frameLength = Layout.BootFrameLength
     let mutable alive = 1
     let mutable owner = Unchecked.defaultof<IPathOwner>
+    let mutable preOpener: RxPreOpener | null = null
     let mutable rxStart = rxStart0
     let mutable rxEnd = rxEnd0
     let mutable bytesWritten = 0L
@@ -295,12 +340,23 @@ type AsyncPathLink private (socket: Socket, probe: INotSentProbe, group: AsyncPo
                 true
 
     /// Queue any complete frames already in the receive buffer (bootstrap tail).
-    member private this.QueueFrames() =
+    member private this.QueueFrames(ioThread: bool) =
         let mutable frame = Span<byte>.Empty
         while this.TryTakeFrame(&frame) do
             let data = ArrayPool<byte>.Shared.Rent frame.Length
             frame.CopyTo(Span<byte>(data, 0, frame.Length))
-            channel.Enqueue(RxFrame(pathId, data, frame.Length))
+            // Only the IO thread uses the path's pre-opener (it is single-owner).
+            if ioThread && isNull preOpener then
+                match channel.PreOpenerFactory with
+                | null -> ()
+                | f -> preOpener <- f.Invoke()
+            let mutable c = 0UL
+            let opened =
+                ioThread
+                && (match preOpener with
+                    | null -> false
+                    | p -> p.TryOpen(Span<byte>(data, 0, frame.Length), pathId, &c))
+            channel.Enqueue(RxFrame(pathId, data, frame.Length, opened, c))
 
     member private this.BeginFrame(frame: byref<Span<byte>>) =
         let len = Volatile.Read(&frameLength)
@@ -402,7 +458,7 @@ type AsyncPathLink private (socket: Socket, probe: INotSentProbe, group: AsyncPo
             while more && rounds < 16 && Volatile.Read(&alive) = 1 do
                 more <- this.ReceiveInto()
                 rounds <- rounds + 1
-                this.QueueFrames()
+                this.QueueFrames true
 
     member this.CheckAlive() =
         if Volatile.Read(&alive) = 1 then
@@ -439,7 +495,7 @@ type AsyncPathLink private (socket: Socket, probe: INotSentProbe, group: AsyncPo
         member _.Alive = Volatile.Read(&alive) = 1
         member this.Attach(o) =
             owner <- o
-            this.QueueFrames ()
+            this.QueueFrames false
         member _.Backlog with set _ = ()
         member _.Watch(_, _) = ()
         member _.Receive(_) = ()

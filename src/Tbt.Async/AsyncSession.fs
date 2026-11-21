@@ -172,6 +172,10 @@ type AsyncSessionCoordinator(carrier: SessionCarrier, clock: CachedClock, ?polle
             carrier.Close()
             stoppedSignal.Set()
             (pl :> IDisposable).Dispose()
+            // The channel's eventfd used to leak: one descriptor per ended session.
+            match channel with
+            | Some rx -> (rx :> IDisposable).Dispose()
+            | None -> ()
 
     interface IDisposable with
         member this.Dispose() = this.Stop()
