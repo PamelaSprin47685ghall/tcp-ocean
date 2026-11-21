@@ -20,6 +20,13 @@ open System.Collections.Generic
 [<Sealed>]
 type PathRefresher(maxAgeNs: int64, perTick: int, perTickIdle: int, tickNs: int64, maxInFlight: int, retryNs: int64) =
     let joinedAt = Dictionary<uint16, int64>()
+    /// When each id is due for refresh: joinedAt + maxAge scaled by a per-join jitter.
+    let dueAt = Dictionary<uint16, int64>()
+    let mutable jitter = 0.0
+    let mutable rng = System.Random(0x7b7)
+    let ageFor () =
+        if jitter <= 0.0 then maxAgeNs
+        else int64 (float maxAgeNs * (1.0 - jitter + 2.0 * jitter * rng.NextDouble()))
     let inFlight = HashSet<uint16>()
     let mutable lastTickNs = 0L
     let mutable started = 0L
@@ -33,14 +40,25 @@ type PathRefresher(maxAgeNs: int64, perTick: int, perTickIdle: int, tickNs: int6
     member _.ReplacedCount = replaced
     member _.FailedCount = failed
 
+    /// Spread of the refresh age, 0..0.9: each join is refreshed after maxAge * U(1-j, 1+j).
+    /// Without it a new session's 256 paths all reach maxAge in the same second and
+    /// the refresh runs as one wave (bench: refresh-only sessions were slowest in
+    /// their first minutes). Default 0 keeps the fixed age.
+    member _.Jitter
+        with get () = jitter
+        and set (v: float) = jitter <- max 0.0 (min 0.9 v)
+    member _.Seed(seed: int) = rng <- System.Random(seed)
+
     /// A path id got a new connection (first JOIN, rebuild or refresh).
     member _.NoteJoined(id: uint16, nowNs: int64) =
         inFlight.Remove id |> ignore
         joinedAt.[id] <- nowNs
+        dueAt.[id] <- nowNs + ageFor ()
 
     /// The id has no connection any more (the pool rebuilds it, which NoteJoined records).
     member _.NoteLost(id: uint16) =
         joinedAt.Remove id |> ignore
+        dueAt.Remove id |> ignore
 
     /// Ids to re-JOIN now: present, not already refreshing, older than maxAge, oldest
     /// first; at most perTick per tick (perTickIdle while the session is idle) and
@@ -58,10 +76,12 @@ type PathRefresher(maxAgeNs: int64, perTick: int, perTickIdle: int, tickNs: int6
                 let cands = ResizeArray<struct (int64 * uint16)>()
                 for id in present do
                     if not (inFlight.Contains id) then
-                        match joinedAt.TryGetValue id with
-                        | true, at when nowNs - at >= maxAgeNs -> cands.Add(struct (at, id))
+                        match dueAt.TryGetValue id with
+                        | true, due when nowNs >= due -> cands.Add(struct (due, id))
                         | true, _ -> ()
-                        | _ -> joinedAt.[id] <- nowNs // first sight: age from now
+                        | _ -> // first sight: age from now
+                            joinedAt.[id] <- nowNs
+                            dueAt.[id] <- nowNs + ageFor ()
                 cands.Sort(fun (struct (a, x)) (struct (b, y)) -> if a <> b then compare a b else compare x y)
                 let n = min room cands.Count
                 let out = Array.init n (fun i -> let struct (_, id) = cands.[i] in id)
@@ -79,6 +99,7 @@ type PathRefresher(maxAgeNs: int64, perTick: int, perTickIdle: int, tickNs: int6
         failed <- failed + 1L
         inFlight.Remove id |> ignore
         joinedAt.[id] <- nowNs - maxAgeNs + retryNs
+        dueAt.[id] <- nowNs + retryNs
 
 /// Client exit rule for an empty path list. The handshake session may be dead
 /// (exit so the service manager starts a fresh one), or paths are still on their

@@ -233,3 +233,28 @@ let ``reinitCongestion keeps the socket on its congestion module`` () =
         Assert.Equal(cc, System.Text.Encoding.ASCII.GetString(buf, 0, n).TrimEnd('\000'))
         c.Dispose()
         Assert.False(SocketTuning.reinitCongestion(c, cc, "reno"))
+
+[<Fact>]
+let ``PathRefresher jitter spreads a new session's first refresh over maxAge*(1 +- j)`` () =
+    let s = 1_000_000_000L
+    let mk j =
+        let r = PathRefresher(60L * s, 256, 256, s, 256, 10L * s)
+        r.Jitter <- j
+        for i in 0 .. 255 do r.NoteJoined(uint16 i, 0L)
+        r
+    let present = ids [ 0 .. 255 ]
+    // Fixed age: the whole pool is due in the same second (the refresh wave).
+    let fixedR = mk 0.0
+    Assert.Empty(fixedR.Due(59L * s, present, true, true))
+    Assert.Equal(256, fixedR.Due(60L * s, present, true, true).Length)
+    // 50 % jitter: nothing before 30 s, everything by 90 s, no second carries a wave.
+    let r = mk 0.5
+    let mutable total = 0
+    let mutable most = 0
+    for t in 1L .. 91L do
+        let n = r.Due(t * s, present, true, true).Length
+        if t < 30L then Assert.Equal(0, n)
+        total <- total + n
+        most <- max most n
+    Assert.Equal(256, total)
+    Assert.True(most <= 16, sprintf "largest per-second batch %d" most)
