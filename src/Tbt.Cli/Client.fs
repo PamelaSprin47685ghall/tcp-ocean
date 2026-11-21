@@ -137,9 +137,10 @@ let run (o: Options) =
         // Rolling refresh: re-JOIN path ids older than path-refresh-s, a few per tick.
         let refresher =
             PathRefresher(int64 (max 0 (o.Int("path-refresh-s", 60))) * 1_000_000_000L,
-                          max 0 (o.Int("path-refresh-per-tick", 4)),
+                          max 0 (o.Int("path-refresh-per-tick", 1)),
+                          max 0 (o.Int("path-refresh-idle-per-tick", 8)),
                           int64 (max 50 (o.Int("path-refresh-tick-ms", 1000))) * 1_000_000L,
-                          max 1 (o.Int("path-refresh-inflight", 8)),
+                          max 1 (o.Int("path-refresh-inflight", 12)),
                           10_000_000_000L)
         let events = ConcurrentQueue<PathEvent>()
         let pending = ResizeArray<PathLink>()
@@ -174,6 +175,10 @@ let run (o: Options) =
             | Some ch -> ch.Wake()
             | None -> ()
         let refreshStart = Dictionary<uint16, int64>()
+        let mutable lastFramesIn = 0L
+        let mutable lastIdleCheckNs = 0L
+        let mutable sessionIdle = false
+        let mutable refreshWakePending = false
         let mutable refreshMsSum = 0L
         let mutable refreshMsMax = 0L
         let refreshDone (id: uint16) =
@@ -255,7 +260,25 @@ let run (o: Options) =
                     batch <- Task.Run(fun () ->
                         JoinBootstrap.runBounded concurrency work (fun (struct (id, baseInc)) -> joinOne id baseInc))
                 if readyLogged then
-                    for id in refresher.Due(clock.FreshNs(), carrier.PathIds, true) do
+                    // Idle: fewer than ~100 cells arrived since the last look.
+                    let now = clock.FreshNs()
+                    if now - lastIdleCheckNs >= 1_000_000_000L then
+                        let fin = carrier.FramesIn
+                        sessionIdle <- fin - lastFramesIn < 100L
+                        lastFramesIn <- fin
+                        lastIdleCheckNs <- now
+                    // An idle session may sleep for seconds between events; keep the
+                    // refresh ticking with one timer wake per second while enabled.
+                    if refresher.Enabled && not refreshWakePending then
+                        match rxChannel with
+                        | Some ch ->
+                            refreshWakePending <- true
+                            Task.Run(fun () ->
+                                Thread.Sleep 1000
+                                refreshWakePending <- false
+                                ch.Wake()) |> ignore
+                        | None -> ()
+                    for id in refresher.Due(now, carrier.PathIds, true, sessionIdle) do
                         match pool.Reserve id with
                         | ValueSome inc ->
                             refreshStart.[id] <- clock.FreshNs()

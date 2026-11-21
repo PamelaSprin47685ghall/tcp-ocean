@@ -18,7 +18,7 @@ namespace Tbt.Carrier
 open System.Collections.Generic
 
 [<Sealed>]
-type PathRefresher(maxAgeNs: int64, perTick: int, tickNs: int64, maxInFlight: int, retryNs: int64) =
+type PathRefresher(maxAgeNs: int64, perTick: int, perTickIdle: int, tickNs: int64, maxInFlight: int, retryNs: int64) =
     let joinedAt = Dictionary<uint16, int64>()
     let inFlight = HashSet<uint16>()
     let mutable lastTickNs = 0L
@@ -27,7 +27,7 @@ type PathRefresher(maxAgeNs: int64, perTick: int, tickNs: int64, maxInFlight: in
     let mutable failed = 0L
 
     /// Off when maxAgeNs <= 0 or perTick <= 0.
-    member _.Enabled = maxAgeNs > 0L && perTick > 0
+    member _.Enabled = maxAgeNs > 0L && (perTick > 0 || perTickIdle > 0)
     member _.InFlight = inFlight.Count
     member _.StartedCount = started
     member _.ReplacedCount = replaced
@@ -43,13 +43,16 @@ type PathRefresher(maxAgeNs: int64, perTick: int, tickNs: int64, maxInFlight: in
         joinedAt.Remove id |> ignore
 
     /// Ids to re-JOIN now: present, not already refreshing, older than maxAge, oldest
-    /// first; at most perTick per tick and maxInFlight at once. `ready` is false until
-    /// the pool is complete, so a refresh never competes with building the pool.
-    member this.Due(nowNs: int64, present: IEnumerable<uint16>, ready: bool) : uint16[] =
+    /// first; at most perTick per tick (perTickIdle while the session is idle) and
+    /// maxInFlight at once. `ready` is false until the pool is complete, so a refresh
+    /// never competes with building the pool. Bench: refreshing at full rate during a
+    /// bulk transfer cost repairs (JOIN replies queue behind bulk for 6-11 s and the
+    /// server closes the old connection at accept), so most of the work runs idle.
+    member this.Due(nowNs: int64, present: IEnumerable<uint16>, ready: bool, idle: bool) : uint16[] =
         if not this.Enabled || not ready || nowNs - lastTickNs < tickNs then Array.empty
         else
             lastTickNs <- nowNs
-            let room = min perTick (maxInFlight - inFlight.Count)
+            let room = min (if idle then max perTick perTickIdle else perTick) (maxInFlight - inFlight.Count)
             if room <= 0 then Array.empty
             else
                 let cands = ResizeArray<struct (int64 * uint16)>()

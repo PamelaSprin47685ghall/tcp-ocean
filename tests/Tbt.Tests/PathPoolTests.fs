@@ -124,39 +124,49 @@ let private ids (xs: int list) = xs |> List.map uint16
 [<Fact>]
 let ``PathRefresher refreshes the oldest paths first, a few per tick, never before ready`` () =
     let s = 1_000_000_000L
-    let r = PathRefresher(60L * s, 2, s, 3, 10L * s)
+    let r = PathRefresher(60L * s, 2, 2, s, 3, 10L * s)
     for i in 0 .. 9 do r.NoteJoined(uint16 i, int64 i * s)
     let present = ids [ 0 .. 9 ]
-    Assert.Empty(r.Due(100L * s, present, false))
+    Assert.Empty(r.Due(100L * s, present, false, false))
     // At 65 s ids 0..5 are 60 s old; oldest two go first.
-    Assert.Equal<uint16[]>([| 0us; 1us |], r.Due(65L * s, present, true))
+    Assert.Equal<uint16[]>([| 0us; 1us |], r.Due(65L * s, present, true, false))
     // Same tick window: nothing more.
-    Assert.Empty(r.Due(65L * s + 1L, present, true))
+    Assert.Empty(r.Due(65L * s + 1L, present, true, false))
     // Next tick: in-flight cap 3 leaves room for one.
-    Assert.Equal<uint16[]>([| 2us |], r.Due(66L * s, present, true))
-    Assert.Empty(r.Due(67L * s, present, true))
+    Assert.Equal<uint16[]>([| 2us |], r.Due(66L * s, present, true, false))
+    Assert.Empty(r.Due(67L * s, present, true, false))
     r.OnReplaced(0us, 67L * s)
     r.OnFailed(1us, 67L * s)
     Assert.Equal(1L, r.ReplacedCount)
     Assert.Equal(1L, r.FailedCount)
     // 0 is young again; 1 waits 10 s; 2 is still in flight, so two slots: 3 and 4.
-    Assert.Equal<uint16[]>([| 3us; 4us |], r.Due(68L * s, present, true))
+    Assert.Equal<uint16[]>([| 3us; 4us |], r.Due(68L * s, present, true, false))
     r.OnReplaced(2us, 69L * s)
     r.OnReplaced(3us, 69L * s)
     // 1 retries as if joined at 17 s, so the older 5 and 6 still go first.
-    Assert.Equal<uint16[]>([| 5us; 6us |], r.Due(78L * s, present, true))
+    Assert.Equal<uint16[]>([| 5us; 6us |], r.Due(78L * s, present, true, false))
     r.OnReplaced(4us, 79L * s)
     r.OnReplaced(5us, 79L * s)
     r.OnReplaced(6us, 79L * s)
-    Assert.Equal<uint16[]>([| 7us; 8us |], r.Due(80L * s, present, true))
+    Assert.Equal<uint16[]>([| 7us; 8us |], r.Due(80L * s, present, true, false))
 
 [<Fact>]
 let ``PathRefresher is off with a zero age and ages unseen ids from first sight`` () =
     let s = 1_000_000_000L
-    let off = PathRefresher(0L, 4, s, 8, s)
+    let off = PathRefresher(0L, 4, 4, s, 8, s)
     Assert.False(off.Enabled)
-    Assert.Empty(off.Due(1000L * s, ids [ 1; 2 ], true))
-    let r = PathRefresher(60L * s, 4, s, 8, s)
-    Assert.Empty(r.Due(10L * s, ids [ 7 ], true))
-    Assert.Empty(r.Due(69L * s, ids [ 7 ], true))
-    Assert.Equal<uint16[]>([| 7us |], r.Due(70L * s, ids [ 7 ], true))
+    Assert.Empty(off.Due(1000L * s, ids [ 1; 2 ], true, false))
+    let r = PathRefresher(60L * s, 4, 4, s, 8, s)
+    Assert.Empty(r.Due(10L * s, ids [ 7 ], true, false))
+    Assert.Empty(r.Due(69L * s, ids [ 7 ], true, false))
+    Assert.Equal<uint16[]>([| 7us |], r.Due(70L * s, ids [ 7 ], true, false))
+
+[<Fact>]
+let ``PathRefresher works faster while the session is idle`` () =
+    let s = 1_000_000_000L
+    let r = PathRefresher(60L * s, 1, 4, s, 8, s)
+    let present = ids [ 0 .. 9 ]
+    for i in 0 .. 9 do r.NoteJoined(uint16 i, 0L)
+    Assert.Equal(1, r.Due(61L * s, present, true, false).Length)
+    Assert.Equal(4, r.Due(62L * s, present, true, true).Length)
+    Assert.Equal(3, r.Due(63L * s, present, true, true).Length)
