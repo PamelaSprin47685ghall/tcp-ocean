@@ -205,15 +205,21 @@ type SessionCarrier(session: Session, bridge: FlowBridge, ?uplinkPace: bool, ?tu
             gated <- false
             passes <- passes + 1
             let n = paths.Count
+            // Set once nothing is left to send. Without it pass 1 still walked every
+            // path and asked the kernel for its unsent bytes (one ioctl per path, 256
+            // per batch) after the last ACK went out: ~13% of the server session
+            // thread on an uplink run. Only TryProduce consumes sendable state, so
+            // the check runs right after it.
+            let mutable idle = false
             // Pass 2 relaxes the gate to notSent <= 16 KiB (spec 3.14). It must run
             // whenever pass 1 gated at least one path, not only when pass 1 made no
             // progress at all: with 256 paths a single idle path sets `progress`, and
             // the other 255 were skipped every round. The live link then sent about
             // six frames per Service iteration (3 Mbit/s) while 50 MB sat queued.
             for pass in 1 .. 2 do
-              if pass = 1 || gated then
+              if (pass = 1 || gated) && not idle then
                 let mutable j = 0
-                while j < n && budget > 0 do
+                while j < n && budget > 0 && not idle do
                     let idx = (next + j) % n
                     let link = paths.[idx]
                     let mutable frame = Span<byte>.Empty
@@ -270,6 +276,7 @@ type SessionCarrier(session: Session, bridge: FlowBridge, ?uplinkPace: bool, ?tu
                             framesOut <- framesOut + 1L
                             budget <- budget - 1
                             progress <- true
+                            if not (session.WantsToSend || session.RepairWaiting) then idle <- true
                             if unpacedRepair then originalsSinceRepair <- 0
                             elif unpacedData then originalsSinceRepair <- originalsSinceRepair + 1
                             if charge = 1 || charge = 2 then

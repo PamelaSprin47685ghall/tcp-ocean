@@ -104,12 +104,12 @@ let sse2MulByteSplit (c: int) (x: Vector128<byte>) =
 /// shift left inside each nibble, then fold each nibble's carried-out top bit back
 /// in as 0b0011. Same field and same output as the split form, about half the ops:
 /// the split form ran this whole chain twice plus the split and merge.
-let private sse2MulX2 (x: Vector128<byte>) =
+let inline private sse2MulX2 (x: Vector128<byte>) =
     let t = x &&& Vector128.Create(0x88uy)
     let s = Sse2.ShiftLeftLogical(x.AsInt16(), 1uy).AsByte() &&& Vector128.Create(0xEEuy)
     s ^^^ Sse2.ShiftRightLogical(t.AsInt16(), 3uy).AsByte() ^^^ Sse2.ShiftRightLogical(t.AsInt16(), 2uy).AsByte()
 
-let sse2MulByte (c: int) (x: Vector128<byte>) =
+let inline sse2MulByte (c: int) (x: Vector128<byte>) =
     let mutable p = x
     let mutable acc = Vector128<byte>.Zero
     if c &&& 1 <> 0 then acc <- p
