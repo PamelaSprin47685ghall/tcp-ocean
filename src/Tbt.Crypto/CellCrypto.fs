@@ -55,6 +55,23 @@ type KeyTable(?suite: byte) =
         aeads.[1] <- Unchecked.defaultof<_>
         count <- 1
 
+    /// Replace the live generations with a snapshot taken on the owning thread (for a
+    /// copy that another thread uses to open frames). No ordering checks: the snapshot
+    /// came from a table that already passed them.
+    member _.Load(entries: struct (uint32 * uint64 * byte[])[]) =
+        for i in 0 .. count - 1 do
+            aeads.[i].Wipe()
+            aeads.[i] <- Unchecked.defaultof<_>
+        count <- 0
+        for struct (gen, start, key) in entries do
+            if count < 2 then
+                gens.[count] <- gen
+                starts.[count] <- start
+                aeads.[count] <-
+                    if suite = 0x01uy then Aegis128LAead(ReadOnlySpan key) :> IAead
+                    else ChaCha20Poly1305Aead(ReadOnlySpan key, rounds) :> IAead
+                count <- count + 1
+
     /// The key for counter c, or null when c is outside every interval.
     member _.Select(c: uint64) : IAead | null =
         if count = 2 && c >= starts.[1] then aeads.[1]
@@ -157,3 +174,48 @@ type CellOpener(dir: Direction, symbolSize: int, keys: KeyTable, mask: IHeaderMa
                     else
                         authFails <- authFails + 1L
                         false
+
+    /// Replay step for a frame another thread already authenticated and decrypted with
+    /// a copy of this table (see CellPreOpener): the counter must still select a live
+    /// key and pass the replay window. On success the window moves.
+    member _.AcceptOpened(c: uint64) =
+        if isNull (keys.Select c) then
+            authFails <- authFails + 1L
+            false
+        elif not (replay.Check c) then
+            replayDrops <- replayDrops + 1L
+            false
+        else
+            replay.Commit c
+            true
+
+/// Authenticate and decrypt a frame off the session thread (steps 3..5 without the
+/// replay window). One instance per thread: it owns its buffers, its mask and its key
+/// copy. On failure the frame is unchanged and the owner opens it the normal way.
+[<Sealed>]
+type CellPreOpener(dir: Direction, symbolSize: int, keys: KeyTable, mask: IHeaderMask) =
+    let nonce: byte[] = Array.zeroCreate 16
+    let aad: byte[] = Array.zeroCreate 18
+    let hp: byte[] = Array.zeroCreate 8
+    let frameLength = Layout.frameLength symbolSize
+
+    member _.Keys = keys
+
+    member _.TryDecrypt(frame: Span<byte>, path: uint16, counter: byref<uint64>) =
+        if frame.Length <> frameLength || keys.Count = 0 then false
+        else
+            mask.Compute(Frame.readOnly (frame.Slice(Layout.MetaOffset, 16)), Span hp)
+            let mutable c = 0UL
+            for i in 0 .. 7 do
+                c <- (c <<< 8) ||| uint64 (frame.[Layout.CellSeqOffset + i] ^^^ hp.[i])
+            match keys.Select c with
+            | null -> false
+            | aead ->
+                Frame.writeNonce dir path c (Span nonce)
+                Frame.writeAad (Frame.readOnly frame) dir path c (Span aad)
+                let body = frame.Slice(Layout.MetaOffset, Layout.MetaLength + symbolSize)
+                let tag = frame.Slice(Layout.tagOffset symbolSize, Layout.TagLength)
+                if aead.TryDecrypt(ReadOnlySpan(nonce, 0, keys.NonceLength), Frame.readOnly body, Frame.readOnly tag, body, ReadOnlySpan aad) then
+                    counter <- c
+                    true
+                else false

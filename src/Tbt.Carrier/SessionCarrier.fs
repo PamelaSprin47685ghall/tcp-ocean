@@ -84,6 +84,15 @@ type SessionCarrier(session: Session, bridge: FlowBridge, ?uplinkPace: bool, ?tu
         if pace then
             group.Add member'
             group.ProtectRecovery <- true
+        // Async IO: authenticate/decrypt cells on the IO threads (TBT_NO_PREOPEN=1 turns it off).
+        match channel with
+        | Some rx when isNull (Environment.GetEnvironmentVariable "TBT_NO_PREOPEN") ->
+            rx.PreOpenerFactory <- Func<RxPreOpener>(fun () -> session.CreatePreOpener())
+            rx.OnPreOpened <-
+                PreOpenedHandler(fun path frame c ->
+                    framesIn <- framesIn + 1L
+                    session.OnFramePreOpened(path, frame, c))
+        | _ -> ()
     let pacers = Dictionary<uint16, PathPacer>()
     /// Local slots visited by Watch and Service (RS-3: grows with armed flows, not 256).
     let mutable slotVisits = 0L

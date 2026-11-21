@@ -5,6 +5,7 @@ namespace Tbt.Session
 
 open System
 open System.Buffers.Binary
+open System.Threading
 open Tbt.Contracts
 open Tbt.Codec
 open Tbt.Crypto
@@ -82,6 +83,20 @@ type private DecoderStore(decoder: Decoder) =
     interface ISourceStore with
         member _.Source(step, slot) = decoder.Source(step, slot)
 
+/// Opens frames on an IO thread: authenticate and decrypt with a private copy of the
+/// receive keys, reloaded whenever the session publishes a key change. A false result
+/// leaves the frame as it was (the session thread then opens it the normal way, which
+/// also covers a key installed after the copy was taken).
+[<Sealed>]
+type RxPreOpener(pre: CellPreOpener, epoch: unit -> int, snapshot: unit -> struct (uint32 * uint64 * byte[])[]) =
+    let mutable seen = -1
+    member _.TryOpen(frame: Span<byte>, path: uint16, counter: byref<uint64>) =
+        let e = epoch ()
+        if e <> seen then
+            pre.Keys.Load(snapshot ())
+            seen <- e
+        pre.TryDecrypt(frame, path, &counter)
+
 [<Sealed>]
 type Session(role: Role, p: SessionParams, port: IFlowPort, clock: IClock, config: SessionConfig) =
     let s = p.Symbol
@@ -97,9 +112,20 @@ type Session(role: Role, p: SessionParams, port: IFlowPort, clock: IClock, confi
         else HeaderMasks.Create(p.Keys.Suite, ReadOnlySpan hp)
     let txKeys = KeyTable(p.Keys.Suite)
     let rxKeys = KeyTable(p.Keys.Suite)
+    // Receive key material, published for the per-path pre-openers on IO threads:
+    // a new array per change, then the epoch moves.
+    let rxMaterial = ResizeArray<struct (uint32 * uint64 * byte[])>()
+    let mutable rxSnapshot: struct (uint32 * uint64 * byte[])[] = [||]
+    let mutable rxEpoch = 0
+    let publishRx () =
+        Volatile.Write(&rxSnapshot, rxMaterial.ToArray())
+        Interlocked.Increment(&rxEpoch) |> ignore
     do
         txKeys.Install(0u, ReadOnlySpan(if client then keys.UpKey 0u else keys.DownKey 0u), 0UL)
-        rxKeys.Install(0u, ReadOnlySpan(if client then keys.DownKey 0u else keys.UpKey 0u), 0UL)
+        let rx0 = Array.copy (if client then keys.DownKey 0u else keys.UpKey 0u)
+        rxKeys.Install(0u, ReadOnlySpan rx0, 0UL)
+        rxMaterial.Add(struct (0u, 0UL, rx0))
+        publishRx ()
     let sealer = CellSealer(txDir, s, txKeys, mask (if client then keys.HpUp else keys.HpDown))
     let opener = CellOpener(rxDir, s, rxKeys, mask (if client then keys.HpDown else keys.HpUp))
     let encoder = Encoder((if client then keys.GraphSeedUp else keys.GraphSeedDown), s, config.WindowSteps)
@@ -341,7 +367,10 @@ type Session(role: Role, p: SessionParams, port: IFlowPort, clock: IClock, confi
                          || next = 0u || cut <= maxSeen || cut <= rxKeys.NewestStart then
                         ctrlRejected <- ctrlRejected + 1L
                     else
-                        rxKeys.Install(next, ReadOnlySpan(rxKey next), cut)
+                        let k = Array.copy (rxKey next)
+                        rxKeys.Install(next, ReadOnlySpan k, cut)
+                        rxMaterial.Add(struct (next, cut, k))
+                        publishRx ()
                         writeU32 next
                         ctrl.Reply(CtrlOp.KeyReady, ReadOnlySpan(ctrlBody, 0, 4)) |> ignore
                         ctrl.Executed h.ControlSeq
@@ -363,6 +392,8 @@ type Session(role: Role, p: SessionParams, port: IFlowPort, clock: IClock, confi
                         ctrlRejected <- ctrlRejected + 1L
                     else
                         rxKeys.RetireOldest()
+                        rxMaterial.RemoveAt 0
+                        publishRx ()
                         ctrl.Executed h.ControlSeq
                         ctrlExecuted <- ctrlExecuted + 1L
                 | CtrlOp.PathClose ->
@@ -613,10 +644,25 @@ type Session(role: Role, p: SessionParams, port: IFlowPort, clock: IClock, confi
 
     /// Receive pipeline for one whole data frame of path (spec 6.6). Returns the cell's
     /// authenticated carrier_wm, or UInt64.MaxValue when the frame did not authenticate.
-    member _.OnFrame(path: uint16, frame: Span<byte>) : uint64 =
+    member this.OnFrame(path: uint16, frame: Span<byte>) : uint64 =
         match rx.Open(frame, path) with
         | ValueNone -> UInt64.MaxValue
-        | ValueSome m ->
+        | ValueSome m -> this.OnOpened(path, frame, m)
+
+    /// OnFrame for a frame a pre-opener already authenticated and decrypted.
+    member this.OnFramePreOpened(path: uint16, frame: Span<byte>, counter: uint64) : uint64 =
+        match rx.OpenPre(frame, counter) with
+        | ValueNone -> UInt64.MaxValue
+        | ValueSome m -> this.OnOpened(path, frame, m)
+
+    /// A pre-opener for one IO-thread path: its own mask, buffers and key copy, kept in
+    /// step with the receive key table through the published snapshot.
+    member _.CreatePreOpener() =
+        let table = KeyTable(p.Keys.Suite)
+        let pre = CellPreOpener(rxDir, s, table, mask (if client then keys.HpDown else keys.HpUp))
+        RxPreOpener(pre, (fun () -> Volatile.Read(&rxEpoch)), (fun () -> Volatile.Read(&rxSnapshot)))
+
+    member private _.OnOpened(path: uint16, frame: Span<byte>, m: Meta) : uint64 =
             peerSeen <- true
             tx.OnPeerAck(m.AckStepLo, m.RxWinGrant)
             tx.OnPeerErasure m.ErasureQ16

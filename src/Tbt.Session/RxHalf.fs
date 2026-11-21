@@ -225,6 +225,22 @@ type RxHalf(symbolSize: int, field: CodeField, decoder: Decoder, opener: CellOpe
                     counters.Cells <- counters.Cells + 1L
                     ValueSome m
 
+    /// Open for a frame an IO thread already authenticated and decrypted (counter c):
+    /// framing, the replay window and the meta parse stay here on the session thread.
+    member _.OpenPre(frame: Span<byte>, c: uint64) =
+        if not (FrameMath.checkFraming symbolSize (Span<byte>.op_Implicit frame)) then
+            counters.FramingErrors <- counters.FramingErrors + 1L
+            ValueNone
+        elif not (opener.AcceptOpened c) then ValueNone
+        else
+            let mutable m = Unchecked.defaultof<Meta>
+            if not (Meta.tryRead (Span<byte>.op_Implicit (frame.Slice(Layout.MetaOffset, Layout.MetaLength))) &m) then
+                counters.ProtoErrors <- counters.ProtoErrors + 1L
+                ValueNone
+            else
+                counters.Cells <- counters.Cells + 1L
+                ValueSome m
+
     member _.HeldParities = hold.Count
 
     /// Hand a coded cell (DATA, PARITY, BOOSTER) of path to the decoder, then deliver what

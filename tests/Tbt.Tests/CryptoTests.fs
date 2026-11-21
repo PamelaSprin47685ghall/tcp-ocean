@@ -327,3 +327,59 @@ let ``a forged frame costs no exception and no allocation`` () =
             opener.TryOpen(Span forged, 1us, &c) |> ignore
     Assert.Equal(0L, GC.GetAllocatedBytesForCurrentThread() - before)
     Assert.Equal(2000L, opener.AuthFails)
+
+[<Fact>]
+let ``a pre-opened frame matches a normal open and keeps replay, wrong-path and stale-key behaviour`` () =
+    let k = keys ()
+    let send = KeyTable()
+    send.Install(0u, ReadOnlySpan(k.UpKey 0u), 0UL)
+    send.Install(1u, ReadOnlySpan(k.UpKey 1u), 5000UL)
+    let sealer = CellSealer(Direction.Up, 1344, send, ChaChaHeaderMask(ReadOnlySpan k.HpUp))
+    let recv = KeyTable()
+    recv.Install(0u, ReadOnlySpan(k.UpKey 0u), 0UL)
+    let normal = KeyTable()
+    normal.Install(0u, ReadOnlySpan(k.UpKey 0u), 0UL)
+    let opener = CellOpener(Direction.Up, 1344, recv, ChaChaHeaderMask(ReadOnlySpan k.HpUp))
+    let refOpener = CellOpener(Direction.Up, 1344, normal, ChaChaHeaderMask(ReadOnlySpan k.HpUp))
+    let copyTable = KeyTable()
+    copyTable.Load([| struct (0u, 0UL, Array.copy (k.UpKey 0u)) |])
+    let pre = CellPreOpener(Direction.Up, 1344, copyTable, ChaChaHeaderMask(ReadOnlySpan k.HpUp))
+    let mutable c = 0UL
+    let mutable c2 = 0UL
+    for counter in [ 1UL; 77UL; 4999UL ] do
+        let f = makeFrame ()
+        sealer.Seal(Span f, counter, 9us)
+        let g = Array.copy f
+        Assert.True(pre.TryDecrypt(Span f, 9us, &c))
+        Assert.Equal(counter, c)
+        Assert.True(opener.AcceptOpened c)
+        Assert.True(refOpener.TryOpen(Span g, 9us, &c2))
+        Assert.True((ReadOnlySpan f).SequenceEqual(ReadOnlySpan g))   // byte-identical plaintext
+        // A second copy: decrypts again, but the replay window drops it.
+        let again = makeFrame ()
+        sealer.Seal(Span again, counter, 9us)
+        Assert.True(pre.TryDecrypt(Span again, 9us, &c))
+        Assert.False(opener.AcceptOpened c)
+    Assert.Equal(3L, opener.ReplayDrops)
+    // Wrong path or flipped bit: false and the frame left as it was (the fallback can open it).
+    let f = makeFrame ()
+    sealer.Seal(Span f, 100UL, 9us)
+    let before = Array.copy f
+    Assert.False(pre.TryDecrypt(Span f, 8us, &c))
+    Assert.True((ReadOnlySpan f).SequenceEqual(ReadOnlySpan before))
+    // A frame under a key the copy does not have yet: false, unchanged; after Load it opens.
+    let n = makeFrame ()
+    sealer.Seal(Span n, 5001UL, 9us)
+    let nb = Array.copy n
+    Assert.False(pre.TryDecrypt(Span n, 9us, &c))
+    Assert.True((ReadOnlySpan n).SequenceEqual(ReadOnlySpan nb))
+    recv.Install(1u, ReadOnlySpan(k.UpKey 1u), 5000UL)
+    copyTable.Load([| struct (0u, 0UL, Array.copy (k.UpKey 0u)); struct (1u, 5000UL, Array.copy (k.UpKey 1u)) |])
+    Assert.True(pre.TryDecrypt(Span n, 9us, &c))
+    Assert.True(opener.AcceptOpened c)
+    // Session retired the old key: an old-interval frame opened by a stale copy is refused.
+    let late = makeFrame ()
+    sealer.Seal(Span late, 4000UL, 9us)
+    Assert.True(pre.TryDecrypt(Span late, 9us, &c))
+    recv.RetireOldest()
+    Assert.False(opener.AcceptOpened c)
