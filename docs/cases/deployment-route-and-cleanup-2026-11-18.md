@@ -46,12 +46,14 @@ ip rule del  pref 8899                            # rc=2, RTNETLINK answers: No 
 
 ### 重启后的持久性
 
-- 系统重启：systemd 启动 `tbtun-hnd0.service` 时重跑 `ExecStartPre`，规则恢复。
+- 系统重启：systemd 启动 `tbtun-hnd0.service` 时会重跑 `ExecStartPre`，但错误可以被忽略，须实查规则及路由。
 - 本地代理重启：不影响 tbtun 的规则，因为规则不归本地代理管。
 - 只重启 `proxy.service` 后应复查 `ip rule show | grep 8890` 与 `ip route get 45.11.1.62`。
 
 未在本机执行整机重启（会中断当前隧道与其它使用者），因此“重启后仍指向 `enp8s0`”
 目前只有上面两条机制性证据，没有重启实测。
+
+后续审计发现，专用代理单元在当前引导中可以重启，但配置在 `tmpfs`，未查到开机生成者。详见[专用代理的开机前置条件](production-fastcom-2026-11-19.md#专用代理的开机前置条件)。
 
 ## 2. systemd 单元
 
@@ -142,16 +144,6 @@ HND0 的 `git status --porcelain`（第一次审计）显示 10 个修改文件�
 `Gf16.mulAddInto` 的分派顺序是：SSSE3/NEON → 表查；`Sse2.IsSupported` → `sse2MulAdd`；
 否则标量。HND0 的 QEMU CPU 只有 SSE2，所以走 `sse2MulAdd`。
 
-不需要改产品代码就能做启用/禁用对比：设置
-
-```
-DOTNET_EnableHWIntrinsic=0
-```
-
-让 `Sse2.IsSupported` 返回 false，同一份二进制会走标量路径。对比时同时记录：
-
-- `--stats-s 1` 日志里的 `csvc_us`、`iter_us_max`；
-- 同一负载下的吞吐与 `recovered / frames_in`；
-- 两次运行必须使用同一二进制、同一 `--max-paths 256`、同一负载脚本。
-
-该对比尚未执行；HND0 上先要完成第 4 节的代码同步。
+不要以 `DOTNET_EnableHWIntrinsic=0` 代替 SSE2 专项对照。JIT 下它会同时关闭密码、编解码等路径的硬件指令；NativeAOT 下也不能靠它切换已编译的分支。
+使用同一源码与工具链在隔离产物中只切换 GF(16) 的 SSE2 运算，核实实际分支；保持 `--max-paths 256`、同一上行目标与负载，交错运行。记录 `async_svc_us_max`、吞吐与 `recovered / frames_in`；异步模式下不使用主循环的累计 `csvc_us` 作为延迟。
+历史四路测试床数据仅是全硬件指令对照；HND0 的同条件上行对照未验收。不需要为验证而覆盖 HND0 现有源码或切换生产服务。

@@ -53,7 +53,8 @@
 - **steps**
   1. 记录两端当前状态：`sha256sum /usr/local/bin/tbtun`、
      `systemctl is-active tbtun-hnd0`、本机
-     `ss -tn state established '( dport = :39443 )' | wc -l`、HND0 侧同式但 `sport`。
+     `ss -tn state established | grep -c ':39443'`、HND0 侧同式。**不要用
+     `ss ... '( dport = :39443 )'` 过滤：本机已实测恒返 0（见证据表「测量陷阱」）。**
   2. 本机部署：`systemctl stop tbtun-hnd0` →
      `install -m 755 <候选> /usr/local/bin/tbtun` →
      `systemctl start tbtun-hnd0`，整段计时；12 s 后确认 ≥254 且 30 s 内到 256 路。
@@ -100,9 +101,9 @@
      `ssh root@45.11.1.62 "curl -sS --max-time 10 -o /dev/null -w 'code=%{http_code} size=%{size_download} speed=%{speed_download} time=%{time_total}\n' '$URL'"`。
   3. 本机连续 5 轮，每轮 ≤15 s，不并发其他下载：
      `curl --proxy http://127.0.0.1:17893 -sS --max-time 15 -o /dev/null -w 'code=%{http_code} size=%{size_download} speed=%{speed_download} time=%{time_total}\n' "$URL"`。
-  4. 每轮前后各取一次连接数与 stats：`ss -tn state established '( dport = :39443 )' | wc -l`；
+  4. 每轮前后各取一次连接数与 stats：`ss -tn state established | grep -c ':39443'`；
      `journalctl -u tbtun-hnd0 -n 1 --no-pager -o cat`；HND0 侧
-     `ssh root@45.11.1.62 "ss -tn state established '( sport = :39443 )' | wc -l; journalctl -u tbtun-hnd0 -n 2 --no-pager -o cat"`。
+     `ssh root@45.11.1.62 "ss -tn state established | grep -c ':39443'; journalctl -u tbtun-hnd0 -n 2 --no-pager -o cat"`。
   5. 把 5 轮原始输出写入一个新目录（如 `/tmp/tbt-link-$(date +%s)`），失败样本也保留。
 - **expected**：先满足 CASE-12 的停摆率（≤1/10），再比较中位：中位 ≥ 同窗口 HND0
   直连的 1/5，且 ≥ 当次好轮基线的 1.5×；总体相对标准差 < 20%，至少 4/5 收到
@@ -126,7 +127,7 @@
 - **threshold**：80。
 - **steps**
   1. 选一个 CASE-1 的有效下载轮，在同一窗口内对 HND0 做前后快照：
-     `ssh root@45.11.1.62 "ss -tinmH state established '( sport = :39443 )'" > before.txt`；
+     `ssh root@45.11.1.62 "ss -tinmH state established | grep ':39443'" > before.txt`；
      下载结束后同样取 `after.txt`。
   2. 逐路配对的 `bytes_sent`/`bytes_retrans`（或 `retrans` 计数），只统计配对成功的路径。
   3. 同时记录本机 `nstat -az TcpRetransSegs TcpOutSegs` 的前后差作为旁证。
@@ -361,7 +362,7 @@
   HND0 tbtun server → `127.0.0.1:18443` → 固定源（proof.ovh 100 MB 或 fast.com OCA）。
 - **threshold**：85。
 - **steps**
-  1. 记录两端 hash 与 `ss -tan '( dport = :39443 )'` 的 ESTAB 数，要求 256。
+  1. 记录两端 hash 与 `ss -tan | grep ':39443' | grep -c ESTAB` 的数，要求 256。
   2. 连续 10 轮，每轮独立进程：
      `curl --proxy http://127.0.0.1:17893 -sS --max-time 10 -o /dev/null -w 'code=%{http_code} size=%{size_download} speed=%{speed_download} time=%{time_total}\n' "$URL"`。
      轮间不加人为间隔；单轮 ≤12 s。
@@ -396,19 +397,19 @@
 - **threshold**：85。
 - **steps**
   1. 记录前置：两端 `sha256sum /usr/local/bin/tbtun`、
-     `ss -tn state established '( dport = :39443 )' | wc -l` 为 256、一次
+     `ss -tn state established | grep -c ':39443'` 为 256、一次
      `generate_204` 成功，并记录客户端进程启动时刻。
   2. 回环床（不依赖 HND0）：同一构建，对服务端进程连续做 3 次主动 restart，
      每次 restart 后每 2 s 读一次客户端 paths 计数，记录“首次 ≥250”与“首次 =256”
      的耗时；3 次都必须 ≤30 s 达 250、≤60 s 达 256。
   3. 生产：同样连续 3 次 `systemctl restart tbtun-hnd0`（HND0 侧），每次在 30 s 内取
-     `ss -tn '( sport = :39443 )' | grep -c ESTAB`，必须 ≥250，60 s 内 256；每次恢复后
+     `ss -tn state established | grep -c ':39443'`，必须 ≥250，60 s 内 256；每次恢复后
      做一次 `generate_204`，`time_total` ≤3 s。
   4. 单路断开，两例都必须做，且必须分别记录被杀的 path id（用客户端日志的
      `path N joined` 与两端 `path_tx` 列表反查）：
      (a) **非 0 路径**：在 HND0 用 `ss -K` 关闭一条 `sport = :39443` 的承载，不重启
      客户端，记录 60 s 内 paths 是否回到 256；
-     (b) **path 0（握手路径）**：先在本机 `ss -tn '( dport = :39443 )'` 找到最早建立
+     (b) **path 0（握手路径）**：先在本机 `ss -tn | grep ':39443'` 找到最早建立
      的那条承载（即客户端 `path_tx` 列表里缺 0 之前、服务端 `carrier.Paths` 的第一条），
      在 HND0 对应 `sport` 上 `ss -K`，记录 60 s 内 paths 是否回到 256，以及客户端日志
      是否出现 `path 0 joined`。**未做 (b) 时本用例不得判通过**：第十二代在回环上
@@ -449,7 +450,7 @@
 - **threshold**：80。
 - **steps**
   1. 记录前置：两端 `sha256sum /usr/local/bin/tbtun`、
-     `ss -tn state established '( dport = :39443 )' | wc -l` 为 256、一次
+     `ss -tn state established | grep -c ':39443'` 为 256、一次
      `generate_204` 成功、两端 stats 各取一次（含 `rho`、`cell_loss`、`srtt_ms`、
      `minrtt_ms`、`beginfail`）。记录客户端进程启动时刻，会话年龄从此刻算。
   2. 同一 URL（`https://proof.ovh.net/files/100Mb.dat`，记录响应头与大小）连续 10 轮，
@@ -525,9 +526,37 @@
 | async 小池启动 | 第十三代 | 2026-11-20 | 未修：默认 async 下 `--paths 2` 首轮 paths=0 后 Exit 75；`--paths 256` 45 s 稳定 256，生产 256 路不受影响 | `/tmp/tbt-g13-mini` |
 | CASE-14 会话衰减 | 第十五代 | 2026-11-20 | 未通过：10 轮 13.57/0/6.14/0/4.82/0/3.31/0/0/2.29 MB，停摆 5/10；好轮 1.13→0.51→0.40→0.28→0.19 MB/s 单调降至 0.17×（<0.7×）；`rho 0.105→0.128`、`beginfail 0→3519` | `/tmp/tbt-g15-base`、result §14.5 |
 | GatePass2 / 发送侧供给 | 第十五代 | 2026-11-20 | GatePass2 证伪：生产 `gate2=392304/0`（deny=0），`beginfail` 来自 16 槽；V1（`--notsent-lowat 32768 --tx-slots 32`）触发既有客户端冻结：服务端 `sessions=0`、客户端 `paths=1`、`beginfail` 1.22 亿、RSS 22 GB，`ss -K` 后 32 s 恢复，判不可判定并回滚 | `/tmp/tbt-g15-prod`、result §14.2/14.6 |
-| CASE-13 三次 restart（第十六代） | 第十六代 | 2026-11-20 | 通过：客户端 `734318db`，服务端 `3f05c4a0`。r1 `first250=25 s`/`first256=26 s`、r3 `32 s`/`36 s`；r2 建池 24 s 后被 r3 打断，未取得数值。三次均 `session lost → 新 PID`，无 `paths=1` 忙循环；RSS 37 / 45 / 70 MB；最终 256 路、204/0.751 s | `journalctl -u tbtun-hnd0`、生产 `ss`、result §15.4 |
+| CASE-13 三次 restart（第十六代） | 第十六代 | 2026-11-20 | 部分通过：客户端 `734318db`，服务端 `3f05c4a0`。r1 `first250=25 s`/`first256=26 s`、r3 `32 s`/`36 s`；r2 建池 24 s 后被 r3 打断，未取得数值。三次均 `session lost → 新 PID`，无 `paths=1` 忙循环；RSS 37 / 45 / 70 MB；最终 256 路、204/0.751 s。按本用例硬失败「只做 1 次 restart 就宣称 3/3」，r2 缺数值不计为 3/3 | `journalctl -u tbtun-hnd0`、生产 `ss`、result §15.4 |
 | CASE-13 半开路径（第十六代） | 第十六代 | 2026-11-20 | 部分：`TCP_USER_TIMEOUT` 已设（30 s，`--user-timeout-ms` 可关）。进程级实验 2000 ms 设 2.484 s `ETIMEDOUT`、关闭 8.002 s 全 `EAGAIN`；**净丢 FIN/RST 的端到端半开场景未执行**，不得写成已通过 | `/tmp/tbt-ut.py`、result §15.4/15.5 |
 | CASE-1 发送侧供给（第十六代） | 第十六代 | 2026-11-20 | 未执行：前置崩溃已修，但 HND0 服务端候选未部署；判据与切片见 plan §14 T10/T11。本代无吞吐提速声明 | result §15.5 |
+| CASE-15 tbtun-only 对照 | 第十七代 | 2026-11-20 | 完成：32 路 1.32/1.13/0.67 MB/s、256 路 1.47/0.65/0.91 MB/s；客户端 57.4 步/s × 17.6 KB；服务端读入 69.25 MB、955 B/次、WouldBlock 9、gate1 deny 19%。判定 <2 MB/s，tbtun 缺陷成立 | `/tmp/tbt-g17`、`/tmp/tbt-g17-b` |
+| 信用窗口 `window/2` | 第十七代 | 2026-11-20 | 未验证并回滚：床上基线 5.676 s、改后 5.950 s（同床 target 直连 4.559 s，床不可判）；生产第二实例旧客户端中位 0.52 MB/s，新 JIT 客户端 `paths=1 → session lost`，无有效对照。源码恢复 `window/8` | `/tmp/tbt-g17b`、result §17.3 |
+| 清理事故 | 第十七代 | 2026-11-20 | `fuser -k 18081/tcp` 误杀本机 omp node（pid 2784797），守护器已重建（2644437）；后续只用记录的 pid 清理。生产未受影响 | 本代会话 |
+
+## CASE-15 tbtun-only 下行上限对照（归因诊断）
+
+- **path**：HND0 第二 `tbtun server --listen 0.0.0.0:39444 --target 127.0.0.1:18080 --max-paths 32`，
+  其中 `18080` 是 HND0 本机 `python3 -m http.server`，只提供 `/tmp/tbt-only/100mb.bin` 一个固定
+  文件；本机第二 `tbtun client --server 45.11.1.62:39444 --listen 127.0.0.1:18444 --paths 32`；
+  `curl http://127.0.0.1:18444/100mb.bin`。生产单元、`:39443` 会话与 mihomo 配置全部不动。
+- **threshold**：75。本用例是归因诊断，不替代 CASE-1；它的数字不得写成用户可见吞吐。
+- **steps**
+  1. 前置：生产 `:39443` 为 256 路；第二实例建池 32 路；一次 `curl` 成功。
+  2. 连续 3 轮，每轮 ≤15 s，轮间 0 间隔；记录 `code`、`size_download`、`speed_download`、`time_total`。
+  3. 每轮前后各取一次第二 server 与第二 client 的 stats 一行；计算 `rx_ack` 增量（步/s）、
+     `RxDelivered` 增量（每步字节）与 `flowread` 三元组增量。
+  4. 清理：停第二 client、第二 server 与 `http.server`，删 `/tmp/tbt-only`；复验生产 256 路与一次
+     `generate_204`。
+- **expected**：好轮中位 ≥5 MB/s ⇒ 墙在外层（mihomo），tbtun 数据面不是主因；<2 MB/s ⇒
+  tbtun 单流下行缺陷成立；2–5 MB/s ⇒ 两侧都有份。步/s × 每步字节必须与 `speed_download`
+  偏差 ≤20%。
+- **rubric**
+  - 100：中位 ≥10 MB/s，步/s 与字节率一致，清理完整。
+  - just-PASS 75：中位 ≥5 MB/s，或 <2 MB/s 但归因数据完整。
+  - just-below 70：只有中位，没有 stats 与步/s 对照。
+  - 0–50：清理不完整，或把本用例数字当生产验收。
+  - 硬失败：改 mihomo 配置；留下第二实例；用本用例数字替代 CASE-1；只测一轮就判墙层。
+  - 扣分：未记步/s −10；未记两端连接数 −5；未清理 −20。
 
 ## 不可改的约束（验收前提）
 

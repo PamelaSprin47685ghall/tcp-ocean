@@ -91,3 +91,7 @@ if observed <> Int64.MaxValue && srttNs < float observed then srttNs <- float ob
 `Client.cycle` 拆成 `watchListener`（`WatchRead`，走 `BeforeWait`）与 `serve`（`IsReadable` → accept、
 `attachJoined`、stats、close，走 `BeforeService`）。同步模式的 `cycle` 顺序不变。
 编译：`dotnet build src/Tbt.Cli -c Release -p:PublishAot=false` → 0 Warning、0 Error、6.03s。
+
+## 帧认证独立复验（2026-11-19）
+
+默认异步、256 路 TCP 回环，HTTP POST 和响应各 4,194,304 B，逐字节相同。两端 `rx_cells` 分别为客户端 3,284、服务端 3,928，`rx_auth_fails` 均为 0。前一字段在认证及 Meta 检查通过后递增，后一字段直接读 `CellOpener`；会话失败数不能替代它们。此为本机测试，不是生产采样。

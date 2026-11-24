@@ -2,7 +2,9 @@
 
 更新：2026-11-18
 
-## 结论
+> 本页是 2026-11-18 的早期集成快照，不是现在的配置。生产 TCP 会话后来默认改为异步；固定 1 ms 的 IO 线程等待和旧的 `AsyncDecoder` / `AsyncEncoder` 已移除。见[默认异步与等待](12-event-driven-default.md)。TUN 仍由共享线程服务。
+
+## 当时结论
 
 `src/Tbt.Async` 与 `src/Tbt.Carrier/AsyncPaths.fs` 一起构成**全异步多线程路径 IO**：
 每个会话一个线程独占 `Session` 状态机，路径 socket 的 `recv` / `send` 与帧边界切分

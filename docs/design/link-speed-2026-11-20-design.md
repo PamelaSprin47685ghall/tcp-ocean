@@ -1096,3 +1096,45 @@ app-limited 区间，`bw` 估计停在 16–138 kbps，`pacing_rate` 随之下�
 4. 生产：换本机客户端，做 3 次服务端 restart，记录 `first250`/`first256` 与
    `paths=1` 是否出现；RSS 必须始终在百 MB 量级。
 
+## 18. 第十七代：tbtun-only 归因与测量边界（2026-11-20 15:00）
+
+### 18.1 结论
+
+生产下行慢不是 mihomo 独有。用 HND0 备用端口起第二 `tbtun` 实例（39444 → 本机
+18082 的固定 100 MB 文件），本机起第二客户端（18444/18445），完全不经过本机
+mihomo：32 路中位 1.13 MB/s、256 路中位 0.91 MB/s。同一时刻生产经 mihomo 是
+6–13 Mbit/s，与该数同量级。**tbtun 自身的单流下行在 314 ms RTT 上约 1 MB/s，
+这是用户可见上限的第一层。**
+
+机制观测量：客户端 57.4 步/s × 每步 17.6 KB = 1.01 MB/s；服务端读 target
+69.25 MB、WouldBlock 仅 9 次（不是 socket 空）、平均每次 955 B，`gate1` deny 19%，
+在途 397 步。路径数、FEC 与承载健康均已排除。
+
+### 18.2 测量边界（后继必须遵守）
+
+| 床 | 供数上限 | 能否判 tbtun |
+|---|---|---|
+| `unshare -rn` + `netem delay 160ms rate 250mbit` + `python3 -m http.server` | 16 MiB 直连 4.559 s = **3.68 MB/s** | **不能**：tbtun 的 2.8–3.0 MB/s 只比供数低 25% |
+
+要判定 tbtun，源必须比隧道快一个数量级：HND0 本机 100 MB 直连 <1 s，可用于
+tbtun-only 对照；回环床需换 nginx/零拷贝源或去掉 netem 对 target 的影响。
+
+### 18.3 被证伪/未证的假设
+
+- **H-credit-1（`window/8` 上报阈值限制吞吐）**：数值上与床上 3.0 MB/s 和生产
+  1.0 MB/s 吻合，但改 `window/2` 后床上无改善（5.95 s），生产对照因 async 小池
+  启动缺陷（`paths=1 → session lost`）未取得。源码已回滚。**不得再把该假设
+  当成既定结论。**
+- **async 小池启动缺陷**：`--paths 2` 与本次 JIT `--paths 256` 都出现
+  `session up: paths=0 → paths=1 → session lost`；生产 AOT 734318db 不触发。
+  修复面在启动时序（`PathOpsPending` 与首个 housekeeping 的竞争），独立于吞吐。
+
+### 18.4 下一步的最小充分实验
+
+1. 修 async 小池启动：用 `--paths 2` 的确定性回环复现，加单测；这是取得任何
+   生产 A/B 对照的前置。
+2. 用 HND0 第二实例 + 干净客户端做 `window/8` vs `window/2` 的 A/B；判据仍是
+   好轮中位 ≥1.5×、停摆不增、`srtt ≤1.6×minrtt`。
+3. 若信用窗口不成立，下一处查服务端 `readPass` 每轮对 256 个 slot 的调度与
+   `AsyncPathLink` 的 16 槽写入节拍；不得再用 3.68 MB/s 的床下结论。
+

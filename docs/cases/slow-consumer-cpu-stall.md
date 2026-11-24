@@ -117,14 +117,14 @@ The remaining 12 Mbit/s ceiling and sawtooth pattern (peaks at 65 Mbit/s, trough
 indicate丢包 recovery or other bottlenecks beyond the read starvation, but the primary
 implementation defect (target socket starvation) is resolved.
 
-## SSE2 GF(16) A/B on the async path (2026-11-18)
+## Hardware-intrinsic A/B on the async path (2026-11-18)
 
 Same JIT binary for both sides (`/tmp/tbt-jit-both`, `tbtun.dll` sha256 `4bf70c4a…`),
 4 paths, 20 ms OWD, 200 Mbit/s shaper, 10 s, `TBTUN_ASYNC_MODE=true`. The only
-difference is `DOTNET_EnableHWIntrinsic=0`, which makes `Sse2.IsSupported` false and
-forces the scalar GF(16) path.
+difference is `DOTNET_EnableHWIntrinsic=0`, which disables all hardware intrinsics and
+forces the scalar GF(16) path. These data do not identify the GF(16) branch used in the enabled run.
 
-| metric | SSE2 on | SSE2 off | delta |
+| metric | Intrinsics on | Intrinsics off | delta |
 |---|---|---|---|
 | server-mux `csvc_us` peak | 167 831 µs | 328 484 µs | +96 % |
 | server-bulk `csvc_us` peak | 183 216 µs | 300 562 µs | +64 % |
@@ -134,14 +134,12 @@ forces the scalar GF(16) path.
 | echo 8 flows (first) | 125.0 Mbit/s | 103.2 Mbit/s | −17 % |
 | iperf3 up (bulk) | 142.7 Mbit/s | 141.9 Mbit/s | −0.6 % |
 
-- Logs: `/tmp/tbtun-e2e.PqboeA` (SSE2 on), `/tmp/tbtun-e2e.lkvWEr` (SSE2 off).
-- `iter_us_max` is 41/42 ms with SSE2 and 42/33 ms without; the regression sits inside the
-  receive/codec path, not in the poll loop.
+- Recorded log locations: `/tmp/tbtun-e2e.PqboeA` (intrinsics on), `/tmp/tbtun-e2e.lkvWEr` (intrinsics off). These temporary logs are no longer available on this host.
+- `iter_us_max` is 41/42 ms with intrinsics enabled and 42/33 ms with them disabled.
 - Bulk iperf is capped by the 200 Mbit/s shaper and hides the difference. The 64-flow echo
   mix is CPU-bound and halves.
-- This is the HND0 scenario: HND0 has SSE2 but no SSSE3, so it takes `sse2MulAdd`. The SSE2
-  path buys roughly 2× CPU headroom in the codec; disabling it costs about half the
-  throughput on mixed small-flow load.
+- HND0 has SSE2 but no SSSE3. The code prefers SSSE3 when available. This testbed comparison
+  does not isolate `sse2MulAdd`, nor does it measure real 256-path HND0 upload. P2-10 remains open.
 - The A/B requires a JIT binary because NativeAOT ignores `DOTNET_EnableHWIntrinsic`. The
   async e2e normally runs an AOT server, so this measurement used the same JIT build for
   both sides.
