@@ -1,10 +1,12 @@
 module Tbt.Tests.PollerTests
 
 open System
+open System.Diagnostics
 open System.Net
 open System.Net.Sockets
 open Xunit
 open Tbt.Carrier
+open Tbt.Contracts
 
 let private pair () =
     use listener = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp)
@@ -95,6 +97,31 @@ let ``poller: a socket left out of a round is not reported`` () =
         Assert.True(Diagnostics.Stopwatch.GetElapsedTime(t0).TotalMilliseconds >= 150.0)
 
 [<Fact>]
+let ``rx channel: a bounded drain leaves the rest queued and stays resumable`` () =
+    // The unbounded drain is a livelock under load: when the IO threads refill faster than
+    // frames are decoded, TryDequeue never fails and the session thread never leaves the
+    // loop, so it cannot send a WIN_ACK, run a protocol timer or log a stats line. Live
+    // forensics measured that as 9.4 s and 12.5 s holes with the peer's credit frozen. A
+    // budget makes the pass finite while leaving the remainder queued for the next one.
+    use ch = new RxChannel()
+    let frames = 1000
+    let counter =
+        { new IPathOwner with
+            member _.OnFrame(_, _) = 0UL
+            member _.Frontier = 0UL
+            member _.ProduceFill(_, _) = false
+            member _.Fail _ = () }
+    for _ in 1 .. frames do
+        ch.Enqueue(RxFrame(0us, Array.zeroCreate<byte> 64, 64, false, 0UL))
+    Assert.Equal(frames, ch.Count)
+    Assert.Equal(256, ch.Drain(counter, 256))
+    Assert.Equal(frames - 256, ch.Count)
+    Assert.True ch.HasItems
+    Assert.Equal(frames - 256, ch.Drain(counter, System.Int32.MaxValue))
+    Assert.Equal(0, ch.Count)
+    Assert.False ch.HasItems
+
+[<Fact>]
 let ``rx channel: repeated wakes are cleared then observed again`` () =
     // A session wakes once per round. A reused read buffer must drain the
     // descriptor completely each time, so the next wake stays observable;
@@ -125,3 +152,66 @@ let ``rx channel: repeated wakes are cleared then observed again`` () =
             Assert.Equal(0L, clearAlloc)
     finally
         (ch :> IDisposable).Dispose()
+
+/// Async IO: a frame committed while the IO thread is blocked must reach the
+/// socket at once. `CommitFrame` publishes `txHead` with a full fence and then
+/// checks the thread's sleeping flag, while the IO loop publishes that flag with
+/// a full fence before it re-scans the pending slots: the two fenced store/load
+/// pairs form a Dekker handshake, so one side always sees the other. Before that
+/// handshake the commit could land between the loop's last scan and `epoll_wait`,
+/// and the frame then waited for the whole 1 s timeout.
+[<Fact>]
+let ``async path: a frame committed while the IO thread blocks leaves at once`` () =
+    if not Platform.current.Value.HasEpoll then () else
+    use listener = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp)
+    listener.Bind(IPEndPoint(IPAddress.Loopback, 0))
+    listener.Listen 1
+    let a = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp)
+    a.Connect(IPEndPoint(IPAddress.Loopback, (listener.LocalEndPoint :?> IPEndPoint).Port))
+    use a = a
+    use b = listener.Accept()
+    b.ReceiveTimeout <- 5_000
+    use channel = new RxChannel()
+    let group = new AsyncPollerGroup(1)
+    let link = new PathLink(a, SocketTuning.probe())
+    link.PathId <- 0us
+    let frameLength = 1024
+    link.FrameLength <- frameLength
+    let path = AsyncPathLink.TakeOver(link, group, channel, 16)
+    // The pool picks a path up only from its queue: TakeOver moves the socket,
+    // it does not register the path with the IO thread.
+    group.Add(path :> IPathIo)
+    group.Start()
+    try
+        let p = path :> IPath
+        let payload = Array.create frameLength 0x5Auy
+        let readBuffer = Array.zeroCreate<byte> (8 * frameLength)
+        let mutable received = 0
+        let iterations = 24
+        let worst = ref 0L
+        for _ in 1 .. iterations do
+            // Let the IO thread drain and block in its 1 s wait, so the commit lands
+            // inside the window this test exists for.
+            Threading.Thread.Sleep 5
+            let mutable frame = Span<byte>.Empty
+            Assert.True(p.TryBeginFrame(&frame))
+            payload.AsSpan().CopyTo frame
+            let started = Stopwatch.GetTimestamp()
+            p.CommitFrame()
+            let mutable delivered = false
+            while not delivered do
+                if b.Poll(300_000, SelectMode.SelectRead) then
+                    let n = b.Receive(readBuffer)
+                    Assert.True(n > 0)
+                    received <- received + n
+                    if received >= frameLength then delivered <- true
+                else
+                    failwithf "a committed frame waited more than 300 ms (%d/%d bytes)" received (frameLength * iterations)
+            let elapsed = Stopwatch.GetElapsedTime(started).TotalMilliseconds
+            if elapsed > float worst.Value then worst.Value <- int64 elapsed
+            received <- received - frameLength
+        Assert.True(worst.Value < 300L, sprintf "worst commit-to-send %d ms" worst.Value)
+    finally
+        (path :> IPath).Close()
+        group.Stop()
+        (channel :> IDisposable).Dispose()

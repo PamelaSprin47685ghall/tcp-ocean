@@ -64,9 +64,17 @@ type SessionConfig =
 
 module SessionConfig =
     let defaults =
-        { Rho = 0.25; WindowSteps = 4096; MaxRows = 16384; MaxPaths = 288; TxQueueCells = 256
+        { Rho = 0.25; WindowSteps = 4096; MaxRows = 16384; MaxPaths = 288; TxQueueCells = 512
           Credit = CreditPolicy.defaults; NewRepair = false
-          FecAdaptive = false; RhoMin = 0.01; RhoMax = 0.50; RhoFloor = 0.02; RhoGain = 3.0
+          // RhoMax 0.38 / RhoGain 1.05: the earlier 0.45/1.35 pair was sized from a *reported*
+          // erasure that a queueing path inflates well above its physical loss (live: 16 % on the
+          // wire, 0.32-0.64 reported, because a 32-path set queues past the cell deadline). With
+          // gain 1.35 a 0.32 report already asks for 1.35*0.32/0.68 = 0.64 of parity, i.e. the cap,
+          // and that parity is itself queue: 40 % extra frames on a link whose problem is queueing
+          // is a self-feeding loop (live: rho 0.406, srtt 748-825 ms, probes p50 829 ms). 0.38 still
+          // leaves 5-6 parities per 16 sources for genuine 24 % loss, and 1.05 keeps a 0 % link at
+          // the floor.
+          FecAdaptive = false; RhoMin = 0.01; RhoMax = 0.38; RhoFloor = 0.02; RhoGain = 1.05
           FecWindowCells = 64 }
 
 /// The negotiated result of the main handshake that a session needs.
@@ -231,13 +239,18 @@ type Session(role: Role, p: SessionParams, port: IFlowPort, clock: IClock, confi
 
     let renderWinAck (frame: Span<byte>) (path: uint16) (now: int64) =
         let symbol = frame.Slice(Layout.SymbolOffset, s)
+        // Selective ack and the burst quantile ride the fields the format already has
+        // (spec 6.10). Leaving the bitmap at zero forced the sender to learn about every
+        // hole from a NACK one round trip later, and sending the mean in the p95 slot hid
+        // the bursts the FEC controller has to size for.
+        let struct (bmp0, bmp1, bmp2, bmp3) = rx.FillDecodedBitmap()
         let head =
             { TLo = rx.AckStepLo; Deficit = uint16 nackDeficit; Span = byte (max 1 nackSpan)
               NackFlags = (if nackDeficit > 0 then 1uy else 0uy)
-              ErasureMeanQ16 = rx.ErasureQ16; ErasureP95Q16 = rx.ErasureQ16
+              ErasureMeanQ16 = rx.ErasureQ16; ErasureP95Q16 = rx.ErasureP95Q16
               THi = (if decoder.SeenEnd > 0UL then decoder.SeenEnd - 1UL else 0UL)
               RxTimeUs = uint64 (now / 1000L); PathCount = 0
-              DecodedBitmap0 = 0UL; DecodedBitmap1 = 0UL; DecodedBitmap2 = 0UL; DecodedBitmap3 = 0UL
+              DecodedBitmap0 = bmp0; DecodedBitmap1 = bmp1; DecodedBitmap2 = bmp2; DecodedBitmap3 = bmp3
               CtrlAckHi = ctrl.AckHi; CtrlAckBitmap = ctrl.AckBitmap }
         symbol.Clear()
         WinAck.writeHead head symbol
@@ -680,6 +693,8 @@ type Session(role: Role, p: SessionParams, port: IFlowPort, clock: IClock, confi
                 if WinAck.tryReadHead (Span<byte>.op_Implicit (frame.Slice(Layout.SymbolOffset, s))) &h then
                     ctrl.OnAck(h.CtrlAckHi, h.CtrlAckBitmap)
                     tx.OnPeerSeen h.THi
+                    tx.OnPeerErasure(h.ErasureMeanQ16, q95 = h.ErasureP95Q16)
+                    tx.OnPeerDecodedBitmap(h.TLo, h.DecodedBitmap0, h.DecodedBitmap1, h.DecodedBitmap2, h.DecodedBitmap3)
                     if h.NackFlags &&& 1uy <> 0uy then tx.OnNack(h.TLo, int h.Span, int h.Deficit)
             | CellType.Heartbeat -> rx.OnHeartbeat m.StepId
             | CellType.Ctrl -> onCtrl (Span<byte>.op_Implicit (frame.Slice(Layout.SymbolOffset, s)))
@@ -689,9 +704,10 @@ type Session(role: Role, p: SessionParams, port: IFlowPort, clock: IClock, confi
                 // A bad page is dropped whole (spec 6.10b.2). Absence of a flow means nothing
                 // (rule 5), so each FLOW record stands alone and snapshots need no assembly.
                 if FlowState.tryReadHead page &h then
-                    for i in 0 .. h.RecordCount - 1 do
-                        if FlowState.kindAt page i = byte FlowStateKind.Flow then
-                            flows.OnPeerCredit(h.StateEpoch, h.StateSeq, FlowState.readFlow page i)
+                    // One page, one atomic decision: Flows validates every record against its
+                    // own slot space before applying any of them (spec 6.10b.2).
+                    if not (flows.OnPeerPage(h.StateEpoch, h.StateSeq, page, h.RecordCount, clock.NowNs())) then
+                        flowStatesRejected <- flowStatesRejected + 1L
                 else flowStatesRejected <- flowStatesRejected + 1L
             | _ -> ()
             m.CarrierWm
@@ -907,6 +923,25 @@ type Session(role: Role, p: SessionParams, port: IFlowPort, clock: IClock, confi
         beganInteractive <- false
         if interactive then interactiveSources <- interactiveSources + 1L
         let t = tx.CommitSource(e, interactive)
+        if Tbt.Contracts.TraceGate.On then
+            // Opt-in send-side pairing, the mirror of Bind/Deliver on the receive side:
+            // `Fill` names the encoding step these bytes entered (path = flow slot,
+            // aux = generation), `Put` carries the flow's cumulative stream offset AFTER this
+            // source, so consecutive `Put` deltas for one (slot, generation) are exactly the
+            // byte range the preceding `Fill` explains.
+            //
+            // Why here: this member is the single funnel for every send path — OPEN
+            // (FlowBridge.TryAdd), bulk reads (FlowBridge.Read) and close (Error: unclosed) —
+            // and it is the only place where the envelope's flow identity and the encoder's
+            // step number coexist. `Seal` alone cannot serve, because it is recorded for
+            // urgent/interactive steps only, so a bulk step had no send-side record at all.
+            // Cost with the gate off: one static load, no allocation, no branch taken further.
+            Tbt.Contracts.Trace.record Tbt.Contracts.Trace.Fill t (uint16 e.FlowSlot) (int e.FlowGeneration)
+            Tbt.Contracts.Trace.record
+                Tbt.Contracts.Trace.Put
+                (e.StreamOffset + uint64 e.RealLength)
+                (uint16 e.FlowSlot)
+                (int e.FlowGeneration)
         if e.Flags &&& (StreamFlags.Fin ||| StreamFlags.Rst) <> StreamFlags.None then flows.NoteEndStep(slot, t)
 
     /// The local connection of slot failed: deliver nothing more, send RST.

@@ -72,6 +72,14 @@ type Decoder(graphSeed: uint64, symbolSize: int, capacitySteps: int, maxRows: in
     /// Highest step seen plus one.
     let mutable seenEnd = 0UL
     let mutable rowsAllocated = 0
+    /// Rows refused because they kept a column of a released step. Always zero in a healthy
+    /// session; anything else means Release is finding unfinished equations, which is the
+    /// signal that the decode window fell behind (see Release).
+    let mutable staleRows = 0L
+    /// Reused key list for clearing colRows / pivots entries of released steps.
+    let staleCols = List<uint64>()
+    /// Idle rows kept for the next burst; Release gives back anything above this.
+    let warmRows = max 256 (min 1024 (capacitySteps / 2))
 
     let colOf (t: uint64) (s: int) = (t <<< 4) ||| uint64 s
     let stepOfCol (c: uint64) = c >>> 4
@@ -79,9 +87,52 @@ type Decoder(graphSeed: uint64, symbolSize: int, capacitySteps: int, maxRows: in
 
     let inWindow (t: uint64) = t >= baseStep && t < baseStep + uint64 capacitySteps
 
+    /// Slots already handed to the owner, one bit per step slot.
+    ///
+    /// A source is reported once, and the flag it carries at that moment is the truth: the
+    /// direct path reports `false` because the cell arrived, elimination reports `true`
+    /// because it had to be rebuilt. Without this, `NoteStepUsed` re-reported every already
+    /// known slot as `true` whenever k for that step arrived late — and it does arrive late
+    /// for history steps, because RxHalf records their k from a later frame's k_hist
+    /// (RxHalf.fs:243). Those sources had been received directly, so the re-report turned
+    /// ordinary arrivals into FEC reconstructions: `counters.Recovered` inflated, and
+    /// `observeTimely` counted a certain erasure for each one, which raised the reported
+    /// erasure rate on a lossless link, drove rho up, and added parity overhead that no loss
+    /// justified. It also broke the documented contract of `TryTakeKnown` ("each exactly
+    /// once"). Reported bits are cleared whenever the step slot is (re)opened.
+    let reported: uint16[] = Array.zeroCreate capacitySteps
+
+    /// Slots whose first report said "rebuilt by elimination" rather than "arrived".
+    /// A rebuilt source is not yet a proven erasure: the spec counts a cell as erased only
+    /// when it was not delivered and authenticated *before the step's deadline*, so a
+    /// source that parity solved early but whose own DATA cell still lands inside the
+    /// deadline was never erased. The countdown lives in RxHalf; this bitmap is what lets
+    /// it recognise that the arriving DATA cell is the one a rebuild already covered.
+    let recoveredBits: uint16[] = Array.zeroCreate capacitySteps
+
+    /// True while the slot's first report was a rebuild and no direct arrival has been
+    /// reported for it. Cleared when the step slot is reused.
+    let wasRecovered (t: uint64) (s: int) =
+        let i = int (t % uint64 capacitySteps)
+        s >= 0 && s < int CodeGraph.SlotsPerStep
+        && recoveredBits.[i] &&& (1us <<< s) <> 0us
+
+    /// Enqueue this slot at most once. A known source keeps the flag it was first
+    /// reported with: the direct path says false, elimination says true.
+    let report (t: uint64) (s: int) (recovered: bool) =
+        let i = int (t % uint64 capacitySteps)
+        let bit = 1us <<< s
+        if reported.[i] &&& bit = 0us then
+            reported.[i] <- reported.[i] ||| bit
+            if recovered then recoveredBits.[i] <- recoveredBits.[i] ||| bit
+            knownQueue.Enqueue(struct (t, byte s, recovered))
+
     let ensureStep (t: uint64) =
         if ring.Contains t then true
         elif inWindow t && ring.TryOpen t then
+            // A fresh slot: its report bits belong to the step that just left.
+            reported.[int (t % uint64 capacitySteps)] <- 0us
+            recoveredBits.[int (t % uint64 capacitySteps)] <- 0us
             if t >= seenEnd then seenEnd <- t + 1UL
             true
         else false
@@ -105,6 +156,17 @@ type Decoder(graphSeed: uint64, symbolSize: int, capacitySteps: int, maxRows: in
     let recycle (r: Row) =
         r.Count <- 0
         freeRows.Push r
+
+    /// Give up a live row that elimination reduced to no columns: drop its pivot entry
+    /// when it owned one, then detach and recycle it. A zero row carries no information,
+    /// but leaving it in `rows` burned a row for ever; once `rowsAllocated` reached
+    /// `maxRows`, every later parity came back OutOfWindow and FEC died after minutes.
+    let discard (q: Row) =
+        match pivots.TryGetValue q.Pivot with
+        | true, p when Object.ReferenceEquals(p, q) -> pivots.Remove q.Pivot |> ignore
+        | _ -> ()
+        detach q
+        recycle q
 
     let addColIndex (col: uint64) (r: Row) =
         match colRows.TryGetValue col with
@@ -168,7 +230,9 @@ type Decoder(graphSeed: uint64, symbolSize: int, capacitySteps: int, maxRows: in
         Array.Copy(mergeCoefs, q.Coefs, n)
         q.Count <- n
         Gf16.mulAddInto c (ReadOnlySpan<byte>(r.Payload)) (Span<byte>(q.Payload))
-        if n = 1 then solvedQueue.Push q
+        if n = 0 then
+            if indexed then discard q
+        elif n = 1 then solvedQueue.Push q
 
     /// Make the smallest column of r its pivot. Pivot rows keep a pivot coefficient of 1.
 
@@ -200,7 +264,7 @@ type Decoder(graphSeed: uint64, symbolSize: int, capacitySteps: int, maxRows: in
     /// Report a known source. Sources of a step with unknown k are reported when k arrives.
     let markKnown (t: uint64) (s: int) (recovered: bool) =
         ring.SetKnown(t, s)
-        if s < ring.K t then knownQueue.Enqueue(struct (t, byte s, recovered))
+        if s < ring.K t then report t s recovered
         elif ring.K t = 0 && ring.KnownMask t = UInt16.MaxValue then
             // All 16 slots of a step with unknown k are solved (its DATA and parities were
             // lost; BOOSTERs solved it). Unused slots are zero in every combination (5.6),
@@ -210,7 +274,7 @@ type Decoder(graphSeed: uint64, symbolSize: int, capacitySteps: int, maxRows: in
             while k > 1 && not ((Span<byte>.op_Implicit (ring.Symbol(t, k - 1))).ContainsAnyExcept 0uy) do
                 k <- k - 1
             ring.SetK(t, k)
-            for slot in 0 .. k - 1 do knownQueue.Enqueue(struct (t, byte slot, true))
+            for slot in 0 .. k - 1 do report t slot true
 
     /// Column (t, s) became known with value v (or known zero when v is empty).
     let substitute (t: uint64) (s: int) (v: ReadOnlySpan<byte>) =
@@ -235,6 +299,7 @@ type Decoder(graphSeed: uint64, symbolSize: int, capacitySteps: int, maxRows: in
                         if not v.IsEmpty then Gf16.mulAddInto q.Coefs.[at] v (Span<byte>(q.Payload))
                         q.RemoveAt at
                         if q.Count = 1 then solvedQueue.Push q
+                        elif q.Count = 0 then discard q
                 colRows.Remove col |> ignore
             | _ -> ()
 
@@ -246,7 +311,10 @@ type Decoder(graphSeed: uint64, symbolSize: int, capacitySteps: int, maxRows: in
     let drainSolved () =
         while solvedQueue.Count > 0 do
             let r = solvedQueue.Pop()
-            if r.Index >= 0 && r.Count = 1 then
+            if r.Index >= 0 && r.Count = 0 then
+                // Stale queue entry for a row that elimination already emptied.
+                discard r
+            elif r.Index >= 0 && r.Count = 1 then
                 let col = r.Cols.[0]
                 let t = stepOfCol col
                 let s = slotOfCol col
@@ -255,6 +323,30 @@ type Decoder(graphSeed: uint64, symbolSize: int, capacitySteps: int, maxRows: in
                 removeColIndex col r
                 r.Payload.AsSpan().CopyTo(ring.Symbol(t, s))
                 markKnown t s true
+                // A source recovered by elimination is a known column for every other
+                // equation too. Only the direct receive path (OfferSource) used to fold it
+                // into the rows that still contained it, so an equation holding a recovered
+                // column could never be reduced again: its column was known but no caller
+                // eliminates it (substitute is private and nothing else touches a row's
+                // columns). Such a row is unsolvable for the rest of the session, yet
+                // `Deficit` still counts it as rank, so the caller was told there was more
+                // rank available than existed and `addPivot` walked ever longer colRows lists
+                // doing one symbolSize-byte GF16 multiply-add per member. Eliminate here,
+                // exactly as substitute does for a received source.
+                match colRows.TryGetValue col with
+                | true, list ->
+                    rowScratch.Clear()
+                    rowScratch.AddRange list
+                    for qi in 0 .. rowScratch.Count - 1 do
+                        let q = rowScratch.[qi]
+                        let at = q.Find col
+                        if at >= 0 then
+                            Gf16.mulAddInto q.Coefs.[at] (ReadOnlySpan<byte> r.Payload) (Span<byte>(q.Payload))
+                            q.RemoveAt at
+                            if q.Count = 1 then solvedQueue.Push q
+                            elif q.Count = 0 then discard q
+                    colRows.Remove col |> ignore
+                | _ -> ()
                 recycle r
         advanceFrontier ()
 
@@ -325,7 +417,62 @@ type Decoder(graphSeed: uint64, symbolSize: int, capacitySteps: int, maxRows: in
     member _.SeenEnd = seenEnd
     /// Pending (unsolved) equations.
     member _.PendingRows = rows.Count
+    /// Rows handed out and not yet given back, including idle ones. The count must equal
+    /// `rows.Count + freeRows.Count`: a row that is neither indexed nor idle is a leak.
+    member _.RowsAllocated = rowsAllocated
+    /// Idle rows available for reuse.
+    member _.FreeRows = freeRows.Count
+    /// Rows discarded by Release because they held a column of an already released step.
+    member _.StaleRows = staleRows
+    /// True when every source slot of step t is known. The peer reports these in the
+    /// WIN_ACK decoded bitmap (spec 6.10) so the sender stops repairing steps that arrived.
+    member _.IsStepComplete(t: uint64) =
+        t < frontier || (ring.Contains t && ring.IsComplete t)
+    /// True when this slot's first report said "rebuilt by elimination" and no direct
+    /// arrival has been reported for it since. RxHalf uses it to withdraw a pending erasure
+    /// that the slot's own DATA cell disproves inside the step deadline.
+    member _.WasRecovered(t: uint64, s: int) = wasRecovered t s
+
+    /// Retire the rebuild flag for one slot once its pending erasure was withdrawn.
+    ///
+    /// Duplicates are normal on this transport: a repair sends the same cell again, TCP
+    /// retransmits a segment, and a late copy of a rebuilt slot arrives after the step
+    /// decoded. Without retiring the flag, the second copy of the same slot withdrew the
+    /// same pending erasure again, because the only other guard was "some slot of this step
+    /// is still pending". One rebuild, several withdrawals: erasures were under-counted.
+    member _.AcknowledgeRecovered(t: uint64, s: int) =
+        let i = int (t % uint64 capacitySteps)
+        if s >= 0 && s < int CodeGraph.SlotsPerStep then
+            recoveredBits.[i] <- recoveredBits.[i] &&& ~~~(1us <<< s)
+    /// Known source slots of step t among its k (0 when the step is outside the window).
+    member _.StepKnownCount(t: uint64) =
+        if not (ring.Contains t) then 0
+        else
+            let k = ring.K t
+            let used = if k = 0 then SlotsPerStep else k
+            let m = int (ring.KnownMask t) &&& ((1 <<< used) - 1)
+            Numerics.BitOperations.PopCount(uint32 m)
     member _.SymbolSize = symbolSize
+
+    /// 256-bit selective-ack bitmap (spec 6.10): bit j is set iff step (tLo + 1 + j) is complete.
+    member _.BuildDecodedBitmap(tLo: uint64) =
+        let mutable b0 = 0UL
+        let mutable b1 = 0UL
+        let mutable b2 = 0UL
+        let mutable b3 = 0UL
+        let limit = if seenEnd > tLo + 1UL then int (min 256UL (seenEnd - (tLo + 1UL))) else 0
+        let mutable j = 0
+        while j < limit do
+            let st = tLo + 1UL + uint64 j
+            if ring.Contains st && ring.IsComplete st then
+                let bit = 1UL <<< (j &&& 63)
+                match j >>> 6 with
+                | 0 -> b0 <- b0 ||| bit
+                | 1 -> b1 <- b1 ||| bit
+                | 2 -> b2 <- b2 ||| bit
+                | _ -> b3 <- b3 ||| bit
+            j <- j + 1
+        struct (b0, b1, b2, b3)
 
     /// Unknown count among the steps [t, t + span), counting 16 slots for steps with unknown k.
     member _.Unknowns(t: uint64, span: int) =
@@ -369,7 +516,10 @@ type Decoder(graphSeed: uint64, symbolSize: int, capacitySteps: int, maxRows: in
             else
                 ring.SetK(t, k)
                 for s in 0 .. k - 1 do
-                    if ring.IsKnown(t, s) then knownQueue.Enqueue(struct (t, byte s, true))
+                    // Only slots not yet reported: a directly received source keeps the
+                    // `false` it was reported with, so k arriving late cannot relabel it as
+                    // an FEC reconstruction (see `reported`).
+                    if ring.IsKnown(t, s) then report t s true
                 for s in k .. SlotsPerStep - 1 do
                     if not (ring.IsKnown(t, s)) then
                         ring.SetKnown(t, s)
@@ -425,3 +575,62 @@ type Decoder(graphSeed: uint64, symbolSize: int, capacitySteps: int, maxRows: in
         while baseStep < limit do
             ring.Free baseStep
             baseStep <- baseStep + 1UL
+        // Row sweep. After `baseStep` has advanced, walk the live rows and:
+        //   · recycle any row that already reduced to zero columns;
+        //   · for a row whose smallest column belongs to a step below `baseStep`, remove that
+        //     row's columns from `colRows` and then recycle it (counting `staleRows`).
+        // The two loops after this sweep drop `colRows` / `pivots` keys whose step is below
+        // `baseStep`.
+        //
+        // Column encoding, for anyone reading the comparison below: `colOf t s = (t <<< 4) ||| s`,
+        // so a step contributes 16 columns (`SlotsPerStep`), and a column's step is `c >>> 4`.
+        //
+        // Tested: `CodecTests` has one concrete construction in which a pending equation's
+        // smallest column sits exactly on the floor (`frontier − HistorySpan`). It asserts that
+        // this sweep leaves that equation in place — `StaleRows = 0`, `BaseStep` equal to the
+        // floor, `PendingRows` unchanged, the row-accounting identity intact — and that the
+        // equation can still be completed afterwards, advancing the frontier. That is the extent
+        // of the coverage: one boundary case in which the branch must not fire. Nothing here
+        // establishes whether the branch fires in other states, and no claim is made about the
+        // cost of this sweep (the design record §7.6 withdrew every causal statement about
+        // decoder cost).
+        //
+        // Columns are sorted ascending, so Cols.[0] is the smallest one and decides
+        // reachability. Detach swaps the last row into the freed slot, so the index must not
+        // advance when a row is discarded.
+        let mutable i = 0
+        while i < rows.Count do
+            let r = rows.[i]
+            if r.Count = 0 then discard r
+            elif stepOfCol r.Cols.[0] < baseStep then
+                staleRows <- staleRows + 1L
+                // Detach from the column index before recycling: `discard` calls `detach` and
+                // `recycle`, but not `removeRowIndex`, so without this call the row's column
+                // entries in `colRows` would keep pointing at a Row object that goes back to
+                // `freeRows` and can be rented again for different columns. Every other discard
+                // site (addScaled, drainSolved, substitute) has already removed its columns by
+                // the time it calls `discard`.
+                removeRowIndex r
+                discard r
+            else i <- i + 1
+        if colRows.Count > 0 then
+            staleCols.Clear()
+            for key in colRows.Keys do
+                if stepOfCol key < baseStep then staleCols.Add key
+            for key in staleCols do
+                colRows.Remove key |> ignore
+        if pivots.Count > 0 then
+            staleCols.Clear()
+            for key in pivots.Keys do
+                if stepOfCol key < baseStep then staleCols.Add key
+            for key in staleCols do
+                pivots.Remove key |> ignore
+        // Give back rows left over from a burst. A row is symbolSize + 576 bytes, so the
+        // 16384-row ceiling is about 32 MiB; holding all of it after one spike pinned a
+        // small host for no benefit. Renting again later allocates, which is far cheaper
+        // than carrying 32 MiB of idle payload buffers.
+        let mutable drop = freeRows.Count - warmRows
+        while drop > 0 do
+            freeRows.Pop() |> ignore
+            rowsAllocated <- rowsAllocated - 1
+            drop <- drop - 1

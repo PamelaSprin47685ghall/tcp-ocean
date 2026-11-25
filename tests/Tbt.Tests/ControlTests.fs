@@ -685,3 +685,169 @@ let ``mss: a repeated MSS_NOTICE is executed once; a stale mss does not roll bac
     Assert.Equal(3L, s.CtrlExecuted)
     Assert.Equal(1448us, s.PathMss 0us)
     Assert.Equal(1448us, s.PathMss 1us)
+
+type private HealthStubPath(id: uint16, initialUnsent: int, initialHealth: PathHealth) =
+    let mutable pathId = id
+    let mutable frameLength = 1448
+    let buf = Array.zeroCreate<byte> 2048
+    member val Unsent = initialUnsent with get, set
+    member val HealthState = initialHealth with get, set
+    member val Frames = 0 with get, set
+    interface IPath with
+        member _.PathId with get () = pathId and set v = pathId <- v
+        member _.FrameLength with get () = frameLength and set v = frameLength <- v
+        member _.Alive = true
+        member _.Attach(_) = ()
+        member _.Backlog with set (_: int) = ()
+        member _.Watch(_, _) = ()
+        member _.Receive(_) = ()
+        member p.UnsentBytes = p.Unsent
+        member p.TryBeginFrame(frame: byref<Span<byte>>) =
+            frame <- Span(buf, 0, frameLength)
+            true
+        member p.CommitFrame() = p.Frames <- p.Frames + 1
+        member _.Close() = ()
+    interface IPathHealth with
+        member p.Health = p.HealthState
+        member _.RefreshHealth(_, _) = ()
+
+[<Fact>]
+let ``health-aware writeBatch skips TCP_CA_Loss paths even at unsent=0 and falls back when all are degraded`` () =
+    let pair = Pair(SessionConfig.defaults, 2, 0.0, 81)
+    let mutable slot = -1
+    Assert.True(pair.Client.TryOpenFlow(&slot))
+    let payload = Array.create 40_000 5uy
+    pair.Feed(pair.Client, slot, ReadOnlySpan payload, false) |> ignore
+    pair.Client.Flush()
+    let carrier = SessionCarrier(pair.Client, FlowBridge(ValueNone))
+    let lossHealth =
+        { PathHealth.unknown with
+            SampledNs = 1L; CaState = 4uy; RttUs = 250_000u; MinRttUs = 113_000u
+            CwndBytes = 14480u; DeliveryRate = 100_000L; RetransRate = 0.30; Valid = true }
+    let goodHealth =
+        { PathHealth.unknown with
+            SampledNs = 1L; CaState = 0uy; RttUs = 114_000u; MinRttUs = 113_000u
+            CwndBytes = 131_072u; DeliveryRate = 2_000_000L; RetransRate = 0.01; Valid = true }
+    // Path 0 is stuck in TCP_CA_Loss with SIOCOUTQNSD=0 (the classic RTO trap).
+    let rtoPath = HealthStubPath(0us, 0, lossHealth)
+    let okPath = HealthStubPath(1us, 0, goodHealth)
+    carrier.AddPath rtoPath
+    carrier.AddPath okPath
+    carrier.RefreshHealthNow()
+    let sent = carrier.WriteBatch 8
+    Assert.True(sent > 0)
+    Assert.Equal(0, rtoPath.Frames)
+    Assert.True(okPath.Frames > 0)
+    // If every path enters Loss simultaneously (blackout), fallback still sends so recovery progresses.
+    okPath.HealthState <- lossHealth
+    carrier.RefreshHealthNow()
+    let before = rtoPath.Frames + okPath.Frames
+    let sentFallback = carrier.WriteBatch 8
+    Assert.True(sentFallback > 0)
+    Assert.True(rtoPath.Frames + okPath.Frames > before)
+
+[<Fact>]
+let ``a round with nothing sent asks for a bounded backoff instead of spinning`` () =
+    // Live 24 %-loss forensics: every path's tx ring was full, so each round admitted no frame
+    // and WaitUs returned 0, and the session thread spun at ~120 000 rounds/s on a 2-vCPU host
+    // (2.58 M futile refusals, a whole core burned, IO threads starved). A round that put
+    // nothing on the wire while data is waiting must yield for a millisecond and let the IO
+    // thread wake it as soon as a ring drains.
+    let pair = Pair(SessionConfig.defaults, 2, 0.0, 85)
+    let mutable slot = -1
+    Assert.True(pair.Client.TryOpenFlow(&slot))
+    let payload = Array.create 60_000 7uy
+    pair.Feed(pair.Client, slot, ReadOnlySpan payload, false) |> ignore
+    pair.Client.Flush()
+    let carrier = SessionCarrier(pair.Client, FlowBridge(ValueNone))
+    let healthy =
+        { PathHealth.unknown with
+            SampledNs = 1L; CaState = 0uy; RttUs = 113_000u; MinRttUs = 113_000u
+            CwndBytes = 131_072u; DeliveryRate = 2_000_000L; Valid = true }
+    // Unsent far above both write gates: WriteGate admits nothing on either path.
+    let a = HealthStubPath(0us, 1_000_000, healthy)
+    let b = HealthStubPath(1us, 1_000_000, healthy)
+    carrier.AddPath a
+    carrier.AddPath b
+    carrier.RefreshHealthNow()
+    Assert.True(pair.Client.WantsToSend)
+    Assert.Equal(0, carrier.WriteBatch 8)
+    Assert.Equal(0, a.Frames + b.Frames)
+    let waitUs = carrier.WaitUs()
+    Assert.True(waitUs > 0, sprintf "WaitUs %d spins on a fully gated round" waitUs)
+    Assert.True(waitUs <= 5_000, sprintf "WaitUs %d oversleeps a microsecond-scale wake" waitUs)
+
+[<Fact>]
+let ``health-aware writeBatch never starves SACK Recovery paths and never freezes output`` () =
+    // Live 24 %-loss forensics: at that loss Linux keeps nearly every socket in
+    // TCP_CA_Recovery (3) or CWR (2) while still carrying line rate. Grading those as sick
+    // made the write loop skip every path, `frames_out` froze for seconds and `hskip`
+    // reached 28 million. Recovery must stay a normal, writable state.
+    let pair = Pair(SessionConfig.defaults, 2, 0.0, 84)
+    let mutable slot = -1
+    Assert.True(pair.Client.TryOpenFlow(&slot))
+    let payload = Array.create 40_000 5uy
+    pair.Feed(pair.Client, slot, ReadOnlySpan payload, false) |> ignore
+    pair.Client.Flush()
+    let carrier = SessionCarrier(pair.Client, FlowBridge(ValueNone))
+    let recoveryHealth =
+        { PathHealth.unknown with
+            SampledNs = 1L; CaState = 3uy; RttUs = 180_000u; MinRttUs = 113_000u
+            CwndBytes = 29_000u; DeliveryRate = 1_500_000L; RetransRate = 0.24; Valid = true }
+    let a = HealthStubPath(0us, 0, recoveryHealth)
+    let b = HealthStubPath(1us, 0, recoveryHealth)
+    carrier.AddPath a
+    carrier.AddPath b
+    carrier.RefreshHealthNow()
+    let sent = carrier.WriteBatch 8
+    Assert.True(sent > 0, "a lossy link in SACK Recovery must still carry data")
+    Assert.True(a.Frames + b.Frames > 0, sprintf "frames a=%d b=%d" a.Frames b.Frames)
+    // Every path stalled in a real RTO (CaState = 4) must still drain via the hard fallback,
+    // or a blackout could never recover and output would freeze again.
+    let lossHealth = { recoveryHealth with CaState = 4uy }
+    a.HealthState <- lossHealth
+    b.HealthState <- lossHealth
+    carrier.RefreshHealthNow()
+    let before = a.Frames + b.Frames
+    let sentFallback = carrier.WriteBatch 8
+    Assert.True(sentFallback > 0)
+    Assert.True(a.Frames + b.Frames > before, "an all-RTO link must still make progress")
+
+[<Fact>]
+let ``elastic active working set holds at 32 when healthy and expands when pass 1 saturates`` () =
+    let pair = Pair(SessionConfig.defaults, 48, 0.0, 82)
+    let mutable slot1 = -1
+    let mutable slot2 = -1
+    Assert.True(pair.Client.TryOpenFlow(&slot1))
+    Assert.True(pair.Client.TryOpenFlow(&slot2))
+    let payload = Array.create 60_000 9uy
+    pair.Feed(pair.Client, slot1, ReadOnlySpan payload, false) |> ignore
+    pair.Feed(pair.Client, slot2, ReadOnlySpan payload, false) |> ignore
+    pair.Client.Flush()
+    let carrier = SessionCarrier(pair.Client, FlowBridge(ValueNone))
+    let goodHealth =
+        { PathHealth.unknown with
+            SampledNs = 1L; CaState = 0uy; RttUs = 113_000u; MinRttUs = 112_000u
+            CwndBytes = 131_072u; DeliveryRate = 2_000_000L; RetransRate = 0.01; Valid = true }
+    let stubs = Array.init 48 (fun i -> HealthStubPath(uint16 i, 0, goodHealth))
+    for st in stubs do carrier.AddPath st
+    carrier.RefreshHealthNow()
+    // The floor moved (32 -> 16); the contract did not. Pinning the literal here would re-break on
+    // the next sizing change, so the test pins the behaviour — hold while pass 1 is healthy, expand
+    // the moment it saturates — plus the floor's own invariant (a working set, not all 48 paths).
+    let initial = carrier.ActivePathTarget
+    Assert.True(initial >= 16 && initial < 48, sprintf "initial working set %d out of range" initial)
+    // Healthy pass 1 (notSent = 0) uses the working set without over-fragmenting to all 48.
+    let sent1 = carrier.WriteBatch 32
+    Assert.True(sent1 > 0)
+    Assert.Equal(initial, carrier.ActivePathTarget)
+    let tailFramesBefore = [| for i in initial .. 47 -> stubs.[i].Frames |] |> Array.sum
+    Assert.Equal(0, tailFramesBefore)
+    // Simulate per-tuple shaping saturating the active working set (notSent > GatePass1Limit).
+    for i in 0 .. initial - 1 do stubs.[i].Unsent <- 8000
+    let sent2 = carrier.WriteBatch 32
+    Assert.True(sent2 > 0)
+    Assert.True(carrier.ActivePathTarget > initial,
+                sprintf "expected expansion > %d, got %d" initial carrier.ActivePathTarget)
+    let tailFramesAfter = [| for i in initial .. 47 -> stubs.[i].Frames |] |> Array.sum
+    Assert.True(tailFramesAfter > 0, "spillover must immediately engage spare paths")

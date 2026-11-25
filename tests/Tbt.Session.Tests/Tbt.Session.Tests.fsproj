@@ -20,6 +20,7 @@
     <Compile Include="../Tbt.Tests/TunTests.fs" Link="TunTests.fs" />
     <Compile Include="../Tbt.Tests/TunTestsB.fs" Link="TunTestsB.fs" />
     <Compile Include="../Tbt.Tests/TunTestsC.fs" Link="TunTestsC.fs" />
+    <Compile Include="../Tbt.Tests/TunJoinRejectTests.fs" Link="TunJoinRejectTests.fs" />
     <Compile Include="../Tbt.Tests/TunTestsD.fs" Link="TunTestsD.fs" />
     <Compile Include="../Tbt.Tests/TunAckSchedulingTests.fs" Link="TunAckSchedulingTests.fs" />
     <Compile Include="../Tbt.Tests/RtoEnvelopeTests.fs" Link="RtoEnvelopeTests.fs" />
@@ -30,12 +31,28 @@
     <Compile Include="../Tbt.Tests/CliTests.fs" Link="CliTests.fs" />
     <Compile Include="../Tbt.Tests/BridgeTests.fs" Link="BridgeTests.fs" />
     <Compile Include="../Tbt.Tests/FlowReportLifecycleTests.fs" Link="FlowReportLifecycleTests.fs" />
+    <Compile Include="../Tbt.Tests/TraceLogTests.fs" Link="TraceLogTests.fs" />
+    <Compile Include="../Tbt.Tests/TraceLifecycleTests.fs" Link="TraceLifecycleTests.fs" />
+    <Compile Include="../Tbt.Tests/AsyncSessionTerminationTests.fs" Link="AsyncSessionTerminationTests.fs" />
+    <Compile Include="../Tbt.Tests/ServerJoinTests.fs" Link="ServerJoinTests.fs" />
+    <Compile Include="../Tbt.Tests/ServerJoinRealTests.fs" Link="ServerJoinRealTests.fs" />
+    <Compile Include="../Tbt.Tests/JoinRefusalRetryTests.fs" Link="JoinRefusalRetryTests.fs" />
   </ItemGroup>
   <ItemGroup>
     <None Include="../vectors/*.json" CopyToOutputDirectory="PreserveNewest" LinkBase="vectors" />
   </ItemGroup>
   <ItemGroup>
     <PackageReference Include="xunit.v3" Version="3.2.2" />
+  </ItemGroup>
+  <!--
+    The one CLI output directory this build of the tests is meant to exercise. `CliTests` spawns
+    `dotnet <tbtun.dll>` as a real process, and it must resolve the same configuration and target
+    framework as the tests themselves — a search over `src/Tbt.Cli/bin` would also match a stale
+    `Debug` output or a leftover `-r <rid>` publish, and enumeration order would decide.
+  -->
+  <ItemGroup>
+    <AssemblyMetadata Include="TbtCliOutput"
+                      Value="$([System.IO.Path]::GetFullPath('$(MSBuildThisFileDirectory)../../src/Tbt.Cli/bin/$(Configuration)/$(TargetFramework)'))" />
   </ItemGroup>
   <ItemGroup>
     <ProjectReference Include="../../src/Tbt.Contracts/Tbt.Contracts.fsproj" />

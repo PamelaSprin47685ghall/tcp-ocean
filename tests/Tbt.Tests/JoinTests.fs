@@ -26,6 +26,31 @@ type private Rig() =
     member _.Request(o: JoinOffer) = (tryJoin p.Keys.PathKey (ReadOnlySpan o.Frame)).Value
     member r.Decide(o: JoinOffer, active: int, alive: bool) =
         r.Admission.Decide(ReadOnlySpan o.Frame, r.Request o, active, alive, false)
+    /// Same decision, with `blocked` spelled out: a session that is closing, or one whose carrier
+    /// is no longer alive, must reject rather than admit a path it cannot service.
+    member r.DecideBlocked(o: JoinOffer, active: int, alive: bool, blocked: bool) =
+        r.Admission.Decide(ReadOnlySpan o.Frame, r.Request o, active, alive, blocked)
+
+[<Fact>]
+let ``a blocked join is rejected with an authenticated ack instead of being admitted`` () =
+    // The server computes `blocked` from the session it is answering for: a session whose last path
+    // left (grace expired), one that faulted, or one already reaped this round. The decision must
+    // then be a Reject carrying a MAC'd ack — the client can act on it — not an Accept into a
+    // session that nothing services, and not silence (which leaves the client waiting out its own
+    // handshake timeout).
+    let rig = Rig()
+    let o = rig.Offer(1, 1u)
+    let d = rig.DecideBlocked(o, 0, false, true)
+    Assert.Equal(JoinVerdict.Reject, d.Verdict)
+    Assert.True(d.Ack.Length > 0, "a reject must still carry the authenticated ack")
+    // The reject is a decision, not a refusal to look: the incarnation is recorded, so a repeat of
+    // the same frame replays the same bytes instead of being decided again.
+    Assert.Equal(1u, rig.Admission.Highest 1us)
+    let again = rig.DecideBlocked(o, 0, false, true)
+    Assert.Equal(JoinVerdict.Replay, again.Verdict)
+    Assert.Equal<byte[]>(d.Ack, again.Ack)
+    // A path that was already in use is not activated by a blocked decision.
+    Assert.Equal(0u, rig.Admission.Active 1us)
 
 [<Fact>]
 let ``a join is decided once: its repeat replays the same frozen JOIN_ACK bytes and never activates`` () =
@@ -60,6 +85,59 @@ let ``an old or equal incarnation and a reused nonce with another transcript are
     let c = rig.Offer(1, 5u)
     Assert.Equal(JoinVerdict.Accept, rig.Decide(c, 2, true).Verdict)
     Assert.Equal(5u, rig.Admission.Active 1us)
+
+[<Fact>]
+let ``a caller that has not authenticated its frame gets Close instead of an exception`` () =
+    // Scope, since the name of a test is a contract: this drives `JoinAdmission.Decide` directly
+    // with frames the production server never passes it. `Server.decideJoin` calls `Decide` only
+    // after `tryJoin` returned a request, and `tryJoin` already rejects a malformed bootstrap
+    // wrapper (`ValueNone`). So no peer can reach `Decide` with an unusable frame, and this test
+    // says nothing about a peer-triggered crash — the earlier note that claimed otherwise was
+    // wrong and is removed.
+    //
+    // What it does pin is that `Decide` is total over the frames a caller may hand it: the verdict
+    // for one it cannot act on is `Close` (no bytes), not an exception thrown out of a decision
+    // function. That matters because the caller in production runs inside the server loop.
+    //
+    // It does NOT explain the one-off `ArgumentOutOfRangeException` seen at this exact statement in
+    // an earlier full-suite run (frame built by `JoinOffer`, so its wrapper was well formed):
+    // that event remains unexplained. Turning it into `Close` here is not a diagnosis, and the real
+    // next step is to keep per-run `TestResults` logs so a recurrence keeps its stack and frame
+    // length (design record §5.8a).
+    let rig = Rig()
+    let r = rig.Request(rig.Offer(1, 1u))
+    let decideWith (frame: byte[]) = rig.Admission.Decide(ReadOnlySpan frame, r, 0, false, false)
+    // Too short to be a bootstrap frame.
+    let short = Array.init 32 (fun i -> byte i)
+    let d = decideWith short
+    Assert.Equal(JoinVerdict.Close, d.Verdict)
+    Assert.Empty(d.Ack)
+    // Empty.
+    Assert.Equal(JoinVerdict.Close, (decideWith Array.empty<byte>).Verdict)
+    // The right length with the wrong wrapper bytes.
+    Assert.Equal(JoinVerdict.Close, (decideWith (Array.zeroCreate<byte> 1087)).Verdict)
+    // None of those recorded a decision or moved the incarnation: a closed frame is not an event.
+    Assert.Equal(0u, rig.Admission.Highest 1us)
+    Assert.Equal(0u, rig.Admission.Active 1us)
+    // And the function is still usable afterwards.
+    Assert.Equal(JoinVerdict.Accept, rig.Decide(rig.Offer(1, 1u), 1, false).Verdict)
+
+[<Fact>]
+let ``the production filter rejects a malformed wrapper before any decision is made`` () =
+    // The defence that actually stands in front of `Decide`: `tryJoin`. A frame whose 1087-byte
+    // bootstrap wrapper is wrong (short, empty, or the right length with wrong bytes) is not
+    // authenticated at all, so no decision — and no state change — can happen for it. This is the
+    // property a peer-triggered failure would have to defeat; `Decide`'s own guard is unreachable
+    // from the server for exactly this reason.
+    let pair = Pair(SessionConfig.defaults, 1, 0.0, 21)
+    let kPath = pair.ClientParams.Keys.PathKey
+    Assert.True((tryJoin kPath (ReadOnlySpan (Array.init 32 (fun i -> byte i)))).IsNone)
+    Assert.True((tryJoin kPath (ReadOnlySpan Array.empty<byte>)).IsNone)
+    Assert.True((tryJoin kPath (ReadOnlySpan (Array.zeroCreate<byte> 1087))).IsNone)
+    // And the genuine frame still authenticates: the filter rejects wrappers, not joins.
+    let good = (JoinOffer(kPath, SeededEntropy 700, pair.ClientParams.Keys.SessionId,
+                          pair.ClientParams.Symbol, pair.ClientParams.Caps, 4, 1us, 1u, 1448)).Frame
+    Assert.True((tryJoin kPath (ReadOnlySpan good)).IsSome)
 
 [<Fact>]
 let ``a refusal consumes the incarnation and keeps the active one; its repeat stays a refusal`` () =

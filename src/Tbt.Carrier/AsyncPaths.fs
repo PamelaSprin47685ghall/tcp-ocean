@@ -96,11 +96,22 @@ type RxChannel() =
 
     /// Deliver every queued frame on the calling (session) thread and return the
     /// pooled buffers. `owner` must be the session that owns this channel.
-    member this.Drain(owner: IPathOwner) =
+    member this.Drain(owner: IPathOwner) = this.Drain(owner, Int32.MaxValue)
+
+    /// Deliver at most `budget` queued frames and return how many were delivered.
+    ///
+    /// The budget is what keeps the coordinator alive. The unbounded form is a trap: at
+    /// 100 Mbit/s over 32 paths the IO threads keep the queue non-empty, so `TryDequeue`
+    /// never fails and the session thread never leaves this loop. It then cannot send a
+    /// single WIN_ACK or FLOW_STATE, cannot run a protocol timer, and never logs a stats
+    /// line — live forensics measured exactly that as 9.4 s and 12.5 s holes in the client
+    /// log, with the peer's credit frozen and its transmit rate down to 0.2 Mbit/s. The
+    /// caller re-arms the wake when frames remain, so the next pass resumes immediately.
+    member this.Drain(owner: IPathOwner, budget: int) =
         let mutable frame = Unchecked.defaultof<RxFrame>
         let mutable delivered = 0
         let pre = this.OnPreOpened
-        while queue.TryDequeue(&frame) do
+        while delivered < budget && queue.TryDequeue(&frame) do
             Interlocked.Decrement(&count) |> ignore
             match pre with
             | null -> owner.OnFrame(frame.PathId, Span(frame.Data, 0, frame.Length)) |> ignore
@@ -133,7 +144,11 @@ type IPathIo =
     abstract ThreadIndex: int
     abstract WatchForIo: poller: Poller -> unit
     abstract PumpRx: poller: Poller -> unit
+    /// Send committed slots. Returns true when more unsent slots remain and did not WouldBlock.
     abstract PumpTx: unit -> unit
+    abstract HasPendingTx: bool
+    abstract AcquireIoRef: unit -> unit
+    abstract ReleaseIoRef: unit -> unit
     /// Detect a socket the kernel destroyed under us (SOCK_DESTROY, RST after
     /// close). epoll drops such a descriptor silently, so a readable-event
     /// driven PumpRx never runs; this probe runs once per idle timeout.
@@ -163,6 +178,11 @@ type AsyncPollerGroup(threadCount: int) =
     let threadWakes: int[] =
         Array.init width (fun _ -> try Native.eventFd () with _ -> -1)
     let threadArmed: int[] = Array.zeroCreate width
+    // 1 while the IO thread is inside, or entering, epoll_wait. A producer that
+    // publishes a frame after the loop's last HasPendingTx scan but before the
+    // wait sees this flag and writes the eventfd, so no wakeup can be lost in
+    // that window. A busy thread keeps it at 0 and pays no syscall.
+    let threadSleeping: int[] = Array.zeroCreate width
 
     member _.ThreadCount = width
     /// Shared eventfd; -1 when the platform has none, in which case session
@@ -172,6 +192,7 @@ type AsyncPollerGroup(threadCount: int) =
 
     /// A new path is picked up by its thread on the next round.
     member _.Add(path: IPathIo) =
+        path.AcquireIoRef()
         let i = ((path.ThreadIndex % width) + width) % width
         pending.[i].Enqueue path
         if threadWakes.[i] >= 0 then
@@ -181,20 +202,22 @@ type AsyncPollerGroup(threadCount: int) =
     member _.Wake() =
         if wakeFd >= 0 then Native.write wakeFd (ReadOnlySpan<byte> wakeToken) |> ignore
 
-    /// Wake one IO thread. A path with a newly committed frame must wake its
-    /// owner: the owner blocks in epoll, and a socket that is only writable
-    /// produces no event, so PumpTx would otherwise never run.
-    ///
-    /// Coalesced per thread: while a wake is outstanding (written, not yet read by
-    /// the IO thread) later commits skip the syscall. The IO thread re-arms right
-    /// after reading its eventfd and only then pumps its paths, so a commit that
-    /// raced with the read is sent in that same round. With gathered sends the
-    /// path queue drains at once, so nearly every commit found it idle and paid
-    /// an eventfd write (~6% of server CPU).
+    /// Wake one IO thread. Coalesced per thread via a fast Volatile.Read check
+    /// followed by a full-fence Interlocked.Exchange. Pairs with the IO loop's
+    /// full-fence clear of threadArmed before checking HasPendingTx and sleeping,
+    /// forming a race-free Dekker handoff (no lost wakeups).
     member _.WakeThread(index: int) =
         let i = ((index % width) + width) % width
-        if threadWakes.[i] >= 0 && Interlocked.Exchange(&threadArmed.[i], 1) = 0 then
-            Native.write threadWakes.[i] (ReadOnlySpan<byte> wakeToken) |> ignore
+        if threadWakes.[i] >= 0 then
+            if Volatile.Read(&threadSleeping.[i]) = 1 then
+                // The thread is entering or inside epoll_wait, and it has already
+                // consumed every earlier token, so the coalescing flag cannot stand
+                // in for this wake: write one unconditionally.
+                Interlocked.Exchange(&threadArmed.[i], 1) |> ignore
+                Native.write threadWakes.[i] (ReadOnlySpan<byte> wakeToken) |> ignore
+            elif Volatile.Read(&threadArmed.[i]) = 0
+                 && Interlocked.Exchange(&threadArmed.[i], 1) = 0 then
+                Native.write threadWakes.[i] (ReadOnlySpan<byte> wakeToken) |> ignore
 
     /// Consume the wake token.
     member _.ClearWake() =
@@ -210,43 +233,67 @@ type AsyncPollerGroup(threadCount: int) =
         let wakeBuffer = Array.zeroCreate<byte> 8
         let mutable lastAliveCheck = 0L
         while Volatile.Read(&running.contents) = 1 do
-            // Register the wake descriptor every round: the poller rebuilds its watch
-            // set each round, so a one-time registration would be dropped by the first
-            // Wait and WakeThread would write into an eventfd nobody watches.
             if wake >= 0 then poller.WatchFd wake
             let mutable path = Unchecked.defaultof<IPathIo>
             while mine.TryDequeue(&path) do
-                if not path.Closed then local.Add path
+                if path.Closed then path.ReleaseIoRef()
+                else local.Add path
             let mutable i = local.Count - 1
             while i >= 0 do
-                if local.[i].Closed then local.RemoveAt i
+                if local.[i].Closed then
+                    let removed = local.[i]
+                    local.RemoveAt i
+                    removed.ReleaseIoRef()
                 i <- i - 1
-            // A session thread may Close (dispose) a path's socket while this thread is
-            // between the alive check and the syscall: that path is simply done. Before
-            // this guard the ObjectDisposedException killed the whole server process.
+            // Clear the wake flag with a full fence BEFORE checking pending tx
+            // slots so a concurrent CommitFrame cannot slip between the empty
+            // check and epoll_wait without seeing threadArmed == 0.
+            Interlocked.Exchange(&threadArmed.[index], 0) |> ignore
+            let mutable needImmediatePump = false
+            for path in local do
+                if path.HasPendingTx then needImmediatePump <- true
+            if needImmediatePump then
+                for path in local do
+                    try path.PumpTx() with :? ObjectDisposedException -> ()
             for path in local do
                 try path.WatchForIo poller with :? ObjectDisposedException -> ()
-            // A destroyed descriptor produces no event at all, so an infinite
-            // wait would keep a dead path in `local` forever. One second is
-            // enough to notice and cheap enough for 256 idle paths.
-            poller.Wait 1_000_000
+            // Publish "about to block", then scan again under a full fence. A producer
+            // that commits between this store and the wait sees the flag in WakeThread
+            // and writes the eventfd; a producer that committed before it is seen by
+            // this second scan. The two fenced store/load pairs (here and in
+            // WakeThread) are a Dekker handshake, so a committed frame can never wait
+            // for the 1 s timeout: the window left by the first scan is closed.
+            Volatile.Write(&threadSleeping.[index], 1)
+            Thread.MemoryBarrier()
+            let mutable mayBlock = not mine.IsEmpty
+            if not mayBlock then
+                for path in local do
+                    if path.HasPendingTx then mayBlock <- true
+            if mayBlock then Volatile.Write(&threadSleeping.[index], 0)
+            poller.Wait(if mayBlock then 0 else 1_000_000)
+            Volatile.Write(&threadSleeping.[index], 0)
             if wake >= 0 && poller.IsFdReadable wake then
                 Native.read wake (Span<byte> wakeBuffer) |> ignore
-                Volatile.Write(&threadArmed.[index], 0)
+                Interlocked.Exchange(&threadArmed.[index], 0) |> ignore
+            // Outgoing work first: at 140 Mbit/s ingress the receive loop below can spend the
+            // whole budget in recv(2), and every ACK, WIN_ACK and credit frame for the peer
+            // travels through PumpTx. Draining tx before rx keeps the acknowledgement clock
+            // running, and the second PumpTx flushes the frames rx just produced.
+            for path in local do
+                try path.PumpTx() with :? ObjectDisposedException -> ()
             for path in local do
                 try path.PumpRx poller with :? ObjectDisposedException -> ()
             for path in local do
                 try path.PumpTx() with :? ObjectDisposedException -> ()
-            // CheckAlive is one poll(2) per path. Run every round it cost a syscall
-            // per path per wakeup (64 per round with 256 paths on 4 threads), which
-            // profiled at ~30% of the server's CPU on a 2-vCPU host. A dead socket
-            // already shows up as EPOLLERR/EPOLLHUP on the read watch; this sweep only
-            // catches the rare descriptor that produces no event, so once a second is
-            // enough (the same cadence as the 1 s wait cap above).
             let nowMs = Environment.TickCount64
             if nowMs - lastAliveCheck >= 1000L then
                 lastAliveCheck <- nowMs
                 for path in local do path.CheckAlive() |> ignore
+        // Release pooled buffers of all remaining paths on shutdown.
+        let mutable leftover = Unchecked.defaultof<IPathIo>
+        while mine.TryDequeue(&leftover) do leftover.ReleaseIoRef()
+        for path in local do path.ReleaseIoRef()
+        local.Clear()
 
     member this.Start() =
         if Interlocked.Exchange(&started.contents, 1) = 0 then
@@ -288,14 +335,44 @@ type AsyncPathLink private (socket: Socket, probe: INotSentProbe, group: AsyncPo
     let mutable rxStart = rxStart0
     let mutable rxEnd = rxEnd0
     let mutable bytesWritten = 0L
-    let txSlots: byte[][] = Array.init slotCount (fun _ -> GC.AllocateUninitializedArray<byte> maxFrame)
+    // Single pooled slab for all tx slots + pooled gather buffer, returned once
+    // both the session thread and IO thread release their references.
+    let mutable rxBuf: byte[] | null = rx
+    let mutable txSlab: byte[] | null = ArrayPool<byte>.Shared.Rent(slotCount * maxFrame)
+    /// Set when a producer found the tx ring full and stopped submitting. The IO thread clears
+    /// it and wakes the session channel as soon as the ring drains, so a full ring costs one
+    /// eventfd round trip instead of a polling interval (or a busy spin).
+    let mutable txFullWait = 0
     let txSent: int[] = Array.zeroCreate slotCount
     let txLen: int[] = Array.zeroCreate slotCount
     let mutable txHead = 0
     let mutable txTail = 0
     // Gather buffer for PumpTx: up to 8 frames go out in one send(2).
     static let gatherLength = 8 * maxFrame
-    let gather: byte[] = GC.AllocateUninitializedArray<byte> gatherLength
+    let mutable gather: byte[] | null = ArrayPool<byte>.Shared.Rent gatherLength
+    let mutable bufRefs = 1
+    let mutable sessionReleased = 0
+    let mutable ioReleased = 0
+    // Cached health snapshot. The session thread refreshes it at most once per
+    // interval, so path ranking never calls getsockopt on the frame path.
+    let mutable health = PathHealth.unknown
+    let mutable healthSampled = false
+    let mutable previousSegsOut = -1L
+    let mutable previousRetrans = -1L
+
+    let releaseRef () =
+        if Interlocked.Decrement(&bufRefs) = 0 then
+            // Interlocked.Exchange returns the nullable field type; pattern-match the
+            // null away instead of asserting the element is non-nullable.
+            match Interlocked.Exchange(&rxBuf, null) with
+            | null -> ()
+            | r -> ArrayPool<byte>.Shared.Return r
+            match Interlocked.Exchange(&txSlab, null) with
+            | null -> ()
+            | t -> ArrayPool<byte>.Shared.Return t
+            match Interlocked.Exchange(&gather, null) with
+            | null -> ()
+            | g -> ArrayPool<byte>.Shared.Return g
 
     member _.Id with get () = pathId and set value = pathId <- value
     member _.Length
@@ -303,6 +380,33 @@ type AsyncPathLink private (socket: Socket, probe: INotSentProbe, group: AsyncPo
         and set value = Volatile.Write(&frameLength, value)
     member _.Alive = Volatile.Read(&alive) = 1
     member _.BytesWritten = Volatile.Read(&bytesWritten)
+    member _.BytesAcked = SocketTuning.tryBytesAcked socket
+    member _.TcpInfo = KernelTcpInfo.tryRead socket
+    /// Same snapshot as `TcpInfo`, named for the health sampler.
+    member _.TryTcpInfo() = KernelTcpInfo.tryRead socket
+
+    /// Last cached snapshot. Never blocks and never calls into the kernel.
+    member _.Health = health
+
+    /// Refresh the cached snapshot when `minIntervalNs` has elapsed since the
+    /// previous one. `RetransRate` is measured between two samples, so it is
+    /// zero until a second sample exists; a compare-and-rank never sees a
+    /// stale rate pretending to be current.
+    member _.RefreshHealth(nowNs: int64, minIntervalNs: int64) =
+        if not healthSampled || nowNs - health.SampledNs >= minIntervalNs then
+            match KernelTcpInfo.tryRead socket with
+            | ValueSome info ->
+                let rate =
+                    if previousSegsOut >= 0L && info.SegsOut > previousSegsOut then
+                        let sent = float (info.SegsOut - previousSegsOut)
+                        let retransmitted = float (max 0L (info.TotalRetrans - previousRetrans))
+                        min 1.0 (max 0.0 (retransmitted / sent))
+                    else 0.0
+                previousSegsOut <- info.SegsOut
+                previousRetrans <- info.TotalRetrans
+                health <- PathHealth.ofInfo nowNs info rate
+                healthSampled <- true
+            | ValueNone -> ()
     member val Incarnation = 0u with get, set
 
     /// Take the socket and the bytes already read from a synchronous link.
@@ -321,28 +425,34 @@ type AsyncPathLink private (socket: Socket, probe: INotSentProbe, group: AsyncPo
 
     member private this.TryTakeFrame(frame: byref<Span<byte>>) =
         let n = Volatile.Read(&frameLength)
-        if n > maxFrame || rxEnd - rxStart < n then false
-        else
-            frame <- Span(rx, rxStart, n)
-            rxStart <- rxStart + n
-            true
+        match rxBuf with
+        | null -> false
+        | rxArr ->
+            if n > maxFrame || rxEnd - rxStart < n then false
+            else
+                frame <- Span(rxArr, rxStart, n)
+                rxStart <- rxStart + n
+                true
 
     member private this.ReceiveInto() =
-        if rxStart > 0 && (rxStart = rxEnd || rxStart > bufferLength / 2) then
-            Buffer.BlockCopy(rx, rxStart, rx, 0, rxEnd - rxStart)
-            rxEnd <- rxEnd - rxStart
-            rxStart <- 0
-        if rxEnd = bufferLength then false
-        else
-            let mutable err = SocketError.Success
-            let n = socket.Receive(Span(rx, rxEnd, bufferLength - rxEnd), SocketFlags.None, &err)
-            if err = SocketError.WouldBlock then false
-            elif err <> SocketError.Success || n = 0 then
-                Volatile.Write(&alive, 0)
-                false
+        match rxBuf with
+        | null -> false
+        | rxArr ->
+            if rxStart > 0 && (rxStart = rxEnd || rxStart > bufferLength / 2) then
+                Buffer.BlockCopy(rxArr, rxStart, rxArr, 0, rxEnd - rxStart)
+                rxEnd <- rxEnd - rxStart
+                rxStart <- 0
+            if rxEnd = bufferLength then false
             else
-                rxEnd <- rxEnd + n
-                true
+                let mutable err = SocketError.Success
+                let n = socket.Receive(Span(rxArr, rxEnd, bufferLength - rxEnd), SocketFlags.None, &err)
+                if err = SocketError.WouldBlock then false
+                elif err <> SocketError.Success || n = 0 then
+                    Volatile.Write(&alive, 0)
+                    false
+                else
+                    rxEnd <- rxEnd + n
+                    true
 
     /// Queue any complete frames already in the receive buffer (bootstrap tail).
     member private this.QueueFrames(ioThread: bool) =
@@ -365,96 +475,115 @@ type AsyncPathLink private (socket: Socket, probe: INotSentProbe, group: AsyncPo
 
     member private this.BeginFrame(frame: byref<Span<byte>>) =
         let len = Volatile.Read(&frameLength)
-        if Volatile.Read(&alive) = 1 && len <= maxFrame
-           && Volatile.Read(&txHead) - Volatile.Read(&txTail) < slotCount then
-            let slot = Volatile.Read(&txHead) % slotCount
-            txSent.[slot] <- 0
-            frame <- Span(txSlots.[slot], 0, len)
-            true
-        else false
+        match txSlab with
+        | null -> false
+        | slab ->
+            if Volatile.Read(&alive) = 1 && len <= maxFrame
+               && Volatile.Read(&txHead) - Volatile.Read(&txTail) < slotCount then
+                let slot = Volatile.Read(&txHead) % slotCount
+                txSent.[slot] <- 0
+                frame <- Span(slab, slot * maxFrame, len)
+                true
+            else
+                // Ring full (or closing): leave a note so the IO thread wakes this producer the
+                // moment it drains, instead of the producer polling the ring on a timer.
+                if Volatile.Read(&alive) = 1 && len <= maxFrame then Volatile.Write(&txFullWait, 1)
+                false
 
     /// Send every committed slot from txTail in one syscall: copy them into the
     /// gather buffer and hand the kernel one write. Returns false when the socket
     /// would block or failed. One send(2) per 1.3 KiB frame was ~20% of the
     /// server's CPU; with NoDelay each frame also left as its own short segment.
     member private this.SendGathered(head: int, progress: byref<bool>) =
-        let mutable used = 0
-        let mutable k = txTail
-        while k < head && used + maxFrame <= gatherLength do
-            let slot = k % slotCount
-            let offset = txSent.[slot]
-            let length = txLen.[slot] - offset
-            if length > 0 then
-                Buffer.BlockCopy(txSlots.[slot], offset, gather, used, length)
-                used <- used + length
-            k <- k + 1
-        if used = 0 then
-            // Only empty slots: retire them.
-            while txTail < k do
-                txSent.[txTail % slotCount] <- 0
-                txTail <- txTail + 1
-            true
-        else
-            let mutable err = SocketError.Success
-            let n = socket.Send(ReadOnlySpan<byte>(gather, 0, used), SocketFlags.None, &err)
-            if err = SocketError.WouldBlock then false
-            elif err <> SocketError.Success then
-                Volatile.Write(&alive, 0)
-                false
-            elif n <= 0 then false
-            else
-                bytesWritten <- bytesWritten + int64 n
-                progress <- true
-                // Retire whole slots; a partial one keeps its offset.
-                let mutable left = n
-                while left > 0 && txTail < k do
-                    let slot = txTail % slotCount
-                    let remaining = txLen.[slot] - txSent.[slot]
-                    if left >= remaining then
-                        left <- left - remaining
-                        txSent.[slot] <- 0
-                        txTail <- txTail + 1
-                    else
-                        txSent.[slot] <- txSent.[slot] + left
-                        left <- 0
-                n = used
-
-    member private this.PumpTx() =
-        if Volatile.Read(&alive) = 1 then
-            let mutable go = true
-            let mutable progress = false
-            while go && Volatile.Read(&txHead) - txTail >= 2 do
-                go <- this.SendGathered(Volatile.Read(&txHead), &progress)
-            while go && txTail < Volatile.Read(&txHead) do
-                let slot = txTail % slotCount
+        match txSlab, gather with
+        | null, _ | _, null -> false
+        | slab, gatherBuf ->
+            let mutable used = 0
+            let mutable k = txTail
+            while k < head && used + maxFrame <= gatherLength do
+                let slot = k % slotCount
                 let offset = txSent.[slot]
-                let committed = txLen.[slot]
-                let length = committed - offset
-                if length <= 0 then
-                    txSent.[slot] <- 0
+                let length = txLen.[slot] - offset
+                if length > 0 then
+                    Buffer.BlockCopy(slab, slot * maxFrame + offset, gatherBuf, used, length)
+                    used <- used + length
+                k <- k + 1
+            if used = 0 then
+                // Only empty slots: retire them.
+                while txTail < k do
+                    txSent.[txTail % slotCount] <- 0
                     txTail <- txTail + 1
+                true
+            else
+                let mutable err = SocketError.Success
+                let n = socket.Send(ReadOnlySpan<byte>(gatherBuf, 0, used), SocketFlags.None, &err)
+                if err = SocketError.WouldBlock then false
+                elif err <> SocketError.Success then
+                    Volatile.Write(&alive, 0)
+                    false
+                elif n <= 0 then false
                 else
-                    let mutable err = SocketError.Success
-                    let n = socket.Send(ReadOnlySpan<byte>(txSlots.[slot], offset, length), SocketFlags.None, &err)
-                    if err = SocketError.WouldBlock then go <- false
-                    elif err <> SocketError.Success then
-                        Volatile.Write(&alive, 0)
-                        go <- false
-                    elif n <= 0 then
-                        // Zero bytes with no error: retry next round rather than spin.
-                        go <- false
-                    else
-                        bytesWritten <- bytesWritten + int64 n
-                        progress <- true
-                        if offset + n >= committed then
+                    bytesWritten <- bytesWritten + int64 n
+                    progress <- true
+                    // Retire whole slots; a partial one keeps its offset.
+                    let mutable left = n
+                    while left > 0 && txTail < k do
+                        let slot = txTail % slotCount
+                        let remaining = txLen.[slot] - txSent.[slot]
+                        if left >= remaining then
+                            left <- left - remaining
                             txSent.[slot] <- 0
                             txTail <- txTail + 1
                         else
-                            txSent.[slot] <- offset + n
+                            txSent.[slot] <- txSent.[slot] + left
+                            left <- 0
+                    n = used
+
+    member private this.PumpTx() =
+        if Volatile.Read(&alive) = 1 then
+            match txSlab with
+            | null -> ()
+            | slab ->
+                let mutable go = true
+                let mutable progress = false
+                while go && Volatile.Read(&txHead) - txTail >= 2 do
+                    go <- this.SendGathered(Volatile.Read(&txHead), &progress)
+                while go && txTail < Volatile.Read(&txHead) do
+                    let slot = txTail % slotCount
+                    let offset = txSent.[slot]
+                    let committed = txLen.[slot]
+                    let length = committed - offset
+                    if length <= 0 then
+                        txSent.[slot] <- 0
+                        txTail <- txTail + 1
+                    else
+                        let mutable err = SocketError.Success
+                        let n = socket.Send(ReadOnlySpan<byte>(slab, slot * maxFrame + offset, length), SocketFlags.None, &err)
+                        if err = SocketError.WouldBlock then go <- false
+                        elif err <> SocketError.Success then
+                            Volatile.Write(&alive, 0)
                             go <- false
-            // Bytes reached the kernel: unsent is now lower, so WriteGate may admit a
-            // new frame at once. Without this wake the session thread waits out a timer.
-            if progress then channel.Wake()
+                        elif n <= 0 then
+                            // Zero bytes with no error: retry next round rather than spin.
+                            go <- false
+                        else
+                            bytesWritten <- bytesWritten + int64 n
+                            progress <- true
+                            if offset + n >= committed then
+                                txSent.[slot] <- 0
+                                txTail <- txTail + 1
+                            else
+                                txSent.[slot] <- offset + n
+                                go <- false
+                // Bytes reached the kernel: unsent is now lower, so WriteGate may admit a
+                // new frame at once. Without this wake the session thread waits out a timer.
+                if progress then channel.Wake()
+                // A producer that stopped because the ring was full is waiting for this: hand
+                // the slots back as soon as half the ring is free, one eventfd round trip away.
+                if Volatile.Read(&txFullWait) = 1
+                   && Volatile.Read(&txHead) - Volatile.Read(&txTail) < slotCount / 2 then
+                    Volatile.Write(&txFullWait, 0)
+                    channel.Wake()
 
     member private this.PumpRx(poller: Poller) =
         if Volatile.Read(&alive) = 1 && poller.IsReadable socket then
@@ -469,19 +598,34 @@ type AsyncPathLink private (socket: Socket, probe: INotSentProbe, group: AsyncPo
         if Volatile.Read(&alive) = 1 then
             try
                 if socket.Poll(0, SelectMode.SelectError) then
-                    this.Close()
+                    this.CloseSocketOnly()
                     false
                 else true
             with _ ->
-                this.Close()
+                this.CloseSocketOnly()
                 false
         else false
 
     member _.Socket = socket
 
-    member this.Close() =
+    /// True when this path's user-space tx ring can accept another frame. A producer should
+    /// ask before TryBeginFrame: the ring is the queue, and `UnsentBytes` reports it.
+    member _.HasTxSpace =
+        Volatile.Read(&alive) = 1
+        && Volatile.Read(&txHead) - Volatile.Read(&txTail) < slotCount
+
+    /// Frames committed to the ring but not yet handed to the kernel, in bytes.
+    member _.PendingTxBytes =
+        max 0 (Volatile.Read(&txHead) - Volatile.Read(&txTail)) * Volatile.Read(&frameLength)
+
+    member private _.CloseSocketOnly() =
         if Interlocked.Exchange(&alive, 0) = 1 then
             try socket.Dispose () with _ -> ()
+
+    member this.Close() =
+        this.CloseSocketOnly()
+        if Interlocked.Exchange(&sessionReleased, 1) = 0 then
+            releaseRef ()
 
     interface IPathIo with
         member _.ThreadIndex = group.ThreadFor pathId
@@ -491,6 +635,11 @@ type AsyncPathLink private (socket: Socket, probe: INotSentProbe, group: AsyncPo
                 if Volatile.Read(&txTail) < Volatile.Read(&txHead) then poller.WatchWrite socket
         member this.PumpRx(poller) = this.PumpRx poller
         member this.PumpTx() = this.PumpTx()
+        member _.HasPendingTx = Volatile.Read(&alive) = 1 && Volatile.Read(&txTail) < Volatile.Read(&txHead)
+        member _.AcquireIoRef() = Interlocked.Increment(&bufRefs) |> ignore
+        member _.ReleaseIoRef() =
+            if Interlocked.Exchange(&ioReleased, 1) = 0 then
+                releaseRef ()
         member this.CheckAlive() = this.CheckAlive()
         member _.Closed = Volatile.Read(&alive) = 0
 
@@ -507,12 +656,21 @@ type AsyncPathLink private (socket: Socket, probe: INotSentProbe, group: AsyncPo
         member _.Watch(_, _) = ()
         member _.Receive(_) = ()
         member _.UnsentBytes =
-            try probe.NotSent socket with _ -> 0
+            // A frame queued in this path's own tx ring has not reached the kernel at all, so
+            // SIOCOUTQNSD reports 0 for it. Reporting only the kernel counter told WriteGate
+            // that a path holding a full 128 KiB ring was idle: it admitted every frame,
+            // TryBeginFrame refused it, and the live 24 %-loss run logged 2 579 328 such
+            // refusals — 95.4 % of all admitted attempts — while the session thread spun at
+            // full speed. The ring is part of the path's backlog, so it is part of this number.
+            let queued = max 0 (Volatile.Read(&txHead) - Volatile.Read(&txTail)) * Volatile.Read(&frameLength)
+            let kernel = try probe.NotSent socket with _ -> 0
+            if kernel < 0 then kernel else kernel + queued
         member this.TryBeginFrame(frame) = this.BeginFrame(&frame)
         member this.CommitFrame() =
             let head = Volatile.Read(&txHead)
-            let idle = head = Volatile.Read(&txTail)
             txLen.[head % slotCount] <- Volatile.Read(&frameLength)
-            Volatile.Write(&txHead, head + 1)
-            if idle then group.WakeThread(group.ThreadFor pathId)
+            // Full StoreLoad fence: publish txHead BEFORE checking threadArmed
+            // inside WakeThread, pairing with the IO loop's fenced clear of threadArmed.
+            Interlocked.Exchange(&txHead, head + 1) |> ignore
+            group.WakeThread(group.ThreadFor pathId)
         member this.Close() = this.Close()

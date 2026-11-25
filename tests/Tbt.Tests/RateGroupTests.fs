@@ -59,6 +59,117 @@ type private Rounds(rateMbit: float, rttMs: int, paths: int) =
 let private near expected actual =
     Assert.InRange(actual, expected * 0.999, expected * 1.001)
 
+[<Fact>]
+let ``cwnd is bounded before the conversion and never wraps negative`` () =
+    // An ACK burst once gave 375 Mbit/s on a 200 Mbit/s link. With a long RTT the product
+    // g * bw * minRtt overflowed Int32 and became a negative cwnd, and that path never sent
+    // anything again. The bound must hold whatever the sample and the RTT are.
+    let clock = Clock()
+    let group = RateGroup(clock)
+    let m = Member(1_000_000_000L)
+    group.Add m
+    for _ in 1 .. 4 do
+        clock.Now <- clock.Now + 10_000_000L
+        m.Delivered <- m.Delivered + 10_000_000_000L
+        m.LastDelivered <- clock.Now
+        group.Service clock.Now
+    let c = group.Cwnd 1415
+    Assert.True(c > 0, sprintf "cwnd %d (bw %f B/ns)" c group.Bandwidth)
+    Assert.True(c <= 268_435_456 + 4 * 1415, sprintf "cwnd %d" c)
+
+[<Fact>]
+let ``a peer-window-limited round is not an app-limited round`` () =
+    let rounds = Rounds(200.0, 40, 4)
+    let group = rounds.Group
+    for _ in 1 .. 4 do rounds.Loaded()
+    Assert.Equal("drain", group.Phase)
+    // The peer window holds the sender for six rounds. The sender had data, so every one of
+    // them is a real sample; read as app-limited, three of them restarted startup and made
+    // a loaded group sprint again on a link whose capacity it had already measured.
+    for _ in 1 .. 6 do
+        group.NoteLimited()
+        rounds.StepWith(rounds.RoundBytes, rounds.RoundBytes / 2, rounds.Bdp, true)
+    Assert.False(group.InStartup, group.Describe())
+    Assert.Equal(0, group.AppLimitedRounds)
+
+[<Fact>]
+let ``AnyDeliveredSince reads the cached snapshot instead of walking every path`` () =
+    let clock = Clock()
+    let group = RateGroup(clock)
+    let a = Member(10_000_000L)
+    let b = Member(10_000_000L)
+    group.Add a
+    group.Add b
+    a.LastDelivered <- clock.Now
+    group.Service clock.Now
+    Assert.True(group.AnyDeliveredSince(clock.Now - 1_000_000L))
+    Assert.False(group.AnyDeliveredSince(clock.Now + 1_000_000L))
+    // A demotion check asks this for every path on every tick; the answer must not need a
+    // rescan within the same microsecond-scale window.
+    Assert.False(group.AnyDeliveredSince(clock.Now + 2_000_000L))
+
+[<Fact>]
+let ``a second Service at the same instant does not close a second sample`` () =
+    // The loop asks WaitUs/WaitMs (which may run Service to see whether the pacer allows a
+    // frame) and then services the group again for the same round. One round = one sample:
+    // a second sample at the same `now` would advance the 8-phase cycle twice and halve the
+    // measured rate (delivered did not change, the interval did).
+    let clock = Clock()
+    let group = RateGroup(clock)
+    let m = Member(40_000_000L)
+    group.Add m
+    for _ in 1 .. 4 do
+        clock.Now <- clock.Now + 40_000_000L
+        m.Delivered <- m.Delivered + 5_000_000L
+        m.Inflight <- 1_000_000
+        m.LastDelivered <- clock.Now
+        group.NoteBacklog()
+        group.OnSent 5_000_000
+        group.Service clock.Now
+    let rounds = group.DeliveryRounds
+    let bw = group.Bandwidth
+    let phase = group.Phase
+    // Same instant, twice: nothing may move.
+    group.Service clock.Now
+    group.Service clock.Now
+    Assert.Equal(rounds, group.DeliveryRounds)
+    Assert.Equal(bw, group.Bandwidth)
+    Assert.Equal(phase, group.Phase)
+    // A later instant is a real round again.
+    clock.Now <- clock.Now + 40_000_000L
+    m.Delivered <- m.Delivered + 5_000_000L
+    m.LastDelivered <- clock.Now
+    group.OnSent 5_000_000
+    group.Service clock.Now
+    Assert.Equal(rounds + 1L, group.DeliveryRounds)
+
+[<Fact>]
+let ``startup ends in three rounds while the estimate rises below the 1.25x plateau threshold`` () =
+    // roundTarget is recomputed with the live (10-tap max filter) estimate. While the
+    // measured bandwidth rises modestly (< 1.25x per round) on a loaded pipe, startup must
+    // still detect the plateau and terminate in three full rounds instead of staying at
+    // gain 2.885 forever.
+    let clock = Clock()
+    let group = RateGroup(clock)
+    let rtt = 40_000_000L
+    let m = Member(rtt)
+    group.Add m
+    let mutable rate = 1_000_000.0 // B/s
+    for _ in 1 .. 10 do
+        clock.Now <- clock.Now + rtt
+        // Modest growth (< 1.25x) so the max filter keeps edging up on a loaded pipe.
+        rate <- rate * 1.05
+        let delivered = int (rate * float rtt / 1_000_000_000.0)
+        m.Delivered <- m.Delivered + int64 delivered
+        m.Inflight <- delivered
+        m.LastDelivered <- clock.Now
+        group.NoteBacklog()
+        group.NoteLimited()
+        group.OnSent delivered
+        group.Service clock.Now
+    Assert.False(group.InStartup, group.Describe())
+    Assert.True(group.FullPipeRounds >= 3, group.Describe())
+
 [<Theory>]
 [<InlineData(20.0, 40, 1)>]
 [<InlineData(200.0, 40, 4)>]

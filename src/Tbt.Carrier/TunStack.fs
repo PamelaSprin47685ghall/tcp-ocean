@@ -9,6 +9,98 @@ open System.Net
 open Tbt.Contracts
 
 [<Sealed>]
+/// Intervals between successive service-loop ticks: one observation per tick, no per-path
+/// multiplication, plus the start instant of the **most recent** over-limit interval.
+///
+/// Why this is separate from `TunCounters.MaxGapNs`: `catchUp` runs on four entries (segment
+/// arrival, send, timer service, send gate), so its gap means "time since anything last touched
+/// this path", counted once per open path. A testbed asks a different question — "did the loop
+/// stop running for >300 ms?" — and only a tick-level observation answers it.
+///
+/// **Resolution: ~1 ms, not ns.** `TunStack` is handed the caller's clock, and production builds
+/// it as `CachedClock(SystemClock())` (Server.fs / Client.fs): `NowNs` returns a cached
+/// `CLOCK_MONOTONIC` sample, refreshed when it is ≥ 1 ms old or every 32 reads. So an interval
+/// here is the difference of two samples and carries that clock's staleness — roughly ±1 ms —
+/// in both directions. It is NOT nanosecond-accurate, and a value sitting next to the 300 ms
+/// limit can fall on either side of it for that reason alone.
+///
+/// **Comparability.** The underlying source is `CLOCK_MONOTONIC`, which on Linux is system-wide
+/// per boot, so these values share a time base with a `monotonic_ns` taken by another process in
+/// the same boot and the same monotonic namespace — `segments.json` records exactly such stamps.
+/// That is a shared base, not a shared instant: the ±1 ms quantisation above still applies, so a
+/// comparison can place an interval in a window but cannot certify sub-millisecond placement.
+/// It must NOT be read across a reboot or across a separate `CLOCK_MONOTONIC` namespace (a
+/// container with its own time namespace). A reader that cannot establish "same boot, same
+/// namespace" must refuse to compare rather than guess.
+///
+/// **What one stats line can say.** `OverCount` counts every over-limit interval since start;
+/// `LastOverNs` / `LastOverStartNs` describe only the **most recent** one. A single line therefore
+/// cannot enumerate the intervals inside its window, nor place more than the last of them: if
+/// several happened since the previous line, only the last is locatable. The millisecond fields
+/// truncate (`/1_000_000L`), so 299.9 ms prints as 299.
+///
+/// Bounded on purpose: the last over-limit interval only. Keeping a ring here would be a second,
+/// silently truncating trace; a worst value, a count, and the last start instant are what a 1 s
+/// stats line can actually be read against.
+type ServiceGapLog(stallNs: int64) =
+    let mutable started = false
+    let mutable lastTickNs = 0L
+    let mutable maxNs = 0L
+    let mutable overCount = 0L
+    let mutable lastOverStartNs = 0L
+    let mutable lastOverNs = 0L
+    let mutable backwards = 0L
+    let mutable resync = false
+
+    /// One tick. `nowNs` is expected to come from the same monotonic source as every other call.
+    ///
+    /// Three cases, and only three:
+    ///   * forward (gap > 0): the interval is measured.
+    ///   * a strictly backwards stamp: the time base changed (a restart that reset the clock, or a
+    ///     different source). The interval across that discontinuity is meaningless, so it is
+    ///     dropped and the observation is counted in `BackwardsObservations`. Crucially the stamp
+    ///     is NOT adopted as the new baseline: doing that would make the next ordinary tick look
+    ///     like a gap spanning the whole backwards jump — a fabricated stall. A flag resyncs the
+    ///     baseline on the next call instead.
+    ///   * equal stamps: a cached clock legitimately repeats a sample (gap = 0). Nothing to
+    ///     measure, nothing wrong, baseline unchanged.
+    member _.Observe(nowNs: int64) =
+        if not started then
+            started <- true
+            lastTickNs <- nowNs
+        elif resync then
+            resync <- false
+            lastTickNs <- nowNs
+        else
+            let gap = nowNs - lastTickNs
+            if gap > 0L then
+                if gap > maxNs then maxNs <- gap
+                if gap > stallNs then
+                    overCount <- overCount + 1L
+                    lastOverStartNs <- lastTickNs
+                    lastOverNs <- gap
+                lastTickNs <- nowNs
+            elif gap < 0L then
+                backwards <- backwards + 1L
+                resync <- true
+
+    /// Largest interval between two ticks, sub-limit intervals included. 0 until two comparable
+    /// ticks run.
+    member _.MaxNs = maxNs
+    /// Ticks that followed an interval longer than the stall limit.
+    member _.OverCount = overCount
+    /// Start of the most recent over-limit interval (monotonic ns); 0 when there is none.
+    member _.LastOverStartNs = lastOverStartNs
+    /// Length of that interval (ns); 0 when there is none.
+    member _.LastOverNs = lastOverNs
+    /// Observations refused because the stamp went backwards. Each one also discarded the next
+    /// interval (the baseline is resynced), so a non-zero value means at least that many
+    /// measurable intervals were dropped — not that a stall occurred.
+    member _.BackwardsObservations = backwards
+    /// Monotonic stamp of the most recent tick — the anchor that places this stats line in the
+    /// same time base as a segment's own `monotonic_ns`, subject to the ~1 ms resolution above.
+    member _.LastTickNs = lastTickNs
+
 type TunStack(fd: int, local: IPEndPoint, clock: IClock, entropy: IEntropy, maxConnections: int,
               ?windowClamp: int) =
     let windowClamp = defaultArg windowClamp SocketTuning.WindowClamp
@@ -23,6 +115,10 @@ type TunStack(fd: int, local: IPEndPoint, clock: IClock, entropy: IEntropy, maxC
     /// One rate group per client address (its paths share a bottleneck).
     let groups = Dictionary<uint32, RateGroup>()
     let counters = TunCounters()
+    /// Tick-level service-loop intervals. Same 300 ms limit as the timeline shift in `TunPath`,
+    /// so "over limit" means the same thing in both places, but the two are parsed differently:
+    /// this one must stay per-tick. See `ServiceGapLog` for what the numbers may be compared with.
+    let serviceGap = ServiceGapLog(300_000_000L)
     let mutable packetsIn = 0L
     let mutable packetsOut = 0L
     let mutable writeFailures = 0L
@@ -169,6 +265,10 @@ type TunStack(fd: int, local: IPEndPoint, clock: IClock, entropy: IEntropy, maxC
     /// Timers and pending ACKs of every connection; closed ones leave the table.
     member _.Service() =
         let now = clock.NowNs()
+        // Tick-level observation, deliberately here and not in `TunPath.catchUp`: one record per
+        // loop pass, so it is not multiplied by the path count and its start instant is the
+        // previous pass, not "whenever this path was last touched".
+        serviceGap.Observe now
         let mutable dead = 0
         for c in conns.Values do
             c.Service now
@@ -199,6 +299,28 @@ type TunStack(fd: int, local: IPEndPoint, clock: IClock, entropy: IEntropy, maxC
         + " seg_lost=" + string counters.SegmentsLost + " borrow_retx=" + string counters.BorrowRetx
         + " tail_repairs=" + string counters.TailRepairs + " rtos=" + string counters.Rtos + " dsacks=" + string counters.Dsacks + " demotions=" + string counters.Demotions + " faults=" + string counters.Faults
         + " clock_jumps=" + string counters.ClockJumps + " jump_skips=" + string counters.JumpSamplesSkipped + " up_holes=" + string counters.UpHoles
+        // `gap_max_ms` is the largest service-loop interval on any path (idle included, sub-limit
+        // included). Of the jumps over the stall limit, `gap_unacked` are the only ones whose
+        // shift refuses measurements (the ring was non-empty at entry, so those segments get no
+        // RTT/rate sample); `gap_work` had a reorder interval or armed RTO only; `gap_idle` had
+        // nothing outstanding. All three are per-path sums (one loop gap with n paths adds n);
+        // `unacked_gap_max_ms` is a max, not a sum. None of them describes the interior of a gap.
+        + " gap_max_ms=" + string (counters.MaxGapNs / 1_000_000L)
+        + " gap_unacked=" + string counters.GapsWithUnacked
+        + " gap_work=" + string counters.GapsWithWork
+        + " gap_idle=" + string counters.GapsWithoutWork
+        + " unacked_gap_max_ms=" + string (counters.MaxUnackedGapNs / 1_000_000L)
+        // Tick-level, once per loop pass (not per path). `tick_mono_ns` is the last tick's stamp in
+        // the same base as a segment's `start.monotonic_ns`, but the clock is cached (~1 ms), so a
+        // reader may place this line in a window — not sub-millisecond. `svc_gap_last_*` locate the
+        // most recent over-limit interval only; `svc_gaps_backwards` counts refusals, after each of
+        // which the next interval was discarded.
+        + " tick_mono_ns=" + string serviceGap.LastTickNs
+        + " svc_gap_max_ms=" + string (serviceGap.MaxNs / 1_000_000L)
+        + " svc_gaps_over=" + string serviceGap.OverCount
+        + " svc_gap_last_start_ns=" + string serviceGap.LastOverStartNs
+        + " svc_gap_last_ms=" + string (serviceGap.LastOverNs / 1_000_000L)
+        + " svc_gaps_backwards=" + string serviceGap.BackwardsObservations
         + " virtual_ack=" + string counters.VirtualAcks + " fast_swallow=" + string counters.FastSwallows
         + " cells_rx=" + string counters.CellsReceived + " cells_spanning=" + string counters.CellsSpanning
         + " cells_dropped=" + string counters.CellsDropped + " swallow_b=" + string counters.BytesSwallowed + " late_first_b=" + string counters.LateFirstBytes

@@ -54,3 +54,20 @@ ComputePool 优先级、BufferPool、FrameAdapter)。路径 IO 拆成 4 个 IO �
 已修四个数据面缺陷:路径 socket 未设非阻塞(IO 线程在 `Send` 里阻塞整组路径)、tx 槽位未记录
 每帧提交长度、槽位复用未清 `txSent`、以及接收环 accept 缺陷(`BeforeService` 在 `Wait` 之后
 注册 listener,清空本轮 `Revents`,导致 `flows=0`)。完整 4 路与 256 路的吞吐数据待补。
+
+## 更新:clean-break WAN 交接(2026-11-25)
+
+真实广域网(112.8 ms RTT、25% 丢包)上完成一轮 clean-break 改造:及时擦除失真与速率控制
+死锁/过冲、解码器行与列索引泄漏、异步路径丢唤醒与无界接收排空、用户态发送环过小、
+控制帧饥饿与健康分层误判、路径刷新空转、`Tbt.Async` 未入 slnx、流控与用户态 TCP 缺陷。
+详见 `docs/cases/2026-11-25-clean-break-wan-handoff.md`。
+
+实测:build 0 Warning/0 Error;单测 566/566(`Tbt.Async.Tests` 8、`Tbt.Tests` 195、
+`Tbt.Session.Tests` 363);离线四套 18/19/11/通过。同窗口 112.8 ms/25% 丢包下,
+裸 TCP 1/16 流 33.6/43.5 Mbps,纯隧道窗内 39.4 Mbps(物理 16 流的 90.6%),
+本地代理端到端单流 30.8 Mbps、4 并发 23.7 Mbps 且零流饿死;服务端 `rho` 0.406→0.104,
+`iter_us_max` 9891→27–150 µs。
+
+未完成:定稿控制律(`RhoMax=0.38`、`minActivePaths=16`)尚未与 `bac3c61` 同批做官方
+`run.sh` 全矩阵对照(含 NativeAOT 服务端);饱和下行仍有 ~500 ms 发送侧排队;`cell_loss`
+仍在 0.28–0.36,高于物理丢包;偶发 `JoinTests` 失败未复现;TUN 拒绝 ACK 单发为 `[OPEN]`。

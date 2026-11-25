@@ -3,6 +3,7 @@
 namespace Tbt.Carrier
 
 open System
+open System.Buffers
 open System.Net
 open System.Net.Sockets
 open Tbt.Contracts
@@ -34,10 +35,35 @@ type FlowBridge(target: EndPoint voption) =
     // writes are staged per slot and flushed when the stage is half full and at
     // the end of every Service round, so no byte waits longer than one round.
     static let stageCap = 65536
+    /// Delivery coalescing buffers, rented from the shared pool only while a slot has bytes
+    /// to stage and returned as soon as it drains. They were one 64 KiB array per slot held
+    /// for the life of the bridge, 16 MiB of resident memory on a 256-slot server.
     let stage: byte[][] = Array.init slotCount (fun _ -> Array.Empty<byte>())
     let stageLen: int[] = Array.zeroCreate slotCount
     let finishAfterStage: bool[] = Array.zeroCreate slotCount
     let staged = ReadySet()
+    /// Bytes handed to the kernel per slot, for the opt-in `Trace.Sent` record.
+    ///
+    /// This exists because `Write` above only STAGES: it copies into the 64 KiB buffer and
+    /// returns the length, so a flow's bytes can sit here while the local socket refuses them.
+    /// Without a separate mark at the real `socket.Send`, "the bridge owns the bytes" and "the
+    /// kernel accepted the bytes" would be indistinguishable, and a probe blocked on a slow
+    /// local reader would look identical to one blocked on the network. One int64 per slot,
+    /// written only when the gate is on; no per-frame allocation and no new lock, because
+    /// `flushSlot` runs on the session thread, the ring's single writer.
+    let sent: int64[] = Array.zeroCreate slotCount
+    let markSent (slot: int) (n: int) =
+        if TraceGate.On && n > 0 then
+            let total = sent.[slot] + int64 n
+            sent.[slot] <- total
+            Trace.record Trace.Sent (uint64 total) (uint16 slot) -1
+    let releaseStage (slot: int) =
+        let buf = stage.[slot]
+        if buf.Length > 0 then
+            ArrayPool<byte>.Shared.Return buf
+            stage.[slot] <- Array.Empty<byte>()
+        stageLen.[slot] <- 0
+        staged.Remove slot
     /// Read-side diagnostics: how often a slot's Read ran, how many bytes it moved, and
     /// how often the local socket had nothing to give. These separate "the socket is
     /// empty" from "Read is called too rarely" without changing data-path behaviour.
@@ -45,9 +71,14 @@ type FlowBridge(target: EndPoint voption) =
     let mutable readBytes = 0L
     let mutable wouldBlock = 0L
 
+    /// Readability of a slot is a SESSION decision: the peer's credit and the local close state
+    /// live there. An unattached bridge therefore has no opinion — `rearm`/`WantsRead` must be
+    /// called after `Attach`, exactly as `Server`/`Client` do before any slot can open. Letting
+    /// an unattached bridge answer "readable" would arm slots whose credit is unknown, and it
+    /// would hide a missing `Attach` from every caller instead of failing loudly at the boundary.
     let wantsRead (slot: int) =
-        not (isNull locals.[slot]) && not connecting.[slot] && session.FlowSending slot
-        && session.FlowRoom slot > 0
+        not (isNull locals.[slot]) && not connecting.[slot]
+        && session.FlowSending slot && session.FlowRoom slot > 0
     let rearm (slot: int) = armed.Set(slot, wantsRead slot)
     let rewrite (slot: int) = writers.Set(slot, not (isNull locals.[slot]) && (connecting.[slot] || wantWrite.[slot]))
     let fail (slot: int) =
@@ -61,8 +92,7 @@ type FlowBridge(target: EndPoint voption) =
         else
             match locals.[slot] with
             | null ->
-                stageLen.[slot] <- 0
-                staged.Remove slot
+                releaseStage slot
                 true
             | socket ->
                 let mutable err = SocketError.Success
@@ -72,29 +102,43 @@ type FlowBridge(target: EndPoint voption) =
                     writers.Add slot
                     false
                 elif err <> SocketError.Success then
-                    stageLen.[slot] <- 0
-                    staged.Remove slot
+                    // The socket is gone: give the staging chunk back now, or a failed slot
+                    // that is never dropped keeps 64 KiB rented for the life of the bridge.
+                    releaseStage slot
                     fail slot
                     true
                 else
                     if n < len then
+                        // A short write accepted n bytes: they ARE in the kernel, and the
+                        // remainder stays staged. Omitting this call made `Sent` under-count
+                        // exactly the sends that matter most on a slow local reader — the
+                        // ones that could not complete in one go — so `Stage − Sent` read as
+                        // if all of a partially accepted stage were still in the bridge.
+                        markSent slot n
                         Buffer.BlockCopy(stage.[slot], n, stage.[slot], 0, len - n)
                         stageLen.[slot] <- len - n
                         wantWrite.[slot] <- true
                         writers.Add slot
                         false
                     else
-                        stageLen.[slot] <- 0
-                        staged.Remove slot
+                        // The kernel took the whole stage: this is the real send event, as
+                        // opposed to `Write` merely copying into the buffer.
+                        markSent slot len
+                        releaseStage slot
                         if finishAfterStage.[slot] then
                             finishAfterStage.[slot] <- false
                             try socket.Shutdown SocketShutdown.Send with :? SocketException -> ()
                         true
 
     let drop (slot: int) =
-        stageLen.[slot] <- 0
+        releaseStage slot
         finishAfterStage.[slot] <- false
-        staged.Remove slot
+        // A slot's kernel-send counter belongs to the socket that carried those bytes. Resetting
+        // it here makes `Sent` a per-slot-lifetime total instead of a per-process one, so a new
+        // generation reusing the slot starts from zero and its deltas mean what they say. (The
+        // record's `aux` is still -1: the bridge does not track generations, so a reader must
+        // pair records with the slot's open/close, not assume a generation id.)
+        sent.[slot] <- 0L
         match locals.[slot] with
         | null -> ()
         | s ->
@@ -194,11 +238,16 @@ type FlowBridge(target: EndPoint voption) =
                 else
                     // Credit or the bulk queue is full: still observe a local close.
                     go <- false
-                    let mutable err = SocketError.Success
-                    let n = socket.Receive(Span peekBuf, SocketFlags.Peek, &err)
-                    if err = SocketError.WouldBlock then ()
-                    elif err <> SocketError.Success then session.FailFlow slot
-                    elif n = 0 then localReadClosed slot socket
+                    if session.FlowRoom slot <= 0 then
+                        // The peer's limit is the reason the socket is not read. Observe a
+                        // close here, or the far end waits on a FIN that cannot be read.
+                        let mutable err = SocketError.Success
+                        let n = socket.Receive(Span peekBuf, SocketFlags.Peek, &err)
+                        if err = SocketError.WouldBlock then ()
+                        elif err <> SocketError.Success then session.FailFlow slot
+                        elif n = 0 then localReadClosed slot socket
+                    // Otherwise only the bulk source ring is momentarily full: it clears in
+                    // this same round, so a Peek here would spend a syscall for nothing.
             rearm slot
 
     /// The local socket of slot is writable: finish a connect, then deliver again.
@@ -272,7 +321,7 @@ type FlowBridge(target: EndPoint voption) =
                 let len = stageLen.[slot]
                 if len + data.Length <= stageCap then
                     // Stage it; flush once half full, the rest at the end of the round.
-                    if stage.[slot].Length = 0 then stage.[slot] <- GC.AllocateUninitializedArray<byte> stageCap
+                    if stage.[slot].Length = 0 then stage.[slot] <- ArrayPool<byte>.Shared.Rent stageCap
                     data.CopyTo(Span<byte>(stage.[slot], len, data.Length))
                     stageLen.[slot] <- len + data.Length
                     staged.Add slot
@@ -283,8 +332,10 @@ type FlowBridge(target: EndPoint voption) =
                     let room = stageCap - stageLen.[slot]
                     let take = min room data.Length
                     if take > 0 then
+                        if stage.[slot].Length = 0 then stage.[slot] <- ArrayPool<byte>.Shared.Rent stageCap
                         data.Slice(0, take).CopyTo(Span<byte>(stage.[slot], stageLen.[slot], take))
                         stageLen.[slot] <- stageLen.[slot] + take
+                        staged.Add slot
                     take
                 elif failed.[slot] then -1
                 else
@@ -296,6 +347,9 @@ type FlowBridge(target: EndPoint voption) =
                         0
                     elif err <> SocketError.Success then -1
                     else
+                        // Direct send path (the chunk alone exceeded the stage): also a real
+                        // kernel send, so it belongs on the same `Sent` timeline.
+                        markSent slot n
                         if n < data.Length then
                             wantWrite.[slot] <- true
                             writers.Add slot

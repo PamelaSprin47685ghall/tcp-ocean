@@ -15,17 +15,28 @@ let private snapshotBytes () =
     set32 8 240_000
     set32 16 1448
     set32 24 5
+    set32 28 7
+    set32 32 5
+    set32 36 3
     set32 68 40_000
     set32 76 64
     set32 80 80
     set32 100 3
     set64 104 30_000_000L
     set64 120 9_000_000L
+    set32 136 1000
     set32 144 1000
+    set32 148 20_000
+    set32 156 900
     set64 160 25_000_000L
     set64 168 300_000L
     set64 176 80_000L
     set64 184 12_000L
+    set32 192 4000
+    set64 200 1_500_000L
+    set64 208 21_000L
+    set32 216 2
+    set32 220 11
     set32 228 600_000
     BitConverter.TryWriteBytes(Span(bytes, 240, 2), 2us) |> ignore
     bytes
@@ -45,22 +56,44 @@ let ``a short TCP_INFO cannot claim zero retransmissions or zero RTO`` () =
     Assert.Contains("/-/", KernelTcpInfo.describePath old)
 
 [<Theory>]
+// Fields below offset 104 are inside the mandatory prefix: `parse` refuses a
+// shorter record (the fact above), so their optional-field rows would read
+// ValueNone. Only fields whose end lies at or past the prefix can be unknown.
 [<InlineData(120, 128)>]
+[<InlineData(136, 140)>]
 [<InlineData(144, 148)>]
+[<InlineData(148, 152)>]
+[<InlineData(156, 160)>]
 [<InlineData(160, 168)>]
 [<InlineData(176, 184)>]
 [<InlineData(184, 192)>]
+[<InlineData(192, 196)>]
+[<InlineData(200, 208)>]
+[<InlineData(208, 216)>]
+[<InlineData(216, 220)>]
+[<InlineData(220, 224)>]
 [<InlineData(228, 232)>]
 [<InlineData(240, 242)>]
 let ``an optional field is unknown until the kernel returns all its bytes`` offset fieldEnd =
     let bytes = snapshotBytes ()
     let field (info: KernelTcpInfo) =
         match offset with
+        | 28 -> info.Sacked
+        | 32 -> info.Lost
+        | 36 -> info.Retrans
         | 120 -> info.BytesAcked
+        | 136 -> info.SegsOut
         | 144 -> info.NotSentBytes
+        | 148 -> info.MinRttUs
+        | 156 -> info.DataSegsOut
         | 160 -> info.DeliveryRate
         | 176 -> info.RwndLimitedUs
         | 184 -> info.SendBufferLimitedUs
+        | 192 -> info.Delivered
+        | 200 -> info.BytesSent
+        | 208 -> info.BytesRetrans
+        | 216 -> info.DsackDups
+        | 220 -> info.ReordSeen
         | 228 -> info.SendWindowBytes
         | _ -> info.TotalRto
     for length in offset .. fieldEnd - 1 do
@@ -165,7 +198,82 @@ let ``an unknown or ample ceiling keeps the full receive request`` () =
     Assert.Equal(SocketTuning.FlowRecvBuf, SocketTuning.flowRecvBufFor 4_194_304)
 
 [<Fact>]
+let ``async tx slots hold a full burst on a long-RTT path`` () =
+    // The ring is the only place a frame waits before send(2), so it caps a path at
+    // slots * frameLength / RTT. 16 slots (the old default) is 32 KiB, i.e. 17 Mbit/s on the
+    // live 341 ms path — exactly the 19.4 Mbit/s the real 24 %-loss run measured while the
+    // carrier itself was saturated. The ceiling has to be above that.
+    Assert.Equal(16, SocketTuning.txSlotsFor 0)
+    Assert.Equal(64, SocketTuning.txSlotsFor 64)
+    Assert.Equal(128, SocketTuning.txSlotsFor 128)
+    Assert.Equal(256, SocketTuning.txSlotsFor 512)
+
+[<Fact>]
 let ``linux stores twice the requested receive buffer`` () =
     Assert.Equal(8_000_000, SocketTuning.flowRecvWinFor SocketTuning.FlowRecvBuf)
     Assert.Equal(425_984, SocketTuning.flowRecvWinFor 212_992)
     Assert.Equal(0, SocketTuning.flowRecvWinFor 0)
+
+[<Fact>]
+let ``the Linux 6 diagnostic tail is parsed at its documented offsets`` () =
+    let bytes = Array.zeroCreate<byte> 280
+    let set32 at value = BitConverter.TryWriteBytes(Span(bytes, at, 4), uint32 value) |> ignore
+    let set64 at value = BitConverter.TryWriteBytes(Span(bytes, at, 8), uint64 value) |> ignore
+    set32 16 1448
+    set32 28 7
+    set32 32 5
+    set32 36 3
+    set32 136 1000
+    set32 148 20_000
+    set32 156 900
+    set32 192 4000
+    set64 200 1_500_000UL
+    set64 208 21_000UL
+    set32 216 2
+    set32 220 11
+    let info = (KernelTcpInfo.parse(ReadOnlySpan bytes)).Value
+    Assert.Equal(7L, info.Sacked)
+    Assert.Equal(5L, info.Lost)
+    Assert.Equal(3L, info.Retrans)
+    Assert.Equal(1000L, info.SegsOut)
+    Assert.Equal(20_000L, info.MinRttUs)
+    Assert.Equal(900L, info.DataSegsOut)
+    Assert.Equal(4000L, info.Delivered)
+    Assert.Equal(1_500_000L, info.BytesSent)
+    Assert.Equal(21_000L, info.BytesRetrans)
+    Assert.Equal(2L, info.DsackDups)
+    Assert.Equal(11L, info.ReordSeen)
+    // Both spellings read the same snapshot field.
+    Assert.Equal(info.Lost, info.LostSegs)
+    Assert.Equal(info.Retrans, info.RetransSegs)
+
+[<Fact>]
+let ``a truncated record leaves the diagnostic tail unknown instead of zero`` () =
+    let bytes = Array.zeroCreate<byte> 280
+    BitConverter.TryWriteBytes(Span(bytes, 136, 4), 1000u) |> ignore
+    let short = (KernelTcpInfo.parse(ReadOnlySpan(bytes, 0, 140))).Value
+    Assert.Equal(1000L, short.SegsOut)
+    Assert.Equal(-1L, short.MinRttUs)
+    Assert.Equal(-1L, short.BytesSent)
+    Assert.Equal(-1L, short.ReordSeen)
+    // An incomplete sample must never rank as healthy.
+    Assert.False((PathHealth.ofInfo 1L short 0.0).Valid)
+
+[<Fact>]
+let ``a health snapshot clamps unknown fields and carries a retransmit ratio`` () =
+    let bytes = Array.zeroCreate<byte> 280
+    let set32 at value = BitConverter.TryWriteBytes(Span(bytes, at, 4), uint32 value) |> ignore
+    set32 16 1448
+    set32 80 40
+    set32 100 9
+    set32 136 500
+    set32 148 30_000
+    let info = (KernelTcpInfo.parse(ReadOnlySpan bytes)).Value
+    let health = PathHealth.ofInfo 12L info 0.25
+    Assert.True health.Valid
+    Assert.Equal(12L, health.SampledNs)
+    Assert.Equal(uint32 (40 * 1448), health.CwndBytes)
+    Assert.Equal(30_000u, health.MinRttUs)
+    Assert.Equal(9u, health.TotalRetrans)
+    Assert.Equal(0.25, health.RetransRate)
+    Assert.False PathHealth.unknown.Valid

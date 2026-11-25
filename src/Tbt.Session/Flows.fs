@@ -3,6 +3,7 @@
 namespace Tbt.Session
 
 open System
+open System.Buffers
 open System.Collections.Generic
 open Tbt.Wire
 
@@ -71,48 +72,129 @@ type ISourceStore =
 /// Delivery reserve of one flow (spec 6.10b.2 delivered_offset "may hold reserve bytes"):
 /// a byte ring that takes delivered bytes the local connection cannot take now, so their
 /// decoder step can go. It grows on demand up to its cap and gives its memory back when empty.
+///
+/// The ring is a sequence of fixed chunks rented from the shared ArrayPool, never one
+/// doubling array: a reserve may reach 8 MiB, and a single array of that size is a Large
+/// Object Heap allocation whose copies run on the session thread that also decodes. A chunk
+/// is 64 KiB, below the 85 000-byte LOH threshold, and goes back to the pool as soon as it
+/// drains, so an idle or closed flow holds no buffer at all.
 [<Sealed>]
 type ByteQueue(cap: int) =
-    let mutable buf: byte[] = Array.Empty<byte>()
+    static let chunkSize = 65536
+    /// Chunk slots in logical order starting at first; ring.Length is a power of two.
+    let mutable ring: (byte[] | null)[] = Array.Empty<byte[] | null>()
+    let mutable first = 0
+    let mutable chunks = 0
+    /// Offset of the first byte inside the oldest chunk.
     let mutable head = 0
     let mutable count = 0
 
+    let slot (i: int) = (first + i) % ring.Length
+
+    let giveBack (from: int) =
+        for i in from .. chunks - 1 do
+            let s = slot i
+            match ring.[s] with
+            | null -> ()
+            | c ->
+                ArrayPool<byte>.Shared.Return c
+                ring.[s] <- null
+        chunks <- min chunks from
+
+    /// Make room for one more chunk, preserving logical order.
+    let grow () =
+        if chunks = ring.Length then
+            let next = Array.zeroCreate<byte[] | null> (max 4 (ring.Length * 2))
+            for i in 0 .. chunks - 1 do next.[i] <- ring.[slot i]
+            // The old array's chunks are now referenced by next; empty the old slots so a
+            // later Clear cannot return the same chunk twice.
+            for i in 0 .. chunks - 1 do ring.[slot i] <- null
+            ring <- next
+            first <- 0
+
+    /// Bytes held by the first chunk (never more than its tail after `head`).
+    let bytesInFirst () = if chunks = 0 then 0 else min count (chunkSize - head)
+    /// Write offset inside the last chunk: after the first chunk's tail, then full chunks.
+    let writeOffsetInLast () =
+        if chunks = 0 then 0
+        elif chunks = 1 then head + count
+        else count - bytesInFirst () - (chunks - 2) * chunkSize
+
     member _.Count = count
     member _.Cap = cap
+
     member _.Free = cap - count
 
-    /// The oldest contiguous bytes.
+    /// The oldest contiguous bytes: at most to the end of the first chunk.
     member _.Peek() : ReadOnlySpan<byte> =
         if count = 0 then ReadOnlySpan.Empty
-        else ReadOnlySpan(buf, head, min count (buf.Length - head))
+        else
+            match ring.[first] with
+            | null -> ReadOnlySpan.Empty
+            | c -> ReadOnlySpan(c, head, min count (chunkSize - head))
 
     member _.Skip(n: int) =
-        count <- count - n
-        head <- if count = 0 then 0 else (head + n) % buf.Length
-        if count = 0 && buf.Length > 65536 then buf <- Array.Empty<byte>()
+        let mutable left = min n count
+        while left > 0 && chunks > 0 do
+            let room = chunkSize - head
+            if left >= room then
+                left <- left - room
+                let s = slot 0
+                match ring.[s] with
+                | null -> ()
+                | c ->
+                    ring.[s] <- null
+                    ArrayPool<byte>.Shared.Return c
+                first <- (first + 1) % ring.Length
+                chunks <- chunks - 1
+                head <- 0
+            else
+                head <- head + left
+                left <- 0
+        count <- max 0 (count - n)
+        if count = 0 then
+            // Nothing is left to mirror an offset: hand every chunk back so an idle slot holds
+            // no memory. Resetting `first` without this left the last chunk rented and, worse,
+            // pointed `first` at a slot a later Write would find null.
+            giveBack 0
+            head <- 0
 
     /// Append all of data. The caller checks Free first.
     member _.Write(data: ReadOnlySpan<byte>) =
-        if count + data.Length > buf.Length then
-            let mutable size = max 4096 buf.Length
-            while size < count + data.Length do size <- size * 2
-            let next = Array.zeroCreate<byte> (min size (max cap (count + data.Length)))
-            if count > 0 then
-                let first = min count (buf.Length - head)
-                Buffer.BlockCopy(buf, head, next, 0, first)
-                if first < count then Buffer.BlockCopy(buf, 0, next, first, count - first)
-            buf <- next
-            head <- 0
-        let tail = (head + count) % buf.Length
-        let first = min data.Length (buf.Length - tail)
-        data.Slice(0, first).CopyTo(Span(buf, tail, first))
-        if first < data.Length then data.Slice(first).CopyTo(Span(buf, 0, data.Length - first))
-        count <- count + data.Length
+        let mutable rest = data
+        while rest.Length > 0 do
+            // Full chunks after the first one. A negative value means the first chunk still
+            // has room, so the last chunk keeps taking bytes.
+            let queuedAfterFirst = if chunks = 0 then 0 else count - (chunkSize - head)
+            if chunks = 0 || queuedAfterFirst >= (chunks - 1) * chunkSize then
+                // The last chunk is full: take another one.
+                grow ()
+                let s = slot chunks
+                match ring.[s] with
+                | null -> ring.[s] <- ArrayPool<byte>.Shared.Rent chunkSize
+                | _ -> ()
+                chunks <- chunks + 1
+            let last = chunks - 1
+            let tail = writeOffsetInLast ()
+            let room = chunkSize - tail
+            let take = min room rest.Length
+            let dst =
+                match ring.[slot last] with
+                | null ->
+                    let fresh = ArrayPool<byte>.Shared.Rent chunkSize
+                    ring.[slot last] <- fresh
+                    fresh
+                | c -> c
+            rest.Slice(0, take).CopyTo(Span(dst, tail, take))
+            rest <- rest.Slice take
+            count <- count + take
 
+    /// Drop every byte and give all rented chunks back to the pool.
     member _.Clear() =
-        count <- 0
+        giveBack 0
+        first <- 0
         head <- 0
-        buf <- Array.Empty<byte>()
+        count <- 0
 
 /// Per-flow byte credit (FLOW_STATE format 2, spec 6.10b.4).
 [<Struct>]
@@ -151,6 +233,17 @@ type Flow(index: int) =
     member val TxResetPending = false with get, set
     member val RxOpened = false with get, set
     member val RxDelivered = 0UL with get, set
+    /// Bytes the local PORT took responsibility for in this generation. Always ≤ RxDelivered:
+    /// `deliver` adds the whole length to RxDelivered when the remainder fits the reserve,
+    /// while only the accepted part reaches here, so `RxDelivered - RxStaged` is the reserve
+    /// backlog — bytes still in the flow's own ring, which is what a slow local reader makes a
+    /// probe wait behind.
+    ///
+    /// "Accepted" stops at the port boundary: `FlowBridge.Write` copies into its 64 KiB stage
+    /// and returns the length, so these bytes are staged, not yet in the kernel. Kernel
+    /// acceptance is traced separately from `flushSlot` (`Trace.Sent`); the peer application's
+    /// `read` is unobservable from this process.
+    member val RxStaged = 0UL with get, set
     member val RxDone = false with get, set
     /// The peer's FIN is taken but the reserve still holds bytes: finish when it drains.
     member val RxFinPending = false with get, set
@@ -159,6 +252,28 @@ type Flow(index: int) =
     member val TxLimit = 0UL with get, set
     member val TxCreditEpoch = 0u with get, set
     member val TxCreditSeq = 0u with get, set
+    /// The peer's `DeliveredOffset` from the last credit report this end ACCEPTED.
+    ///
+    /// It is the peer's rx CUSTODY frontier (`RxDelivered` on the far side), not its
+    /// application read position: on the receiver those differ by the reserve ring. It is also
+    /// a REPORTED number, so it lags the peer by one FLOW_STATE report and cannot be turned
+    /// into an in-flight byte count by subtracting a local window — `TxLimit` is a monotone
+    /// high-water mark against an absolute peer limit, and the local `FlowWindowMax` never
+    /// crosses the wire. Observation only: nothing in the credit path reads it.
+    member val TxDeliveredReported = 0UL with get, set
+    /// Local monotonic ns at which that report was accepted; 0 = no report seen yet.
+    /// Freshness is a LOCAL age, so it needs no clock agreement with the peer.
+    member val TxReportNs = 0L with get, set
+    /// Reports accepted (advanced epoch:seq), rejected as stale (≤ last epoch:seq, i.e. a
+    /// duplicate or out-of-order page), and rejected as foreign (slot inactive or unused,
+    /// generation mismatch, credit disabled). Counters only; the accept rule below is unchanged.
+    member val TxReportsAccepted = 0L with get, set
+    member val TxReportsStale = 0L with get, set
+    member val TxReportsForeign = 0L with get, set
+    /// Accepted reports whose DeliveredOffset went backwards. A peer's custody frontier is
+    /// monotone, so this counts a peer invariant violation; the stored offset keeps the higher
+    /// value instead of following the bad report.
+    member val TxDeliveredRegressions = 0L with get, set
     /// Absolute byte limit this end promised the peer for its rx.
     member val RxLimit = 0UL with get, set
     /// Reports that still carry this flow (a change goes out in more than one report).
@@ -181,14 +296,26 @@ type Flow(index: int) =
         f.TxResetPending <- false
         f.RxOpened <- false
         f.RxDelivered <- 0UL
+        f.RxStaged <- 0UL
         f.RxDone <- false
         f.RxFinPending <- false
         f.TxLimit <- if credit.Enabled then uint64 credit.Initial else UInt64.MaxValue
         f.TxCreditEpoch <- 0u
         f.TxCreditSeq <- 0u
+        // A new generation has its own report history; carrying the old numbers over would read
+        // as a fresh report for bytes this generation never sent.
+        f.TxDeliveredReported <- 0UL
+        f.TxReportNs <- 0L
+        f.TxReportsAccepted <- 0L
+        f.TxReportsStale <- 0L
+        f.TxReportsForeign <- 0L
+        f.TxDeliveredRegressions <- 0L
         f.RxLimit <- uint64 credit.Initial
         f.ReportsDue <- 0
-        if f.Reserve.Cap <> credit.FlowWindowMax then f.Reserve <- ByteQueue(credit.FlowWindowMax)
+        if f.Reserve.Cap <> credit.FlowWindowMax then
+            // Clear before replacing: the old ring must give its chunks back to the pool.
+            f.Reserve.Clear()
+            f.Reserve <- ByteQueue(credit.FlowWindowMax)
         else f.Reserve.Clear()
 
 /// Counters for statistics.
@@ -270,11 +397,6 @@ type FlowTable(port: IFlowPort, store: ISourceStore, stepUndelivered: Action<uin
         f.RxDone <- true
         if not f.TxEndSent then f.TxResetPending <- true
 
-    let openRx (f: Flow) =
-        f.RxOpened <- true
-        rxActive <- rxActive + 1
-        port.Open(f.Index, f.Gen)
-
     /// Grow the rx limit when the local connection took bytes (spec 6.10b.4: a limit only
     /// grows). The window per flow is C0 plus the shared pool split over the open flows, at
     /// most FlowWindowMax, and never more than the pool still has free.
@@ -285,27 +407,56 @@ type FlowTable(port: IFlowPort, store: ISourceStore, stepUndelivered: Action<uin
             let taken = consumed f
             let free = sharedPool - poolUsed
             let limit = min (taken + uint64 window) (taken + uint64 (c0 + f.Charged + free))
-            // Report when an eighth of the window is free again, not on every write; when the
-            // pool is tight, as soon as the flow's own room falls under C0 / 2.
+            // Report when a sixteenth of the window is free again, floored at C0 / 2 and
+            // capped at 256 KiB. The old rule waited for a full window / 8, which is 1 MiB
+            // on an 8 MiB window: at 33 Mbit/s that is a quarter second of silence, enough
+            // for the peer to drain its credit to zero and stop reading its local socket
+            // (the observed 93.6% rwnd_limited). A report also goes out when the flow's own
+            // room falls under half the window, so a fast drain can never reach zero.
+            let step = max (c0 / 2L) (int64 (min (window / 16) 262144))
             let room = f.RxLimit - min f.RxLimit taken
-            if limit >= f.RxLimit + uint64 (window / 8) || (limit > f.RxLimit && room < uint64 (c0 / 2L)) then
+            if limit >= f.RxLimit + uint64 step || (limit > f.RxLimit && room < uint64 (window / 2)) then
                 f.RxLimit <- limit
                 recharge f
                 if f.ReportsDue = 0 then reportsDue <- reportsDue + 1
                 f.ReportsDue <- 2
 
+    let openRx (f: Flow) =
+        f.RxOpened <- true
+        rxActive <- rxActive + 1
+        // Announce the fair share now. Without this the peer starts at C0 (64 KiB) and the
+        // first round trip after the handshake runs on a window far below the BDP of a long
+        // path, which costs one RTT of slow start on every flow.
+        refreshCredit f
+        port.Open(f.Index, f.Gen)
+
     /// Bytes the local connection of f takes from data; the rest goes to the reserve when
     /// it fits. Returns the bytes taken out of the decoder window, or -1 on failure.
+    ///
+    /// The return value is CUSTODY, not socket acceptance: when the reserve has room for the
+    /// remainder this returns `data.Length`, so `RxDelivered` counts bytes the local socket
+    /// never took. `RxStaged` is the part the port took responsibility for — which for
+    /// `FlowBridge` means copied into its stage buffer, not handed to the kernel; `flushSlot`
+    /// reports kernel acceptance as the separate `Sent` record.
     let deliver (f: Flow) (data: ReadOnlySpan<byte>) =
         let written = if f.Reserve.Count > 0 then 0 else port.Write(f.Index, data)
         if written < 0 then -1
-        elif written = data.Length then written
         else
-            let rest = data.Slice written
-            if rest.Length <= f.Reserve.Free then
-                f.Reserve.Write rest
-                data.Length
-            else written
+            if written > 0 then
+                f.RxStaged <- f.RxStaged + uint64 written
+                if Tbt.Contracts.TraceGate.On then
+                    Tbt.Contracts.Trace.record
+                        Tbt.Contracts.Trace.Stage
+                        f.RxStaged
+                        (uint16 f.Index)
+                        (int f.Gen)
+            if written = data.Length then written
+            else
+                let rest = data.Slice written
+                if rest.Length <= f.Reserve.Free then
+                    f.Reserve.Write rest
+                    data.Length
+                else written
 
     /// Give the reserve to the local connection. False when it still holds bytes.
     let drainReserve (f: Flow) =
@@ -318,6 +469,18 @@ type FlowTable(port: IFlowPort, store: ISourceStore, stepUndelivered: Action<uin
                 go <- false
             else
                 f.Reserve.Skip n
+                // Draining the reserve is the same kind of event as `deliver`'s accepted part:
+                // the port took the bytes. For `FlowBridge` that still means "copied into the
+                // stage", so it belongs on the `Stage` timeline — counting it as kernel
+                // acceptance would overstate `Sent − Stage` by however much drained here.
+                if n > 0 then
+                    f.RxStaged <- f.RxStaged + uint64 n
+                    if Tbt.Contracts.TraceGate.On then
+                        Tbt.Contracts.Trace.record
+                            Tbt.Contracts.Trace.Stage
+                            f.RxStaged
+                            (uint16 f.Index)
+                            (int f.Gen)
                 if n < seg.Length then go <- false
         if f.Reserve.Count = 0 && f.RxFinPending then
             f.RxFinPending <- false
@@ -356,18 +519,58 @@ type FlowTable(port: IFlowPort, store: ISourceStore, stepUndelivered: Action<uin
         elif f.TxLimit <= f.TxOffset then 0
         else int (min (f.TxLimit - f.TxOffset) (uint64 Int32.MaxValue))
 
+    /// Apply one FLOW_STATE page (spec 6.10b.2). Every FLOW record is checked against this end's
+    /// slot space BEFORE any of them moves state, so a record outside it rejects the page whole
+    /// ("拒收整份报告，禁止半份更新") instead of leaving half an update behind. The wire reader
+    /// already enforces `flow_slot <= 255`; this is the application boundary doing the same
+    /// check against its own `slotCount`, so the atomicity rule survives any future relaxation
+    /// of the wire guard. Returns false when the page was refused and nothing was applied.
+    member this.OnPeerPage(epoch: uint32, seq: uint32, page: ReadOnlySpan<byte>, recordCount: int, nowNs: int64) =
+        let mutable ok = true
+        let mutable i = 0
+        while ok && i < recordCount do
+            if FlowState.kindAt page i = byte FlowStateKind.Flow then
+                let slot = (FlowState.readFlow page i).FlowSlot
+                if slot < 0 || slot >= slotCount then ok <- false
+            i <- i + 1
+        if ok then
+            for i in 0 .. recordCount - 1 do
+                if FlowState.kindAt page i = byte FlowStateKind.Flow then
+                    this.OnPeerCredit(epoch, seq, FlowState.readFlow page i, nowNs)
+        ok
+
+    /// A peer's slot space is this end's slot space; exposed so a caller can pre-check bounds.
+    member _.SlotCount = slotCount
+
     /// A FLOW record from the peer about the bytes this end sends (spec 6.10b.2/3): a newer
     /// version per (slot, gen) may only grow the limit.
-    member _.OnPeerCredit(epoch: uint32, seq: uint32, r: FlowRecord) =
+    member _.OnPeerCredit(epoch: uint32, seq: uint32, r: FlowRecord, ?nowNs: int64) =
+        // Defense in depth: an out-of-range slot is a foreign report, never an index fault.
+        if r.FlowSlot < 0 || r.FlowSlot >= slotCount then
+            raise (System.ArgumentOutOfRangeException("r", "FlowSlot outside the slot space"))
         let f = flows.[r.FlowSlot]
-        if credit.Enabled && f.Active && f.Gen = r.FlowGeneration
-           && (epoch > f.TxCreditEpoch || (epoch = f.TxCreditEpoch && seq > f.TxCreditSeq)) then
-            f.TxCreditEpoch <- epoch
-            f.TxCreditSeq <- seq
-            let limit = r.DeliveredOffset + uint64 r.CreditBytes
-            if limit > f.TxLimit then
-                f.TxLimit <- limit
-                port.Credit r.FlowSlot
+        if credit.Enabled && f.Active && f.Gen = r.FlowGeneration then
+            if epoch > f.TxCreditEpoch || (epoch = f.TxCreditEpoch && seq > f.TxCreditSeq) then
+                f.TxCreditEpoch <- epoch
+                f.TxCreditSeq <- seq
+                // Observation only (a counter, a stored offset, a timestamp). The accept rule and
+                // the limit arithmetic below are unchanged: this record must not move credit.
+                f.TxReportsAccepted <- f.TxReportsAccepted + 1L
+                f.TxReportNs <- defaultArg nowNs 0L
+                if r.DeliveredOffset < f.TxDeliveredReported then
+                    // A peer's custody frontier is monotone. Count the violation, keep the higher
+                    // value, and still apply the limit below so a bad report cannot shrink credit.
+                    f.TxDeliveredRegressions <- f.TxDeliveredRegressions + 1L
+                else f.TxDeliveredReported <- r.DeliveredOffset
+                let limit = r.DeliveredOffset + uint64 r.CreditBytes
+                if limit > f.TxLimit then
+                    f.TxLimit <- limit
+                    port.Credit r.FlowSlot
+            else
+                // Duplicate or out-of-order page: benign repeats are normal (an unchanged flow
+                // reappears in later pages), so this is a counter, not an error path.
+                f.TxReportsStale <- f.TxReportsStale + 1L
+        else f.TxReportsForeign <- f.TxReportsForeign + 1L
 
     /// The FLOW record this end reports for slot (its rx side).
     member _.Record(slot: int) =
@@ -507,6 +710,29 @@ type FlowTable(port: IFlowPort, store: ISourceStore, stepUndelivered: Action<uin
                     go <- false
                 else
                     f.RxDelivered <- f.RxDelivered + uint64 taken
+                    // Opt-in custody timeline (TraceGate off costs one load). `RxDelivered` is
+                    // CUSTODY, not socket acceptance: `deliver` returns the full length when the
+                    // remainder fits the reserve, so bytes the local socket never took are
+                    // counted here (the module's own `consumed` subtracts `Reserve.Count` for
+                    // exactly that reason). The port-accepted part is the separate `Stage`
+                    // record and kernel acceptance is `Sent`; none of them is the peer
+                    // application's read position.
+                    if taken > 0 && Tbt.Contracts.TraceGate.On then
+                        // `Bind` first, then `Deliver`: the reader pairs them positionally, so a
+                        // `Deliver` delta is attributed to the step named by the `Bind` that
+                        // immediately precedes it, without needing another field or another
+                        // clock. `src.Step` is the step these bytes came out of, and the byte
+                        // range is exactly the delta this `Deliver` records.
+                        Tbt.Contracts.Trace.record
+                            Tbt.Contracts.Trace.Bind
+                            src.Step
+                            (uint16 f.Index)
+                            (int f.Gen)
+                        Tbt.Contracts.Trace.record
+                            Tbt.Contracts.Trace.Deliver
+                            f.RxDelivered
+                            (uint16 f.Index)
+                            (int f.Gen)
                     if taken < remaining then go <- false
                     else
                         dropHead f

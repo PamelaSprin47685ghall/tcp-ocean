@@ -49,7 +49,17 @@ type TunCounters() =
     member val Demotions = 0L with get, set
     /// Exceptions caught at a path entry point: the owner failed, the connection was reset.
     member val Faults = 0L with get, set
-    /// Gaps between two calls longer than the stall limit, cut from the timeline.
+    /// Gaps between two calls to this path longer than the stall limit, cut from the timeline.
+    ///
+    /// Read it as "this path went >300 ms unvisited", not as a stall duration:
+    ///   * `TunStack.Service` visits every connection on each tick and they read one clock, so a
+    ///     single gap raises this counter once per open path — four paths log +4. Do not multiply
+    ///     the aggregate by the stall limit and call it stall seconds; that over-counts by the
+    ///     path count.
+    ///   * It also fires when the path has nothing in flight, where the shift moves no stamp at
+    ///     all. So an increment is not proof that a segment's RTT or rate sample was discarded.
+    /// What it *does* establish: the service loop for this stack did not run for >300 ms, so every
+    /// timing sample spanning that gap is unreliable (onDelivered drops them, see `jumpNs`).
     member val ClockJumps = 0L with get, set
     /// Swallowed (virtually acked) bytes whose first copy arrived later: not duplicates.
     member val LateFirstBytes = 0L with get, set
@@ -64,6 +74,34 @@ type TunCounters() =
     member val DemotedRepairs = 0L with get, set
     /// Deliveries of segments sent before a clock jump: no RTT or rate sample taken.
     member val JumpSamplesSkipped = 0L with get, set
+    /// Largest interval between two `catchUp` calls on this path, in ns — gaps under the stall
+    /// limit included, and gaps with nothing outstanding included. Sampled at entry, before the
+    /// shift, so it is the raw wall interval and not a shifted one.
+    ///
+    /// It is a maximum over observations, not a proven bound: if two threads ever wrote it
+    /// concurrently a `max` update could be lost (that can only hide a larger value, never invent
+    /// one). Today one loop thread services the whole stack, so no update is lost.
+    member val MaxGapNs = 0L with get, set
+    /// Gaps over the stall limit whose entry time had an **unacked segment in the ring** on this
+    /// path. This is the only class for which the shift really refuses measurements: the segments
+    /// in the ring were sent before the jump, so `onDelivered` gives them no RTT and no rate sample
+    /// (`JumpSamplesSkipped`). It says "work was outstanding when the gap was noticed", NOT "work
+    /// was outstanding for the whole gap": path state can change inside a gap without a `catchUp`
+    /// (a SYN arrives through `OnSyn`, which mutates state and does not sample), so neither this
+    /// class nor the next is a proof about the gap's interior. Summed per path.
+    member val GapsWithUnacked = 0L with get, set
+    /// Gaps over the stall limit whose entry time had no unacked segment, but did have work that
+    /// the shift moves: a reorder interval, or an armed RTO. No delivery sample is refused for
+    /// these, so they do not by themselves invalidate a rate or RTT measurement. Summed per path.
+    member val GapsWithWork = 0L with get, set
+    /// Gaps over the stall limit whose entry time showed nothing outstanding on this path: no
+    /// unacked segment, no reorder interval, no armed RTO. The shift moved no stamp. Summed per
+    /// path, like `ClockJumps` — so a single loop gap with `n` open paths adds `n`.
+    member val GapsWithoutWork = 0L with get, set
+    /// Largest of `GapsWithUnacked`, in ns: the longest gap that actually refused measurements on
+    /// this path. `max`, not a sum, and (like `MaxGapNs`) not a proven bound under concurrent
+    /// writers.
+    member val MaxUnackedGapNs = 0L with get, set
 
 [<Struct>]
 type SentSegment =
@@ -103,7 +141,12 @@ type TunPath(output: ITunOutput, counters: TunCounters, localIp: uint32, localPo
     /// uplink cannot build a standing queue at the bottleneck beyond it (was 4 MiB: about 350 ms).
     /// Overridable by --window-clamp; default remains WindowClamp.
     let windowBytes = defaultArg windowClamp SocketTuning.WindowClamp
-    static let ourScale = 7
+    /// Window scale we advertise: 7, because the spec's 600 000 B per-path window needs
+    /// 65535 <<< 3.36. A peer that offers no WS option never scales its window, so our
+    /// advertised value must then be unscaled: ourScale becomes 0 and window() advertises
+    /// min (windowBytes, 65535) = 65535 B. Shifting by 7 in that case advertised 4687 B, a
+    /// 4.6 KB window worth about 41 KB/s on a 113 ms path.
+    let mutable ourScale = 7
     /// Initial OFO interval (gap) table; grows up to the advertised window (see gapBudget).
     static let gapCount0 = 16
     /// Initial fragment-slot table; grows up to the advertised window (see slotBudget).
@@ -113,6 +156,10 @@ type TunPath(output: ITunOutput, counters: TunCounters, localIp: uint32, localPo
     static let stallNs = 300_000_000L
     /// Tail repairs per timer: the oldest few; their SACKs then let RACK find the rest.
     static let tailBudget = 4
+    /// Waiting repairs a path may hold before it stops taking new frames. Above this the
+    /// path is genuinely behind; below it, new data still goes out, so a single hole that
+    /// the pacer has not cleared yet cannot turn the path into a retransmit-only pipe.
+    static let repairBurst = 8
     static let headCap = Handshake.MaxHeadLength + Layout.BootFrameLength + 16384
     static let wrapBase = 1UL <<< 32
     let sackOption = Array.zeroCreate<byte> 36
@@ -187,6 +234,15 @@ type TunPath(output: ITunOutput, counters: TunCounters, localIp: uint32, localPo
     let mutable ringCount = 0
     let mutable inflight = 0
     let mutable rackSentNs = 0L
+    /// True once a SACK block has confirmed out-of-order delivery after sndUna;
+    /// pure in-order TLP probes without SACK evidence are never network reordering.
+    let mutable sackReordSeen = false
+    /// RFC 8985 reordering window: how far in send time behind a delivered segment an
+    /// unacked one may sit before RACK calls it lost. Zero until this path shows reordering,
+    /// then the observed span, capped at min(minRtt/4, 20 ms). A reordering path must not
+    /// turn every reordered segment into a repair (that was 1.5-2x wire amplification on a
+    /// 24 % loss link), while a path without reordering keeps exact fast loss detection.
+    let mutable reoWndNs = 0L
     /// RTO fallback (independent of SACK and RACK): snd.una still for the RTO makes every
     /// unsacked segment sent before it lost; they go again from snd.una (go-back-N), paced.
     let mutable unaNs = 0L
@@ -240,7 +296,13 @@ type TunPath(output: ITunOutput, counters: TunCounters, localIp: uint32, localPo
     let unwrapRx (seq: uint32) = rcvNxt + uint64 (int64 (int32 (seq - uint32 rcvNxt)))
     let unwrapTx (seq: uint32) = sndUna + uint64 (int64 (int32 (seq - uint32 sndUna)))
 
-    let window () = uint16 (min 65535 (windowBytes >>> ourScale))
+    let window () =
+        // `ourScale` is set from the peer's own window-scale option in OnSyn (7, or 0 when
+        // the peer sent none, RFC 7323 s2.2). Shifting unconditionally used to tell such a
+        // peer 600000 >>> 7 = 4687 bytes, a 4.6 KiB window that caps it at about 41 KB/s at
+        // 113 ms RTT; every modern Linux offers WS, so only a middlebox that strips the
+        // option would have hit it.
+        uint16 (min 65535 (windowBytes >>> ourScale))
 
     let send (flags: byte) (seq: uint64) (options: ReadOnlySpan<byte>) (payload: int) =
         let p = output.Scratch
@@ -612,9 +674,10 @@ type TunPath(output: ITunOutput, counters: TunCounters, localIp: uint32, localPo
     // ---- demotion ---------------------------------------------------------------------
 
     /// A path with data in flight and no delivery for max(1 s, 3 RTO) is demoted (spec: slow
-    /// subflows are demoted, not dropped): it takes no new frames and its in-flight bytes
-    /// leave the group's sum, so one dead path cannot hold the shared cwnd of the others.
-    /// Repairs go on; the first delivery restores it.
+    /// subflows are demoted, not dropped): it takes no new frames, so one dead path cannot
+    /// hold the shared cwnd of the others. Its in-flight bytes stay in the group's sum (the
+    /// hidden-bytes variant let the survivors overshoot the bottleneck); the repairs that go
+    /// on are charged like any other, and the first delivery restores it.
     let isDemoted (now: int64) =
         let rto = max (1.15 * srttNs) (srttNs + 10_000_000.0)
         let after = max 1_000_000_000L (int64 (3.0 * rto))
@@ -643,7 +706,23 @@ type TunPath(output: ITunOutput, counters: TunCounters, localIp: uint32, localPo
     let catchUp (now: int64) =
         let gap = now - seenNs
         seenNs <- now
+        // Sample the gap and the outstanding-work state BEFORE the shift below.
+        //
+        // What this sample is allowed to claim: the interval since the previous `catchUp` call,
+        // and the work-queue state at THIS entry, i.e. as left by whatever last touched this path.
+        // What it must not claim: the state *during* the gap. `catchUp` is the first statement in
+        // `OnSegmentCore`, `SendReliable`, `ServiceCore` and `TryBeginFrame`, so any of those
+        // entries would itself have reset `seenNs`; but `OnSyn` mutates state (rcvNxt, peerMss,
+        // window, sndUna, SYN-ACK) without sampling, and the clock source is bounded to 1 ms per
+        // 32 reads, so a gap's interior is not observable here. Treat these counters as
+        // "outstanding when the gap was noticed", never as "outstanding for the whole gap".
+        if gap > counters.MaxGapNs then counters.MaxGapNs <- gap
         if gap > stallNs then
+            if ringCount > 0 then
+                counters.GapsWithUnacked <- counters.GapsWithUnacked + 1L
+                if gap > counters.MaxUnackedGapNs then counters.MaxUnackedGapNs <- gap
+            elif ivCount > 0 || rtoActive then counters.GapsWithWork <- counters.GapsWithWork + 1L
+            else counters.GapsWithoutWork <- counters.GapsWithoutWork + 1L
             let d = gap - 1_000_000L
             counters.ClockJumps <- counters.ClockJumps + 1L
             jumpNs <- now
@@ -672,6 +751,20 @@ type TunPath(output: ITunOutput, counters: TunCounters, localIp: uint32, localPo
         // RACK time (RFC 8985 6.2): a repaired segment counts only when the ACK cannot be
         // for its first copy (at least min RTT after the repair). Otherwise a late ACK of the
         // first copy would make every segment sent before the repair look lost.
+        // Reordering evidence (RFC 8985 6.2): either an unrepaired segment sent before one
+        // already delivered arrived late, or a repaired segment was ACKed within less than
+        // minRtt of its repair (proving its original copy arrived late — spurious retransmit).
+        // Its span bounds how far an unacked segment may lag rackSentNs before RACK declares
+        // it lost, stopping reordering from multiplying repairs on the wire.
+        if rackSentNs > 0L then
+            let cap = if minRttNs <> Int64.MaxValue then min (minRttNs / 4L) 20_000_000L else 20_000_000L
+            if s.Retx = 0 && s.SentNs < rackSentNs then
+                let span = min cap (max 1_000_000L (rackSentNs - s.SentNs))
+                if span > reoWndNs then reoWndNs <- span
+            elif sackReordSeen && s.Retx > 0 && minRttNs <> Int64.MaxValue && now - s.SentNs < minRttNs then
+                let step = max 1_000_000L (max (minRttNs / 8L) (now - s.SentNs))
+                let nextWnd = min cap (reoWndNs + step)
+                if nextWnd > reoWndNs then reoWndNs <- nextWnd
         if s.SentNs > rackSentNs && (s.Retx = 0 || now - s.SentNs >= minRttNs) then rackSentNs <- s.SentNs
         let ackElapsed = now - s.DeliveredNs
         let sendElapsed = s.SentNs - s.FirstSentNs
@@ -692,7 +785,10 @@ type TunPath(output: ITunOutput, counters: TunCounters, localIp: uint32, localPo
                 if r < minRttNs || now - minRttStamp > 10_000_000_000L then
                     minRttNs <- r
                     minRttStamp <- now
-            if interval > 0L then
+            // One controller per bottleneck: once the group has an estimate it owns rate and
+            // pacing, and this path keeps only RTT, RACK and RTO state (the two local phase
+            // clocks were fighting over the same BDP).
+            if interval > 0L && not group.Ready then
                 let rate = float (delivered - s.Delivered) / float interval
                 let slot = int (round % int64 bwRounds.Length)
                 if rate > bwRounds.[slot] then bwRounds.[slot] <- rate
@@ -727,11 +823,15 @@ type TunPath(output: ITunOutput, counters: TunCounters, localIp: uint32, localPo
                         draining <- true
 
     /// Send segment i again: exact bytes for the head part, new content for a frame
-    /// (borrowed shell). HOLE-2: min(2 + j, 4) copies for the j-th repair.
+    /// (borrowed shell). Two copies, the HOLE-2 redundancy that keeps one lost repair copy
+    /// from costing another round on a lossy link. It no longer grows to four: on a 24 %
+    /// loss path the escalation doubled the wire cost of every repeatedly-repaired segment,
+    /// and a segment that loses both copies is repaired again in the next round.
+    /// RACK time (RFC 8985 6.2) is the comment below, kept where the stamps it reads are set.
     let repair (i: int) (now: int64) =
         let s = &ring.[at i]
         let p = output.Scratch
-        let copies = min (2 + s.Retx) 4
+        let copies = 2
         let mutable filled = true
         if s.Kind = 0uy then
             let off = int (s.Seq - relBase)
@@ -804,7 +904,7 @@ type TunPath(output: ITunOutput, counters: TunCounters, localIp: uint32, localPo
             let i = if ringCount > 0 then find seq else 0
             if i < ringCount && ring.[at i].Seq = seq && ring.[at i].Due && not ring.[at i].Sacked then
                 let s = &ring.[at i]
-                let copies = min (2 + s.Retx) 4
+                let copies = 2
                 if repairAllowed (copies * s.Length) now then
                     repairQ.Dequeue() |> ignore
                     s.Due <- false
@@ -839,6 +939,7 @@ type TunPath(output: ITunOutput, counters: TunCounters, localIp: uint32, localPo
             let l = unwrapTx (BinaryPrimitives.ReadUInt32BigEndian(options.Slice(blocksAt + 8 * b)))
             let r = unwrapTx (BinaryPrimitives.ReadUInt32BigEndian(options.Slice(blocksAt + 8 * b + 4)))
             if l >= sndUna && r <= sndNxt && l < r then
+                if l > sndUna then sackReordSeen <- true
                 if r > highSacked then highSacked <- r
                 let mutable i = find l
                 while i < ringCount && ring.[at i].Seq + uint64 ring.[at i].Length <= r do
@@ -847,12 +948,19 @@ type TunPath(output: ITunOutput, counters: TunCounters, localIp: uint32, localPo
                         s.Sacked <- true
                         onDelivered &s now
                     i <- i + 1
-        // RACK, reordering window 0 (HOLE-1): a segment sent before a delivered one is lost.
+            elif l < sndUna && l < r then
+                // D-SACK (RFC 2883 / RFC 8985 6.2): peer received a duplicate of already-ACKed
+                // bytes, proving a spurious retransmit; widen the reordering window.
+                sackReordSeen <- true
+                let cap = if minRttNs <> Int64.MaxValue then min (minRttNs / 4L) 20_000_000L else 20_000_000L
+                if cap > reoWndNs then reoWndNs <- max reoWndNs (min cap (max 1_000_000L (cap / 2L)))
+        // RACK (RFC 8985): a segment sent before a delivered one, by more than the reordering
+        // window, is lost. The window is 0 until this path shows reordering (see reoWndNs).
         if n > 0 then
             let mutable i = 0
             while i < ringCount && ring.[at i].Seq < highSacked do
                 let s = &ring.[at i]
-                if not s.Sacked && s.SentNs < rackSentNs then requestRepair i
+                if not s.Sacked && s.SentNs + reoWndNs < rackSentNs then requestRepair i
                 i <- i + 1
             drainRepairs now
         if draining && inflight <= int (btlBw * float minRttNs) then
@@ -870,6 +978,10 @@ type TunPath(output: ITunOutput, counters: TunCounters, localIp: uint32, localPo
     member _.BottleneckBw = btlBw
     /// Send time of the newest segment known delivered (RACK).
     member _.RackSentNs = rackSentNs
+    /// The proven reordering span (RFC 8985): 0 until this path shows a late arrival, then the
+    /// observed span capped at min(minRtt/4, 20 ms). Exposed so a test can assert that a pure
+    /// reorder widens the window instead of turning into a repair.
+    member _.ReoWndNs = reoWndNs
     member _.SrttNs = srttNs
     member _.Inflight = inflight
     /// Unique payload bytes acknowledged (ACK/SACK evidence).
@@ -894,6 +1006,7 @@ type TunPath(output: ITunOutput, counters: TunCounters, localIp: uint32, localPo
         + " acc_b=" + string bytesAccepted + " sw_b=" + string swallowedBytes
         + " ack_b=" + string (if dataPhase then int64 (rcvNxt - data0) else 0L)
         + " late_b=" + string lateFirstLocal
+        + " reo_ms=" + (float reoWndNs / 1e6).ToString("F1")
         + (if demoted then " demoted" else "")
     /// The HTTP head and bootstrap frame are whole: BootFrame holds the frame. -2: bad head.
     member _.BootState = if bootAt = -2 then -2 elif bootAt >= 0 && headLen >= bootAt + Layout.BootFrameLength then 1 else 0
@@ -919,7 +1032,9 @@ type TunPath(output: ITunOutput, counters: TunCounters, localIp: uint32, localPo
         rcvNxt <- wrapBase + uint64 seq + 1UL
         headAt <- rcvNxt
         peerMss <- if m > 0 then min m mss else 536
-        peerScale <- max 0 ws
+        peerScale <- if ws >= 0 then min 14 ws else 0
+        // Without WS the receive window is never scaled: advertise min (windowBytes, 65535).
+        ourScale <- if ws >= 0 then 7 else 0
         sackOk <- sack
         sndUna <- wrapBase + uint64 isn
         sndNxt <- sndUna + 1UL
@@ -945,7 +1060,6 @@ type TunPath(output: ITunOutput, counters: TunCounters, localIp: uint32, localPo
         o.Slice(0, len).CopyTo(Span synAckOptions)
         synAckLength <- len
         send (Packet.Syn ||| Packet.Ack) sndUna (Span<byte>.op_Implicit (o.Slice(0, len))) 0
-        if ws < 0 then peerScale <- 0
 
     /// A non-SYN segment of this connection; packet is the whole IP packet.
     member private _.OnSegmentCore(seg: Packet.Segment, packet: Span<byte>, now: int64) =
@@ -1076,7 +1190,12 @@ type TunPath(output: ITunOutput, counters: TunCounters, localIp: uint32, localPo
                     i <- i + 1
                 if i >= ringCount || rtoSeq >= rtoEnd then rtoActive <- false
             drainRepairs now
-            if not startup && not draining && minRttNs <> Int64.MaxValue && now - cycleNs > minRttNs then
+            // The 8-phase gain cycle belongs to this path's own pacer. Once the group holds
+            // the estimate it is the single controller of the shared bottleneck (spec Q-2),
+            // so rotating a second phase clock here only spends CPU: pacingGain and
+            // cwnd are not consulted on the group path.
+            if not group.Ready && not startup && not draining && minRttNs <> Int64.MaxValue
+               && now - cycleNs > minRttNs then
                 cycle <- (cycle + 1) % 8
                 cycleNs <- now
 
@@ -1136,6 +1255,9 @@ type TunPath(output: ITunOutput, counters: TunCounters, localIp: uint32, localPo
     member this.Service(now: int64) =
         // The last backlog the session reported still stands: not an app-limited round.
         if backlog >= RateGroup.BacklogFrames then group.NoteBacklog()
+        // A waiting repair the pacer has not paid for is a backlog the transport holds, not
+        // an application that ran dry: the group must not read this round as app-limited.
+        if repairQ.Count > repairBurst then group.NoteLimited()
         try this.ServiceCore now
         with ex -> this.Faulted ex
 
@@ -1148,6 +1270,9 @@ type TunPath(output: ITunOutput, counters: TunCounters, localIp: uint32, localPo
     interface IRateMember with
         // Use the flag ServiceCore refreshes once per tick; do not call
         // isDemoted(NowNs) here (that was O(n) AnyDeliveredSince per path).
+        // A demoted path takes no new frames, so its bytes are not queued at the shared
+        // bottleneck: keeping them in the sum starved every healthy path (TunTests: one dead
+        // peer left inflight=571660 while goodput was 0). Its repairs are still charged.
         member _.Inflight = if demoted then 0 else inflight
         member _.Delivered = delivered
         member _.CopyEstimate = copyEstimate
@@ -1190,13 +1315,25 @@ type TunPath(output: ITunOutput, counters: TunCounters, localIp: uint32, localPo
             let now = clock.NowNs()
             catchUp now
             if state <> TunState.Established || not attached || frameLength > peerMss then false
-            // Waiting repairs go before new frames.
-            elif repairQ.Count > 0 && (drainRepairs now; repairQ.Count > 0) then false
+            // Waiting repairs go before new frames, but only while they are more than one
+            // burst: a queue that never empties (the pacer defers, the hole is on a slow
+            // path) must not stop this path from carrying new data, which is what turned a
+            // lossy link into a retransmit-only one.
+            elif repairQ.Count > 0 && (drainRepairs now; repairQ.Count > repairBurst) then
+                group.NoteLimited()
+                false
             else
                 let l = frameLength
                 let bulk = backlog >= RateGroup.BacklogFrames
-                if int (sndNxt + uint64 l - sndUna) > peerWnd then false
-                elif isDemoted now then false
+                if int (sndNxt + uint64 l - sndUna) > peerWnd then
+                    // The peer, not the application, is holding this path: a real sample.
+                    if bulk then group.NoteLimited()
+                    false
+                elif isDemoted now then
+                    // Demotion held this path, not an idle application: the round is a
+                    // real sample, not evidence that the sender ran dry.
+                    if bulk then group.NoteLimited()
+                    false
                 elif group.Ready then
                     // The group gates the shared bottleneck; this path keeps its estimate.
                     if group.TryTake(l, bulk) then

@@ -1,8 +1,7 @@
 /// Async mode switch for Server and Client.
 ///
-/// The environment variable is the only switch. Anything but an explicit
-/// enable keeps the synchronous loop, so a typo cannot silently move a
-/// production node onto the experimental path.
+/// Async (per-session coordinator + AsyncPollerGroup) is the default; only an
+/// explicit `TBTUN_ASYNC_MODE=0|false|off|disabled` selects the synchronous loop.
 module Tbt.Cli.AsyncMode
 
 open System

@@ -7,7 +7,10 @@
     <InvariantGlobalization>true</InvariantGlobalization>
     <UseSystemResourceKeys>true</UseSystemResourceKeys>
     <ServerGarbageCollector>false</ServerGarbageCollector>
-    <ConcurrentGarbageCollection>false</ConcurrentGarbageCollection>
+    <!-- Workstation concurrent GC: a 2-vCPU VPS cannot afford stop-the-world
+         collections. The previous `false` blocked every thread for 50-120 ms
+         and those pauses landed on the packet path (iter_max_us 71-114 ms). -->
+    <ConcurrentGarbageCollection>true</ConcurrentGarbageCollection>
   </PropertyGroup>
   <ItemGroup>
     <Compile Include="Common.fs" />

@@ -45,7 +45,13 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
             rho0: float, fecAdaptive: bool, rhoMin: float, rhoMax: float, rhoFloor: float,
             rhoGain: float, fecWindowCells: int,
             maxPaths: int, queueLimit: int, clock: IClock) =
-    let capacity = 1 <<< 16
+    /// Per-step rings. A power of two that covers the encoder window: at the default
+    /// 4096-step window this is 4096 slots instead of a fixed 65536, which removed about
+    /// 3 MiB of per-session arrays that no window could ever index.
+    let capacity =
+        let mutable c = 1024
+        while c < encoder.Capacity do c <- c * 2
+        c
     let stepParities: byte[] = Array.zeroCreate capacity
     let stepFlags: MetaFlags[] = Array.zeroCreate capacity
     /// Next parity index for a hole fill of the step (starts at m_t, spec 6.7.2 priority 2).
@@ -78,25 +84,85 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
     /// every missing cell, including those FEC repaired, so this signal is
     /// unbiased: raising rho does not hide loss from the estimator.
     let mutable peerErasure = 0.05
+    /// Recent srtt / minRtt ratio, refreshed by `OnPeerErasure`. Above 1.65 the path is
+    /// queueing behind its own sends, and that is the spec's congestion signal: the loss is
+    /// then ours, so adding parity only feeds the queue that causes it.
+    let mutable rttRatio = 1.0
     let smooth = 1.0 / float (max 1 fecWindowCells)
 
     /// Track rho = safety * loss / (1 - loss): the parity ratio that covers the
     /// measured loss, floored so a quiet path still carries protection. Each
     /// direction owns its TxHalf, so uplink and downlink never copy each other.
-    let adaptRho (e: float) =
+    let adaptRho (mean: float) (burst: float) =
+        // Spec 6.10 gives the peer both the mean and the p95 of its 10 ms window series.
+        // Sizing rho on the mean alone leaves every burst step short of parity, and a step
+        // cannot borrow parity from its neighbours, so blend the two.
+        // Mean-anchored blend. A 0.65 weight on `burst` was over-taxing a lossy link: the peer's
+        // p95 is taken over 10 ms windows, and on a path that queues past the cell deadline that
+        // percentile saturates at 1.0 while the mean is still 0.32 — so `0.65*1.0` alone asked for
+        // rho 0.65, i.e. 40 % of the wire spent on parity that then queues further (live round 5:
+        // rho 0.406, srtt 748-825 ms, probes p50 829 ms on a 16 %-loss link).
+        //
+        // Two guards, both on the consumer side because the percentile itself is spec 6.10 and must
+        // keep reporting the window series unchanged:
+        //   · `burst` is truncated at `mean + 0.25`. A p95 of 1.00 from a two-cell window may add a
+        //     tail allowance, it may not weigh as one full window; the allowance scales with the
+        //     mean, so a genuinely bursty link (mean high) still gets the extra parity.
+        //   · the mean keeps its own weight, so the report that actually tracks the wire rate is
+        //     never diluted below `0.70 * mean`.
+        let tail = min burst (mean + 0.25)
+        let e = max mean (0.70 * mean + 0.30 * tail)
         peerErasure <- peerErasure + (e - peerErasure) * smooth
         if fecAdaptive then
             let target =
                 min rhoMax (max rhoFloor (rhoGain * peerErasure / max 0.05 (1.0 - peerErasure)))
-            if target > rho + 0.01 then rho <- min target (rho + 0.02)
-            elif target < rho - 0.01 then rho <- max target (rho - 0.005)
-        erasure <- max 1e-4 (min 0.9 peerErasure)
+            // Rise fast enough to cover a loss step within a couple of reports, fall
+            // slowly so one quiet moment cannot strip the protection off a lossy path.
+            // A standing queue (srtt well above minRtt) means the loss is our own, so do not
+            // chase it upward: more parity would add load to the queue that caused it.
+            // Congestion means a standing queue well beyond the loss-driven stall. At 24 %
+            // loss with rho at 0.32 the frontier is still waiting on TCP retransmissions, so
+            // srtt sits near 2x minRtt from loss alone; treating 1.65x as congestion parked
+            // rho at 0.324, gave only 5 parities per 16 sources (54 % first-round decode) and
+            // kept the stall that produced the ratio. 2.0x separates them: loss-driven waiting
+            // stays under it, real queueing does not.
+            let congested = rttRatio > 2.0
+            // A standing queue alone must never hold redundancy at zero. With rho pinned at its
+            // floor on a 24 %-loss carrier, every step's frontier waits for a TCP retransmission,
+            // which by itself keeps srtt at two to three times minRtt — so the brake that was
+            // meant to stop chasing congestion locked rho at 0.035 while firing 11 013 boosters
+            // (live round 2). Cover the erasure the peer actually reports first; that is what
+            // drains the stall that looks like congestion.
+            let neededFloor = min 0.40 target
+            // ...but only while the queue is not ours. `neededFloor` exists to break the deadlock
+            // where rho sat at its floor, every step waited for a TCP retransmission, and the srtt
+            // that resulted *looked* like congestion (live round 2). It must not become the opposite
+            // deadlock: when `congested` already holds, a report of 0.32-0.64 is partly the queue
+            // itself, and climbing to 0.40 on it adds the parity that deepens that queue. Hold the
+            // current ratio and let the drain branch below pull it toward 0.30.
+            if rho < neededFloor && not congested then
+                rho <- min target (rho + 0.06)
+            elif target > rho + 0.01 then
+                if not congested then rho <- min target (rho + 0.08)
+            elif target < rho - 0.01 then rho <- max target (rho - 0.02)
+            elif congested && rho > 0.30 then
+                // Drain the parity ratio while the queue that produced the loss is standing.
+                rho <- max 0.30 (rho - 0.02)
+        // A reliable TCP carrier hides most loss behind retransmission, so the reported rate
+        // must never be read as pure "wire" truth: cap it where the controller can still
+        // trust it. Above this the parity ratio only adds queueing, which the live run showed
+        // as 0.92 reported loss, rho 0.65 and 400-790 ms SRTT (a self-feeding loop).
+        erasure <- max 1e-4 (min 0.45 peerErasure)
     /// First-copy DATA/PARITY cells per step (not BOOSTERs), still in the window.
     let uniqueCells: int[] = Array.zeroCreate capacity
     // DATA can be selected from either the original queue or a repair fallback.
     // One bit per source slot records the first successful Seal, not queue origin.
     // Reuse follows encoder lifetime; custody alone must not clear this mask.
     let renderedData: uint16[] = Array.zeroCreate encoder.Capacity
+    /// Steps the peer's WIN_ACK decoded bitmap confirmed (spec 6.10). Repair, extra parity
+    /// and BOOSTER for them are pure waste, and they prove the hole below them. Cleared
+    /// when the step is sealed again.
+    let peerDecoded: bool[] = Array.zeroCreate encoder.Capacity
     let mutable uniqueRendered = 0L
     /// Cumulative first-copy cells the peer has in custody (sum of uniqueCells over acked steps).
     let mutable uniqueAcked = 0L
@@ -104,7 +170,10 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
     /// that are still ahead of peer_ack. Client uplink rate samples use this.
     let mutable uniqueArrived = 0L
     /// Repair (spec 5.8): BOOSTER cells go before all other cells.
-    let repairs = Queue<Candidate>(256)
+    /// Repair queue depth. A fixed 256 slots silently dropped repairs under a bursty
+    /// 24 %-loss link, which is exactly when they matter.
+    let repairCapacity = 1024
+    let repairs = Queue<Candidate>(repairCapacity)
     /// Interactive steps (spec 16.3 CR-1): one small session-level reserve, sent before the
     /// bulk queue. Bulk leaves reserveSteps of the peer's step grant to it (CR-4: no grant
     /// already given to bulk is taken back).
@@ -247,6 +316,7 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
         spilled.[index t] <- spillPending && not wasUrgent
         spillPending <- false
         renderedData.[si] <- 0us
+        peerDecoded.[si] <- false
         sealNs.[si] <- clock.FreshNs()
         firstSendNs.[si] <- 0L
         lastRepairNs.[si] <- 0L
@@ -521,10 +591,16 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
     member _.InitialGrant(limit: uint64) = if limit > grantLimit then grantLimit <- limit
 
     /// The peer's report of its erasure rate of our cells.
-    member _.OnPeerErasure(q16: uint16) =
-        let e = float q16 / 65536.0
+    member _.OnPeerErasure(q16: uint16, ?q95: uint16) =
+        let mean = float q16 / 65536.0
+        let burst = float (defaultArg q95 q16) / 65536.0
         let before = erasure
-        adaptRho e
+        // Refresh the queueing ratio the rho controller reads: a real minRtt sample and a
+        // srtt above it mean this direction is queueing behind its own sends.
+        let minRtt = min minCurNs minPrevNs
+        if minRtt <> Int64.MaxValue && minRtt > 0L then
+            rttRatio <- srttNs / float minRtt
+        adaptRho mean burst
         if abs (erasure - before) > 0.01 then
             for k in 1 .. 16 do smallParities.[k] <- SmallStep.parities k erasure
 
@@ -573,6 +649,67 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
             peerSeenHi <- thi
             refreshUniqueArrived ()
 
+    /// The peer's selective ack (spec 6.10): bit j of b0..b3 is step t_lo + 1 + j decoded
+    /// on its own. Two uses: never repair a step the peer already has, and read the
+    /// frontier's hole off the bitmap instead of waiting a whole round trip for a NACK.
+    member this.OnPeerDecodedBitmap(ackLo: uint64, b0: uint64, b1: uint64, b2: uint64, b3: uint64) =
+        if b0 <> 0UL || b1 <> 0UL || b2 <> 0UL || b3 <> 0UL then
+            let mutable highest = 0UL
+            let mutable count = 0
+            for j in 0 .. 255 do
+                let bits = if j < 64 then b0 elif j < 128 then b1 elif j < 192 then b2 else b3
+                if (bits >>> (j % 64)) &&& 1UL <> 0UL then
+                    let t = ackLo + 1UL + uint64 j
+                    if t >= peerAck && t < encoder.Head then
+                        peerDecoded.[int (t % uint64 peerDecoded.Length)] <- true
+                        highest <- t
+                        count <- count + 1
+            // Three decoded steps above the frontier prove the frontier's copies are not
+            // merely reordered: later cells already crossed the link and decoded.
+            if not newRepair && count >= 3 && highest >= ackLo + 4UL then this.ArmProvenHole ackLo
+
+    /// Close a proven frontier hole now instead of after the 1.05 x minRTT NACK timer.
+    /// Only when the reorder window since the step's first copy has already passed, so a
+    /// late-but-healthy cell is never retransmitted on a guess.
+    member private this.ArmProvenHole(t: uint64) =
+        let si = int (t % uint64 sealNs.Length)
+        if t >= peerAck && t < encoder.Head && encoder.StepUsed t > 0
+           && not peerDecoded.[si] && repairs.Count < repairCapacity then
+            let now = clock.FreshNs()
+            let minRtt = min minCurNs minPrevNs
+            let sentAt = firstSendNs.[si]
+            let reference = if sentAt > 0L then sentAt else sealNs.[si]
+            let waited =
+                minRtt <> Int64.MaxValue
+                && reference > 0L
+                && now - reference >= minRtt + int64 this.ReoWndNs
+            // At most one bitmap-triggered micro-repair per step per RTT. The bitmap rides
+            // every WIN_ACK (10 ms) and at 24 % loss the frontier lags almost always, so
+            // without this cooldown the same hole was re-armed on every report: the live run
+            // emitted 26 402 BOOSTERs for a handful of holes.
+            let cooled =
+                lastRepairNs.[si] = 0L
+                || now - lastRepairNs.[si] >= max 100_000_000L minRtt
+            if waited && cooled then
+                if lastRepairNs.[si] > 0L then repairRepeats <- repairRepeats + 1L
+                lastRepairNs.[si] <- now
+                pendingDeficit.[si] <- 0
+                nextDeadlineNs.[si] <- 0L
+                repairLo <- t
+                repairSpan <- 1
+                repairNs <- now
+                repairDeficit <- 1
+                // One BOOSTER per proven hole per cooldown. Two copies on every report added a
+                // second full copy of the wire load on top of rho, on a link whose queueing is
+                // exactly what widening rho should relieve.
+                let n = 1
+                if repairCount.[si] + n <= 256 then
+                    for i in 0 .. n - 1 do
+                        repairs.Enqueue
+                            { Kind = CellType.Booster; Step = t; Index = byte (repairCount.[si] + i)
+                              Span = 1uy; Round = byte n }
+                    repairCount.[si] <- repairCount.[si] + n
+
     /// Deadline for step t: if a later-sealed step has been seen, wait until
     /// that step's seal + minRTT + reo_wnd (it has already been acknowledged,
     /// and a short reorder window remains). Otherwise this is a tail loss:
@@ -605,7 +742,8 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
 
     /// Record a NACK against step t and insert it into the deadline heap.
     member private this.ArmStep(t: uint64, deficit: int) =
-        if t < peerAck || t >= encoder.Head || encoder.StepUsed t = 0 || deficit < 1 then ()
+        if t < peerAck || t >= encoder.Head || encoder.StepUsed t = 0 || deficit < 1
+           || peerDecoded.[int (t % uint64 peerDecoded.Length)] then ()
         else
             let si = int (t % uint64 sealNs.Length)
             let sealAt = sealNs.[si]
@@ -623,23 +761,34 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
         let deficit = pendingDeficit.[si]
         if deficit < 1 then ()
         else
-            let room = max 0 (256 - repairs.Count)
-            let n = min room (min 64 (int (ceil (float (deficit + 2) / (1.0 - min 0.9 erasure)))))
-            if room = 0 || n < 1 then ()
+            let room = max 0 (repairCapacity - repairs.Count)
+            // One or two cells per missing rank is enough: a BOOSTER repairs a rank, not a
+            // packet. The old `1 - min 0.9 erasure` divisor exploded to 30-64 copies per hole
+            // as soon as the peer's estimate climbed (the live run emitted 26 402 BOOSTERs in
+            // 40 s, ~700/s, which queued the link behind itself and pushed the estimate even
+            // higher). Cap the divisor at 0.45, cap the burst at 12, and fill the 256 seeds
+            // exactly instead of skipping the remainder.
+            let divisor = 1.0 - min 0.45 erasure
+            let want = min 12 (max (deficit + 1) (int (ceil (float (deficit + 2) / divisor))))
+            let seedsLeft = max 0 (256 - repairCount.[si])
+            let n = min room (min want seedsLeft)
+            if room = 0 || (n < 1 && seedsLeft > 0) then ()
             else
                 if lastRepairNs.[si] > 0L then repairRepeats <- repairRepeats + 1L
                 lastRepairNs.[si] <- now
                 pendingDeficit.[si] <- 0
                 nextDeadlineNs.[si] <- 0L
-                if repairCount.[si] + n <= 256 then
+                if n > 0 then
                     for i in 0 .. n - 1 do
                         repairs.Enqueue
                             { Kind = CellType.Booster; Step = t; Index = byte (repairCount.[si] + i)
                               Span = 1uy; Round = byte n }
                     repairCount.[si] <- repairCount.[si] + n
                 else
+                    // All 256 BOOSTER seeds of this step are used: fall back to its DATA cells,
+                    // which is the last recovery channel a real lossy link has.
                     for s in 0 .. encoder.StepUsed t - 1 do
-                        if repairs.Count < 256 then
+                        if repairs.Count < repairCapacity then
                             repairs.Enqueue { Kind = CellType.Data; Step = t; Index = byte s; Span = 0uy; Round = 0uy }
 
     /// Pop every step whose deadline has passed; O(due this call).
@@ -650,7 +799,7 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
             let now = clock.FreshNs()
             let mutable step = 0UL
             let mutable deadline = 0L
-            while repairs.Count < 256 && dueQ.TryPeek(&step, &deadline) && deadline <= now do
+            while repairs.Count < repairCapacity && dueQ.TryPeek(&step, &deadline) && deadline <= now do
                 dueQ.Dequeue() |> ignore
                 let si = int (step % uint64 nextDeadlineNs.Length)
                 if nextDeadlineNs.[si] <> deadline then ()
@@ -697,7 +846,7 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
                     // holes recovers in one round trip instead of one round trip per hole.
                     // Each step keeps its own 256-seed budget; the guarded step only falls
                     // back to DATA after its seeds are exhausted (spec 5.8 contract).
-                    let room = max 0 (256 - repairs.Count)
+                    let room = max 0 (repairCapacity - repairs.Count)
                     let per = max 1 (int (ceil (float deficit / float span)))
                     let want = min 64 (int (ceil (float (per + 2) / (1.0 - min 0.9 erasure))))
                     let n = min room want
@@ -706,11 +855,11 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
                         for j in 0 .. span - 1 do
                             let t = tLo + uint64 j
                             let si = int (t % uint64 repairCount.Length)
-                            if repairs.Count < 256 && encoder.StepUsed t > 0 then
+                            if repairs.Count < repairCapacity && encoder.StepUsed t > 0 then
                                 let before = repairs.Count
                                 if repairCount.[si] + n <= 256 then
                                     for i in 0 .. n - 1 do
-                                        if repairs.Count < 256 then
+                                        if repairs.Count < repairCapacity then
                                             repairs.Enqueue
                                                 { Kind = CellType.Booster; Step = t
                                                   Index = byte (repairCount.[si] + i)
@@ -718,7 +867,7 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
                                     repairCount.[si] <- repairCount.[si] + n
                                 else
                                     for s in 0 .. encoder.StepUsed t - 1 do
-                                        if repairs.Count < 256 then
+                                        if repairs.Count < repairCapacity then
                                             repairs.Enqueue
                                                 { Kind = CellType.Data; Step = t; Index = byte s
                                                   Span = 0uy; Round = 0uy }
@@ -766,12 +915,16 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
     member this.HasCandidate =
         if newRepair then this.DrainDueRepairs()
         let mutable c = Unchecked.defaultof<Candidate>
-        while repairs.TryPeek(&c) && c.Step + uint64 (max 1uy c.Span) <= peerAck do
+        while repairs.TryPeek(&c)
+              && (c.Step + uint64 (max 1uy c.Span) <= peerAck
+                  || peerDecoded.[int (c.Step % uint64 peerDecoded.Length)]) do
             repairs.Dequeue() |> ignore
-        while urgent.TryPeek(&c) && c.Step < peerAck do
+        while urgent.TryPeek(&c)
+              && (c.Step < peerAck || peerDecoded.[int (c.Step % uint64 peerDecoded.Length)]) do
             droppedAcked <- droppedAcked + 1L
             urgent.Dequeue() |> ignore
-        while queue.TryPeek(&c) && c.Step < peerAck do
+        while queue.TryPeek(&c)
+              && (c.Step < peerAck || peerDecoded.[int (c.Step % uint64 peerDecoded.Length)]) do
             droppedAcked <- droppedAcked + 1L
             queue.Dequeue() |> ignore
         repairs.Count > 0 || urgent.Count > 0 || queue.Count > 0
@@ -908,7 +1061,8 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
         while not found && t < last do
             let k = encoder.StepUsed t
             let p = int fillParity.[index t]
-            if k > 0 && p < 48 && encoder.TryRenderParity(t, p, field, false, symbol) then
+            if k > 0 && p < 48 && not peerDecoded.[int (t % uint64 peerDecoded.Length)]
+               && encoder.TryRenderParity(t, p, field, false, symbol) then
                 fillParity.[index t] <- byte (p + 1)
                 for i in 0 .. 5 do
                     let r = CodeGraph.Strides.[i]

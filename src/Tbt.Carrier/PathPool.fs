@@ -34,19 +34,21 @@ type PathPool(target: int, concurrency: int, baseDelayNs: int64, capDelayNs: int
     /// increasing and a later rebuild never reuses a value.
     member _.Request(nowNs: int64, present: HashSet<uint16>) : struct (uint16 * uint32)[] =
         let start = ResizeArray<struct (uint16 * uint32)>()
+        let mutable anySaturated = false
         let mutable id = 0
         while id < slots && id <= 65535 && inFlight.Count < cap do
             let key = uint16 id
             if not (present.Contains key) && not (inFlight.Contains key) && nowNs >= nextAt.[id] then
                 if incarnation.[id] > UInt32.MaxValue - uint32 stride then
                     // Never reuse an incarnation: stop rebuilding this id.
-                    saturated <- true
+                    anySaturated <- true
                     nextAt.[id] <- nowNs + max 1L capDelayNs
                 else
                     incarnation.[id] <- incarnation.[id] + uint32 stride
                     inFlight.Add key |> ignore
                     start.Add(struct (key, incarnation.[id]))
             id <- id + 1
+        saturated <- anySaturated
         start.ToArray()
 
     /// Reserve the next incarnation stride of a present id for a refresh JOIN (the

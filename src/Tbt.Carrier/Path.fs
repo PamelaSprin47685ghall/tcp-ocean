@@ -38,3 +38,9 @@ type IPath =
     /// Send the frame begun last.
     abstract CommitFrame: unit -> unit
     abstract Close: unit -> unit
+
+/// Optional per-path TCP health source for health-aware scheduling and targeted
+/// recovery. Paths that do not implement it (TUN paths, unit-test stubs) stay neutral.
+type IPathHealth =
+    abstract Health: PathHealth
+    abstract RefreshHealth: nowNs: int64 * minIntervalNs: int64 -> unit

@@ -43,10 +43,14 @@ module SocketTuning =
         elif requested > 262144 then 262144
         else requested
 
-    /// Async tx slots per path: 16 keeps the historical 32 KiB at 2 KiB/frame.
+    /// Async tx slots per path. The ring is the only place a frame can wait before send(2),
+    /// so by Little's law it caps a path at `slots * frameLength / RTT`: 16 slots at 2 KiB is
+    /// 32 KiB, i.e. 17 Mbit/s on a 341 ms path. The live 24 %-loss run measured exactly that
+    /// (19.4 Mbit/s) while the carrier itself was saturated. 64 slots is 128 KiB per path
+    /// (4 MiB across 32 pooled paths), and up to 256 is allowed for a long-RTT link.
     let txSlotsFor (requested: int) =
         if requested < 16 then 16
-        elif requested > 64 then 64
+        elif requested > 256 then 256
         else requested
 
     /// A carrier path whose sent data stays unacknowledged this long is dead.
@@ -211,6 +215,12 @@ module SocketTuning =
             try socket.SetRawSocketOption(6, 23, ReadOnlySpan(BitConverter.GetBytes queue))
             with :? SocketException -> ()
 
+    /// Gracefully tear down a TCP socket so FIN is sent cleanly before closing,
+    /// reducing lingering half-closed states during path replacement.
+    let closeGraceful (socket: Socket) =
+        try socket.Shutdown SocketShutdown.Both with _ -> ()
+        try socket.Dispose() with _ -> ()
+
     /// Linux TCP_INFO.tcpi_bytes_acked (offset 120), or -1 when unavailable.
     /// RFC 4898 thru octets acked: payload the peer has cumulatively ACKed.
     let tryBytesAcked (socket: Socket) =
@@ -232,3 +242,19 @@ module WriteGate =
     /// Pass 2 admits notsent ≤ 256 KiB: the product default.
     let admits (pass: int) (notSent: int) =
         admitsWith SocketTuning.GatePass2Limit pass notSent
+
+    /// Per-path adaptive pass-2 ceiling scaled to the path's own cwnd so low-BDP
+    /// paths do not build 6x self-queueing behind 256 KiB while high-BDP paths
+    /// retain the full configured ceiling. No link rate constant is hard-coded.
+    let adaptivePass2Limit (configuredMax: int) (cwndBytes: uint32) =
+        // One cwnd of headroom, floored at 64 KiB and capped at 96 KiB. Half a cwnd (the
+        // previous rule) starved the carrier exactly when SACK recovery shrank cwnd to
+        // 15-30 KiB: the kernel stayed application-limited, never filled the pipe, and cwnd
+        // had no reason to grow back. The absolute cap matters as much as the share: 256 KiB
+        // per path over 32 paths is 8 MB of kernel queue, which the live 24 %-loss run turned
+        // into 500-790 ms of self-inflicted RTT (minrtt_ms 626 vs 113 ms physical), and a deep
+        // queue is exactly what makes loss look like our own congestion.
+        if cwndBytes = 0u then configuredMax
+        else
+            let want = int (min (uint32 Int32.MaxValue) cwndBytes)
+            min configuredMax (min 98304 (max 65536 want))

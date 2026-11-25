@@ -294,16 +294,28 @@ type JoinAdmission(kPath: byte[], entropy: IEntropy, clock: IClock, sessionId: G
 
     /// Decide on an authenticated JOIN frame with request r. activePaths: paths the session
     /// serves now; pathAlive: whether r's path id is among them; closing: the session closes.
+    ///
+    /// Precondition: the frame is one `tryJoin` accepted (that is how `Server.decideJoin` calls
+    /// it — `tryJoin` first rejects a frame whose 1087-byte bootstrap wrapper is malformed, before
+    /// any decision is made). A peer therefore cannot reach this function with an unusable wrapper.
+    ///
+    /// The check below is a contract at the API boundary, not a fix for a peer-triggered crash:
+    /// if a future caller passes a frame it has not authenticated, the decision is `Close` — the
+    /// verdict the spec has for a frame that cannot be acted on — rather than an exception out of
+    /// a decision function. It deliberately does not claim to explain any past test-run exception:
+    /// an empty `Bootstrap.content` from a well-formed offer is still unexplained, and turning it
+    /// into `Close` here must not be counted as having diagnosed it (see the design record §5.8a).
     member this.Decide(frame: ReadOnlySpan<byte>, r: Join.JoinRequest, activePaths: int, pathAlive: bool, closing: bool) =
         let close = { Verdict = JoinVerdict.Close; Ack = Array.Empty<byte>(); Request = r }
         let p = int r.PathId
-        if p >= pathLimit then close
+        let c = Bootstrap.content frame
+        if p >= pathLimit || c.IsEmpty then close
         else
             let now = clock.NowNs()
             this.Expire now
             let jthBytes = Join.transcriptHash frame
             let jth = Convert.ToHexString jthBytes
-            let nonce = Convert.ToHexString(Bootstrap.content(frame).Slice(0, 16))
+            let nonce = Convert.ToHexString(c.Slice(0, 16))
             match records.TryGetValue jth with
             | true, struct (_, ack) ->
                 if ack.Length = 0 then close else { Verdict = JoinVerdict.Replay; Ack = ack; Request = r }

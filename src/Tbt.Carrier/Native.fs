@@ -84,11 +84,10 @@ let SIOCOUTQNSD = 0x894Bun
 let trySiocoutqnsd (handle: nativeint) =
     if not hasLibc.Value then -1
     else
-        let buf = Array.zeroCreate<byte> 4
+        let mutable value = 0
         try
-            use p = fixed &buf.[0]
-            if sysIoctl(int handle, SIOCOUTQNSD, NativePtr.toNativeInt p) = 0 then
-                BitConverter.ToInt32(buf, 0)
+            use p = fixed &value
+            if sysIoctl(int handle, SIOCOUTQNSD, NativePtr.toNativeInt p) = 0 then value
             else -1
         with :? DllNotFoundException | :? EntryPointNotFoundException -> -1
 
@@ -196,9 +195,8 @@ let tryTxQueueLen (name: string) (setTo: int option) =
 let trySetTunSndBuf (tunFd: int) (bytes: int) =
     if not hasLibc.Value then struct (false, bytes, 38)
     else
-        let buf = Array.zeroCreate<byte> 4
-        BitConverter.TryWriteBytes(Span buf, bytes) |> ignore
-        use p = fixed &buf.[0]
+        let mutable value = bytes
+        use p = fixed &value
         if sysIoctl(tunFd, TUNSETSNDBUF, NativePtr.toNativeInt p) < 0 then
             struct (false, bytes, lastError ())
         else struct (true, bytes, 0)

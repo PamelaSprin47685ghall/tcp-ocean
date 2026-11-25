@@ -133,7 +133,8 @@ let ``a demoted path's repairs are charged to the group and counted, one probe p
     for _ in 1 .. 3000 do step false
     let probes = c.DemotedRepairs - probes0
     Assert.InRange(probes, 1L, 4L)
-    // Each probe is charged to the group: 2..4 copies of one frame.
+    // Each probe is charged to the group: two copies of one frame (HOLE-2 keeps two so
+    // one more loss of the repair still recovers; the count never escalates past two).
     Assert.True(group.RepairBytes - bytes0 >= probes * 2L * int64 L)
 
 [<Fact>]

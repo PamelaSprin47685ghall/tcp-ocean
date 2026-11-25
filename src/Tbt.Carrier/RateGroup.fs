@@ -99,6 +99,16 @@ type RateGroup(clock: IClock) =
     let mutable cachedDelivered = 0L
     let mutable cachedCopies = 0L
     let mutable cachedLastDelivered = Int64.MinValue / 2L
+    /// Bytes charged by OnSent since the last scan. A member reports its own in-flight
+    /// counter only when scanned, so the group adds what it put on the wire after the
+    /// snapshot instead of walking every path for each frame.
+    let mutable sentSinceScan = 0L
+    let mutable lastScanNs = Int64.MinValue / 2L
+    /// The loop asks for its next wait (WaitUs/WaitMs) and then services the group; both used
+    /// to run the whole sample path, so one round could close two samples and advance the
+    /// phase cycle twice. A round is a round: service is idempotent at or before the last
+    /// instant already serviced.
+    let mutable lastServiceNs = Int64.MinValue / 2L
 
     let scan () =
         let mutable r = Int64.MaxValue
@@ -119,9 +129,16 @@ type RateGroup(clock: IClock) =
         cachedDelivered <- d
         cachedCopies <- c
         cachedLastDelivered <- last
+        lastScanNs <- clock.NowNs()
+        sentSinceScan <- 0L
+
+    /// Rescan at most every 500 us once steady (before the first delivery sample, always
+    /// scan so the 4-frame startup cwnd cap reacts immediately to member inflight).
+    let scanIfStale (now: int64) =
+        if bw = 0.0 || now - lastScanNs >= 500_000L then scan ()
 
     let minRtt () = cachedMinRtt
-    let inflight () = cachedInflight
+    let inflight () = cachedInflight + int sentSinceScan
     let delivered () = cachedDelivered
     let copyEstimate () = cachedCopies
 
@@ -154,7 +171,10 @@ type RateGroup(clock: IClock) =
     member _.AnyDeliveredSince(t: int64) =
         if cachedLastDelivered >= t then true
         else
-            scan ()
+            // isDemoted asks this once per path per tick, and the answer only decides a
+            // one-second threshold, so a slightly stale snapshot is harmless. Rescanning
+            // for every path was O(paths^2) member walks per tick at 256 paths.
+            scanIfStale (clock.NowNs())
             cachedLastDelivered >= t
 
     /// Last round in which no member delivered anything.
@@ -192,8 +212,8 @@ type RateGroup(clock: IClock) =
 
     /// Refill both buckets; returns the recovery reserve.
     member private _.Refill(l: int) =
-        scan ()
         let now = clock.NowNs()
+        scanIfStale now
         let rate = gain () * bw
         let depth = max (4.0 * float l) (rate * 2_000_000.0)
         let reserve = max (16.0 * float l) (rate * 2_000_000.0)
@@ -203,9 +223,25 @@ type RateGroup(clock: IClock) =
         tokensNs <- now
         reserve
 
+    /// In-flight bound of the group. The product is bounded before the conversion to int:
+    /// with no RTT sample yet minRtt is Int64.MaxValue, and an ACK burst once pushed bw to
+    /// 375 Mbit/s, so the raw product overflowed Int32 and turned into a negative cwnd - a
+    /// path that then never sends again. 256 MiB is far above any BDP this protocol carries
+    /// and stays inside Int32.
     member _.Cwnd(frameLength: int) =
         let g = if startup then 2.885 else cwndGain
-        int (g * bw * float (minRtt ())) + 4 * frameLength
+        let rtt = minRtt ()
+        // No RTT sample yet (Int64.MaxValue) or no rate yet: the group may hold 4 frames.
+        // Without this the product overflowed to the 256 MiB clamp and every caller saw an
+        // enormous cwnd before the first delivery sample (PaceTests: 4 frames expected).
+        if rtt <= 0L || rtt = Int64.MaxValue || bw <= 0.0 then 4 * frameLength
+        else
+            let raw = g * bw * float rtt
+            let bounded =
+                if Double.IsNaN raw then 0.0
+                elif Double.IsPositiveInfinity raw then 268_435_456.0
+                else min 268_435_456.0 (max 0.0 raw)
+            int bounded + 4 * frameLength
 
     /// May one more frame of l bytes go now? bulk: the session has a real backlog (a refusal
     /// then marks the round as not app-limited).
@@ -260,6 +296,13 @@ type RateGroup(clock: IClock) =
     /// The session has at least BacklogFrames frames queued (called once per write round).
     member _.NoteBacklog() = backlogged <- true
 
+    /// A round in which a path refused to send for a reason other than the pacer or cwnd (the
+    /// peer window, a backlog of waiting repairs). The sender had data, so this is not an
+    /// app-limited round: it must count as a real sample and must not feed the three-round
+    /// rule that restarts startup and makes a loaded group sprint again on a link whose
+    /// capacity it already measured.
+    member _.NoteLimited() = limited <- true
+
     /// The bulk threshold of the paths (TunPath `bulk`): a backlog of this many frames is
     /// data the sender could not put out, not an application that ran dry.
     static member BacklogFrames = 16
@@ -267,6 +310,7 @@ type RateGroup(clock: IClock) =
     member _.OnSent(bytes: int) =
         tokens <- tokens - float bytes
         sentBytes <- sentBytes + int64 bytes
+        sentSinceScan <- sentSinceScan + int64 bytes
 
     /// Repair copies (HOLE-2) take the same pacer as new frames: they load the same bottleneck.
     member _.OnRepair(bytes: int) =
@@ -340,7 +384,12 @@ type RateGroup(clock: IClock) =
                 for i in 0 .. memberCount - 1 do
                     if members.[i].Inflight > 0 then waiting <- waiting + 1
                 if waiting >= min 2 memberCount then outageNs <- now
-            elif now - sampleNs >= max rtt 5_000_000L then
+            elif now - sampleNs >= max rtt 5_000_000L && now > lastServiceNs then
+                // One sample per instant: the loop asks for its next wait (WaitUs/WaitMs runs
+                // this member to see whether the pacer would allow a frame) and then services
+                // the group again for the same round. Without this guard that round closed two
+                // samples and advanced the 8-phase cycle twice.
+                lastServiceNs <- now
                 let d = delivered ()
                 let cp = copyEstimate ()
                 // The bottleneck carried the unique bytes plus, by estimate, the extra copies:
@@ -374,7 +423,9 @@ type RateGroup(clock: IClock) =
                     let roundDone = d >= roundTarget
                     if roundDone then
                         deliveryRounds <- deliveryRounds + 1L
-                        roundTarget <- d + int64 (bw * float rtt)
+                        // At least one byte, so a zero estimate cannot make every sample
+                        // "end a round" and inflate the round counter.
+                        roundTarget <- d + max 1L (int64 (bw * float rtt))
                     if startup then
                         // Full-pipe only when this group has at least one BDP in flight.
                         // After idle, TryTake hits the 2 ms pacer (limited=true) with

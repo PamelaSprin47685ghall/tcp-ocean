@@ -258,3 +258,83 @@ let ``PathRefresher jitter spreads a new session's first refresh over maxAge*(1 
         most <- max most n
     Assert.Equal(256, total)
     Assert.True(most <= 16, sprintf "largest per-second batch %d" most)
+
+let private mkHealth (caState: byte) (deliveryRate: int64) (retransRate: float) (notSent: int) =
+    { PathHealth.unknown with
+        SampledNs = 1_000_000_000L
+        CaState = caState
+        RttUs = 113_000u
+        MinRttUs = 112_000u
+        CwndBytes = 65536u
+        DeliveryRate = deliveryRate
+        NotSentBytes = notSent
+        RetransRate = retransRate
+        Valid = true }
+
+[<Fact>]
+let ``PathRefresher DueDegraded does zero idle churn and only replaces degraded paths under load`` () =
+    let s = 1_000_000_000L
+    let r = PathRefresher(60L * s, 2, 0, s, 4, 10L * s)
+    for id in 0us .. 4us do r.NoteJoined(id, 0L)
+    let paths =
+        [| struct (0us, mkHealth 0uy 2_000_000L 0.02 0)       // healthy fast
+           struct (1us, mkHealth 0uy 2_100_000L 0.01 0)       // healthy fast
+           struct (2us, mkHealth 0uy 1_900_000L 0.03 0)       // healthy fast
+           struct (3us, mkHealth 4uy 2_000_000L 0.20 0)       // stuck in TCP_CA_Loss
+           struct (4us, mkHealth 0uy   200_000L 0.10 4096) |] // BBR collapsed < med/4 with demand
+    // Idle: ZERO refreshes even when degraded paths are past maxAge.
+    Assert.Empty(r.DueDegraded(120L * s, paths, true, true))
+    // Active: picks the two degraded paths (Loss first, then BBR-collapsed), never healthy 0..2.
+    let picked = r.DueDegraded(121L * s, paths, true, false)
+    Assert.Equal<uint16[]>([| 3us; 4us |], picked)
+    // Next tick: remaining healthy paths are left untouched.
+    Assert.Empty(r.DueDegraded(122L * s, paths, true, false))
+
+[<Fact>]
+let ``CcNudgePlan precomputes score once per eligible key and DueDegraded skips idle and healthy sockets`` () =
+    let s = 1_000_000_000L
+    let keys = Array.init 16 (fun i -> box i)
+    let p = CcNudgePlan<obj>(10L * s, s, true)
+    p.Due(s, keys, fun _ -> 0L) |> ignore
+    let mutable calls = 0
+    let picked =
+        p.Due(11L * s, keys, fun k ->
+            calls <- calls + 1
+            int64 (100 - unbox<int> k))
+    // O(n) precomputation, not O(n log n) calls inside comparator.
+    Assert.Equal(keys.Length, calls)
+    Assert.Equal<obj[]>([| box 15; box 14 |], picked)
+    // DueDegraded: idle => empty; active => only Loss / BBR-collapsed.
+    let p2 = CcNudgePlan<obj>(10L * s, s, true)
+    let snaps =
+        [| struct (keys.[0], mkHealth 0uy 2_000_000L 0.01 0)
+           struct (keys.[1], mkHealth 0uy 2_000_000L 0.01 0)
+           struct (keys.[2], mkHealth 0uy 2_000_000L 0.01 0)
+           struct (keys.[3], mkHealth 4uy 2_000_000L 0.20 0)
+           struct (keys.[4], mkHealth 0uy   100_000L 0.05 8192) |]
+    Assert.Empty(p2.DueDegraded(s, snaps, true))
+    Assert.Empty(p2.DueDegraded(12L * s, snaps, false))
+    let nudged = p2.DueDegraded(13L * s, snaps, true)
+    Assert.Equal<obj[]>([| keys.[3] |], nudged)
+
+[<Fact>]
+let ``WriteGate adaptivePass2Limit keeps the carrier fed and clamps cleanly`` () =
+    // Floored at one cwnd / 64 KiB: half a cwnd starved a socket whose cwnd SACK recovery had
+    // shrunk to 15-30 KiB, so the kernel stayed app-limited and cwnd never grew back.
+    Assert.Equal(262144, WriteGate.adaptivePass2Limit 262144 0u)
+    Assert.Equal(65536, WriteGate.adaptivePass2Limit 262144 8000u)
+    Assert.Equal(65536, WriteGate.adaptivePass2Limit 262144 65536u)
+    Assert.Equal(98304, WriteGate.adaptivePass2Limit 262144 131072u)
+    Assert.Equal(98304, WriteGate.adaptivePass2Limit 262144 2_000_000u)
+
+[<Fact>]
+let ``PathPool Saturated reflects live exhaustion and clears when no requested slot is exhausted`` () =
+    let pool = PathPool(2, 4, 100L, 1_000L, 1)
+    let first = pool.Request(0L, noIds ())
+    Assert.Equal(2, first.Length)
+    Assert.False(pool.Saturated)
+    pool.Joined 0us
+    pool.Joined 1us
+    let present = HashSet<uint16>([ 0us; 1us ])
+    Assert.Empty(pool.Request(10L, present))
+    Assert.False(pool.Saturated)

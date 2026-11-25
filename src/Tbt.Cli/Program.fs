@@ -19,9 +19,17 @@ let main argv =
         | prefix ->
             Tbt.Contracts.Trace.start (prefix + "." + argv.[0] + "." + string System.Environment.ProcessId)
             System.AppDomain.CurrentDomain.ProcessExit.Add(fun _ -> Tbt.Contracts.Trace.flush ())
-        match argv.[0] with
-        | "client" -> Client.run o
-        | "server" -> Server.run o
-        | _ ->
-            System.Console.Error.WriteLine usage
+        try
+            match argv.[0] with
+            | "client" -> Client.run o
+            | "server" -> Server.run o
+            | _ ->
+                System.Console.Error.WriteLine usage
+                2
+        with
+        | UsageError message ->
+            // A bad invocation is one line for the operator, not a stack trace. Every other
+            // exception is a bug in tbtun and is left to the runtime: masking it as a tidy
+            // one-liner would hide the stack the bug report needs.
+            System.Console.Error.WriteLine("tbtun: " + message)
             2

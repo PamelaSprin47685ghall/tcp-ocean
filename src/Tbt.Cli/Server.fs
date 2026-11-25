@@ -14,6 +14,128 @@ open Tbt.Carrier
 open Tbt.Async
 open Tbt.Cli.Common
 
+/// Whether a JOIN for this session must be refused rather than admitted.
+///
+/// Four conditions, and each one has a reason:
+///   · `retired` — the entry has left `sessions`, so an accept would attach a path to a session that
+///     nothing services and nothing closes. It must be a function of the argument, not of a
+///     momentary reading of the carrier.
+///   · `closeState <> Open` — the session is closing or closed: admitting would hand out a path that
+///     is torn down in the same breath.
+///   · `pathClosing` — the incarnation in the frame belongs to a path already in PATH_CLOSE.
+///   · `not alive` — the session is faulted, closed, or out of path grace. Grace matters: while it
+///     holds, `alive` is true with zero paths, which is exactly the state a client rejoins from
+///     after a burst of resets. That case must stay admissible; only after the grace expires does
+///     the session become unserviceable.
+///
+/// Kept at module scope, not inlined in the decision, so the rule can be tested on its own without
+/// constructing a whole server loop.
+let joinMustReject (retired: bool) (closeState: CloseState) (pathClosing: bool) (alive: bool) =
+    retired || closeState <> CloseState.Open || pathClosing || not alive
+
+/// How long a reaped entry stays addressable for JOIN when its tail has not finished.
+///
+/// The blocking reap used to keep a dying session in `sessions` for up to `t.Join 5000`. This is the
+/// same bound, applied without waiting for it: an entry leaves earlier the moment its own loop
+/// publishes `Stopped` (its keys are then meaningless), and never later than this. It bounds the
+/// retained memory; it does not extend any protocol deadline.
+let retireWindowMs = 5000L
+
+/// Whether a retired entry should be dropped from the addressable list.
+///
+/// `released` is the session's own claim that its teardown finished; the deadline is the backstop
+/// for a tail that never finishes, so the list cannot grow without bound.
+let retireExpired (released: bool) (nowMs: int64) (reapedAtMs: int64) =
+    released || nowMs - reapedAtMs > retireWindowMs
+
+/// What a JOIN decision needs from one session: its carrier and its admission state.
+///
+/// `[<Struct>]` so the server hands one over per JOIN frame without allocating; a record distinct
+/// from `Entry` so the rule can be driven with a real carrier and a real admission and no server
+/// loop (an `Entry` is private here and carries a coordinator).
+[<Struct>]
+type JoinTarget =
+    { Carrier: SessionCarrier
+      Admission: JoinAdmission }
+
+/// What one authenticated JOIN frame did.
+[<RequireQualifiedAccess>]
+type JoinOutcome =
+    /// The frame did not authenticate for this target: the caller tries the next session.
+    | NotMine
+    /// The path is attached; the session services it from here on.
+    | Accepted
+    /// A MAC'd reject/replay ack was replied and the path closed — the client can act on it.
+    | Refused
+    /// A terminal verdict with nothing actionable: the path is closed.
+    | Closed
+
+/// Decide one authenticated JOIN against one session (spec 6.5.7.4). True when the frame was
+/// consumed, i.e. anything but `NotMine`.
+///
+/// `blocked` also covers `not c.Alive`. Without it, a session whose last path left and whose grace
+/// expired looks like a healthy empty session to `Decide` (its `CloseState` is still `Open`,
+/// capacity is free), so a JOIN racing the reaper would be ACCEPTED into a session that the same
+/// round removes and closes — a positive ACK for a path that is closed a moment later. With it,
+/// such a JOIN gets a MAC'd reject, which is what the client can act on.
+///
+/// `retired` makes the answer for a reaped session a function of the argument, not of a race with
+/// its tail: accepting is impossible even if `Alive` were to read true for a moment.
+///
+/// `reply` is the path's transmit, the one thing this rule cannot own (kernel `PathLink` and TUN
+/// `TunPath` differ). Everything that decides, and every side effect on the session, lives here, so
+/// the server loop and the tests run one implementation rather than two that can drift.
+let decideJoin (reply: IPath -> byte[] -> unit) (t: JoinTarget) (link: IPath) (frame: byte[]) (retired: bool) =
+    let s = t.Carrier.Session
+    match tryJoin s.Keys.PathKey (ReadOnlySpan frame) with
+    | ValueSome r ->
+        let c = t.Carrier
+        // `retired` first: see the note above on why it cannot be inferred from `Alive`.
+        let blocked =
+            joinMustReject retired s.CloseState (s.PathState r.PathId = PathCloseState.Closing) c.Alive
+        let d = t.Admission.Decide(ReadOnlySpan frame, r, c.PathCount, c.HasPath r.PathId, blocked)
+        match d.Verdict with
+        | JoinVerdict.Accept ->
+            link.PathId <- r.PathId
+            reply link d.Ack
+            // A higher incarnation replaces the path (spec 6.5.7.4 rule 6).
+            if c.HasPath r.PathId then c.RemovePath r.PathId
+            c.AddPath link
+            JoinOutcome.Accepted
+        | JoinVerdict.Reject
+        | JoinVerdict.Replay ->
+            reply link d.Ack
+            link.Close()
+            JoinOutcome.Refused
+        | _ ->
+            link.Close()
+            JoinOutcome.Closed
+    | ValueNone -> JoinOutcome.NotMine
+
+/// Try the live sessions first, then the retired ones (spec 5.8 message order).
+///
+/// The order is the contract, not a detail: in the round a session dies its entry is still in the
+/// live list and is refused by `not alive`; from the next round on it is only in the retired list
+/// and is refused by `retired`. Both answers carry a MAC'd ack, so a path refresh racing the death
+/// is refused rather than silently dropped.
+///
+/// Accessors instead of arrays: the server owns two mutable lists and passes their index/count, so
+/// this costs no per-frame allocation and the loop stays the only thing that mutates them.
+let tryJoinAnyOf (reply: IPath -> byte[] -> unit)
+                 (liveAt: int -> JoinTarget) (liveCount: int)
+                 (retiredAt: int -> JoinTarget) (retiredCount: int)
+                 (link: IPath) (frame: byte[]) =
+    let mutable done' = false
+    let mutable i = 0
+    while not done' && i < liveCount do
+        done' <- decideJoin reply (liveAt i) link frame false <> JoinOutcome.NotMine
+        i <- i + 1
+    let mutable j = 0
+    while not done' && j < retiredCount do
+        done' <- decideJoin reply (retiredAt j) link frame true <> JoinOutcome.NotMine
+        j <- j + 1
+    done'
+
 /// A path before its bootstrap is classified.
 [<Sealed>]
 type private Pending(link: PathLink, since: int64) =
@@ -28,8 +150,11 @@ type private Entry(carrier: SessionCarrier, maxPaths: int, admission: JoinAdmiss
     member _.MaxPaths = maxPaths
     member _.Admission = admission
     member _.Coordinator = coordinator
+    /// The two fields a JOIN decision reads, handed to `decideJoin` so the loop and the tests run
+    /// one rule. A struct, so this costs no allocation per JOIN frame.
+    member e.Target = { Carrier = carrier; Admission = admission }
 
-let run (o: Options) =
+let private runCore (o: Options) =
     let asyncMode = AsyncMode.isEnabled ()
     if asyncMode then log "async mode: one poller and one thread per session (TBTUN_ASYNC_MODE)"
     let mutable asyncGroup: AsyncPollerGroup option = None
@@ -53,11 +178,13 @@ let run (o: Options) =
     let noPathGraceNs = int64 (max 0 (o.Int("no-path-grace-s", 30))) * 1_000_000_000L
     let windowClamp = o.Int("window-clamp", SocketTuning.WindowClamp)
     let statsMs = int64 (o.Int("stats-s", 0)) * 1000L
-    // Rolling congestion-control re-init of carrier sockets (0 = off): each socket
-    // is switched to --cc-nudge-via and back to bbr once per --cc-nudge-s seconds.
+    // Congestion-control re-init of carrier sockets (0 = off).
+    // Default pick "degraded" reads cached PathHealth snapshots (zero getsockopt), does nothing
+    // while idle, and only re-inits sockets stuck in Loss or BBR collapse (never healthy fast paths).
+    let ccNudgePick = o.TextOr("cc-nudge-pick", "degraded").ToLowerInvariant()
     let ccNudge =
         CcNudgePlan<System.Net.Sockets.Socket>(int64 (max 0 (o.Int("cc-nudge-s", 0))) * 1_000_000_000L,
-                                               1_000_000_000L, o.TextOr("cc-nudge-pick", "oldest") = "worst")
+                                               1_000_000_000L, (ccNudgePick = "worst"))
     let ccNudgeVia = o.TextOr("cc-nudge-via", "reno")
     // Downlink group pacing: 0 (default) keeps the pre-existing unpaced write
     // gate; 1 charges the session RateGroup so a 256-path burst cannot outrun
@@ -71,7 +198,7 @@ let run (o: Options) =
     // product values; the switches exist so the two can be compared alone.
     let notsentLowat = SocketTuning.notsentLowatFor (o.Int("notsent-lowat", SocketTuning.NotSentLimit))
     let userTimeoutMs = SocketTuning.userTimeoutMsFor (o.Int("user-timeout-ms", SocketTuning.UserTimeoutMs))
-    let txSlots = SocketTuning.txSlotsFor (o.Int("tx-slots", 16))
+    let txSlots = SocketTuning.txSlotsFor (o.Int("tx-slots", 64))
     // "full" = always-read + read-after-Service, each Receive capped at
     // TunRecvBudget so Service / downlink / ACKs interleave (virtual-ACK grace).
     // "adaptive" = same always-read, but each Receive runs until EAGAIN and
@@ -108,6 +235,18 @@ let run (o: Options) =
                             offerAegis = offerAegis, offerChaCha20 = offerChaCha20)
     let pending = List<Pending>()
     let sessions = List<Entry>()
+    /// Sessions reaped this round, still addressable for a JOIN for a short window.
+    ///
+    /// The blocking reap used to keep a dying session in `sessions` for up to its 5 s join, and a
+    /// JOIN that raced the death got a MAC'd reject because `Decide` saw a closing/sick session.
+    /// Removing the entry at once (the non-blocking reap) turned that reject into silence: the new
+    /// path was classified as "no session", left pending, and closed silently after 60 s.
+    ///
+    /// So the entry stays here, with the instant it was reaped, and leaves when the session's own
+    /// loop publishes `Stopped` (the release is finished, so its keys must not be honoured) or when
+    /// the window closes. The window is the old join timeout, so addressability is what it was; the
+    /// difference is that nobody waits for it.
+    let retiring = List<struct (Entry * int64)>()
     // Kernel TCP listener for paths (the baseline carrier); optional when a TUN is used.
     let listener: Socket | null =
         match listenAt with
@@ -164,32 +303,17 @@ let run (o: Options) =
         | _ -> ()
 
     let tryJoinAny (link: IPath) (frame: byte[]) =
-        let mutable done' = false
-        let mutable i = 0
-        while not done' && i < sessions.Count do
-            let e = sessions.[i]
-            let s = e.Carrier.Session
-            match tryJoin s.Keys.PathKey (ReadOnlySpan frame) with
-            | ValueSome r ->
-                done' <- true
-                let c = e.Carrier
-                let blocked = s.CloseState <> CloseState.Open || s.PathState r.PathId = PathCloseState.Closing
-                let d = e.Admission.Decide(ReadOnlySpan frame, r, c.PathCount, c.HasPath r.PathId, blocked)
-                match d.Verdict with
-                | JoinVerdict.Accept ->
-                    link.PathId <- r.PathId
-                    reply link d.Ack
-                    // A higher incarnation replaces the path (spec 6.5.7.4 rule 6).
-                    if c.HasPath r.PathId then c.RemovePath r.PathId
-                    c.AddPath link
-                | JoinVerdict.Reject
-                | JoinVerdict.Replay ->
-                    reply link d.Ack
-                    link.Close()
-                | _ -> link.Close()
-            | ValueNone -> ()
-            i <- i + 1
-        done'
+        // Live sessions first, then the retired window: see `tryJoinAnyOf` for why the order is the
+        // contract. A reaped entry stays addressable for the window the blocking reap used to give
+        // it, so a JOIN racing the death still finds the session's keys and gets the MAC'd reject
+        // above instead of silence. The reaping thread does not wait for any tail: entries leave on
+        // their own (`Stopped`) or on the deadline.
+        tryJoinAnyOf reply
+            (fun i -> sessions.[i].Target) sessions.Count
+            (fun i ->
+                let struct (e, _reapedAt) = retiring.[i]
+                e.Target)
+            retiring.Count link frame
 
     /// Classify the bootstrap frame (spec 6.5.9). True when the link left the pending list.
     let classify (link: IPath) (frame: byte[]) =
@@ -233,6 +357,7 @@ let run (o: Options) =
             let rmem = SocketTuning.rmemMax ()
             let flowBuf = SocketTuning.flowRecvBufFor rmem
             log ("session " + a.Params.Keys.SessionId.ToString() + " up, S=" + string a.Params.Symbol
+                 + " max_paths=" + string maxPaths + " negotiated_paths=" + string paths
                  + " " + describeOffer a.Params.Keys.Suite a.Params.Caps
                  + " flow_rcvbuf_req=" + string flowBuf
                  + " flow_rcvbuf_eff=" + string (SocketTuning.flowRecvWinFor flowBuf)
@@ -279,6 +404,9 @@ let run (o: Options) =
     use poller = new Poller()
     log ("readiness wait: " + string poller.Backend)
     let mutable lastStats = Environment.TickCount64
+    let mutable acceptedThisRound = false
+    let mutable lastNudgeFrames = 0L
+    let mutable lastNudgeCheckMs = 0L
     let mutable faults = 0L
     let mutable failed = 0L
     let stamp () = Stopwatch.GetTimestamp()
@@ -364,12 +492,13 @@ let run (o: Options) =
         // Passing the milliseconds straight through made a 1 s stats timer a 1 ms
         // poll (about 900 idle rounds per second on the main thread).
         let waitMs =
-            if rxPending then 0L
+            if rxPending || acceptedThisRound then 0L
             elif busy then 1L
             elif sessions.Count > 0 || pending.Count > 0 then
                 if timerMs = Int64.MaxValue then -1L else timerMs
             else
                 if timerMs = Int64.MaxValue then 100_000L else min 100_000L timerMs
+        acceptedThisRound <- false
         poller.Wait(if waitMs < 0L then -1 else int (min 100_000_000L (waitMs * 1000L)))
         // The pool's shared eventfd is level-triggered: a coordinator that exits
         // writes it once, and unless it is read here every later Wait returns at
@@ -393,6 +522,7 @@ let run (o: Options) =
                         SocketTuning.pathWith(s, windowClamp, notsentLowat, userTimeoutMs)
                         s.Blocking <- false
                         pending.Add(Pending(PathLink(s, probe), now))
+                        acceptedThisRound <- true
         match tun with
         | null -> ()
         | t ->
@@ -424,19 +554,56 @@ let run (o: Options) =
                     else " closed"
                 log ("session " + c.Session.Keys.SessionId.ToString() + why)
                 match entry.Coordinator with
-                | Some co -> co.Stop()
+                | Some co ->
+                    // Non-blocking: this thread is the poller for every other session, and the
+                    // session's own tail does the release (carrier close, poller and channel
+                    // dispose, `Stopped`) on every exit. Joining here would stall all other
+                    // sessions while this one closes up to `--max-paths` sockets.
+                    co.RequestClose()
+                    retiring.Add(struct (entry, now))
                 | None -> c.Close()
                 sessions.RemoveAt i
             i <- i - 1
+        // Retire sweep: a reaped session leaves as soon as its own loop publishes `Stopped` (the
+        // release finished, so its keys must not be honoured any more), or when the addressability
+        // window the blocking reap used to give it has closed. This bounds the list without
+        // waiting for any tail, and without inventing a session limit.
+        let mutable r = retiring.Count - 1
+        while r >= 0 do
+            let struct (e, reapedAt) = retiring.[r]
+            let finished =
+                match e.Coordinator with
+                | Some co -> co.Stopped.IsSet
+                | None -> true
+            if retireExpired finished now reapedAt then retiring.RemoveAt r
+            r <- r - 1
         winCsvcUs <- winCsvcUs + toUs (stamp () - csvcA)
-        if ccNudge.Enabled && sessions.Count > 0 then
-            let socks = sessions |> Seq.collect (fun e -> e.Carrier.PathSockets) |> Seq.toArray
-            let score (sk: System.Net.Sockets.Socket) =
-                match KernelTcpInfo.tryRead sk with
-                | ValueSome i when i.DeliveryRate >= 0L -> i.DeliveryRate
-                | _ -> Int64.MaxValue
-            for sk in ccNudge.Due(now * 1_000_000L, socks, score) do
-                SocketTuning.reinitCongestion(sk, "bbr", ccNudgeVia) |> ignore
+        if ccNudge.Enabled && sessions.Count > 0 && now - lastNudgeCheckMs >= 1000L then
+            lastNudgeCheckMs <- now
+            let mutable totalFrames = 0L
+            for e in sessions do
+                totalFrames <- totalFrames + e.Carrier.FramesIn + e.Carrier.FramesOut
+            let active = totalFrames - lastNudgeFrames >= 32L
+            lastNudgeFrames <- totalFrames
+            if ccNudgePick = "degraded" then
+                if active then
+                    let snaps = ResizeArray<struct (System.Net.Sockets.Socket * PathHealth)>()
+                    for e in sessions do
+                        let s = e.Carrier.SnapshotSocketHealth()
+                        for k in 0 .. s.Length - 1 do snaps.Add s.[k]
+                    for sk in ccNudge.DueDegraded(now * 1_000_000L, snaps.ToArray(), true) do
+                        SocketTuning.reinitCongestion(sk, "bbr", ccNudgeVia) |> ignore
+            else
+                let socks = ResizeArray<System.Net.Sockets.Socket>()
+                for e in sessions do
+                    let s = e.Carrier.PathSockets
+                    for k in 0 .. s.Length - 1 do socks.Add s.[k]
+                let score (sk: System.Net.Sockets.Socket) =
+                    match KernelTcpInfo.tryRead sk with
+                    | ValueSome i when i.DeliveryRate >= 0L -> i.DeliveryRate
+                    | _ -> Int64.MaxValue
+                for sk in ccNudge.Due(now * 1_000_000L, socks.ToArray(), score) do
+                    SocketTuning.reinitCongestion(sk, "bbr", ccNudgeVia) |> ignore
         match tun with
         | null -> ()
         | t ->
@@ -482,3 +649,9 @@ let run (o: Options) =
             | t -> log ("stats " + t.Describe())
             Tbt.Contracts.Trace.flush ()
     0
+
+let run (o: Options) =
+    if o.Has "help" then
+        Console.Error.WriteLine "usage: tbtun server --target HOST:PORT --psk-file FILE [--listen ADDR:PORT | --tun NAME --tun-listen ADDR:PORT] [--max-paths 64] [--window 1024] [--cc-nudge-s 0] [--cc-nudge-pick degraded|worst|oldest] [--stats-s 0]"
+        0
+    else runCore o

@@ -25,16 +25,62 @@ type private PathEvent =
     | PathRefreshed of uint16 * PathLink
     | PathRefreshFailed of uint16 * string
 
-/// Connect, send head and bootstrap frame, wait for the reply head and bootstrap frame.
-/// `timeoutMs` is used for Connect, Send, and Receive so TCP can retransmit a JOIN
-/// inside one attempt. The socket is disposed if this throws.
+let private queueBootstrap (link: PathLink) (host: string) (boot: byte[]) =
+    link.Queue(ReadOnlySpan(requestHead host))
+    link.Queue(ReadOnlySpan boot)
+
+let private tryExtractBootstrapReply (link: PathLink) (failed: byref<bool>) : byte[] | null =
+    let mutable reply = Span<byte>.Empty
+    if link.TryTakeHead(&failed) && link.TryTakeFrame(&reply) then reply.ToArray()
+    else null
+
+let private tryAcceptJoinReply (join: JoinOffer) (ack: byte[]) =
+    (join.TryAccept(ReadOnlySpan ack)).IsSome
+
+/// Connect, send head and bootstrap frame, wait for the reply head and bootstrap frame
+/// without blocking OS threads or thread-pool workers. `timeoutMs` bounds the full attempt.
+let private bootstrapAsync (server: IPEndPoint) (host: string) (boot: byte[]) (windowClamp: int) (notsentLowat: int) (userTimeoutMs: int) (timeoutMs: int) (stopToken: CancellationToken) : Task<struct (PathLink * byte[])> =
+    task {
+        let socket = new Socket(server.AddressFamily, SocketType.Stream, ProtocolType.Tcp)
+        use cts = CancellationTokenSource.CreateLinkedTokenSource(stopToken)
+        cts.CancelAfter timeoutMs
+        let ct = cts.Token
+        let mutable err: exn | null = null
+        let mutable okResult: struct (PathLink * byte[]) = Unchecked.defaultof<_>
+        try
+            SocketTuning.pathWith(socket, windowClamp, notsentLowat, userTimeoutMs)
+            SocketTuning.fastOpenConnect socket
+            do! socket.ConnectAsync(server, ct).AsTask()
+            let link = PathLink(socket, SocketTuning.probe ())
+            queueBootstrap link host boot
+            let! sendRes = link.SendAsync(ct).AsTask()
+            if sendRes <> IoResult.Progress then failwith "path closed during bootstrap"
+            let mutable failed = false
+            let mutable result: byte[] | null = null
+            while isNull result do
+                let extracted = tryExtractBootstrapReply link &failed
+                if not (isNull extracted) then
+                    result <- extracted
+                elif failed then
+                    failwith "bad reply head"
+                else
+                    let! rxRes = link.ReceiveAsync(ct).AsTask()
+                    if rxRes <> IoResult.Progress then failwith "path closed during bootstrap"
+            socket.Blocking <- false
+            okResult <- struct (link, nonNull result)
+        with ex ->
+            SocketTuning.closeGraceful socket
+            err <- ex
+        match err with
+        | null -> return okResult
+        | ex ->
+            System.Runtime.ExceptionServices.ExceptionDispatchInfo.Capture(ex).Throw()
+            return okResult
+    }
+
 let private bootstrap (server: IPEndPoint) (host: string) (boot: byte[]) (windowClamp: int) (notsentLowat: int) (userTimeoutMs: int) (timeoutMs: int) =
     let socket = new Socket(server.AddressFamily, SocketType.Stream, ProtocolType.Tcp)
     try
-        // The client carrier is kernel TCP, not a TUN: there is no tbt0-style qdisc
-        // this process owns. Write gating (TCP_NOTSENT_LOWAT) keeps unsent bytes
-        // small; a queue overflow, if any, is on the host path and shows up as
-        // kernel retranmissions, not as a userspace virtual ACK.
         SocketTuning.pathWith(socket, windowClamp, notsentLowat, userTimeoutMs)
         SocketTuning.fastOpenConnect socket
         socket.ReceiveTimeout <- timeoutMs
@@ -57,10 +103,10 @@ let private bootstrap (server: IPEndPoint) (host: string) (boot: byte[]) (window
         socket.Blocking <- false
         struct (link, nonNull result)
     with _ ->
-        socket.Dispose()
+        SocketTuning.closeGraceful socket
         reraise()
 
-let run (o: Options) =
+let private runCore (o: Options) =
     let asyncMode = AsyncMode.isEnabled ()
     let server = endpoint (o.Text "server")
     let host = if o.Has "host" then o.Text "host" else server.Address.ToString()
@@ -71,7 +117,7 @@ let run (o: Options) =
     let windowClamp = o.Int("window-clamp", SocketTuning.WindowClamp)
     let notsentLowat = SocketTuning.notsentLowatFor (o.Int("notsent-lowat", SocketTuning.NotSentLimit))
     let userTimeoutMs = SocketTuning.userTimeoutMsFor (o.Int("user-timeout-ms", SocketTuning.UserTimeoutMs))
-    let txSlots = SocketTuning.txSlotsFor (o.Int("tx-slots", 16))
+    let txSlots = SocketTuning.txSlotsFor (o.Int("tx-slots", 64))
     let fecAdaptive =
         match System.Environment.GetEnvironmentVariable "TBTUN_FEC_ADAPTIVE" with
         | null -> true
@@ -125,59 +171,95 @@ let run (o: Options) =
                 && carrier.PathCount < poolRef.Target)
         carrier.AddPath link0
         let maxPaths = int hello.MaxPaths
-        // Forward as soon as path 0 is up; remaining JOINs run with bounded
+        let targetPaths = min pathCount maxPaths
+        // Forward as soon as path 0 is up; remaining JOINs run asynchronously with bounded
         // concurrency and are attached on this thread via `pending`.
         log ("session up: S=" + string p.Symbol + " paths=" + string carrier.PathCount
+             + " target_paths=" + string targetPaths + " server_max_paths=" + string maxPaths
              + " window_clamp=" + string windowClamp + " " + describeOffer p.Keys.Suite p.Caps)
+        if pathCount > maxPaths then
+            log ("note: requested --paths " + string pathCount + " exceeds server --max-paths "
+                 + string maxPaths + "; aligned to " + string targetPaths)
         let concurrency = JoinBootstrap.clampConcurrency (o.Int("join-concurrency", JoinBootstrap.DefaultConcurrency))
         let mutable stopAt = 0L
-        let targetPaths = min pathCount maxPaths
         let pool = PathPool(targetPaths, concurrency, 100_000_000L, 2_000_000_000L, max 1 attempts)
         poolRef <- pool
-        // Rolling refresh: re-JOIN path ids older than path-refresh-s, a few per tick.
+        // Health-targeted refresh (default "degraded"): zero idle churn/allocation, never kills
+        // healthy fast paths; only refreshes aged paths that show genuine Loss/BBR collapse.
+        // --path-refresh-mode blind restores the legacy fixed-age rolling refresh for A/B checks.
+        let refreshBlind = o.TextOr("path-refresh-mode", "degraded").ToLowerInvariant() = "blind"
         let refresher =
             PathRefresher(int64 (max 0 (o.Int("path-refresh-s", 60))) * 1_000_000_000L,
                           max 0 (o.Int("path-refresh-per-tick", 1)),
-                          max 0 (o.Int("path-refresh-idle-per-tick", 8)),
+                          max 0 (o.Int("path-refresh-idle-per-tick", if refreshBlind then 8 else 0)),
                           int64 (max 50 (o.Int("path-refresh-tick-ms", 1000))) * 1_000_000L,
                           max 1 (o.Int("path-refresh-inflight", 12)),
                           10_000_000_000L)
-        // Per-join spread of the refresh age in percent (default 0 = fixed age; 50 bench-tested
-        // worse: 13.7 vs 16.7 Mbit/s, paths refreshed from 30 s). Desyncs the
-        // 256 paths of a new session so they do not all refresh in the same second.
         refresher.Jitter <- float (max 0 (min 90 (o.Int("path-refresh-jitter-pct", 0)))) / 100.0
         let events = ConcurrentQueue<PathEvent>()
         let pending = ResizeArray<PathLink>()
         let applying = HashSet<uint16>()
         let mutable readyLogged = false
-        let mutable batch = Task.CompletedTask
-        // One JOIN with one incarnation. Refusal throws, so tryRepeated retries
-        // it with the next incarnation.
-        let joinOnce (id: uint16) (inc: uint32) =
-            let join = JoinOffer(p.Keys.PathKey, entropy, p.Keys.SessionId, p.Symbol, p.Caps, maxPaths, id, inc, mss, p.Keys.Suite)
-            let struct (link, ack) = bootstrap server host join.Frame windowClamp notsentLowat userTimeoutMs timeoutMs
-            if (join.TryAccept(ReadOnlySpan ack)).IsSome then
-                link.PathId <- id
-                link.Incarnation <- inc
-                link
-            else
-                link.Close()
-                failwith "join refused"
-        // Each attempt takes the next incarnation inside the stride the pool
-        // reserved, so an accepted-then-lost reply still cannot replay.
-        let joinOne (id: uint16) (baseInc: uint32) =
-            match JoinBootstrap.tryRepeated attempts backoff Thread.Sleep (fun i ->
-                let link = joinOnce id (baseInc + uint32 i)
-                events.Enqueue(PathJoined(id, link))) with
-            | JoinBootstrap.Joined -> ()
-            | JoinBootstrap.GaveUp msg -> events.Enqueue(PathFailed(id, msg))
-        // One attempt: on failure the old connection simply stays.
-        let refreshOne (id: uint16) (inc: uint32) =
-            try events.Enqueue(PathRefreshed(id, joinOnce id inc))
-            with ex -> events.Enqueue(PathRefreshFailed(id, ex.Message))
+        use joinCts = new CancellationTokenSource()
+        let joinSem = new SemaphoreSlim(concurrency, concurrency)
+        let wakeCoordinator () =
             match rxChannel with
             | Some ch -> ch.Wake()
             | None -> ()
+        // Non-blocking async JOIN: no LongRunning OS threads, no Thread.Sleep backoff.
+        let joinOnceAsync (id: uint16) (inc: uint32) : Task<PathLink> =
+            task {
+                let join = JoinOffer(p.Keys.PathKey, entropy, p.Keys.SessionId, p.Symbol, p.Caps, maxPaths, id, inc, mss, p.Keys.Suite)
+                let! struct (link, ack) = bootstrapAsync server host join.Frame windowClamp notsentLowat userTimeoutMs timeoutMs joinCts.Token
+                if tryAcceptJoinReply join ack then
+                    link.PathId <- id
+                    link.Incarnation <- inc
+                    return link
+                else
+                    link.Close()
+                    return failwith "join refused"
+            }
+        let joinOneAsync (id: uint16) (baseInc: uint32) : Task =
+            task {
+                let mutable acquired = false
+                try
+                    do! joinSem.WaitAsync joinCts.Token
+                    acquired <- true
+                    let mutable attempt = 0
+                    let mutable joined = false
+                    let mutable lastErr = ""
+                    while not joined && attempt < attempts && not joinCts.IsCancellationRequested do
+                        let mutable retryDelay = 0
+                        try
+                            let! link = joinOnceAsync id (baseInc + uint32 attempt)
+                            events.Enqueue(PathJoined(id, link))
+                            joined <- true
+                        with ex ->
+                            lastErr <- ex.Message
+                            attempt <- attempt + 1
+                            if attempt < attempts && not joinCts.IsCancellationRequested then
+                                retryDelay <- backoff (attempt - 1)
+                        if retryDelay > 0 then
+                            do! Task.Delay(retryDelay, joinCts.Token)
+                    if not joined then
+                        events.Enqueue(PathFailed(id, lastErr))
+                with
+                | :? OperationCanceledException -> ()
+                | :? ObjectDisposedException -> ()
+                if acquired then
+                    try joinSem.Release() |> ignore with _ -> ()
+                wakeCoordinator ()
+            }
+        // One attempt: on failure the old connection simply stays.
+        let refreshOneAsync (id: uint16) (inc: uint32) : Task =
+            task {
+                try
+                    let! link = joinOnceAsync id inc
+                    events.Enqueue(PathRefreshed(id, link))
+                with ex ->
+                    events.Enqueue(PathRefreshFailed(id, ex.Message))
+                wakeCoordinator ()
+            }
         let refreshStart = Dictionary<uint16, int64>()
         let mutable lastFramesIn = 0L
         let mutable lastIdleCheckNs = 0L
@@ -248,21 +330,12 @@ let run (o: Options) =
             for link in pending do s.Add link.PathId |> ignore
             for id in applying do s.Add id |> ignore
             s
-        // Wake the session loop once while a JOIN is in flight. The sync loop
-        // caps its poll wait instead; the async coordinator needs an event.
-        let wakeLater () =
-            match rxChannel with
-            | Some ch ->
-                Task.Run(fun () ->
-                    Thread.Sleep 50
-                    ch.Wake()) |> ignore
-            | None -> ()
         let plan () =
             if not session.Closed && stopAt = 0L then
                 let work = pool.Request(clock.FreshNs(), presentIds ())
-                if work.Length > 0 then
-                    batch <- Task.Run(fun () ->
-                        JoinBootstrap.runBounded concurrency work (fun (struct (id, baseInc)) -> joinOne id baseInc))
+                for i in 0 .. work.Length - 1 do
+                    let struct (id, baseInc) = work.[i]
+                    joinOneAsync id baseInc |> ignore
                 if readyLogged then
                     // Idle: fewer than ~100 cells arrived since the last look.
                     let now = clock.FreshNs()
@@ -271,24 +344,26 @@ let run (o: Options) =
                         sessionIdle <- fin - lastFramesIn < 100L
                         lastFramesIn <- fin
                         lastIdleCheckNs <- now
-                    // An idle session may sleep for seconds between events; keep the
-                    // refresh ticking with one timer wake per second while enabled.
-                    if refresher.Enabled && not refreshWakePending then
+                    // Only blind-mode refresh needs an idle 1 s timer; degraded mode does zero work when idle.
+                    if refreshBlind && refresher.Enabled && not refreshWakePending then
                         match rxChannel with
                         | Some ch ->
                             refreshWakePending <- true
-                            Task.Run(fun () ->
-                                Thread.Sleep 1000
+                            task {
+                                do! Task.Delay 1000
                                 refreshWakePending <- false
-                                ch.Wake()) |> ignore
+                                ch.Wake()
+                            } |> ignore
                         | None -> ()
-                    for id in refresher.Due(now, carrier.PathIds, true, sessionIdle) do
+                    let due =
+                        if refreshBlind then refresher.Due(now, carrier.PathIds, true, sessionIdle)
+                        else refresher.DueDegraded(now, carrier.SnapshotPathHealth(), true, sessionIdle)
+                    for id in due do
                         match pool.Reserve id with
                         | ValueSome inc ->
                             refreshStart.[id] <- clock.FreshNs()
-                            Task.Run(fun () -> refreshOne id inc) |> ignore
+                            refreshOneAsync id inc |> ignore
                         | ValueNone -> refresher.OnFailed(id, clock.FreshNs())
-                if pool.InFlight > 0 then wakeLater ()
         let closePool () =
             drainEvents ()
             for link in pending do link.Close()
@@ -414,8 +489,14 @@ let run (o: Options) =
                 acceptNow poller
                 carrier.Service poller
         log (if session.Closed then "session closed" else "all paths closed")
-        try batch.Wait 2000 |> ignore with _ -> ()
+        joinCts.Cancel()
         if not asyncMode then attachJoined ()
         closePool ()
         carrier.Close()
         if session.Closed then 0 else 1
+
+let run (o: Options) =
+    if o.Has "help" then
+        Console.Error.WriteLine "usage: tbtun client --server HOST:PORT --listen ADDR:PORT --psk-file FILE [--paths 4] [--window 1024] [--join-concurrency 32] [--path-refresh-s 60] [--path-refresh-mode degraded|blind] [--stats-s 0]"
+        0
+    else runCore o

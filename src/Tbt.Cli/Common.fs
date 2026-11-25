@@ -27,6 +27,13 @@ let unixMs () = DateTimeOffset.UtcNow.ToUnixTimeMilliseconds()
 let log (text: string) =
     Console.Error.WriteLine(DateTime.Now.ToString("HH:mm:ss.fff") + " " + text)
 
+/// A rejected invocation: the message is written for the operator, not for a stack trace.
+/// Raised while options are being resolved, before any socket exists, so `Program.main` can
+/// turn it into one line of stderr and exit 2 instead of an unhandled-exception dump.
+exception UsageError of message: string
+
+let failUsage (message: string) : 'T = raise (UsageError message)
+
 /// Options of the form --name value.
 [<Sealed>]
 type Options(args: string[]) =
@@ -35,30 +42,41 @@ type Options(args: string[]) =
         let mutable i = 0
         while i < args.Length do
             let a = args.[i]
-            if not (a.StartsWith "--") || a.Length < 3 then failwith ("bad option: " + a)
-            let name = a.Substring 2
-            // A bare flag is allowed when it is last, or the next token is another --option.
-            if i + 1 < args.Length && not (args.[i + 1].StartsWith "--") then
-                values.[name] <- args.[i + 1]
-                i <- i + 2
-            else
-                values.[name] <- "1"
+            if a = "-h" || a = "--help" then
+                values.["help"] <- "1"
                 i <- i + 1
+            elif not (a.StartsWith "--") || a.Length < 3 then failUsage ("bad option: " + a)
+            else
+                let name = a.Substring 2
+                // A bare flag is allowed when it is last, or the next token is another --option.
+                if i + 1 < args.Length && not (args.[i + 1].StartsWith "--") then
+                    values.[name] <- args.[i + 1]
+                    i <- i + 2
+                else
+                    values.[name] <- "1"
+                    i <- i + 1
     member _.Text(name: string) =
         match values.TryGetValue name with
         | true, v -> v
-        | _ -> failwith ("missing option --" + name)
+        | _ -> failUsage ("missing option --" + name)
     member _.TextOr(name: string, fallback: string) =
         match values.TryGetValue name with
         | true, v -> v
         | _ -> fallback
     member _.Int(name: string, fallback: int) =
         match values.TryGetValue name with
-        | true, v -> Int32.Parse v
+        | true, v ->
+            // A typo'd number is the operator's mistake, not a bug: report it as one.
+            match Int32.TryParse v with
+            | true, n -> n
+            | _ -> failUsage ("option --" + name + " needs an integer, got: " + v)
         | _ -> fallback
     member _.Float(name: string, fallback: float) =
         match values.TryGetValue name with
-        | true, v -> Double.Parse(v, Globalization.CultureInfo.InvariantCulture)
+        | true, v ->
+            match Double.TryParse(v, Globalization.NumberStyles.Float, Globalization.CultureInfo.InvariantCulture) with
+            | true, n -> n
+            | _ -> failUsage ("option --" + name + " needs a number, got: " + v)
         | _ -> fallback
     member _.Has(name: string) = values.ContainsKey name
 
@@ -99,19 +117,33 @@ let endpoint (text: string) : IPEndPoint =
     | true, ep when not (isNull ep) -> nonNull ep
     | _ ->
         let at = text.LastIndexOf ':'
-        if at <= 0 then failwith ("bad endpoint: " + text)
+        if at <= 0 then failUsage ("bad endpoint: " + text)
         let addresses = Dns.GetHostAddresses(text.Substring(0, at))
         IPEndPoint(addresses.[0], Int32.Parse(text.Substring(at + 1)))
 
 /// PSK file: one key per line, 64 hex digits; '#' starts a comment.
+/// Every failure here is the operator's typing (path, permissions, digits), so each one is a
+/// `UsageError` naming the file — never the key material, and never a raw exception.
 let readPsks (path: string) =
-    File.ReadAllLines path
-    |> Array.map (fun l -> (match l.IndexOf '#' with -1 -> l | i -> l.Substring(0, i)).Trim())
-    |> Array.filter (fun l -> l.Length > 0)
-    |> Array.map (fun l ->
-        let k = Convert.FromHexString l
-        if k.Length <> 32 then failwith "a PSK has 32 bytes (64 hex digits)"
-        k)
+    let lines =
+        try File.ReadAllLines path
+        with
+        | :? UnauthorizedAccessException -> failUsage ("psk-file is not readable: " + path)
+        | :? FileNotFoundException
+        | :? DirectoryNotFoundException -> failUsage ("psk-file not found: " + path)
+        | :? IOException as e -> failUsage ("psk-file cannot be read: " + path + ": " + e.Message)
+    let keys =
+        lines
+        |> Array.map (fun l -> (match l.IndexOf '#' with -1 -> l | i -> l.Substring(0, i)).Trim())
+        |> Array.filter (fun l -> l.Length > 0)
+        |> Array.map (fun l ->
+            let k =
+                try Convert.FromHexString l
+                with :? FormatException -> failUsage ("a PSK has 32 bytes (64 hex digits): " + path)
+            if k.Length <> 32 then failUsage ("a PSK has 32 bytes (64 hex digits): " + path)
+            k)
+    if keys.Length = 0 then failUsage ("psk-file has no keys: " + path)
+    keys
 
 /// Resident set size in KiB. Linux uses /proc/self/status; elsewhere WorkingSet64. -1 if unknown.
 let rssKiB () =
