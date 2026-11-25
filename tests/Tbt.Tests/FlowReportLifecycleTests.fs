@@ -366,6 +366,46 @@ let ``segmented reserve survives randomized write peek skip clear`` () =
     Assert.Equal(0, q.Count)
 
 [<Fact>]
+let ``default credit policy fits a 24 MiB single flow inside a 64 MiB pool`` () =
+    let port = RecordingPort()
+    let flows = FlowTable(port, SymbolStore(), Action<uint64,int>(fun _ _ -> ()), CreditPolicy.defaults)
+    Assert.Equal(24 <<< 20, CreditPolicy.defaults.FlowWindowMax)
+    Assert.Equal(64 <<< 20, CreditPolicy.defaults.PoolBytes)
+    // One active flow gets the full BDP window immediately on OPEN, not after a slow
+    // linear climb from C0.
+    let e =
+        { RealLength = 1328; FlowSlot = 3uy; Flags = StreamFlags.Open; FlowGeneration = 1u
+          StreamOffset = 0UL }
+    Assert.True(flows.OnSource(0UL, 0, e))
+    flows.Pump 3
+    Assert.Equal(uint64 CreditPolicy.defaults.FlowWindowMax, flows.[3].RxLimit)
+    Assert.True(flows.CommittedBytes <= int64 CreditPolicy.defaults.PoolBytes)
+    Assert.True(flows.PoolUsed <= int64 CreditPolicy.defaults.PoolBytes - 256L * int64 CreditPolicy.C0)
+
+[<Fact>]
+let ``shrinking the new-window cap never revokes an issued promise`` () =
+    let port = RecordingPort()
+    let flows = FlowTable(port, SymbolStore(), Action<uint64,int>(fun _ _ -> ()), CreditPolicy.defaults)
+    let source (slot: byte) (step: uint64) (gen: uint32) =
+        let e =
+            { RealLength = 1328; FlowSlot = slot; Flags = StreamFlags.Open; FlowGeneration = gen
+              StreamOffset = 0UL }
+        Assert.True(flows.OnSource(step, int slot, e))
+        flows.Pump(int slot)
+    source 3uy 0UL 1u
+    let large = flows.[3].RxLimit
+    Assert.Equal(uint64 CreditPolicy.defaults.FlowWindowMax, large)
+    flows.SetNewWindowCap CreditPolicy.C0
+    // An existing flow keeps its window; a new flow opens with only C0.
+    Assert.Equal(large, flows.[3].RxLimit)
+    source 4uy 1UL 1u
+    Assert.Equal(uint64 CreditPolicy.C0, flows.[4].RxLimit)
+    // Control/FIN frames do not depend on credit: a 0-byte source still commits and pumps.
+    flows.SetNewWindowCap Int32.MaxValue
+    source 4uy 2UL 1u |> ignore
+    Assert.True(flows.ReportsDue >= 1)
+
+[<Fact>]
 let ``credit is announced at flow open and refreshed in fine steps`` () =
     let port = RecordingPort()
     let flows = FlowTable(port, SymbolStore(), Action<uint64,int>(fun _ _ -> ()), CreditPolicy.defaults)

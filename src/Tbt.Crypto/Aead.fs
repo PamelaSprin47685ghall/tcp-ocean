@@ -39,6 +39,10 @@ type ChaCha20Poly1305Aead(key: ReadOnlySpan<byte>, ?doubleRounds: int, ?platform
     // throws or allocates.
     let native: ChaCha20Poly1305 | null =
         if wantPlatform && rounds = 10 && ChaCha20Poly1305.IsSupported then new ChaCha20Poly1305(key) else null
+    // The platform Decrypt refuses overlapping buffers. In-place opens decrypt
+    // into this buffer and copy only after the tag matches. A mismatch throws
+    // before that API writes, so the caller's buffer stays unchanged.
+    let mutable decryptScratch: byte[] = Array.zeroCreate 2048
 
     member private _.Authenticate(nonce: ReadOnlySpan<byte>, aad: ReadOnlySpan<byte>, cipher: ReadOnlySpan<byte>, tag: Span<byte>) =
         ChaCha20.blockRounds rounds words 0u nonce (Span polyKey)
@@ -51,6 +55,7 @@ type ChaCha20Poly1305Aead(key: ReadOnlySpan<byte>, ?doubleRounds: int, ?platform
     /// Clear the key words when the key retires.
     member _.Wipe() =
         Array.Clear words
+        CryptographicOperations.ZeroMemory(Span decryptScratch)
         match native with
         | null -> ()
         | n -> n.Dispose()
@@ -64,16 +69,37 @@ type ChaCha20Poly1305Aead(key: ReadOnlySpan<byte>, ?doubleRounds: int, ?platform
             this.Authenticate(nonce, aad, Span<byte>.op_Implicit cipher, tag)
         | n -> n.Encrypt(nonce, plain, cipher, tag, aad)
 
-    /// Check the tag in constant time; when it matches, decrypt cipher into plain (the same
-    /// memory is allowed) and return true. On false plain is not written.
+    member private _.EnsureScratch(n: int) =
+        if decryptScratch.Length < n then
+            CryptographicOperations.ZeroMemory(Span decryptScratch)
+            decryptScratch <- Array.zeroCreate n
+
+    /// Check the tag; when it matches, decrypt cipher into plain (the same memory is
+    /// allowed) and return true. On false plain is not written.
     member this.TryDecrypt(nonce: ReadOnlySpan<byte>, cipher: ReadOnlySpan<byte>, tag: ReadOnlySpan<byte>, plain: Span<byte>, aad: ReadOnlySpan<byte>) =
         if nonce.Length <> 12 || tag.Length <> 16 || cipher.Length <> plain.Length then false
         else
-            this.Authenticate(nonce, aad, cipher, Span expected)
-            if CryptographicOperations.FixedTimeEquals(ReadOnlySpan expected, tag) then
-                ChaCha20.xorStreamRounds rounds words 1u nonce cipher plain (Span scratch)
-                true
-            else false
+            match native with
+            | null ->
+                this.Authenticate(nonce, aad, cipher, Span expected)
+                if CryptographicOperations.FixedTimeEquals(ReadOnlySpan expected, tag) then
+                    ChaCha20.xorStreamRounds rounds words 1u nonce cipher plain (Span scratch)
+                    true
+                else false
+            | n ->
+                // Reject first on the allocation-free managed MAC. A bad frame never reaches
+                // the platform API, whose mismatch exception allocates. The platform call only
+                // decrypts an already-accepted tag.
+                this.Authenticate(nonce, aad, cipher, Span expected)
+                if not (CryptographicOperations.FixedTimeEquals(ReadOnlySpan expected, tag)) then false
+                else
+                    try
+                        this.EnsureScratch cipher.Length
+                        let dst = Span<byte>(decryptScratch, 0, cipher.Length)
+                        n.Decrypt(nonce, cipher, tag, dst, aad)
+                        dst.CopyTo plain
+                        true
+                    with :? AuthenticationTagMismatchException -> false
 
     interface IAead with
         member this.Encrypt(n, p, c, tg, a) = this.Encrypt(n, p, c, tg, a)

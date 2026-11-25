@@ -258,8 +258,8 @@ let ``the grant limit is each report's own ack plus its grant: late, duplicate a
         Assert.Equal(model, tx.GrantLimit)
 
 [<Fact>]
-let ``256 flows opened one after another with readers that take nothing stay within the 32 MiB pool`` () =
-    let config = { SessionConfig.defaults with WindowSteps = 1024 }
+let ``256 flows opened one after another with readers that take nothing stay within the 64 MiB pool`` () =
+    let config = { SessionConfig.defaults with WindowSteps = 2048 }
     let pair = Pair(config, 4, 0.0, 9)
     pair.ServerPort.WriteLimit <- 0
     let c = pair.Client
@@ -275,7 +275,7 @@ let ``256 flows opened one after another with readers that take nothing stay wit
                 Assert.True(l >= limits.[i], sprintf "slot %d limit %d fell below %d" i l limits.[i])
                 limits.[i] <- l
     // The first flow fills its whole promise: the bytes sit in its reserve (held, not consumed).
-    let payload = Array.create (9 <<< 20) 5uy
+    let payload = Array.create (config.Credit.FlowWindowMax + (1 <<< 20)) 5uy
     let mutable first = -1
     Assert.True(c.TryOpenFlow(&first))
     let mutable sent = 0

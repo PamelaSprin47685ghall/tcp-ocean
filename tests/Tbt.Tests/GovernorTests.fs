@@ -120,3 +120,34 @@ let ``session at 70 percent stops new bulk intake and does not drop in-flight re
     c.Governor.ReportTotal 0L
     Assert.Equal(GovernorLevel.Normal, c.Governor.Level)
     Assert.True(c.TryBeginSource(&app))
+
+[<Fact>]
+let ``module reports do not double-count and pressure halves future bulk only`` () =
+    let g = MemoryGovernor(10_000L)
+    g.Report(GovernorModules.EncoderRing, 4000L)
+    g.Report(GovernorModules.DecoderRing, 3000L)
+    g.Report(GovernorModules.FlowRxBuffers, 1000L)
+    Assert.Equal(8000L, g.Used)
+    g.Report(GovernorModules.EncoderRing, 2000L)
+    Assert.Equal(6000L, g.Used)
+    g.Report(GovernorModules.EncoderRing, 4000L)
+    Assert.Equal(GovernorLevel.ShrinkWindow, g.Level)
+    Assert.True(g.Order.DownlinkHalf && g.Order.ShrinkNewWindows)
+    g.NoteExternalRxScratch 500L
+    Assert.Equal(8500L, g.Used)
+    g.NoteExternalRxScratch 0L
+    Assert.Equal(8000L, g.Used)
+    // DownlinkHalf and EnableHoleCap are pressure flags. They have no separate byte owner
+    // in RxHalf, so applying them here would invent a limit. ShrinkNewWindows is the
+    // action Session consumes, and it only caps windows opened after the flag rises.
+
+[<Fact>]
+let ``delivery reserve reports rented chunks, not the credit promise`` () =
+    let q = ByteQueue(1 <<< 20)
+    Assert.Equal(0, q.Rented)
+    q.Write(ReadOnlySpan(Array.zeroCreate<byte> 100))
+    Assert.Equal(65536, q.Rented)
+    Assert.Equal(100, q.Count)
+    q.Clear()
+    Assert.Equal(0, q.Rented)
+    Assert.Equal(0, q.Count)

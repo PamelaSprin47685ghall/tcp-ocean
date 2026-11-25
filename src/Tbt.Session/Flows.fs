@@ -121,6 +121,9 @@ type ByteQueue(cap: int) =
         else count - bytesInFirst () - (chunks - 2) * chunkSize
 
     member _.Count = count
+    /// Bytes requested from the shared pool. ArrayPool may hand back a larger slab;
+    /// this is the reserved chunk size, not a guess of the process RSS.
+    member _.Rented = chunks * chunkSize
     member _.Cap = cap
 
     member _.Free = cap - count
@@ -212,7 +215,17 @@ type CreditPolicy =
 
 module CreditPolicy =
     let C0 = 65536
-    let defaults = { Enabled = true; Initial = C0; FlowWindowMax = 8 <<< 20; PoolBytes = 32 <<< 20 }
+    /// Default single-flow receive window. A 45-50 MB/s flow needs about 20 MB in flight
+    /// at 0.4 s BDP; 24 MiB leaves headroom without allocating it up front.
+    let DefaultFlowWindowMax = 24 <<< 20
+    /// 256 slots still reserve 16 MiB of C0. The remaining 48 MiB is shared, enough for
+    /// two large flows or many small ones; the pool only charges promises, not RSS.
+    let DefaultPoolBytes = 64 <<< 20
+    let defaults =
+        { Enabled = true
+          Initial = C0
+          FlowWindowMax = DefaultFlowWindowMax
+          PoolBytes = DefaultPoolBytes }
 
 /// State of one slot. Tx: this end's bytes to the peer. Rx: the peer's bytes to this end.
 [<Sealed>]
@@ -329,8 +342,9 @@ type FlowCounters() =
 /// The flow slots of one session. stepUndelivered(step, delta) counts sources per step
 /// that wait for delivery; the decoder keeps a step while its count is not zero.
 [<Sealed>]
-type FlowTable(port: IFlowPort, store: ISourceStore, stepUndelivered: Action<uint64, int>, credit: CreditPolicy) =
+type FlowTable(port: IFlowPort, store: ISourceStore, stepUndelivered: Action<uint64, int>, credit: CreditPolicy, ?newWindowCap: unit -> int) =
     static let slotCount = 256
+    let mutable windowCap = defaultArg newWindowCap (fun () -> Int32.MaxValue)
     let flows = Array.init slotCount Flow
     let closing = List<int>()
     /// Client side: next slot to try, so that a freed slot rests as long as possible.
@@ -403,17 +417,22 @@ type FlowTable(port: IFlowPort, store: ISourceStore, stepUndelivered: Action<uin
     let refreshCredit (f: Flow) =
         if credit.Enabled && f.Active then recharge f
         if credit.Enabled && f.Active && f.RxOpened && not f.RxDone then
-            let window = max credit.Initial (min credit.FlowWindowMax (int (c0 + sharedPool / int64 (max 1 rxActive))))
+            // A pressure cap applies to NEW promises only. RxLimit never shrinks here, so
+            // bytes already promised and in flight keep their right to arrive. The floor is
+            // C0 because Start already promised it; retracting it would break custody.
+            let cap = max c0 (int64 (windowCap ()))
+            let window =
+                int (max (int64 credit.Initial)
+                         (min (min (int64 credit.FlowWindowMax) cap)
+                              (c0 + sharedPool / int64 (max 1 rxActive))))
             let taken = consumed f
             let free = sharedPool - poolUsed
             let limit = min (taken + uint64 window) (taken + uint64 (c0 + f.Charged + free))
-            // Report when a sixteenth of the window is free again, floored at C0 / 2 and
-            // capped at 256 KiB. The old rule waited for a full window / 8, which is 1 MiB
-            // on an 8 MiB window: at 33 Mbit/s that is a quarter second of silence, enough
-            // for the peer to drain its credit to zero and stop reading its local socket
-            // (the observed 93.6% rwnd_limited). A report also goes out when the flow's own
-            // room falls under half the window, so a fast drain can never reach zero.
-            let step = max (c0 / 2L) (int64 (min (window / 16) 262144))
+            // Report when an eighth of the window (capped at 256 KiB) is free again, floored
+            // at C0/2. A 24 MiB window would be 3 MiB on the uncapped rule, too silent for
+            // 400 Mbit/s; 256 KiB is about 5 ms at that rate. A report also goes out when
+            // the flow's own room falls below half the window, so a fast drain cannot hit 0.
+            let step = max (c0 / 2L) (int64 (min (window / 8) 262144))
             let room = f.RxLimit - min f.RxLimit taken
             if limit >= f.RxLimit + uint64 step || (limit > f.RxLimit && room < uint64 (window / 2)) then
                 f.RxLimit <- limit
@@ -489,11 +508,25 @@ type FlowTable(port: IFlowPort, store: ISourceStore, stepUndelivered: Action<uin
 
     member _.Counters = counters
     member _.Credit = credit
+    /// Governor hook for ShrinkNewWindows. The cap is clamped to [C0, FlowWindowMax];
+    /// lowering it stops future RxLimit growth but never revokes an issued promise.
+    /// Passing Int32.MaxValue restores the configured ceiling.
+    member this.SetNewWindowCap(cap: int) =
+        let lower = max CreditPolicy.C0 cap
+        windowCap <- fun () -> min credit.FlowWindowMax lower
     /// Flows whose rx limit changed and waits for a FLOW_STATE report.
     member _.ReportsDue = reportsDue
     member _.RxActive = rxActive
     /// Shared-pool bytes charged now (at most the current budget cap minus 256 x C0).
+    /// This is a credit promise, not physical memory. Memory accounting uses ReserveBytes.
     member _.PoolUsed = poolUsed
+    /// Delivery-reserve chunks currently rented. Zero while a flow has not had to queue
+    /// bytes the local peer refused. Not the credit commitment.
+    member _.ReserveBytes =
+        let mutable n = 0L
+        for f in flows do
+            if f.Active then n <- n + int64 f.Reserve.Rented
+        n
     /// Session rx budget cap in bytes (CTRL CAPACITY_CHANGE). Starts at PoolBytes.
     member _.BudgetCap = budgetCap
     /// Tighten or raise the rx budget cap. Already issued RxLimit values are kept.

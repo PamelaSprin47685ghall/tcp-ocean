@@ -157,6 +157,10 @@ type Session(role: Role, p: SessionParams, port: IFlowPort, clock: IClock, confi
     let hhfBytes: int[] = Array.zeroCreate 256
     let hhfLast: int[] = Array.zeroCreate 256
     let mutable beganInteractive = false
+    let mutable reportedEncoder = -1L
+    let mutable reportedDecoder = -1L
+    let mutable reportedFlow = -1L
+    let mutable windowsShrunk = false
     let mutable interactiveSources = 0L
     let flows = FlowTable(port, DecoderStore decoder, Action<uint64, int>(fun t d -> rx.StepUndelivered(t, d)), credit)
     let governor = MemoryGovernor(MemTier.budgetBytes (MemTier.ofCaps p.Caps))
@@ -799,6 +803,29 @@ type Session(role: Role, p: SessionParams, port: IFlowPort, clock: IClock, confi
                         markPath i PathCloseState.Closed
         rx.Service now
         rx.Release()
+        // StepRing allocates capacity * 16 * symbol once and never returns it.
+        // Decoder rows have no public byte owner, so they are not guessed.
+        // PoolUsed is a credit promise and is never reported as memory.
+        // ReserveBytes is the delivery queue's rented chunks, not its credit commitment.
+        let stride = int64 encoder.SymbolSize * int64 Tbt.Codec.CodeGraph.SlotsPerStep
+        let encoderBytes = stride * int64 encoder.Capacity
+        let decoderBytes = stride * int64 config.WindowSteps
+        let flowBytes = flows.ReserveBytes
+        if encoderBytes <> reportedEncoder then
+            governor.Report(GovernorModules.EncoderRing, encoderBytes)
+            reportedEncoder <- encoderBytes
+        if decoderBytes <> reportedDecoder then
+            governor.Report(GovernorModules.DecoderRing, decoderBytes)
+            reportedDecoder <- decoderBytes
+        if flowBytes <> reportedFlow then
+            governor.Report(GovernorModules.FlowRxBuffers, flowBytes)
+            reportedFlow <- flowBytes
+        let shrink = governor.Order.ShrinkNewWindows
+        if shrink <> windowsShrunk then
+            // C0 stops future growth. MaxValue restores the configured ceiling.
+            // SetNewWindowCap does not rewrite an RxLimit already promised.
+            flows.SetNewWindowCap(if shrink then CreditPolicy.C0 else Int32.MaxValue)
+            windowsShrunk <- shrink
         let changed = rx.AckStepLo <> lastAckLo || rx.AckStepLo + uint64 rx.Grant <> lastGrantLimit
         if (changed && now - lastAckNs >= winAckPeriodNs) || now - lastAckNs >= keepAliveNs then ackDue <- true
         // A NACK is state: repeat it every 10 ms while the frontier lacks rank (spec 5.8).

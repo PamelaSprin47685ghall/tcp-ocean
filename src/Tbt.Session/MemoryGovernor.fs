@@ -45,6 +45,20 @@ type GovernorState =
       /// >95%: refuse new flows; existing flows continue.
       RejectNewFlows: bool }
 
+/// Single owner of each reported byte. A byte counted in two modules is a defect.
+/// Credit promises, grant limits, and unsent kernel buffers are not physical occupancy.
+module GovernorModules =
+    [<Literal>]
+    let EncoderRing = 1uy
+    [<Literal>]
+    let DecoderRing = 2uy
+    [<Literal>]
+    let DecoderRows = 3uy
+    [<Literal>]
+    let FlowRxBuffers = 4uy
+    [<Literal>]
+    let ExternalRxScratch = 5uy
+
 [<Sealed>]
 type MemoryGovernor(budgetBytes: int64) =
     let usage: int64[] = Array.zeroCreate 256
@@ -81,6 +95,9 @@ type MemoryGovernor(budgetBytes: int64) =
         refresh ()
 
     member this.ReportTotal(bytes: int64) = this.Report(0uy, bytes)
+
+    /// Carrier-owned receive scratch. Session never owns these bytes; it only relays the count.
+    member this.NoteExternalRxScratch(bytes: int64) = this.Report(GovernorModules.ExternalRxScratch, bytes)
 
     member _.Order =
         { Level = level

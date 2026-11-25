@@ -258,6 +258,43 @@ let ``AEAD matches RFC 8439 section 2.8.2`` () =
     Assert.All(back, fun b -> Assert.Equal(0uy, b))
 
 [<Fact>]
+let ``platform decrypt matches managed, including in place, and a bad tag writes nothing`` () =
+    if Security.Cryptography.ChaCha20Poly1305.IsSupported then
+        let rng = Random 23
+        for len in [| 0; 1; 63; 64; 65; 255; 1344; 2048; 3000 |] do
+            let key, nonce, aad = Array.zeroCreate 32, Array.zeroCreate 12, Array.zeroCreate 18
+            let plain = Array.init len byte
+            rng.NextBytes key
+            rng.NextBytes nonce
+            rng.NextBytes aad
+            let cipher, tag = Array.zeroCreate len, Array.zeroCreate 16
+            ChaCha20Poly1305Aead(ReadOnlySpan key, platform = false).Encrypt(ReadOnlySpan nonce, ReadOnlySpan plain, Span cipher, Span tag, ReadOnlySpan aad)
+            let separated = Array.create len 0xA5uy
+            let aead = ChaCha20Poly1305Aead(ReadOnlySpan key)
+            Assert.True(aead.TryDecrypt(ReadOnlySpan nonce, ReadOnlySpan cipher, ReadOnlySpan tag, Span separated, ReadOnlySpan aad))
+            Assert.Equal<byte[]>(plain, separated)
+            let inplace = Array.copy cipher
+            Assert.True(aead.TryDecrypt(ReadOnlySpan nonce, ReadOnlySpan inplace, ReadOnlySpan tag, Span inplace, ReadOnlySpan aad))
+            Assert.Equal<byte[]>(plain, inplace)
+            let marker = Array.create len 0x5Auy
+            tag.[0] <- tag.[0] ^^^ 1uy
+            Assert.False(aead.TryDecrypt(ReadOnlySpan nonce, ReadOnlySpan cipher, ReadOnlySpan tag, Span marker, ReadOnlySpan aad))
+            Assert.True(marker |> Array.forall (fun b -> b = 0x5Auy))
+            let unchanged = Array.copy cipher
+            Assert.False(aead.TryDecrypt(ReadOnlySpan nonce, ReadOnlySpan cipher, ReadOnlySpan tag, Span cipher, ReadOnlySpan aad))
+            Assert.Equal<byte[]>(unchanged, cipher)
+            tag.[0] <- tag.[0] ^^^ 1uy
+            aad.[0] <- aad.[0] ^^^ 1uy
+            Assert.False(aead.TryDecrypt(ReadOnlySpan nonce, ReadOnlySpan cipher, ReadOnlySpan tag, Span marker, ReadOnlySpan aad))
+            Assert.True(marker |> Array.forall (fun b -> b = 0x5Auy))
+            aad.[0] <- aad.[0] ^^^ 1uy
+            if len > 0 then
+                cipher.[0] <- cipher.[0] ^^^ 1uy
+                let tampered = Array.copy cipher
+                Assert.False(aead.TryDecrypt(ReadOnlySpan nonce, ReadOnlySpan cipher, ReadOnlySpan tag, Span cipher, ReadOnlySpan aad))
+                Assert.Equal<byte[]>(tampered, cipher)
+
+[<Fact>]
 let ``AEAD agrees with the platform implementation on random inputs`` () =
     if Security.Cryptography.ChaCha20Poly1305.IsSupported then
         let rng = Random 7

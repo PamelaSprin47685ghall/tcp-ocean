@@ -216,15 +216,17 @@ let ``echo returns every byte in order and closes both ends`` (loss: float, path
 
 [<Fact>]
 let ``a blocked local reader stops its flow through the flow credit, then resumes`` () =
-    let config = { SessionConfig.defaults with WindowSteps = 512 }
+    // The step window must be larger than one 24 MiB credit window, or WIN_ACK
+    // stops the sender before credit does and the assertion measures the wrong gate.
+    let config = { SessionConfig.defaults with WindowSteps = 2048 }
     let pair = Pair(config, 4, 0.0, 7)
     pair.ServerPort.WriteLimit <- 0
     let c = pair.Client
     let mutable slot = -1
     Assert.True(c.TryOpenFlow(&slot))
-    let payload = Array.init (12000 * 1328) byte
+    let payload = Array.init (config.Credit.FlowWindowMax + (1 <<< 20)) byte
     let mutable sent = 0
-    for _ in 1 .. 1000 do
+    for _ in 1 .. 2500 do
         sent <- sent + pair.Feed(c, slot, ReadOnlySpan(payload, sent, payload.Length - sent), false)
         pair.Round() |> ignore
     // The receiver promised one flow window past the bytes its reader took (none).
@@ -233,7 +235,7 @@ let ``a blocked local reader stops its flow through the flow credit, then resume
     Assert.Equal(sent, pair.Server.Flows.[slot].Reserve.Count)
     Assert.True(pair.Server.FlowStatesSent > 0L)
     pair.ServerPort.WriteLimit <- Int32.MaxValue
-    for _ in 1 .. 6000 do
+    for _ in 1 .. 8000 do
         pair.Server.PumpFlow slot
         sent <- sent + pair.Feed(c, slot, ReadOnlySpan(payload, sent, payload.Length - sent), false)
         pair.Round() |> ignore
