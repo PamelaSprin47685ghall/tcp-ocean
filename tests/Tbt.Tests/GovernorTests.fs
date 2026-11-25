@@ -157,3 +157,20 @@ let ``delivery reserve reports rented chunks, not the credit promise`` () =
     q.Clear()
     Assert.Equal(0, q.Rented)
     Assert.Equal(0, q.Count)
+
+[<Fact>]
+let ``tx queue report is candidate slots, not a second copy of encoder symbols`` () =
+    let pair = Pair(SessionConfig.defaults, 1, 0.0, 55)
+    let c = pair.Client
+    let mutable slot = -1
+    Assert.True(c.TryOpenFlow(&slot))
+    c.Tick()
+    let before = c.Governor.Used
+    let beforeQueue = c.Tx.QueueMemoryBytes
+    Assert.True(pair.Feed(c, slot, ReadOnlySpan(Array.init 8000 byte), false) > 0)
+    c.Tick()
+    let queued = c.Tx.QueueMemoryBytes
+    Assert.True(queued > 0L)
+    // Candidate arrays are retained even when empty. The update must account for any
+    // growth without counting the encoder's payload a second time.
+    Assert.True(c.Governor.Used >= before + queued - beforeQueue)

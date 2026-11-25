@@ -342,6 +342,11 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
     member _.SymbolSize = symbolSize
     /// Bytes still sitting in the send queues. Credit grants are not included.
     member _.QueuedBytes = int64 (queue.Count + urgent.Count + repairs.Count) * int64 symbolSize
+    /// Backing-array capacity, excluding managed headers. Symbols belong to the encoder.
+    member _.QueueMemoryBytes =
+        let candidates = queue.EnsureCapacity(0) + repairs.EnsureCapacity(0) + urgent.EnsureCapacity(0)
+        int64 candidates * int64 (System.Runtime.CompilerServices.Unsafe.SizeOf<Candidate>())
+        + int64 (dueQ.EnsureCapacity(0)) * int64 (System.Runtime.CompilerServices.Unsafe.SizeOf<ValueTuple<uint64, int64>>())
     member _.PeerAck = peerAck
     member _.GrantLimit = grantLimit
     member _.Head = encoder.Head

@@ -28,6 +28,11 @@ type PathRefresher(maxAgeNs: int64, perTick: int, perTickIdle: int, tickNs: int6
         if jitter <= 0.0 then maxAgeNs
         else int64 (float maxAgeNs * (1.0 - jitter + 2.0 * jitter * rng.NextDouble()))
     let inFlight = HashSet<uint16>()
+    /// Consecutive samples of a mature path whose delivered rate stayed below one
+    /// third of the healthy median while it still had a backlog. A single RTT spike
+    /// must not kill a path; a carrier policer that stays slow must be replaced.
+    let slowStreak = Dictionary<uint16, int>()
+    let slowZombieSamples = 3
     let mutable lastTickNs = 0L
     let mutable started = 0L
     let mutable replaced = 0L
@@ -52,6 +57,7 @@ type PathRefresher(maxAgeNs: int64, perTick: int, perTickIdle: int, tickNs: int6
     /// A path id got a new connection (first JOIN, rebuild or refresh).
     member _.NoteJoined(id: uint16, nowNs: int64) =
         inFlight.Remove id |> ignore
+        slowStreak.Remove id |> ignore
         joinedAt.[id] <- nowNs
         dueAt.[id] <- nowNs + ageFor ()
 
@@ -59,6 +65,7 @@ type PathRefresher(maxAgeNs: int64, perTick: int, perTickIdle: int, tickNs: int6
     member _.NoteLost(id: uint16) =
         joinedAt.Remove id |> ignore
         dueAt.Remove id |> ignore
+        slowStreak.Remove id |> ignore
 
     /// Ids to re-JOIN now: present, not already refreshing, older than maxAge, oldest
     /// first; at most perTick per tick (perTickIdle while the session is idle) and
@@ -96,7 +103,10 @@ type PathRefresher(maxAgeNs: int64, perTick: int, perTickIdle: int, tickNs: int6
     ///   or delivery rate collapsed below 1/4 of healthy peers while having unsent demand)
     ///   are refreshed, worst first.
     member this.DueDegraded(nowNs: int64, paths: struct (uint16 * PathHealth)[], ready: bool, idle: bool) : uint16[] =
-        if not this.Enabled || not ready || idle || nowNs - lastTickNs < tickNs then Array.empty
+        if not this.Enabled || not ready || idle then
+            slowStreak.Clear()
+            Array.empty
+        elif nowNs - lastTickNs < tickNs then Array.empty
         else
             lastTickNs <- nowNs
             let room = min perTick (maxInFlight - inFlight.Count)
@@ -125,17 +135,36 @@ type PathRefresher(maxAgeNs: int64, perTick: int, perTickIdle: int, tickNs: int6
                             // RTT sample so "not yet measured" is not treated as dead.
                             let stalled =
                                 medRate > 0L && h.DeliveryRate = 0L && demand && h.RttUs > 0u
+                            let collapsedRate =
+                                medRate > 0L && h.DeliveryRate > 0L
+                                && h.DeliveryRate * 4L < medRate && demand
+                            // A carrier policer can hold a mature path at a low positive
+                            // rate with no loss. Grace after repeated samples only; one
+                            // transient jitter cannot evict a path.
+                            let slowNow =
+                                h.Valid && medRate > 0L && h.DeliveryRate > 0L
+                                && h.DeliveryRate < medRate / 3L && demand && h.RttUs > 0u
+                            let streak =
+                                if slowNow then
+                                    let prior =
+                                        match slowStreak.TryGetValue id with
+                                        | true, n -> n
+                                        | _ -> 0
+                                    prior + 1
+                                else 0
+                            if streak = 0 then slowStreak.Remove id |> ignore
+                            else slowStreak.[id] <- streak
+                            let zombie = slowNow && not collapsedRate && streak >= slowZombieSamples
                             let degraded =
                                 h.Valid
                                 && (h.CaState >= 4uy
                                     || h.RetransRate >= 0.45
                                     || stalled
-                                    || (medRate > 0L && h.DeliveryRate > 0L
-                                        && h.DeliveryRate * 4L < medRate
-                                        && demand))
+                                    || collapsedRate
+                                    || zombie)
                             if degraded then
                                 // Lower severity score goes first: Loss, then zero-rate
-                                // backlog, then high-retrans, then slow positive rate.
+                                // backlog, then high-retrans, then collapsed/zombie slow rate.
                                 let severity =
                                     if h.CaState >= 4uy then 0L
                                     elif stalled then 500_000L
@@ -164,6 +193,7 @@ type PathRefresher(maxAgeNs: int64, perTick: int, perTickIdle: int, tickNs: int6
     member _.OnFailed(id: uint16, nowNs: int64) =
         failed <- failed + 1L
         inFlight.Remove id |> ignore
+        slowStreak.Remove id |> ignore
         joinedAt.[id] <- nowNs - maxAgeNs + retryNs
         dueAt.[id] <- nowNs + retryNs
 

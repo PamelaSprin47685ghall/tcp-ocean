@@ -63,6 +63,7 @@ internal static class ClientHost
         // The native host keeps the synchronous path, so both async hooks stay null.
         var carrier = new SessionCarrier(session, bridge, null, null, null, null,
                                         Microsoft.FSharp.Core.FSharpOption<int>.None,
+                                        Microsoft.FSharp.Core.FSharpOption<int>.None,
                                         Microsoft.FSharp.Core.FSharpOption<int>.None);
         carrier.AddPath(link0);
 

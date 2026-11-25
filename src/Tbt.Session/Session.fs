@@ -161,6 +161,7 @@ type Session(role: Role, p: SessionParams, port: IFlowPort, clock: IClock, confi
     let mutable reportedDecoder = -1L
     let mutable reportedRows = -1L
     let mutable reportedFlow = -1L
+    let mutable reportedTxQueues = -1L
     let mutable windowsShrunk = false
     let mutable interactiveSources = 0L
     let flows = FlowTable(port, DecoderStore decoder, Action<uint64, int>(fun t d -> rx.StepUndelivered(t, d)), credit)
@@ -825,6 +826,12 @@ type Session(role: Role, p: SessionParams, port: IFlowPort, clock: IClock, confi
         if flowBytes <> reportedFlow then
             governor.Report(GovernorModules.FlowRxBuffers, flowBytes)
             reportedFlow <- flowBytes
+        // Candidate queue slots, not encoder symbols. Reporting the same payload twice
+        // would trip pressure while the bytes have one owner.
+        let txQueueBytes = tx.QueueMemoryBytes
+        if txQueueBytes <> reportedTxQueues then
+            governor.Report(GovernorModules.TxQueues, txQueueBytes)
+            reportedTxQueues <- txQueueBytes
         let shrink = governor.Order.ShrinkNewWindows
         if shrink <> windowsShrunk then
             // C0 stops future growth. MaxValue restores the configured ceiling.

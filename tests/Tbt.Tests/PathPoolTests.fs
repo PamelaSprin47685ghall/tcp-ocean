@@ -310,6 +310,37 @@ let ``PathRefresher DueDegraded replaces a zero-rate path with backlog when peer
     Assert.Empty(stalled.DueDegraded(121L * s, allZero, true, false))
 
 [<Fact>]
+let ``PathRefresher needs repeated evidence before replacing a continuously policed path`` () =
+    let s = 1_000_000_000L
+    let r = PathRefresher(60L * s, 2, 0, s, 4, 10L * s)
+    for id in 0us .. 4us do r.NoteJoined(id, 0L)
+    let live id rate notSent = struct (id, mkHealth 0uy rate 0.02 notSent)
+    let paths slow =
+        [| live 0us 2_000_000L 0
+           live 1us 2_100_000L 0
+           live 2us 1_900_000L 0
+           live 3us slow 8192
+           live 4us 1_800_000L 0 |]
+    // 600 KiB/s is below 1/3 of the 2 MiB/s median but above the old 1/4 collapse rule.
+    // One and two samples are grace; the third sustained sample replaces it.
+    Assert.Empty(r.DueDegraded(121L * s, paths 600_000L, true, false))
+    Assert.Empty(r.DueDegraded(122L * s, paths 600_000L, true, false))
+    Assert.Equal<uint16[]>([| 3us |], r.DueDegraded(123L * s, paths 600_000L, true, false))
+
+[<Fact>]
+let ``PathRefresher does not kill a transient slow sample`` () =
+    let s = 1_000_000_000L
+    let r = PathRefresher(60L * s, 4, 0, s, 8, 10L * s)
+    for id in 0us .. 4us do r.NoteJoined(id, 0L)
+    let live id rate notSent = struct (id, mkHealth 0uy rate 0.02 notSent)
+    let slow = [| live 0us 2_000_000L 0; live 1us 2_100_000L 0; live 2us 1_900_000L 0; live 3us 600_000L 8192; live 4us 1_800_000L 0 |]
+    let healed = [| live 0us 2_000_000L 0; live 1us 2_100_000L 0; live 2us 1_900_000L 0; live 3us 1_950_000L 0; live 4us 1_800_000L 0 |]
+    Assert.Empty(r.DueDegraded(121L * s, slow, true, false))
+    Assert.Empty(r.DueDegraded(122L * s, healed, true, false))
+    Assert.Empty(r.DueDegraded(123L * s, healed, true, false))
+    Assert.Empty(r.DueDegraded(124L * s, healed, true, false))
+
+[<Fact>]
 let ``CcNudgePlan precomputes score once per eligible key and DueDegraded skips idle and healthy sockets`` () =
     let s = 1_000_000_000L
     let keys = Array.init 16 (fun i -> box i)
