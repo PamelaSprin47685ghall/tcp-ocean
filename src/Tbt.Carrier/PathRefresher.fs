@@ -211,15 +211,20 @@ type PathRefresher(maxAgeNs: int64, perTick: int, perTickIdle: int, tickNs: int6
             else
                 let picked = ResizeArray<uint16>(room)
                 for id in plateau do
-                        if picked.Count < room && not (inFlight.Contains id) && dueAt.ContainsKey id then
+                    if picked.Count < room && not (inFlight.Contains id) then
+                        let present = paths |> Array.exists (fun struct (pathId, _) -> pathId = id)
+                        match joinedAt.TryGetValue id, dueAt.TryGetValue id with
+                        | (true, at), (true, due) when present && nowNs >= due && nowNs - at >= rotateNs ->
                             picked.Add id
+                        | _ -> ()
                 if picked.Count < room then
                     let oldest = ResizeArray<struct (int64 * uint16)>()
                     for i in 0 .. paths.Length - 1 do
                         let struct (id, _) = paths.[i]
                         if not (inFlight.Contains id) && not (picked.Contains id) then
-                            match joinedAt.TryGetValue id with
-                            | true, at when nowNs - at >= rotateNs -> oldest.Add(struct (at, id))
+                            match joinedAt.TryGetValue id, dueAt.TryGetValue id with
+                            | (true, at), (true, due) when nowNs >= due && nowNs - at >= rotateNs ->
+                                oldest.Add(struct (at, id))
                             | _ -> ()
                     oldest.Sort(fun (struct (a, x)) (struct (b, y)) ->
                         if a <> b then compare a b else compare x y)

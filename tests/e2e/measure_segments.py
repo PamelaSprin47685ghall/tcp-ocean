@@ -72,9 +72,13 @@ def read_log(path, anchor, gap_s):
         if "clock_jumps" in values:
             count = int(values["clock_jumps"])
             if count > clock_count:
-                result["events"].append({"start": clock_sample if clock_sample is not None else first,
-                                         "end": current, "kind": "clock_jump", "log": path.name,
-                                         "count": count - clock_count})
+                # A catch-up proves a product stall and makes timing-derived samples
+                # uncertain. It is not a wall-clock step, so it must not be an invalid
+                # event; it must also not be silently treated as clean evidence.
+                result.setdefault("uncertain", []).append(
+                    {"start": clock_sample if clock_sample is not None else first,
+                     "end": current, "kind": "product_clock_catchup", "log": path.name,
+                     "count": count - clock_count})
             elif count < clock_count:
                 result["uncertain"].append({"start": clock_sample, "end": current,
                                             "kind": "clock_counter_reset", "log": path.name})

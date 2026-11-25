@@ -707,10 +707,9 @@ let private runCore (o: Options) =
     match asyncGroup with
     | Some g -> g.Stop()
     | None -> ()
-    // TunStack has no Close. The process exit reclaims the fd; do not cast it.
     match tun with
     | null -> ()
-    | _ -> ()
+    | t -> t.Close()
     log "stopped"
     0
 

@@ -94,7 +94,7 @@ class MeasurementTests(unittest.TestCase):
         outcomes = {row["name"]: row["validity"] for row in result["records"]}
         self.assertEqual(outcomes, {"bulk_up": "invalid", "iperf_1": "valid"})
 
-    def test_clock_counter_only_invalidates_its_increment_window(self):
+    def test_clock_counter_only_makes_its_increment_window_unknown(self):
         path = self.work / "server-mux.log"
         path.write_text("12:00:00.000 stats sessions=1\n"
                         "12:00:00.001 stats tun clock_jumps=0\n"
@@ -104,8 +104,9 @@ class MeasurementTests(unittest.TestCase):
                         "12:00:02.001 stats tun clock_jumps=2\n"
                         "12:00:03.000 stats sessions=1\n")
         log = measure.read_log(path, ANCHOR, 2.5)
-        self.assertEqual(len(log["events"]), 1)
-        self.assertEqual(measure.classify(record(0.5, 1.1), [log], [], [], 2.5)["validity"], "invalid")
+        self.assertEqual(log["events"], [])
+        self.assertEqual(log["uncertain"][0]["kind"], "product_clock_catchup")
+        self.assertEqual(measure.classify(record(0.5, 1.1), [log], [], [], 2.5)["validity"], "unknown")
         self.assertEqual(measure.classify(record(1.5, 2.5), [log], [], [], 2.5)["validity"], "valid")
 
     def test_cpu_and_gc_counters_do_not_invalidate(self):

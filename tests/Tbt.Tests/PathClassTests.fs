@@ -72,6 +72,20 @@ let ``a plateau does not need a median outlier and rotation still runs when idle
     Assert.Equal<uint16[]>([| 2us |], r.DueRotation(61L * s, peers, [| 2us |], true, false, 60L * s))
 
 [<Fact>]
+let ``rotation respects age and failed refresh retry for plateau and ordinary paths`` () =
+    let h = health 500_000L 0.01 0uy 200_000u 180_000u true
+    let s = 1_000_000_000L
+    let r = PathRefresher(60L * s, 1, 0, s, 4, 10L * s)
+    let peers = [| struct (1us, h) |]
+    r.NoteJoined(1us, 0L)
+    Assert.Empty(r.DueRotation(2L * s, peers, [| 1us |], true, false, 60L * s))
+    Assert.Equal<uint16[]>([| 1us |], r.DueRotation(61L * s, peers, [| 1us |], true, false, 60L * s))
+    r.OnFailed(1us, 61L * s)
+    Assert.Empty(r.DueRotation(62L * s, peers, [| 1us |], true, false, 60L * s))
+    Assert.Empty(r.DueRotation(63L * s, peers, [||], true, false, 60L * s))
+    Assert.Equal<uint16[]>([| 1us |], r.DueRotation(71L * s, peers, [| 1us |], true, false, 60L * s))
+
+[<Fact>]
 let ``a policed queue is 20 ms at the cap and a missing rate stays a probe`` () =
     // 100 KiB/s * 20 ms = 2000 B, raised to the 4 KiB floor, then softened by 1/8.
     let q = PathBudget.PolicedQueue(100_000L, 1400)

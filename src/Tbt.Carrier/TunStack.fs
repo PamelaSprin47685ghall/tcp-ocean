@@ -102,7 +102,9 @@ type ServiceGapLog(stallNs: int64) =
     member _.LastTickNs = lastTickNs
 
 type TunStack(fd: int, local: IPEndPoint, clock: IClock, entropy: IEntropy, maxConnections: int,
-              ?windowClamp: int) =
+              ?windowClamp: int, ?ownsFd: bool) =
+    let ownsFd = defaultArg ownsFd false
+    let mutable closed = 0
     let windowClamp = defaultArg windowClamp SocketTuning.WindowClamp
     let localIp =
         let b = local.Address.GetAddressBytes()
@@ -165,6 +167,12 @@ type TunStack(fd: int, local: IPEndPoint, clock: IClock, entropy: IEntropy, maxC
             output.Write(ReadOnlySpan(scratch, 0, n))
 
     member _.Fd = fd
+    /// Call on the owner thread after all users of this stack have stopped.
+    /// Attach borrows its descriptor; Open owns and closes it exactly once.
+    member _.Close() =
+        if System.Threading.Interlocked.Exchange(&closed, 1) = 0 && ownsFd then
+            Native.sysClose fd |> ignore
+    member _.IsClosed = System.Threading.Volatile.Read(&closed) <> 0
     /// txqueuelen after the startup ioctl, or -1 if it was not attempted.
     member _.TxQueueLen = txqLen
     member _.TxQueueOk = txqOk
@@ -352,7 +360,7 @@ type TunStack(fd: int, local: IPEndPoint, clock: IClock, entropy: IEntropy, maxC
         let fd = Native.openTun name
         if fd < 0 then null
         else
-            let t = TunStack(fd, local, clock, entropy, maxConnections, ?windowClamp=windowClamp)
+            let t = TunStack(fd, local, clock, entropy, maxConnections, ?windowClamp=windowClamp, ownsFd=true)
             let qlen = defaultArg txQueueLen SocketTuning.TunTxQueueLen
             if qlen > 0 then
                 let struct (ok, got, errno) = Native.tryTxQueueLen name (Some qlen)

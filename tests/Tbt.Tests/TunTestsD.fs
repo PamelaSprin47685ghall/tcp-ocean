@@ -391,6 +391,36 @@ let ``TunStack.Attach refuses a bad fd and accepts an injected descriptor`` () =
             UnixPair.close sv.[1]
 
 [<Fact>]
+let ``TunStack.Close is idempotent and owns Open descriptors only`` () =
+    if not UnixPair.isAvailable then ()
+    else
+        let clock = ManualClock() :> Tbt.Contracts.IClock
+        let entropy = SeededEntropy 3 :> Tbt.Contracts.IEntropy
+        let local = System.Net.IPEndPoint(System.Net.IPAddress.Parse "10.200.3.2", 8443)
+        // Owned descriptor: Close releases the fd, and a second Close is harmless.
+        let owned = UnixPair.openPair()
+        let stack = TunStack(owned.[0], local, clock, entropy, 4, ownsFd = true)
+        stack.Close()
+        Assert.True(stack.IsClosed)
+        stack.Close()
+        let closedWrite = UnixPair.sysWrite(owned.[0], [| 0x45uy |], nativeint 1)
+        Assert.Equal(nativeint -1, closedWrite)
+        UnixPair.close owned.[1]
+        // Borrowed descriptor: Close leaves the caller's fd usable.
+        let borrowed = UnixPair.openPair()
+        try
+            let attached = TunStack.Attach(borrowed.[0], local, clock, entropy, 4, sndBuf = 0)
+            Assert.False(isNull attached)
+            let attached = nonNull attached
+            attached.Close()
+            Assert.True(attached.IsClosed)
+            UnixPair.writeOne borrowed.[1]
+            Assert.Equal(1, attached.Receive(8))
+        finally
+            UnixPair.close borrowed.[0]
+            UnixPair.close borrowed.[1]
+
+[<Fact>]
 let ``tun sndbuf auto is window_clamp times paths, or zero to leave the kernel default`` () =
     Assert.Equal(2_000_000, SocketTuning.TunSndBuf)
     Assert.Equal(2000, SocketTuning.TunRecvYieldUs)
