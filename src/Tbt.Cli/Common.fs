@@ -81,6 +81,14 @@ type Options(args: string[]) =
         | _ -> fallback
     member _.Has(name: string) = values.ContainsKey name
 
+/// The floor that keeps enough independent tuples open: explicit when given,
+/// otherwise the bundle width, capped at 64.
+let defaultMinActivePaths (explicitValue: int option) (bundleWidth: int) =
+    match explicitValue with
+    | Some n when n < 1 -> failUsage "--min-active-paths needs a positive integer"
+    | Some n -> n
+    | None -> min (max 1 bundleWidth) 64
+
 /// CLI offer flags. Default (no --suites / --x25519): suite 0x02 only, no X25519.
 /// --suites is a comma-separated list (aegis, chacha8, chacha20). --x25519 is a
 /// bare flag, or --x25519 0 to turn it off explicitly.

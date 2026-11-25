@@ -209,6 +209,7 @@ type SessionCarrier(session: Session, bridge: FlowBridge, ?uplinkPace: bool, ?tu
     let mutable pathTiers: int[] = Array.Empty<int>()
     let mutable hasHealthyPath = true
     let mutable lastHealthRefreshNs = 0L
+    let mutable lastBacklogSampleNs = 0L
     let mutable framesIn = 0L
     let mutable framesOut = 0L
     let mutable lastActivityFrames = 0L
@@ -221,6 +222,10 @@ type SessionCarrier(session: Session, bridge: FlowBridge, ?uplinkPace: bool, ?tu
     let mutable activeTarget = minActivePaths
     let mutable lastShrinkCheckNs = 0L
     let mutable overflowInWindow = false
+    let mutable txActivityAtWindowStart = 0L
+    let mutable txActivityWindowOpen = false
+    let mutable backlogSeenInWindow = false
+    let mutable framesOutAtWindowStart = 0L
     /// Reusable builders for periodic Describe() snapshots (avoids ~120 string allocs/s).
     let pathTxBuf = System.Text.StringBuilder(1024)
     let pathTcpBuf = System.Text.StringBuilder(2048)
@@ -341,6 +346,7 @@ type SessionCarrier(session: Session, bridge: FlowBridge, ?uplinkPace: bool, ?tu
         System.Threading.Volatile.Write(&socketHealthSnap, sSnap.ToArray())
 
     let refreshHealthAndRank (nowNs: int64) =
+        let mutable written = 0L
         let live = paths.ToArray()
         let n = live.Length
         let totalFrames = framesIn + framesOut
@@ -360,14 +366,41 @@ type SessionCarrier(session: Session, bridge: FlowBridge, ?uplinkPace: bool, ?tu
                 refreshPathHealth live.[(start + j) % n] nowNs 50_000_000L
             healthCursor <- (start + batch) % n
             rebuildRanking ()
-            // Gently contract the active working set if no overflow occurred for 2 s.
+        // Independent 50 ms cadence: a blocked sender can be idle for more than 2 s while
+        // its kernel or local backlog remains, so this must not share the idleLong gate.
+        if n > minActivePaths && (lastBacklogSampleNs = 0L || nowNs - lastBacklogSampleNs >= 50_000_000L) then
+            lastBacklogSampleNs <- nowNs
+            // Sample kernel backlog only on this cadence, never every Service call.
+            // The flag remembers a backlog that appears and drains before the window ends.
             if n > minActivePaths then
-                if lastShrinkCheckNs = 0L then lastShrinkCheckNs <- nowNs
-                elif nowNs - lastShrinkCheckNs >= 2_000_000_000L then
-                    if not overflowInWindow && activeTarget > minActivePaths && session.Tx.Queued = 0 then
-                        activeTarget <- max minActivePaths (activeTarget * 3 / 4)
-                    overflowInWindow <- false
-                    lastShrinkCheckNs <- nowNs
+                let mutable backlog = 0L
+                let mutable sampled = 0L
+                for p in live do
+                    let unsent = int64 p.UnsentBytes
+                    if unsent > 0L then backlog <- backlog + unsent
+                    match p with
+                    | :? AsyncPathLink as ap -> sampled <- sampled + ap.BytesWritten
+                    | :? PathLink as pl -> sampled <- sampled + pl.BytesWritten
+                    | _ -> ()
+                if backlog > 0L || session.Tx.Queued > 0 || framesOut <> framesOutAtWindowStart
+                   || sampled <> txActivityAtWindowStart then
+                    backlogSeenInWindow <- true
+                written <- sampled
+        // Decision remains independent of the health gate, using only counters and flags.
+        if n > minActivePaths then
+            if lastShrinkCheckNs = 0L || not txActivityWindowOpen then
+                lastShrinkCheckNs <- nowNs
+                txActivityAtWindowStart <- written
+                framesOutAtWindowStart <- framesOut
+                txActivityWindowOpen <- true
+            elif nowNs - lastShrinkCheckNs >= 2_000_000_000L then
+                if not overflowInWindow && activeTarget > minActivePaths && not backlogSeenInWindow then
+                    activeTarget <- max minActivePaths (activeTarget * 3 / 4)
+                overflowInWindow <- false
+                backlogSeenInWindow <- false
+                txActivityAtWindowStart <- written
+                framesOutAtWindowStart <- framesOut
+                lastShrinkCheckNs <- nowNs
 
     let publishIds () =
         // One snapshot for the whole function: `paths.[i]` re-reads the published array, so a
@@ -851,14 +884,25 @@ type SessionCarrier(session: Session, bridge: FlowBridge, ?uplinkPace: bool, ?tu
     let readPass (poller: Poller) (interactive: bool) =
         let armed = bridge.Armed
         let mutable slot = armed.NextUp -1
+        let mutable readable = 0
         while slot >= 0 do
+            if session.IsInteractive slot = interactive && bridge.WantsRead slot then
+                readable <- readable + 1
+            slot <- armed.NextUp slot
+        let quantum = if readable <= 1 then 4096 else FlowBridge.Quantum
+        let mutable visited = 0
+        let mutable slot = if readable > 1 then armed.NextUp (bridge.ReadCursor - 1) else armed.NextUp -1
+        while slot >= 0 && visited < 256 do
             slotVisits <- slotVisits + 1L
             match bridge.Local slot with
             | null -> ()
             | s ->
                 if session.IsInteractive slot = interactive then
                     if interactive then hot.Add slot
-                    if bridge.WantsRead slot then bridge.Read slot
+                    if bridge.WantsRead slot then
+                        bridge.Read(slot, limit = quantum)
+                        if readable > 1 then bridge.ReadCursor <- slot + 1
+            visited <- visited + 1
             slot <- armed.NextUp slot
 
     /// Send at most 256 frames in batches; the interactive input is read again between batches.

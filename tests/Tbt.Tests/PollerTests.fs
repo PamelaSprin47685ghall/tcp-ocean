@@ -4,6 +4,7 @@ open System
 open System.Diagnostics
 open System.Net
 open System.Net.Sockets
+open System.Threading
 open Xunit
 open Tbt.Carrier
 open Tbt.Contracts
@@ -211,6 +212,79 @@ let ``async path: a frame committed while the IO thread blocks leaves at once`` 
             if elapsed > float worst.Value then worst.Value <- int64 elapsed
             received <- received - frameLength
         Assert.True(worst.Value < 300L, sprintf "worst commit-to-send %d ms" worst.Value)
+    finally
+        (path :> IPath).Close()
+        group.Stop()
+        (channel :> IDisposable).Dispose()
+
+/// A peer that stops reading fills the kernel queue. Further scans must wait for writability
+/// instead of calling send on every pass; when the peer resumes, every committed byte arrives.
+[<Fact>]
+let ``async path: a full send buffer waits for writability and resumes without loss`` () =
+    if not Platform.current.Value.HasEpoll then () else
+    use listener = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp)
+    listener.Bind(IPEndPoint(IPAddress.Loopback, 0))
+    listener.Listen 1
+    let a = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp)
+    a.Connect(IPEndPoint(IPAddress.Loopback, (listener.LocalEndPoint :?> IPEndPoint).Port))
+    use a = a
+    use b = listener.Accept()
+    let tiny = 4 * 1024
+    b.ReceiveBufferSize <- tiny
+    b.SendBufferSize <- tiny
+    a.SendBufferSize <- tiny
+    a.ReceiveBufferSize <- tiny
+    Assert.True(a.SendBufferSize <= 16 * 1024, sprintf "send buffer stayed large: %d" a.SendBufferSize)
+    use channel = new RxChannel()
+    let group = new AsyncPollerGroup(1)
+    let link = new PathLink(a, SocketTuning.probe())
+    link.PathId <- 0us
+    let frameLength = 1024
+    link.FrameLength <- frameLength
+    let path = AsyncPathLink.TakeOver(link, group, channel, 128)
+    group.Add(path :> IPathIo)
+    group.Start()
+    try
+        let p = path :> IPath
+        let payload = Array.init frameLength (fun i -> byte i)
+        let mutable accepted = 0
+        let started = Stopwatch.GetTimestamp()
+        // Occupied user-ring bytes are not a refusal. Keep offering until send(2) itself returns
+        // WouldBlock; otherwise a large auto-tuned buffer makes the later bound vacuous.
+        while path.WouldBlockCount = 0L && Stopwatch.GetElapsedTime(started).TotalMilliseconds < 2000.0 do
+            let mutable frame = Span<byte>.Empty
+            if p.TryBeginFrame(&frame) then
+                payload.AsSpan().CopyTo frame
+                p.CommitFrame()
+                accepted <- accepted + 1
+            else Thread.Yield() |> ignore
+        Assert.True(path.WouldBlockCount > 0L, "send never returned WouldBlock")
+        let blocks = path.WouldBlockCount
+        let attempts = path.SendAttempts
+        let pause = Stopwatch.GetTimestamp()
+        // A commit while blocked must not clear the refusal and restart the send loop.
+        while Stopwatch.GetElapsedTime(pause).TotalMilliseconds < 200.0 do
+            let mutable frame = Span<byte>.Empty
+            if p.TryBeginFrame(&frame) then
+                payload.AsSpan().CopyTo frame
+                p.CommitFrame()
+                accepted <- accepted + 1
+            else Thread.Yield() |> ignore
+        let expected = accepted
+        Assert.True(path.SendAttempts - attempts < 50L, sprintf "send retries while blocked: %d" (path.SendAttempts - attempts))
+        Assert.True(path.WouldBlockCount - blocks < 50L, sprintf "WouldBlock retries while blocked: %d" (path.WouldBlockCount - blocks))
+        let buffer = Array.zeroCreate<byte> (expected * frameLength)
+        let mutable got = 0
+        let resumed = Stopwatch.GetTimestamp()
+        while got < expected * frameLength && Stopwatch.GetElapsedTime(resumed).TotalMilliseconds < 8000.0 do
+            if b.Poll(100_000, SelectMode.SelectRead) then
+                let n = b.Receive(buffer, got, buffer.Length - got, SocketFlags.None)
+                Assert.True(n > 0)
+                got <- got + n
+        Assert.Equal(expected * frameLength, got)
+        for frame in 0 .. expected - 1 do
+            for i in 0 .. frameLength - 1 do
+                Assert.Equal(byte i, buffer.[frame * frameLength + i])
     finally
         (path :> IPath).Close()
         group.Stop()

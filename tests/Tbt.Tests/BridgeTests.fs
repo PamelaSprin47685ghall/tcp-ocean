@@ -1054,6 +1054,28 @@ type private StatePath(id: uint16, caState: byte) =
         member _.RefreshHealth(_, _) = ()
 
 [<Fact>]
+let ``four busy flows share a service round and an idle flow does not stop them`` () =
+    use listener = listen ()
+    let struct (session, bridge) = clientOnBridge ()
+    let pairs = Array.init 5 (fun _ -> loopPair listener)
+    for struct (_, local) in pairs do Assert.True(bridge.TryAdd local)
+    let payload = Array.create 64_000 7uy
+    for i in 0 .. 3 do
+        let struct (app, _) = pairs.[i]
+        app.Send payload |> ignore
+    use poller = new Poller()
+    let carrier = SessionCarrier(session, bridge)
+    for i in 0 .. 15 do carrier.AddPath(StatePath(uint16 i, 0uy))
+    for _ in 1 .. 80 do carrier.Service poller
+    let sent = [| for i in 0 .. 3 -> session.Flows.[i].TxOffset |]
+    let lo = Array.min sent
+    let hi = Array.max sent
+    Assert.True(hi > 0UL && lo * 10UL >= hi * 6UL, sprintf "shares %A" sent)
+    Assert.Equal(0UL, session.Flows.[4].TxOffset)
+    for struct (app, _) in pairs do app.Dispose()
+    bridge.CloseAll()
+
+[<Fact>]
 let ``a stray TCP_CA_Loss verdict does not widen the active working set`` () =
     // The defect this pins: the write loop counted a tier-2 *skip* as proof that the working set
     // was saturated, so each stray verdict grew `activeTarget` by 50 %. The shrink clause needs

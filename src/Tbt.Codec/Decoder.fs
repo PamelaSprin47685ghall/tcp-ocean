@@ -30,6 +30,9 @@ type private Row(symbolSize: int) =
     /// Pivot column of this row. Other columns may be smaller or larger.
     member val Pivot = 0UL with get, set
     member val Payload: byte[] = Array.zeroCreate symbolSize
+    /// Bytes of the arrays this row owns. The CLR object header and dictionary/list
+    /// capacity are not row-owned arrays and are deliberately excluded.
+    member val OwnedBytes: int64 = int64 symbolSize + 64L * 8L + 64L with get, set
     /// Position in the decoder row list, -1 when not in it.
     member val Index = -1 with get, set
 
@@ -44,6 +47,7 @@ type private Row(symbolSize: int) =
             Array.Copy(r.Coefs, k, r.Count)
             r.Cols <- c
             r.Coefs <- k
+            r.OwnedBytes <- int64 symbolSize + int64 size * 8L + int64 size
 
     member r.RemoveAt(i: int) =
         Array.Copy(r.Cols, i + 1, r.Cols, i, r.Count - i - 1)
@@ -72,6 +76,9 @@ type Decoder(graphSeed: uint64, symbolSize: int, capacitySteps: int, maxRows: in
     /// Highest step seen plus one.
     let mutable seenEnd = 0UL
     let mutable rowsAllocated = 0
+    /// O(1) sum of row-owned payload/column arrays. Updated at the exact allocation and
+    /// release sites; never derives from credit promises or index capacity.
+    let mutable rowMemoryBytes = 0L
     /// Rows refused because they kept a column of a released step. Always zero in a healthy
     /// session; anything else means Release is finding unfinished equations, which is the
     /// signal that the decode window fell behind (see Release).
@@ -141,7 +148,9 @@ type Decoder(graphSeed: uint64, symbolSize: int, capacitySteps: int, maxRows: in
         if freeRows.Count > 0 then ValueSome(freeRows.Pop())
         elif rowsAllocated < maxRows then
             rowsAllocated <- rowsAllocated + 1
-            ValueSome(Row(symbolSize))
+            let r = Row(symbolSize)
+            rowMemoryBytes <- rowMemoryBytes + r.OwnedBytes
+            ValueSome(r)
         else ValueNone
 
     let detach (r: Row) =
@@ -225,7 +234,9 @@ type Decoder(graphSeed: uint64, symbolSize: int, capacitySteps: int, maxRows: in
                     removeColIndex col q
                 i <- i + 1
                 j <- j + 1
+        let before = q.OwnedBytes
         q.EnsureCapacity n
+        rowMemoryBytes <- rowMemoryBytes + q.OwnedBytes - before
         Array.Copy(mergeCols, q.Cols, n)
         Array.Copy(mergeCoefs, q.Coefs, n)
         q.Count <- n
@@ -354,7 +365,9 @@ type Decoder(graphSeed: uint64, symbolSize: int, capacitySteps: int, maxRows: in
     let buildRow (r: Row) (count: int) =
         let mutable ok = true
         let mutable n = 0
+        let before = r.OwnedBytes
         r.EnsureCapacity count
+        rowMemoryBytes <- rowMemoryBytes + r.OwnedBytes - before
         for i in 0 .. count - 1 do
             let term = terms.[i]
             let t = term.Step
@@ -561,14 +574,15 @@ type Decoder(graphSeed: uint64, symbolSize: int, capacitySteps: int, maxRows: in
             recovered <- c
             true
 
-    /// Payload and column arrays owned by active and cached rows, excluding CLR object and
-    /// index overhead. Capacity can grow during elimination, so count the actual arrays.
-    member _.RowMemoryBytes =
+    /// O(1): the ledger is maintained at the exact array allocation and release sites.
+    member _.RowMemoryBytes = rowMemoryBytes
+
+    /// Test-only slow recomputation from the arrays actually retained by active and warm-idle
+    /// rows. Excludes CLR object/index overhead by the same contract as `RowMemoryBytes`.
+    member _.RecomputeRowMemoryBytesForTest() =
         let mutable bytes = 0L
-        for row in rows do
-            bytes <- bytes + int64 row.Payload.Length + int64 row.Cols.Length * 8L + int64 row.Coefs.Length
-        for row in freeRows do
-            bytes <- bytes + int64 row.Payload.Length + int64 row.Cols.Length * 8L + int64 row.Coefs.Length
+        for row in rows do bytes <- bytes + int64 row.Payload.Length + int64 row.Cols.Length * 8L + int64 row.Coefs.Length
+        for row in freeRows do bytes <- bytes + int64 row.Payload.Length + int64 row.Cols.Length * 8L + int64 row.Coefs.Length
         bytes
 
     member _.StepUsed(t: uint64) = if ring.Contains t then ring.K t else 0
@@ -641,6 +655,7 @@ type Decoder(graphSeed: uint64, symbolSize: int, capacitySteps: int, maxRows: in
         // than carrying 32 MiB of idle payload buffers.
         let mutable drop = freeRows.Count - warmRows
         while drop > 0 do
-            freeRows.Pop() |> ignore
+            let r = freeRows.Pop()
+            rowMemoryBytes <- rowMemoryBytes - r.OwnedBytes
             rowsAllocated <- rowsAllocated - 1
             drop <- drop - 1

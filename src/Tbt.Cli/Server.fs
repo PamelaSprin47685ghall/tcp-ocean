@@ -324,8 +324,13 @@ let private runCore (o: Options) =
             bridge.Attach session
             let channel = if asyncMode && isNull tun then Some (new RxChannel()) else None
             let ioGroup = if channel.IsSome then Some (ensureIoPool ()) else None
+            let requestedMin =
+                defaultMinActivePaths
+                    (if o.Has "min-active-paths" then Some (o.Int("min-active-paths", 16)) else None)
+                    maxPaths
             let carrier = SessionCarrier(session, bridge, uplinkPace = pace, ?rxChannel = channel, ?asyncIo = ioGroup,
-                                         gatePass2 = gatePass2, txSlots = txSlots)
+                                         gatePass2 = gatePass2, txSlots = txSlots,
+                                         minActivePaths = max 1 requestedMin)
             carrier.NoPathGraceNs <- noPathGraceNs
             link.PathId <- 0us
             reply link a.Reply
@@ -652,6 +657,6 @@ let private runCore (o: Options) =
 
 let run (o: Options) =
     if o.Has "help" then
-        Console.Error.WriteLine "usage: tbtun server --target HOST:PORT --psk-file FILE [--listen ADDR:PORT | --tun NAME --tun-listen ADDR:PORT] [--max-paths 64] [--window 1024] [--cc-nudge-s 0] [--cc-nudge-pick degraded|worst|oldest] [--stats-s 0]"
+        Console.Error.WriteLine "usage: tbtun server --target HOST:PORT --psk-file FILE [--listen ADDR:PORT | --tun NAME --tun-listen ADDR:PORT] [--max-paths 64] [--min-active-paths min(max-paths,64)] [--window 1024] [--cc-nudge-s 0] [--cc-nudge-pick degraded|worst|oldest] [--stats-s 0]"
         0
     else runCore o

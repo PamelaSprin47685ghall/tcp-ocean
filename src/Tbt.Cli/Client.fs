@@ -163,8 +163,13 @@ let private runCore (o: Options) =
                 group.Start()
                 Some group
             else None
+        let requestedMin =
+            defaultMinActivePaths
+                (if o.Has "min-active-paths" then Some (o.Int("min-active-paths", 16)) else None)
+                pathCount
         let carrier = SessionCarrier(session, bridge, uplinkPace=pace, tupleMbit=tupleMbit,
-                                     ?rxChannel=rxChannel, ?asyncIo=ioGroup, gatePass2=gatePass2, txSlots=txSlots)
+                                     ?rxChannel=rxChannel, ?asyncIo=ioGroup, gatePass2=gatePass2,
+                                     txSlots=txSlots, minActivePaths=max 1 requestedMin)
         carrier.KeepAlive <-
             Some (fun () ->
                 not (isNull (box poolRef)) && not session.Closed
@@ -497,6 +502,6 @@ let private runCore (o: Options) =
 
 let run (o: Options) =
     if o.Has "help" then
-        Console.Error.WriteLine "usage: tbtun client --server HOST:PORT --listen ADDR:PORT --psk-file FILE [--paths 4] [--window 1024] [--join-concurrency 32] [--path-refresh-s 60] [--path-refresh-mode degraded|blind] [--stats-s 0]"
+        Console.Error.WriteLine "usage: tbtun client --server HOST:PORT --listen ADDR:PORT --psk-file FILE [--paths 4] [--min-active-paths min(paths,64)] [--window 1024] [--join-concurrency 32] [--path-refresh-s 60] [--path-refresh-mode degraded|blind] [--stats-s 0]"
         0
     else runCore o

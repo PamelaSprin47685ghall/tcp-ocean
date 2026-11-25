@@ -150,6 +150,10 @@ type IPathIo =
     /// Send committed slots. Returns true when more unsent slots remain and did not WouldBlock.
     abstract PumpTx: unit -> unit
     abstract HasPendingTx: bool
+    /// Pending data that the kernel has not refused. A path that returned WouldBlock stays pending
+    /// but is not runnable until its poller reports writable, so the IO loop can block instead of
+    /// retrying send on every slot of every path.
+    abstract HasRunnableTx: bool
     abstract AcquireIoRef: unit -> unit
     abstract ReleaseIoRef: unit -> unit
     /// Detect a socket the kernel destroyed under us (SOCK_DESTROY, RST after
@@ -257,7 +261,8 @@ type AsyncPollerGroup(threadCount: int) =
                 if path.HasPendingTx then needImmediatePump <- true
             if needImmediatePump then
                 for path in local do
-                    try path.PumpTx() with :? ObjectDisposedException -> ()
+                    if path.HasRunnableTx then
+                        try path.PumpTx() with :? ObjectDisposedException -> ()
             for path in local do
                 try path.WatchForIo poller with :? ObjectDisposedException -> ()
             // Publish "about to block", then scan again under a full fence. A producer
@@ -268,12 +273,25 @@ type AsyncPollerGroup(threadCount: int) =
             // for the 1 s timeout: the window left by the first scan is closed.
             Volatile.Write(&threadSleeping.[index], 1)
             Thread.MemoryBarrier()
-            let mutable mayBlock = not mine.IsEmpty
-            if not mayBlock then
+            // A committed frame makes the second scan immediate, but a frame the kernel already
+            // refused does not. Treating every pending path as runnable turned EAGAIN into a 0 ms
+            // epoll loop. A producer that commits after this scan sees the sleeping flag and writes
+            // the eventfd; a path that becomes writable wakes the same wait.
+            let mutable runnable = not mine.IsEmpty
+            let mutable blockedPending = false
+            if not runnable then
                 for path in local do
-                    if path.HasPendingTx then mayBlock <- true
-            if mayBlock then Volatile.Write(&threadSleeping.[index], 0)
-            poller.Wait(if mayBlock then 0 else 1_000_000)
+                    if path.HasRunnableTx then runnable <- true
+                    elif path.HasPendingTx then blockedPending <- true
+            if runnable then Volatile.Write(&threadSleeping.[index], 0)
+            // A refused socket waits for EPOLLOUT, but a missed edge or a zero-window update that
+            // does not surface must not sit for a full second. 50 ms is a probe, not a spin.
+            // Without an eventfd, even an idle wait has to come back for newly committed frames.
+            let idleWait =
+                if blockedPending then 50_000
+                elif wake >= 0 then 1_000_000
+                else 5_000
+            poller.Wait(if runnable then 0 else idleWait)
             Volatile.Write(&threadSleeping.[index], 0)
             if wake >= 0 && poller.IsFdReadable wake then
                 Native.read wake (Span<byte> wakeBuffer) |> ignore
@@ -357,6 +375,11 @@ type AsyncPathLink private (socket: Socket, probe: INotSentProbe, group: AsyncPo
     static let gatherFrames = 32
     static let gatherLength = gatherFrames * maxFrame
     let mutable gather: byte[] | null = ArrayPool<byte>.Shared.Rent gatherLength
+    // Set by this path's IO thread only. A WouldBlock is terminal for the current wakeup: later
+    // scans skip the socket until its poller reports writable. The session thread never writes it.
+    let mutable txBlocked = 0
+    let mutable sendAttempts = 0L
+    let mutable wouldBlockCount = 0L
     let mutable bufRefs = 1
     let mutable sessionReleased = 0
     let mutable ioReleased = 0
@@ -523,12 +546,20 @@ type AsyncPathLink private (socket: Socket, probe: INotSentProbe, group: AsyncPo
                 true
             else
                 let mutable err = SocketError.Success
+                Interlocked.Increment(&sendAttempts) |> ignore
                 let n = socket.Send(ReadOnlySpan<byte>(gatherBuf, 0, used), SocketFlags.None, &err)
-                if err = SocketError.WouldBlock then false
+                if err = SocketError.WouldBlock then
+                    Interlocked.Increment(&wouldBlockCount) |> ignore
+                    Volatile.Write(&txBlocked, 1)
+                    false
                 elif err <> SocketError.Success then
                     Volatile.Write(&alive, 0)
                     false
-                elif n <= 0 then false
+                elif n <= 0 then
+                    // Zero without an error is the same readiness signal as WouldBlock: wait for
+                    // the next writable event instead of treating the socket as failed.
+                    Volatile.Write(&txBlocked, 1)
+                    false
                 else
                     bytesWritten <- bytesWritten + int64 n
                     progress <- true
@@ -547,7 +578,7 @@ type AsyncPathLink private (socket: Socket, probe: INotSentProbe, group: AsyncPo
                     n = used
 
     member private this.PumpTx() =
-        if Volatile.Read(&alive) = 1 then
+        if Volatile.Read(&alive) = 1 && Volatile.Read(&txBlocked) = 0 then
             match txSlab with
             | null -> ()
             | slab ->
@@ -565,13 +596,18 @@ type AsyncPathLink private (socket: Socket, probe: INotSentProbe, group: AsyncPo
                         txTail <- txTail + 1
                     else
                         let mutable err = SocketError.Success
+                        Interlocked.Increment(&sendAttempts) |> ignore
                         let n = socket.Send(ReadOnlySpan<byte>(slab, slot * maxFrame + offset, length), SocketFlags.None, &err)
-                        if err = SocketError.WouldBlock then go <- false
+                        if err = SocketError.WouldBlock then
+                            Interlocked.Increment(&wouldBlockCount) |> ignore
+                            Volatile.Write(&txBlocked, 1)
+                            go <- false
                         elif err <> SocketError.Success then
                             Volatile.Write(&alive, 0)
                             go <- false
                         elif n <= 0 then
-                            // Zero bytes with no error: retry next round rather than spin.
+                            // Zero bytes with no error is not progress. Wait for writability again.
+                            Volatile.Write(&txBlocked, 1)
                             go <- false
                         else
                             bytesWritten <- bytesWritten + int64 n
@@ -593,6 +629,11 @@ type AsyncPathLink private (socket: Socket, probe: INotSentProbe, group: AsyncPo
                     channel.Wake()
 
     member private this.PumpRx(poller: Poller) =
+        // A write-ready event belongs to the same wait as the read event. Clear it before the
+        // next scan, including when the first write only retires part of the ring and blocks again.
+        if Volatile.Read(&txBlocked) = 1 && poller.IsWritable socket then
+            Volatile.Write(&txBlocked, 0)
+            this.PumpTx()
         if Volatile.Read(&alive) = 1 && poller.IsReadable socket then
             let mutable more = true
             let mutable rounds = 0
@@ -621,6 +662,11 @@ type AsyncPathLink private (socket: Socket, probe: INotSentProbe, group: AsyncPo
         Volatile.Read(&alive) = 1
         && Volatile.Read(&txHead) - Volatile.Read(&txTail) < slotCount
 
+    /// Calls that reached send(2), including WouldBlock. A blocked socket must not add one on every scan.
+    member _.SendAttempts = Volatile.Read(&sendAttempts)
+    /// Kernel refusals, not merely bytes still sitting in the user ring.
+    member _.WouldBlockCount = Volatile.Read(&wouldBlockCount)
+
     /// Frames committed to the ring but not yet handed to the kernel, in bytes.
     member _.PendingTxBytes =
         max 0 (Volatile.Read(&txHead) - Volatile.Read(&txTail)) * Volatile.Read(&frameLength)
@@ -639,10 +685,16 @@ type AsyncPathLink private (socket: Socket, probe: INotSentProbe, group: AsyncPo
         member this.WatchForIo(poller) =
             if Volatile.Read(&alive) = 1 then
                 poller.WatchRead socket
-                if Volatile.Read(&txTail) < Volatile.Read(&txHead) then poller.WatchWrite socket
+                // Watch the edge that can clear a refused write. Watching every pending path would
+                // also wake on an empty send queue, but skipping a blocked path leaves its bytes
+                // stuck until the 1 s timeout.
+                if Volatile.Read(&txBlocked) = 1 then poller.WatchWrite socket
         member this.PumpRx(poller) = this.PumpRx poller
         member this.PumpTx() = this.PumpTx()
         member _.HasPendingTx = Volatile.Read(&alive) = 1 && Volatile.Read(&txTail) < Volatile.Read(&txHead)
+        member _.HasRunnableTx =
+            Volatile.Read(&alive) = 1 && Volatile.Read(&txBlocked) = 0
+            && Volatile.Read(&txTail) < Volatile.Read(&txHead)
         member _.AcquireIoRef() = Interlocked.Increment(&bufRefs) |> ignore
         member _.ReleaseIoRef() =
             if Interlocked.Exchange(&ioReleased, 1) = 0 then
@@ -678,6 +730,8 @@ type AsyncPathLink private (socket: Socket, probe: INotSentProbe, group: AsyncPo
             txLen.[head % slotCount] <- Volatile.Read(&frameLength)
             // Full StoreLoad fence: publish txHead BEFORE checking threadArmed
             // inside WakeThread, pairing with the IO loop's fenced clear of threadArmed.
+            // Do not clear a prior WouldBlock here. Only the IO thread may do that, after
+            // the poller reports writable; otherwise every new commit restarts the send storm.
             Interlocked.Exchange(&txHead, head + 1) |> ignore
             group.WakeThread(group.ThreadFor pathId)
         member this.Close() = this.Close()

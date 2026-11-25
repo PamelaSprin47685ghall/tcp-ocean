@@ -468,6 +468,33 @@ let ``packed SSE2 GF16 multiply equals the table and the split kernel for every 
                     Assert.Equal(Gf16.MulByte.[c * 256 + block * 16 + i], out.[i])
 
 [<Fact>]
+let ``decoder row byte ledger agrees with retained arrays during equations and release`` () =
+    let d = Decoder(gseed, 64, 1024, 512)
+    let bytes = Array.zeroCreate<byte> 64
+    let rnd = Random 1907
+    let check () =
+        Assert.True(d.RowMemoryBytes >= 0L)
+        Assert.Equal(d.RecomputeRowMemoryBytesForTest(), d.RowMemoryBytes)
+    check ()
+    for t in 0 .. 299 do
+        let step = uint64 t
+        d.NoteStepUsed(step, 16) |> ignore
+        for p in 0 .. 3 do
+            rnd.NextBytes bytes
+            d.OfferParity(step, p, CodeField.Gf16, false, 16, ReadOnlySpan bytes) |> ignore
+            check ()
+        for s in 0 .. 14 do
+            rnd.NextBytes bytes
+            d.OfferSource(step, s, 16, ReadOnlySpan bytes) |> ignore
+            check ()
+        d.Release(UInt64.MaxValue)
+        check ()
+    for t in 0 .. 299 do
+        d.OfferSource(uint64 t, 15, 16, ReadOnlySpan bytes) |> ignore
+        d.Release(UInt64.MaxValue)
+        check ()
+
+[<Fact>]
 let ``release keeps a pending equation whose oldest column sits on the floor`` () =
     // One concrete boundary case, exercising the row sweep in `Release`.
     //

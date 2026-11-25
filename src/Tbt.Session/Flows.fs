@@ -545,6 +545,8 @@ type FlowTable(port: IFlowPort, store: ISourceStore, stepUndelivered: Action<uin
             total <- total + (if f.Active then max c0 (commitment f) else c0)
         total
 
+    member this.Committed = this.CommittedBytes
+
     /// Bytes slot may still commit under the peer's limit.
     member _.TxRoom(slot: int) =
         let f = flows.[slot]

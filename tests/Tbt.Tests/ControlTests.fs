@@ -851,3 +851,34 @@ let ``elastic active working set holds at 32 when healthy and expands when pass 
                 sprintf "expected expansion > %d, got %d" initial carrier.ActivePathTarget)
     let tailFramesAfter = [| for i in initial .. 47 -> stubs.[i].Frames |] |> Array.sum
     Assert.True(tailFramesAfter > 0, "spillover must immediately engage spare paths")
+
+[<Fact>]
+let ``observed backlog keeps an expanded working set and silence shrinks it`` () =
+    let pair = Pair(SessionConfig.defaults, 1, 0.0, 84)
+    let mutable slot = -1
+    Assert.True(pair.Client.TryOpenFlow(&slot))
+    pair.Feed(pair.Client, slot, ReadOnlySpan(Array.create 200_000 1uy), false) |> ignore
+    pair.Client.Flush()
+    let carrier = SessionCarrier(pair.Client, FlowBridge(ValueNone), minActivePaths = 16)
+    let stubs = Array.init 64 (fun i -> HealthStubPath(uint16 i, 0, PathHealth.unknown))
+    for st in stubs do carrier.AddPath st
+    use poller = new Poller()
+    let mutable guard = 0
+    for st in stubs do st.Unsent <- 8000
+    carrier.WriteBatch 64 |> ignore
+    let expanded = carrier.ActivePathTarget
+    Assert.True(expanded > 16, sprintf "expanded=%d" expanded)
+    stubs.[0].Unsent <- 4096
+    carrier.Service poller
+    pair.Clock.Now <- pair.Clock.Now + 2_000_000_000L
+    carrier.Service poller
+    Assert.Equal(expanded, carrier.ActivePathTarget)
+    stubs.[0].Unsent <- 0
+    carrier.Service poller
+    pair.Clock.Now <- pair.Clock.Now + 2_000_000_000L
+    carrier.Service poller
+    pair.Clock.Now <- pair.Clock.Now + 2_000_000_000L
+    carrier.Service poller
+    Assert.True(carrier.ActivePathTarget < 64)
+
+

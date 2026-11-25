@@ -70,6 +70,7 @@ type FlowBridge(target: EndPoint voption) =
     let mutable readCalls = 0L
     let mutable readBytes = 0L
     let mutable wouldBlock = 0L
+    let mutable readCursor = 0
 
     /// Readability of a slot is a SESSION decision: the peer's credit and the local close state
     /// live there. An unattached bridge therefore has no opinion — `rearm`/`WantsRead` must be
@@ -246,12 +247,24 @@ type FlowBridge(target: EndPoint voption) =
     member _.WantsWrite(slot: int) = not (isNull locals.[slot]) && (connecting.[slot] || wantWrite.[slot])
 
     /// Move bytes from the local socket of slot into sources (at most 16 sources).
-    member _.Read(slot: int) =
+    /// Bytes one of several readable flows may take before the cursor must move.
+    /// A lone flow keeps the old 4096-receive budget.
+    static member val Quantum = 16
+    member _.ReadCursor
+        with get () = readCursor and set value = readCursor <- value
+    member _.ReadableCount() =
+        let mutable n = 0
+        let mutable slot = armed.NextUp -1
+        while slot >= 0 do
+            n <- n + 1
+            slot <- armed.NextUp slot
+        n
+    member _.Read(slot: int, ?limit: int) =
         match locals.[slot] with
         | null -> ()
         | socket ->
             readCalls <- readCalls + 1L
-            let mutable budget = 4096
+            let mutable budget = max 1 (defaultArg limit 4096)
             let mutable app = Span<byte>.Empty
             let mutable go = true
             while go && budget > 0 && session.FlowSending slot do

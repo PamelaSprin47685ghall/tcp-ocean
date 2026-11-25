@@ -99,6 +99,13 @@ let ``CLI endpoints keep literal families and reject bad ports`` () =
     Assert.Contains("bad endpoint port", usageMessage (fun () -> endpoint "127.0.0.1:70000" |> ignore))
 
 [<Fact>]
+let ``min-active-paths defaults to the bundle cap and rejects zero`` () =
+    Assert.Equal(48, defaultMinActivePaths (Some 48) 64)
+    Assert.Equal(64, defaultMinActivePaths None 256)
+    Assert.Equal(8, defaultMinActivePaths None 8)
+    Assert.Contains("positive integer", usageMessage (fun () -> defaultMinActivePaths (Some 0) 64 |> ignore))
+
+[<Fact>]
 let ``operator mistakes are usage errors, not internal errors`` () =
     // These used to raise plain `failwith`, which the old top-level catch labelled
     // "internal error" and exited 1 — a different contract from a missing PSK (exit 2).
