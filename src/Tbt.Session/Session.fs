@@ -715,7 +715,7 @@ type Session(role: Role, p: SessionParams, port: IFlowPort, clock: IClock, confi
     /// True when a cell waits for a path.
     member _.WantsToSend =
         ackDue || (ctrl.Pending > 0 && ctrl.IsDue(clock.NowNs(), int64 tx.SrttNs))
-        || (tx.CanSealPayload && (flowStateDue || tx.HasCandidate || (peerSeen && tx.HeartbeatDue)))
+        || (tx.CanSealPayload && (flowStateDue || (tx.Prepare(); tx.HasCandidate) || (peerSeen && tx.HeartbeatDue)))
 
     /// WIN_ACK, CTRL, FLOW_STATE, or heartbeat: not paced by the uplink group.
     member _.ControlWaiting =

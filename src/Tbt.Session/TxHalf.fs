@@ -906,13 +906,10 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
         frame.[frame.Length - 1] <- 10uy
         this.Seal(frame, path)
 
-    /// True when a BOOSTER (or other repair cell) is at the head of the send queues.
-    member this.RepairWaiting =
-        this.HasCandidate |> ignore
-        repairs.Count > 0
-
-    /// Drop queued cells of steps the peer already holds; true when a cell waits.
-    member this.HasCandidate =
+    /// Move due repairs into the send queue and drop cells the peer already holds.
+    /// Callers that used to rely on `HasCandidate` doing this as a side effect call this
+    /// first. `HasCandidate` itself only looks.
+    member this.Prepare () =
         if newRepair then this.DrainDueRepairs()
         let mutable c = Unchecked.defaultof<Candidate>
         while repairs.TryPeek(&c)
@@ -927,6 +924,14 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
               && (c.Step < peerAck || peerDecoded.[int (c.Step % uint64 peerDecoded.Length)]) do
             droppedAcked <- droppedAcked + 1L
             queue.Dequeue() |> ignore
+
+    /// True when a BOOSTER (or other repair cell) is at the head of the send queues.
+    member this.RepairWaiting =
+        this.Prepare()
+        repairs.Count > 0
+
+    /// True when a cell waits. No queue mutation: `Prepare` is the step that drains.
+    member this.HasCandidate =
         repairs.Count > 0 || urgent.Count > 0 || queue.Count > 0
 
     /// Seal a rendered frame with the next counter of this direction (one counter seals
@@ -968,6 +973,7 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
         let mutable done' = false
         let allowRepair = defaultArg allowRepair true
         let mutable ok = false
+        this.Prepare()
         while not done' && this.HasCandidate do
             if not allowRepair && repairs.Count > 0 && urgent.Count = 0 && queue.Count = 0 then
                 done' <- true
@@ -1044,7 +1050,8 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
         let mutable found = false
         // Only BOOSTERs: a repeated DATA cell (the seeds of a range ran out) stays queued for
         // TryRenderNext, which renders it with its own step meta.
-        while not found && (this.HasCandidate |> ignore; repairs.TryPeek(&c) && c.Kind = CellType.Booster) do
+        this.Prepare()
+        while not found && repairs.TryPeek(&c) && c.Kind = CellType.Booster do
             repairs.Dequeue() |> ignore
             if encoder.StepUsed c.Step > 0 && encoder.TryRenderBooster(c.Step, int c.Span, int c.Index, symbol) then
                 meta <- { Type = CellType.Booster; Flags = MetaFlags.Fill; Slot = c.Index; StepUsed = c.Span

@@ -16,15 +16,28 @@ type Encoder(graphSeed: uint64, symbolSize: int, capacitySteps: int) =
     let mutable head = 0UL
     let mutable headOpen = false
 
-    let combine (count: int) (dst: Span<byte>) =
-        dst.Clear()
+    let sourcesHeld (count: int) =
         let mutable ok = true
-        for i in 0 .. count - 1 do
+        let mutable i = 0
+        while ok && i < count do
             let term = terms.[i]
-            if term.Step < tail then ok <- false
-            elif int term.Slot < ring.K term.Step then
-                Gf16.mulAddInto term.Coef (Span<byte>.op_Implicit (ring.Symbol(term.Step, int term.Slot))) dst
+            // Same predicate the old combine used to fail on, checked before dst is cleared.
+            // A slot past k is skipped at write time; it is not a missing source.
+            ok <- term.Step >= tail
+            i <- i + 1
         ok
+
+    /// False leaves `dst` untouched. Checking after Clear used to wipe a caller's buffer
+    /// when a history step had already left the ring.
+    let combine (count: int) (dst: Span<byte>) =
+        if not (sourcesHeld count) then false
+        else
+            dst.Clear()
+            for i in 0 .. count - 1 do
+                let term = terms.[i]
+                if int term.Slot < ring.K term.Step then
+                    Gf16.mulAddInto term.Coef (Span<byte>.op_Implicit (ring.Symbol(term.Step, int term.Slot))) dst
+            true
 
     member _.SymbolSize = symbolSize
     /// Most steps held at once.

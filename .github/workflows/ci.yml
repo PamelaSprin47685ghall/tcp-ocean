@@ -20,7 +20,12 @@ jobs:
       - name: Build (Release)
         run: dotnet build Tbt.slnx -c Release
       - name: Unit tests
-        run: dotnet test tests/Tbt.Tests -c Release --no-build
+        run: |
+          dotnet test tests/Tbt.Tests -c Release --no-build
+          dotnet test tests/Tbt.Session.Tests -c Release --no-build
+          dotnet test tests/Tbt.Async.Tests -c Release --no-build
+          dotnet test tests/Tbt.Probe.Tests -c Release --no-build
+          dotnet test tests/Tbt.ProbeCrypto.Tests -c Release --no-build
       - name: Offline e2e script tests
         run: |
           python3 tests/e2e/test_tb_guard.py

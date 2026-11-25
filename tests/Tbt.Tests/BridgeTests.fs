@@ -175,6 +175,45 @@ let ``a real loopback send is traced only when the kernel accepts the staged byt
         listener.Dispose()
     IO.File.Delete tmp
 
+[<Fact>]
+let ``a half close waits for the staged tail, and a reused slot does not inherit failure`` () =
+    use listener = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp)
+    listener.Bind(IPEndPoint(IPAddress.Loopback, 0))
+    listener.Listen 8
+    let port = (listener.LocalEndPoint :?> IPEndPoint).Port
+    let received = [| 0 |]
+    let reader =
+        Thread(fun () ->
+            try
+                use peer = listener.Accept()
+                peer.ReceiveTimeout <- 3000
+                let buf = Array.zeroCreate<byte> 256
+                let mutable go = true
+                while go do
+                    match peer.Receive(buf, 0, buf.Length, SocketFlags.None) with
+                    | n when n > 0 -> Interlocked.Add(&received.[0], n) |> ignore
+                    | _ -> go <- false
+            with _ -> ())
+    reader.IsBackground <- true
+    reader.Start()
+    let bridge = FlowBridge(ValueSome(IPEndPoint(IPAddress.Loopback, port)))
+    let pair = Pair(SessionConfig.defaults, 1, 0.0, 1)
+    bridge.Attach pair.Server
+    let p = bridge :> IFlowPort
+    p.Open(0, 1u)
+    let payload = Array.init 64 (fun i -> byte (i + 1))
+    Assert.Equal(64, p.Write(0, ReadOnlySpan<byte> payload))
+    p.Finish 0
+    bridge.Flush()
+    let sw = Diagnostics.Stopwatch.StartNew()
+    while Volatile.Read(&received.[0]) < 64 && sw.ElapsedMilliseconds < 2000L do Thread.Sleep 5
+    Assert.Equal(64, Volatile.Read(&received.[0]))
+    p.Reset 0
+    p.Open(0, 2u)
+    Assert.Equal(8, p.Write(0, ReadOnlySpan<byte>(Array.create 8 9uy)))
+    bridge.CloseAll()
+    bridge.Settle()
+
 /// The step↔flow link. `Bind` names the step whose bytes are leaving custody, written
 /// immediately before the `Deliver` that counts them, so a reader can attribute a byte range
 /// to a step without another field, another clock, or a cross-machine comparison.

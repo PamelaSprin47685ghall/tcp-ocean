@@ -85,6 +85,28 @@ type FlowBridge(target: EndPoint voption) =
         failed.[slot] <- true
         failures.Add slot
 
+    /// Finish a non-blocking connect that Open left in progress. True when a send may proceed.
+    let finishConnect (slot: int) (socket: Socket) =
+        if not connecting.[slot] then true
+        else
+            try
+                let code = socket.GetSocketOption(SocketOptionLevel.Socket, SocketOptionName.Error) :?> int
+                if code = 0 && socket.Poll(0, SelectMode.SelectWrite) then
+                    connecting.[slot] <- false
+                    true
+                elif code = 0 then
+                    wantWrite.[slot] <- true
+                    writers.Add slot
+                    false
+                else
+                    releaseStage slot
+                    fail slot
+                    false
+            with :? SocketException ->
+                releaseStage slot
+                fail slot
+                false
+
     /// Send the staged bytes of slot. True when the stage is empty afterwards.
     let flushSlot (slot: int) =
         let len = stageLen.[slot]
@@ -95,9 +117,15 @@ type FlowBridge(target: EndPoint voption) =
                 releaseStage slot
                 true
             | socket ->
+                if not (finishConnect slot socket) then false
+                else
                 let mutable err = SocketError.Success
                 let n = socket.Send(ReadOnlySpan<byte>(stage.[slot], 0, len), SocketFlags.None, &err)
-                if err = SocketError.WouldBlock then
+                // Not yet established (TFO or a non-blocking connect that Connect reported as
+                // success). The bytes stay staged; dropping them here is how the first write of
+                // a flow disappeared.
+                if err = SocketError.WouldBlock || err = SocketError.NotConnected
+                   || err = SocketError.InProgress || err = SocketError.IOPending then
                     wantWrite.[slot] <- true
                     writers.Add slot
                     false
@@ -139,6 +167,11 @@ type FlowBridge(target: EndPoint voption) =
         // record's `aux` is still -1: the bridge does not track generations, so a reader must
         // pair records with the slot's open/close, not assume a generation id.)
         sent.[slot] <- 0L
+        // The failure flag and the ready-set entry belong to the socket just closed. Leaving
+        // them set made the next Open of this slot inherit a dead generation: Write refused
+        // to stage, and Settle reported FailFlow against a connection that had not failed.
+        failed.[slot] <- false
+        failures.Remove slot
         match locals.[slot] with
         | null -> ()
         | s ->
@@ -168,9 +201,14 @@ type FlowBridge(target: EndPoint voption) =
             if session.TryBeginSourceClose(&app) then session.CommitSource(slot, 0, true)
 
     /// Start a non-blocking connect; return its first result.
+    ///
+    /// TCP_FASTOPEN_CONNECT is not set here. The local peer (mihomo, a test listener) does
+    /// not enable a TFO accept queue. With the option on, Linux answers connect(2) with
+    /// EINPROGRESS while Socket.Connected is already true, and the first payload is either
+    /// refused (ENOTCONN) or accepted into a SYN the peer never delivers. Carrier sockets
+    /// still use TFO, because both ends of that path call fastOpenListen.
     static member private Connect(socket: Socket, ep: EndPoint) =
         try
-            SocketTuning.fastOpenConnect socket
             socket.Connect ep
             SocketError.Success
         with :? SocketException as e -> e.SocketErrorCode
@@ -313,10 +351,21 @@ type FlowBridge(target: EndPoint voption) =
         member _.Write(slot, data) =
             match locals.[slot] with
             | null -> -1
-            | _ when connecting.[slot] || failed.[slot] ->
-                wantWrite.[slot] <- true
-                writers.Add slot
-                0
+            | _ when failed.[slot] -> -1
+            | _ when connecting.[slot] ->
+                // The handshake is not finished. Stage anyway: returning 0 here made the
+                // session believe the local peer refused the bytes, and the first cell of
+                // every flow was lost until some later rewrite that never saw them.
+                let len = stageLen.[slot]
+                if len + data.Length > stageCap then 0
+                else
+                    if stage.[slot].Length = 0 then stage.[slot] <- ArrayPool<byte>.Shared.Rent stageCap
+                    data.CopyTo(Span<byte>(stage.[slot], len, data.Length))
+                    stageLen.[slot] <- len + data.Length
+                    staged.Add slot
+                    wantWrite.[slot] <- true
+                    writers.Add slot
+                    data.Length
             | socket ->
                 let len = stageLen.[slot]
                 if len + data.Length <= stageCap then

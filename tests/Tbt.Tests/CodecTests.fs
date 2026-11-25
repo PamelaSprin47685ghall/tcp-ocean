@@ -521,3 +521,40 @@ let ``release keeps a pending equation whose oldest column sits on the floor`` (
     Assert.Equal(520UL, dec.Frontier)
     Assert.Equal(0, dec.PendingRows)
     Assert.Equal(dec.RowsAllocated, dec.PendingRows + dec.FreeRows)
+
+[<Fact>]
+let ``TryRender false does not clear the caller's buffer`` () =
+    let enc = Encoder(7UL, 32, 4)
+    let mutable slot = Span<byte>.Empty
+    Assert.True(enc.TryGetFillSlot(0, &slot))
+    for i in 0 .. slot.Length - 1 do slot.[i] <- byte (i + 1)
+    ignore (enc.Seal 1)
+    enc.Release(1UL)
+    let dst = Array.create 32 0xA5uy
+    Assert.False(enc.TryRenderParity(0UL, 0, CodeField.Gf16, false, Span dst))
+    Assert.True(dst |> Array.forall (fun b -> b = 0xA5uy))
+    Assert.False(enc.TryRenderBooster(0UL, 1, 0, Span dst))
+    Assert.True(dst |> Array.forall (fun b -> b = 0xA5uy))
+
+[<Fact>]
+let ``Release drops a pending equation whose smallest column is below the floor`` () =
+    // Parity of step 300 cites history 256 steps back. After the frontier passes that
+    // history, Release must discard the row and keep the ledger balanced.
+    let enc = filledEncoder 302
+    let dec = Decoder(gseed, symbol, 1024, 2048)
+    let out = Array.zeroCreate<byte> symbol
+    let zero = Array.zeroCreate<byte> symbol
+    dec.NoteStepUsed(300UL, stepUsed 300UL) |> ignore
+    Assert.True(enc.TryRenderParity(300UL, 0, CodeField.Gf16, false, Span out))
+    Assert.Equal(EquationResult.Innovative, dec.OfferParity(300UL, 0, CodeField.Gf16, false, stepUsed 300UL, ReadOnlySpan out))
+    for t in 0 .. 301 do
+        if t <> 300 then
+            let k = stepUsed (uint64 t)
+            dec.NoteStepUsed(uint64 t, k) |> ignore
+            for s in 0 .. k - 1 do
+                dec.OfferSource(uint64 t, s, k, ReadOnlySpan zero) |> ignore
+    let pending = dec.PendingRows
+    dec.Release(UInt64.MaxValue)
+    Assert.True(dec.BaseStep > 0UL, sprintf "base %d frontier %d" dec.BaseStep dec.Frontier)
+    Assert.Equal(pending, dec.PendingRows + int dec.StaleRows)
+    Assert.Equal(dec.RowsAllocated, dec.PendingRows + dec.FreeRows)
