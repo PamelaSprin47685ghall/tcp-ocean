@@ -58,6 +58,8 @@ module GovernorModules =
     let FlowRxBuffers = 4uy
     [<Literal>]
     let ExternalRxScratch = 5uy
+    [<Literal>]
+    let TxQueues = 6uy
 
 [<Sealed>]
 type MemoryGovernor(budgetBytes: int64) =

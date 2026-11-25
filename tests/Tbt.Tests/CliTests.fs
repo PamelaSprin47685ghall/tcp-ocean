@@ -88,6 +88,17 @@ let ``a valid psk-file still parses into 32-byte keys with comments stripped`` (
         Assert.All(keys.[1], fun b -> Assert.Equal(0xBBuy, b)))
 
 [<Fact>]
+let ``CLI endpoints keep literal families and reject bad ports`` () =
+    let ipv6 = endpoint "[::1]:18443"
+    Assert.Equal(18443, ipv6.Port)
+    Assert.Equal(System.Net.Sockets.AddressFamily.InterNetworkV6, ipv6.AddressFamily)
+    let ipv4 = endpoint "127.0.0.1:18443"
+    Assert.Equal(18443, ipv4.Port)
+    Assert.Equal(System.Net.Sockets.AddressFamily.InterNetwork, ipv4.AddressFamily)
+    Assert.Contains("bad endpoint port", usageMessage (fun () -> endpoint "[::1]:0" |> ignore))
+    Assert.Contains("bad endpoint port", usageMessage (fun () -> endpoint "127.0.0.1:70000" |> ignore))
+
+[<Fact>]
 let ``operator mistakes are usage errors, not internal errors`` () =
     // These used to raise plain `failwith`, which the old top-level catch labelled
     // "internal error" and exited 1 — a different contract from a missing PSK (exit 2).

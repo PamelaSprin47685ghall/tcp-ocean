@@ -137,6 +137,12 @@ let ``module reports do not double-count and pressure halves future bulk only`` 
     Assert.Equal(8500L, g.Used)
     g.NoteExternalRxScratch 0L
     Assert.Equal(8000L, g.Used)
+    g.Report(GovernorModules.DecoderRows, 500L)
+    g.Report(GovernorModules.TxQueues, 250L)
+    Assert.Equal(8750L, g.Used)
+    g.Report(GovernorModules.DecoderRows, 0L)
+    g.Report(GovernorModules.TxQueues, 0L)
+    Assert.Equal(8000L, g.Used)
     // DownlinkHalf and EnableHoleCap are pressure flags. They have no separate byte owner
     // in RxHalf, so applying them here would invent a limit. ShrinkNewWindows is the
     // action Session consumes, and it only caps windows opened after the flag rises.

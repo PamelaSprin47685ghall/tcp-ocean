@@ -159,6 +159,7 @@ type Session(role: Role, p: SessionParams, port: IFlowPort, clock: IClock, confi
     let mutable beganInteractive = false
     let mutable reportedEncoder = -1L
     let mutable reportedDecoder = -1L
+    let mutable reportedRows = -1L
     let mutable reportedFlow = -1L
     let mutable windowsShrunk = false
     let mutable interactiveSources = 0L
@@ -811,12 +812,16 @@ type Session(role: Role, p: SessionParams, port: IFlowPort, clock: IClock, confi
         let encoderBytes = stride * int64 encoder.Capacity
         let decoderBytes = stride * int64 config.WindowSteps
         let flowBytes = flows.ReserveBytes
+        let rowBytes = decoder.RowMemoryBytes
         if encoderBytes <> reportedEncoder then
             governor.Report(GovernorModules.EncoderRing, encoderBytes)
             reportedEncoder <- encoderBytes
         if decoderBytes <> reportedDecoder then
             governor.Report(GovernorModules.DecoderRing, decoderBytes)
             reportedDecoder <- decoderBytes
+        if rowBytes <> reportedRows then
+            governor.Report(GovernorModules.DecoderRows, rowBytes)
+            reportedRows <- rowBytes
         if flowBytes <> reportedFlow then
             governor.Report(GovernorModules.FlowRxBuffers, flowBytes)
             reportedFlow <- flowBytes

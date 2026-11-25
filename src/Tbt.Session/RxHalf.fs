@@ -318,13 +318,12 @@ type RxHalf(symbolSize: int, field: CodeField, decoder: Decoder, opener: CellOpe
                 // tail: its sources are spread by the application, so only FEC evidence speaks.
                 elif target < 4 || timelySlow.[i] then false
                 elif timelyLateMark.[i] > 0 then
+                    // Still past the adaptive deadline. Arrival alone does not prove the cell
+                    // was only queued; the 75k late count was not shown to be all false loss.
                     timelyLateMark.[i] <- timelyLateMark.[i] - 1
                     true
                 else false
             if erased then timelyErased.[i] <- timelyErased.[i] + 1
-            // Exactly one of the two source counters moves per accounted cell: a rebuilt
-            // source is also late, so `elif` keeps it out of the clock-only bucket and the
-            // two can never describe the same cell twice.
             counters.TimelyDue <- counters.TimelyDue + 1L
             if recovered then counters.ErasureRecovered <- counters.ErasureRecovered + 1L
             elif erased then counters.ErasureLateClock <- counters.ErasureLateClock + 1L

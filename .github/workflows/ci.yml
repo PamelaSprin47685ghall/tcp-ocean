@@ -24,8 +24,9 @@ jobs:
           dotnet test tests/Tbt.Tests -c Release --no-build
           dotnet test tests/Tbt.Session.Tests -c Release --no-build
           dotnet test tests/Tbt.Async.Tests -c Release --no-build
-          dotnet test tests/Tbt.Probe.Tests -c Release --no-build
-          dotnet test tests/Tbt.ProbeCrypto.Tests -c Release --no-build
+          # The probe projects are not members of Tbt.slnx; let dotnet test build them.
+          dotnet test tests/Tbt.Probe.Tests -c Release
+          dotnet test tests/Tbt.ProbeCrypto.Tests -c Release
       - name: Offline e2e script tests
         run: |
           python3 tests/e2e/test_tb_guard.py

@@ -179,7 +179,8 @@ type private PathOp =
 
 [<Sealed>]
 type SessionCarrier(session: Session, bridge: FlowBridge, ?uplinkPace: bool, ?tupleMbit: float,
-                    ?rxChannel: RxChannel, ?asyncIo: AsyncPollerGroup, ?gatePass2: int, ?txSlots: int) =
+                    ?rxChannel: RxChannel, ?asyncIo: AsyncPollerGroup, ?gatePass2: int, ?txSlots: int,
+                    ?minActivePaths: int) =
     let pace = defaultArg uplinkPace false
     let tupleMbit = defaultArg tupleMbit 0.0
     let gatePass2 = defaultArg gatePass2 SocketTuning.GatePass2Limit
@@ -213,17 +214,10 @@ type SessionCarrier(session: Session, bridge: FlowBridge, ?uplinkPace: bool, ?tu
     let mutable lastActivityFrames = 0L
     let mutable lastActivityNs = 0L
     let mutable healthCursor = 0
-    /// Elastic active working set: at least min(n, minActivePaths) paths carry data, so one
-    /// step spreads over distinct paths and each active TCP path stays well above the
-    /// SACK/dupACK threshold; it expands to all paths the moment the active set saturates
-    /// (e.g. per-tuple shaping). 16, not 32: the working set must keep every active path well
-    /// above the RTO cliff, and on a 16-50 Mbit/s WAN with 16 % loss 32 paths halved each path's
-    /// BDP share and doubled the standing queue — the live round-5 run read srtt 748-825 ms
-    /// against a 310 ms minimum on 32 paths, i.e. 435-605 ms of our own queue, with probes p50
-    /// 829 ms. Sixteen paths double the per-path in-flight share; genuine pass-1 saturation
-    /// (a gate refusal or a full tx ring) still grows the set to 32..n, which is what the
-    /// rtt400 per-tuple profile needs.
-    let minActivePaths = 16
+    // Keep the measured conservative default for general networks; callers may explicitly
+    // raise the floor for a tested multipath deployment.
+    let defaultMinActivePaths = 16
+    let minActivePaths = max 1 (defaultArg minActivePaths defaultMinActivePaths)
     let mutable activeTarget = minActivePaths
     let mutable lastShrinkCheckNs = 0L
     let mutable overflowInWindow = false
@@ -356,8 +350,11 @@ type SessionCarrier(session: Session, bridge: FlowBridge, ?uplinkPace: bool, ?tu
         let idleLong = lastHealthRefreshNs > 0L && nowNs - lastActivityNs >= 2_000_000_000L
         if n > 0 && not idleLong && (lastHealthRefreshNs = 0L || nowNs - lastHealthRefreshNs >= 50_000_000L) then
             lastHealthRefreshNs <- nowNs
-            // Amortize kernel TCP_INFO reads across ticks when path count is large (<= 16/tick).
-            let batch = min n 16
+            // Refresh the whole active working set within one 50 ms tick. Amortising over
+            // 16 per tick left a 256-path bundle stale for 800 ms (and 64 paths for 200 ms),
+            // so the rank table and write gate could make decisions on old TCP_INFO samples
+            // while live queues were already deep. TCP_INFO is cheap relative to one frame.
+            let batch = if n <= 128 then n else max 64 (n / 3)
             let start = healthCursor % n
             for j in 0 .. batch - 1 do
                 refreshPathHealth live.[(start + j) % n] nowNs 50_000_000L
@@ -473,12 +470,19 @@ type SessionCarrier(session: Session, bridge: FlowBridge, ?uplinkPace: bool, ?tu
                 pacers.[pathId] <- p
                 Some p
 
+    let mutable tuplePacerDenied = false
+
     let pathAllows (pathId: uint16) (bytes: int) (now: int64) =
         match pacerOf pathId with
         | None -> true
         | Some p ->
             p.SetMinRtt session.Tx.MinRttNs
-            p.TryTake(bytes, now)
+            let ok = p.TryTake(bytes, now)
+            // A tuple pacer refusal is capacity evidence exactly like a gate refusal.
+            // Without this, --tuple-mbit sessions could stay pinned to the initial
+            // working set while spare paths sat idle (the 64 -> 27 shrink signature).
+            if not ok then tuplePacerDenied <- true
+            ok
 
     let chargePath (pathId: uint16) (bytes: int) =
         match pacerOf pathId with
@@ -639,6 +643,9 @@ type SessionCarrier(session: Session, bridge: FlowBridge, ?uplinkPace: bool, ?tu
                 expanded <- true
             let allowDegraded = not hasHealthyPath
             let mutable activeSaturated = false
+            // Reset the saturation evidence at the start of each pass. A tuple pacer refusal
+            // from pass 1 must reach the spillover test; pass 2 must not inherit an old flag.
+            tuplePacerDenied <- false
             // A health verdict may not starve output. At 24 % loss nearly every socket is in
             // SACK Recovery, and a tier table up to one refresh batch (50 ms) stale can hide
             // the paths that would have carried the frame, so an unconditional skip let the
@@ -750,6 +757,7 @@ type SessionCarrier(session: Session, bridge: FlowBridge, ?uplinkPace: bool, ?tu
                                     group.OnSent fl
                                     chargePath link.PathId fl
                     j <- j + 1
+                if pass = 1 && tuplePacerDenied then activeSaturated <- true
                 // Spillover: if pass 1 actually saturated the active working set — a pass-1 gate
                 // refusal or a full tx ring, both capacity facts — while demand remains and spare
                 // paths exist, expand scanLimit to all n paths immediately and grow activeTarget.

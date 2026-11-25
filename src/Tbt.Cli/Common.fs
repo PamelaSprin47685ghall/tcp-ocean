@@ -112,30 +112,29 @@ let describeOffer (suite: byte) (caps: uint16) =
     let dh = if (caps &&& Caps.X25519) <> 0us then "1" else "0"
     "suite=0x" + suite.ToString("x2") + "(" + Suite.name suite + ") x25519=" + dh
 
-/// host:port, or [IPv6]:port. A host name prefers IPv6, then IPv4; the first
-/// address of an arbitrary family is not used.
+/// host:port, or [IPv6]:port. Literal addresses keep their family. A host name
+/// uses the resolver's first result: no hardcoded AAAA preference, because a
+/// machine with no working IPv6 route must still be able to bind/connect by name.
 let endpoint (text: string) : IPEndPoint =
-    match IPEndPoint.TryParse text with
-    | true, ep when not (isNull ep) -> nonNull ep
-    | _ ->
-        let at = text.LastIndexOf ':'
-        if at <= 0 then failUsage ("bad endpoint: " + text)
-        let host = text.Substring(0, at)
-        let portText = text.Substring(at + 1)
-        let mutable port = 0
-        if not (Int32.TryParse(portText, &port)) || port < 1 || port > 65535 then
-            failUsage ("bad endpoint port: " + text)
+    let at = text.LastIndexOf ':'
+    if at <= 0 then failUsage ("bad endpoint: " + text)
+    let host = text.Substring(0, at)
+    let portText = text.Substring(at + 1)
+    let mutable port = 0
+    if not (Int32.TryParse(portText, &port)) || port < 1 || port > 65535 then
+        failUsage ("bad endpoint port: " + text)
+    let mutable address = Unchecked.defaultof<IPAddress>
+    let literal =
+        IPAddress.TryParse(host, &address)
+        || (host.StartsWith "[" && host.EndsWith "]" && IPAddress.TryParse(host.Substring(1, host.Length - 2), &address))
+    if literal then IPEndPoint(address, port)
+    else
         let addresses =
             try Dns.GetHostAddresses host
             with :? System.Net.Sockets.SocketException ->
                 failUsage ("endpoint did not resolve: " + text)
         if addresses.Length = 0 then failUsage ("endpoint did not resolve: " + text)
-        let chosen =
-            addresses
-            |> Array.tryFind (fun a -> a.AddressFamily = AddressFamily.InterNetworkV6)
-            |> Option.orElseWith (fun () -> addresses |> Array.tryFind (fun a -> a.AddressFamily = AddressFamily.InterNetwork))
-            |> Option.defaultValue addresses.[0]
-        IPEndPoint(chosen, port)
+        IPEndPoint(addresses.[0], port)
 
 /// PSK file: one key per line, 64 hex digits; '#' starts a comment.
 /// Every failure here is the operator's typing (path, permissions, digits), so each one is a

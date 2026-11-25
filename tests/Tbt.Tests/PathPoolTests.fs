@@ -291,6 +291,25 @@ let ``PathRefresher DueDegraded does zero idle churn and only replaces degraded 
     Assert.Empty(r.DueDegraded(122L * s, paths, true, false))
 
 [<Fact>]
+let ``PathRefresher DueDegraded replaces a zero-rate path with backlog when peers still deliver`` () =
+    let s = 1_000_000_000L
+    let r = PathRefresher(60L * s, 2, 0, s, 4, 10L * s)
+    for id in 0us .. 4us do r.NoteJoined(id, 0L)
+    let live =
+        [| struct (0us, mkHealth 0uy 2_000_000L 0.01 0)
+           struct (1us, mkHealth 0uy 2_100_000L 0.01 0)
+           struct (2us, mkHealth 0uy 1_900_000L 0.02 0)
+           struct (3us, { mkHealth 0uy 0L 0.0 8192 with RttUs = 200_000u })
+           struct (4us, mkHealth 0uy 1_800_000L 0.02 0) |]
+    Assert.Equal<uint16[]>([| 3us |], r.DueDegraded(121L * s, live, true, false))
+    // Every path at zero is a shared stall, not a candidate to kill.
+    let stalled = PathRefresher(60L * s, 4, 0, s, 8, 10L * s)
+    for id in 0us .. 3us do stalled.NoteJoined(id, 0L)
+    let allZero =
+        [| for id in 0us .. 3us -> struct (id, { mkHealth 0uy 0L 0.0 4096 with RttUs = 200_000u }) |]
+    Assert.Empty(stalled.DueDegraded(121L * s, allZero, true, false))
+
+[<Fact>]
 let ``CcNudgePlan precomputes score once per eligible key and DueDegraded skips idle and healthy sockets`` () =
     let s = 1_000_000_000L
     let keys = Array.init 16 (fun i -> box i)

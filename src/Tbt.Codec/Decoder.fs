@@ -561,6 +561,16 @@ type Decoder(graphSeed: uint64, symbolSize: int, capacitySteps: int, maxRows: in
             recovered <- c
             true
 
+    /// Payload and column arrays owned by active and cached rows, excluding CLR object and
+    /// index overhead. Capacity can grow during elimination, so count the actual arrays.
+    member _.RowMemoryBytes =
+        let mutable bytes = 0L
+        for row in rows do
+            bytes <- bytes + int64 row.Payload.Length + int64 row.Cols.Length * 8L + int64 row.Coefs.Length
+        for row in freeRows do
+            bytes <- bytes + int64 row.Payload.Length + int64 row.Cols.Length * 8L + int64 row.Coefs.Length
+        bytes
+
     member _.StepUsed(t: uint64) = if ring.Contains t then ring.K t else 0
 
     member _.Source(t: uint64, slot: int) : ReadOnlySpan<byte> =

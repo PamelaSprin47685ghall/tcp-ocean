@@ -19,7 +19,10 @@ open Tbt.Session
 
 /// One whole frame copied out of a path's receive buffer. Opened: the IO thread
 /// already authenticated and decrypted it in place (Counter is its cell_seq).
-[<Sealed>]
+// A frame descriptor per 1.3 KiB frame was a sealed heap object; at WAN rates
+// that is tens of thousands of short-lived allocations per second. The queue
+// stores descriptors by value; buffer ownership and return order are unchanged.
+[<Struct; NoEquality; NoComparison>]
 type RxFrame(pathId: uint16, data: byte[], length: int, opened: bool, counter: uint64) =
     member _.PathId = pathId
     member _.Data = data
@@ -347,8 +350,12 @@ type AsyncPathLink private (socket: Socket, probe: INotSentProbe, group: AsyncPo
     let txLen: int[] = Array.zeroCreate slotCount
     let mutable txHead = 0
     let mutable txTail = 0
-    // Gather buffer for PumpTx: up to 8 frames go out in one send(2).
-    static let gatherLength = 8 * maxFrame
+    // Gather up to 32 frames in one send(2). The previous 8-frame cap left a
+    // 64-path sender issuing thousands of small writes per second on a 2-vCPU
+    // host. The cap is still bounded by the slot ring and the write gate, and
+    // short writes keep their partial-slot offsets below.
+    static let gatherFrames = 32
+    static let gatherLength = gatherFrames * maxFrame
     let mutable gather: byte[] | null = ArrayPool<byte>.Shared.Rent gatherLength
     let mutable bufRefs = 1
     let mutable sessionReleased = 0

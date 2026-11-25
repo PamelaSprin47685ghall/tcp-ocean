@@ -127,27 +127,20 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
             // kept the stall that produced the ratio. 2.0x separates them: loss-driven waiting
             // stays under it, real queueing does not.
             let congested = rttRatio > 2.0
-            // A standing queue alone must never hold redundancy at zero. With rho pinned at its
-            // floor on a 24 %-loss carrier, every step's frontier waits for a TCP retransmission,
-            // which by itself keeps srtt at two to three times minRtt — so the brake that was
-            // meant to stop chasing congestion locked rho at 0.035 while firing 11 013 boosters
-            // (live round 2). Cover the erasure the peer actually reports first; that is what
-            // drains the stall that looks like congestion.
+            // A standing queue alone must never hold redundancy at zero while the peer still
+            // reports real loss and the path is not queued. Cover that erasure first.
             let neededFloor = min 0.40 target
-            // ...but only while the queue is not ours. `neededFloor` exists to break the deadlock
-            // where rho sat at its floor, every step waited for a TCP retransmission, and the srtt
-            // that resulted *looked* like congestion (live round 2). It must not become the opposite
-            // deadlock: when `congested` already holds, a report of 0.32-0.64 is partly the queue
-            // itself, and climbing to 0.40 on it adds the parity that deepens that queue. Hold the
-            // current ratio and let the drain branch below pull it toward 0.30.
-            if rho < neededFloor && not congested then
+            // Congestion (srtt well above minRtt) means the queue is ours. Climbing rho, or
+            // parking it at 0.30, feeds the queue that produced the report (live: 4 220 boosters,
+            // srtt 347 ms on a 115 ms path). Drain toward the floor; do not hold a 30 % tax.
+            if congested && rho > max rhoFloor target + 0.01 then
+                rho <- max (max rhoFloor target) (rho - 0.04)
+            elif rho < neededFloor then
                 rho <- min target (rho + 0.06)
             elif target > rho + 0.01 then
-                if not congested then rho <- min target (rho + 0.08)
-            elif target < rho - 0.01 then rho <- max target (rho - 0.02)
-            elif congested && rho > 0.30 then
-                // Drain the parity ratio while the queue that produced the loss is standing.
-                rho <- max 0.30 (rho - 0.02)
+                rho <- min target (rho + 0.08)
+            elif target < rho - 0.01 then
+                rho <- max target (rho - 0.02)
         // A reliable TCP carrier hides most loss behind retransmission, so the reported rate
         // must never be read as pure "wire" truth: cap it where the controller can still
         // trust it. Above this the parity ratio only adds queueing, which the live run showed
@@ -347,6 +340,8 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
     /// The peer's reported erasure rate of this direction (0..1).
     member _.CellLoss = peerErasure
     member _.SymbolSize = symbolSize
+    /// Bytes still sitting in the send queues. Credit grants are not included.
+    member _.QueuedBytes = int64 (queue.Count + urgent.Count + repairs.Count) * int64 symbolSize
     member _.PeerAck = peerAck
     member _.GrantLimit = grantLimit
     member _.Head = encoder.Head

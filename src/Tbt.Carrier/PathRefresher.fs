@@ -118,17 +118,27 @@ type PathRefresher(maxAgeNs: int64, perTick: int, perTickIdle: int, tickNs: int6
                     if not (inFlight.Contains id) then
                         match dueAt.TryGetValue id with
                         | true, due when nowNs >= due ->
+                            let demand = h.NotSentBytes > 0 || h.UnackedBytes > 0u
+                            // Zero delivery with a backlog is invisible to the positive-rate
+                            // test below. Require a positive peer median so a shared stall
+                            // (every path at 0) does not refresh the whole set. Require an
+                            // RTT sample so "not yet measured" is not treated as dead.
+                            let stalled =
+                                medRate > 0L && h.DeliveryRate = 0L && demand && h.RttUs > 0u
                             let degraded =
                                 h.Valid
                                 && (h.CaState >= 4uy
                                     || h.RetransRate >= 0.45
+                                    || stalled
                                     || (medRate > 0L && h.DeliveryRate > 0L
                                         && h.DeliveryRate * 4L < medRate
-                                        && (h.NotSentBytes > 0 || h.UnackedBytes > 0u)))
+                                        && demand))
                             if degraded then
-                                // Lower severity score goes first: Loss/high-retrans before rate decay.
+                                // Lower severity score goes first: Loss, then zero-rate
+                                // backlog, then high-retrans, then slow positive rate.
                                 let severity =
                                     if h.CaState >= 4uy then 0L
+                                    elif stalled then 500_000L
                                     elif h.RetransRate >= 0.45 then 1_000_000L - int64 (h.RetransRate * 1000.0)
                                     else 2_000_000L + h.DeliveryRate
                                 cands.Add(struct (severity, id))
