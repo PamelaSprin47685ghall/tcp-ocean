@@ -140,11 +140,52 @@ let private sse2Scale (c: int) (dst: Span<byte>) =
     for i in start .. dst.Length - 1 do
         dst.[i] <- MulByte.[row + int dst.[i]]
 
+/// AVX2 doubles the 128-bit packed path: one Vector256 covers two SSSE3 shuffle
+/// blocks. The 256-bit table is two copies of the 128-bit low/high table because
+/// Avx2.Shuffle selects independently inside each 128-bit lane, like SSSE3.
+let private avx2LowTables: Vector256<byte>[] =
+    lowTables |> Array.map (fun t -> Vector256.Create(t, t))
+
+let private avx2HighTables: Vector256<byte>[] =
+    highTables |> Array.map (fun t -> Vector256.Create(t, t))
+
+/// dst <- dst XOR c * src. Falls back to the existing SSSE3/AdvSimd/SSE2/scalar
+/// path for the tail and for hosts without AVX2; no field semantics change.
+let private avx2MulAdd (c: int) (src: ReadOnlySpan<byte>) (dst: Span<byte>) =
+    let sv = MemoryMarshal.Cast<byte, Vector256<byte>>(src)
+    let dv = MemoryMarshal.Cast<byte, Vector256<byte>>(dst)
+    let lo = avx2LowTables.[c]
+    let hi = avx2HighTables.[c]
+    let nib = Vector256.Create(0x0Fuy)
+    for j in 0 .. sv.Length - 1 do
+        let x = sv.[j]
+        let l = Avx2.Shuffle(lo, x &&& nib)
+        let h = Avx2.Shuffle(hi, Vector256.ShiftRightLogical(x, 4) &&& nib)
+        dv.[j] <- dv.[j] ^^^ l ^^^ h
+    mulAddScalar c src dst (sv.Length * 32)
+
+/// dst <- c * dst.
+let private avx2Scale (c: int) (dst: Span<byte>) =
+    let dv = MemoryMarshal.Cast<byte, Vector256<byte>>(dst)
+    let lo = avx2LowTables.[c]
+    let hi = avx2HighTables.[c]
+    let nib = Vector256.Create(0x0Fuy)
+    for j in 0 .. dv.Length - 1 do
+        let x = dv.[j]
+        let l = Avx2.Shuffle(lo, x &&& nib)
+        let h = Avx2.Shuffle(hi, Vector256.ShiftRightLogical(x, 4) &&& nib)
+        dv.[j] <- l ^^^ h
+    let start = dv.Length * 32
+    let row = c * 256
+    for i in start .. dst.Length - 1 do
+        dst.[i] <- MulByte.[row + int dst.[i]]
+
 /// dst <- dst + c * src (GF(16) multiply-add on both nibbles). Lengths must be equal.
 let mulAddInto (c: byte) (src: ReadOnlySpan<byte>) (dst: Span<byte>) =
     if src.Length <> dst.Length then invalidArg "src" "length mismatch"
     if c = 0uy then ()
     elif c = 1uy then xorInto src dst
+    elif Avx2.IsSupported then avx2MulAdd (int c) src dst
     elif Ssse3.IsSupported || AdvSimd.Arm64.IsSupported then
         let lo = lowTables.[int c]
         let hi = highTables.[int c]
@@ -172,6 +213,7 @@ let mulAddInto (c: byte) (src: ReadOnlySpan<byte>) (dst: Span<byte>) =
 let scaleInPlace (c: byte) (dst: Span<byte>) =
     if c = 0uy then dst.Clear()
     elif c = 1uy then ()
+    elif Avx2.IsSupported then avx2Scale (int c) dst
     elif Sse2.IsSupported && not Ssse3.IsSupported && not AdvSimd.Arm64.IsSupported then
         sse2Scale (int c) dst
     elif c <> 1uy then

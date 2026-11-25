@@ -81,10 +81,21 @@ type RxChannel() =
                 Native.write wakeFd (ReadOnlySpan<byte> wakeToken) |> ignore
             Interlocked.Decrement(&inFd) |> ignore
 
+    static member MaxQueued = 4096
+
+    /// False when the channel is at `MaxQueued`. The caller keeps the frame.
+    member this.TryEnqueue(frame: RxFrame) =
+        if Volatile.Read(&count) >= 4096 then false
+        else
+            queue.Enqueue frame
+            Interlocked.Increment(&count) |> ignore
+            this.Wake()
+            true
+
     member this.Enqueue(frame: RxFrame) =
-        queue.Enqueue frame
-        Interlocked.Increment(&count) |> ignore
-        this.Wake()
+        if not (this.TryEnqueue frame) then
+            // Legacy callers that cannot retry still must not leak the rented buffer.
+            ArrayPool<byte>.Shared.Return frame.Data
 
     /// Consume the wake token on the session thread.
     member _.ClearWake() =
@@ -485,9 +496,11 @@ type AsyncPathLink private (socket: Socket, probe: INotSentProbe, group: AsyncPo
                     true
 
     /// Queue any complete frames already in the receive buffer (bootstrap tail).
+    /// Stops while the session channel is full so the bytes stay in this buffer.
     member private this.QueueFrames(ioThread: bool) =
         let mutable frame = Span<byte>.Empty
-        while this.TryTakeFrame(&frame) do
+        let mutable go = true
+        while go && channel.Count < 4096 && this.TryTakeFrame(&frame) do
             let data = ArrayPool<byte>.Shared.Rent frame.Length
             frame.CopyTo(Span<byte>(data, 0, frame.Length))
             // Only the IO thread uses the path's pre-opener (it is single-owner).
@@ -501,7 +514,13 @@ type AsyncPathLink private (socket: Socket, probe: INotSentProbe, group: AsyncPo
                 && (match preOpener with
                     | null -> false
                     | p -> p.TryOpen(Span<byte>(data, 0, frame.Length), pathId, &c))
-            channel.Enqueue(RxFrame(pathId, data, frame.Length, opened, c))
+            if channel.TryEnqueue(RxFrame(pathId, data, frame.Length, opened, c)) then ()
+            else
+                ArrayPool<byte>.Shared.Return data
+                // The frame was already taken. Put the read cursor back so the
+                // next pump retries it instead of dropping the bytes.
+                rxStart <- rxStart - frame.Length
+                go <- false
 
     member private this.BeginFrame(frame: byref<Span<byte>>) =
         let len = Volatile.Read(&frameLength)

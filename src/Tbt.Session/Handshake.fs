@@ -150,6 +150,9 @@ type ServerOffer(psks: byte[][], entropy: IEntropy, grant0: uint16, maxPaths: in
                     | ValueSome(h, clientPub) when abs (int64 h.UnixTimeMs - unixTimeMs) <= 120_000L
                                            && Suite.select h.Suites wantAegis wantChaCha8 wantChaCha20 <> 0uy
                                            && h.Caps &&& Caps.JoinAck2 <> 0us && h.MssClient > 0us
+                                           // Unknown wire capabilities may change decoding semantics. Do not
+                                           // silently negotiate them away and accept a different protocol.
+                                           && h.Caps &&& Caps.Reserved = 0us
                                            && MemTier.isKnown (MemTier.ofCaps h.Caps)
                                            && caches.[i].TryAdd(cn, unixTimeMs) ->
                         let symbol = FrameMath.symbolForMss (min (int h.MssClient) mssServer)

@@ -96,30 +96,53 @@ type MPMCTaskQueue(queueCapacity: int, workerCount: int) =
         if workerCount < 1 then invalidArg "workerCount" "need at least one worker"
 
     let workerQueues = Array.init workerCount (fun _ -> WorkStealingQueue<ComputeTask>(queueCapacity))
+    // Bound is the sum of the three global lanes. A full lane refuses the task
+    // so a flooded producer blocks (backpressure) instead of growing without limit.
+    let bound = queueCapacity
     let high = ConcurrentQueue<ComputeTask>()
     let normal = ConcurrentQueue<ComputeTask>()
     let low = ConcurrentQueue<ComputeTask>()
+    let mutable highN = 0
+    let mutable normalN = 0
+    let mutable lowN = 0
 
-    /// Enqueue according to priority. Always succeeds (the global queues are unbounded).
+    let tryPush (q: ConcurrentQueue<ComputeTask>) (n: byref<int>) (task: ComputeTask) =
+        let mutable reserved = false
+        let mutable full = false
+        while not reserved && not full do
+            let current = Volatile.Read(&n)
+            if current >= bound then full <- true
+            else reserved <- Interlocked.CompareExchange(&n, current + 1, current) = current
+        if full then false
+        else
+            q.Enqueue task
+            true
+
+    let tryTake (q: ConcurrentQueue<ComputeTask>) (n: byref<int>) =
+        let mutable task = Unchecked.defaultof<ComputeTask>
+        if q.TryDequeue(&task) then
+            Interlocked.Decrement(&n) |> ignore
+            Some task
+        else None
+
+    /// Enqueue according to priority. False when that lane is at `queueCapacity`.
     member _.Enqueue(task: ComputeTask) =
         match task.Priority with
-        | TaskPriority.High -> high.Enqueue task
-        | TaskPriority.Normal -> normal.Enqueue task
-        | _ -> low.Enqueue task
-        true
+        | TaskPriority.High -> tryPush high &highN task
+        | TaskPriority.Normal -> tryPush normal &normalN task
+        | _ -> tryPush low &lowN task
 
     /// High, then normal, then own queue, then a steal, then low.
-    member _.TryDequeue(workerId: int) =
-        let own = workerQueues.[workerId].TryPop()
-        match own with
+    member this.TryDequeue(workerId: int) =
+        match workerQueues.[workerId].TryPop() with
         | Some task -> Some task
         | None ->
-            let mutable task = Unchecked.defaultof<ComputeTask>
-            if high.TryDequeue(&task) then Some task
-            else
-                let mutable task = Unchecked.defaultof<ComputeTask>
-                if normal.TryDequeue(&task) then Some task
-                else
+            match tryTake high &highN with
+            | Some task -> Some task
+            | None ->
+                match tryTake normal &normalN with
+                | Some task -> Some task
+                | None ->
                     let mutable stolen = None
                     let mutable i = 1
                     while i < workerCount && stolen.IsNone do
@@ -127,14 +150,10 @@ type MPMCTaskQueue(queueCapacity: int, workerCount: int) =
                         i <- i + 1
                     match stolen with
                     | Some task -> Some task
-                    | None ->
-                        let mutable task = Unchecked.defaultof<ComputeTask>
-                        if low.TryDequeue(&task) then Some task else None
+                    | None -> tryTake low &lowN
 
     /// Approximate total pending tasks.
     member _.ApproximateCount =
-        let mutable total = high.Count + normal.Count + low.Count
-        for q in workerQueues do total <- total + q.Count
-        total
+        Volatile.Read(&highN) + Volatile.Read(&normalN) + Volatile.Read(&lowN)
 
     member _.WorkerCount = workerCount

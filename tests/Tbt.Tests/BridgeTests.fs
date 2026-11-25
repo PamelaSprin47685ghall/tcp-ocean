@@ -1053,6 +1053,161 @@ type private StatePath(id: uint16, caState: byte) =
         member _.Health = health
         member _.RefreshHealth(_, _) = ()
 
+/// Rate-carrying path for the scheduler contract tests. CountingPath cannot report a
+/// delivery rate; StatePath fixes a single CA state. This fake supplies a stable
+/// rate and the normal Tier-0 health fields while counting real committed frames.
+type private RatePath(id: uint16, rateBps: int64, ?unsent: int) =
+    let buf = Array.zeroCreate<byte> 2048
+    let mutable closes = 0
+    let health =
+        { PathHealth.unknown with
+            SampledNs = 1L; CaState = 0uy; CwndBytes = 100_000u
+            UnackedBytes = 0u; Retrans = 0u; RetransRate = 0.0
+            MinRttUs = 40_000u; RttUs = 40_000u
+            DeliveryRate = rateBps; Valid = rateBps > 0L }
+    member val Frames = 0 with get, set
+    member val Unsent = defaultArg unsent 0 with get, set
+    interface IPath with
+        member val PathId = id with get, set
+        member val FrameLength = 0 with get, set
+        member _.Alive = true
+        member _.Attach(_) = ()
+        member _.Backlog with set (_: int) = ()
+        member _.Watch(_, _) = ()
+        member _.Receive(_) = ()
+        member p.UnsentBytes = p.Unsent
+        member p.TryBeginFrame(frame: byref<Span<byte>>) =
+            frame <- Span(buf, 0, (p :> IPath).FrameLength); true
+        member p.CommitFrame() = p.Frames <- p.Frames + 1
+        member _.Close() = System.Threading.Interlocked.Increment(&closes) |> ignore
+    interface IPathHealth with
+        member _.Health = health
+        member _.RefreshHealth(_, _) = ()
+
+[<Fact>]
+let ``write batch weights measured path rates four to one`` () =
+    use listener = listen ()
+    let struct (session, bridge) = clientOnBridge ()
+    let struct (app, local) = loopPair listener
+    use app = app
+    Assert.True(bridge.TryAdd local)
+    let slot = bridge.Opened.NextUp -1
+    app.Send(Array.create 60000 3uy) |> ignore
+    for _ in 1 .. 200 do
+        if session.Tx.Queued < 40 then
+            bridge.Read slot
+            Thread.Sleep 1
+    Assert.True(session.Tx.Queued >= 40)
+    let carrier = SessionCarrier(session, bridge)
+    let fast = RatePath(0us, 4_000_000L)
+    let slow = RatePath(1us, 1_000_000L)
+    carrier.AddPath fast
+    carrier.AddPath slow
+    // Count committed frames over repeated batches; the sender queue is finite.
+    // This test detects grossly equal scheduling, not a steady-state ratio.
+    for _ in 1 .. 40 do carrier.WriteBatch 256 |> ignore
+    let fastFrames = fast.Frames
+    let slowFrames = slow.Frames
+    Assert.True(fastFrames > 0 && slowFrames > 0)
+    let ratio = float fastFrames / float slowFrames
+    Assert.InRange(ratio, 3.2, 4.8)
+    bridge.CloseAll()
+
+[<Fact>]
+let ``write batch keeps equal shares when path rates are unknown`` () =
+    use listener = listen ()
+    let struct (session, bridge) = clientOnBridge ()
+    let struct (app, local) = loopPair listener
+    use app = app
+    Assert.True(bridge.TryAdd local)
+    let slot = bridge.Opened.NextUp -1
+    app.Send(Array.create 60000 3uy) |> ignore
+    for _ in 1 .. 200 do
+        if session.Tx.Queued < 40 then
+            bridge.Read slot
+            Thread.Sleep 1
+    Assert.True(session.Tx.Queued >= 40)
+    let carrier = SessionCarrier(session, bridge)
+    let a = RatePath(0us, 0L)
+    let b = RatePath(1us, 0L)
+    carrier.AddPath a
+    carrier.AddPath b
+    for _ in 1 .. 40 do carrier.WriteBatch 256 |> ignore
+    let x = a.Frames
+    let y = b.Frames
+    Assert.True(x > 0 && y > 0)
+    let ratio = float (max x y) / float (min x y)
+    Assert.InRange(ratio, 0.8, 1.25)
+    bridge.CloseAll()
+
+let private longWeightedSessions fastRate slowRate =
+    let mutable fastTotal = 0
+    let mutable slowTotal = 0
+    for _ in 1 .. 40 do
+        use listener = listen ()
+        let struct (session, bridge) = clientOnBridge ()
+        let struct (app, local) = loopPair listener
+        use app = app
+        Assert.True(bridge.TryAdd local)
+        let slot = bridge.Opened.NextUp -1
+        Assert.Equal(60000, app.Send(Array.create 60000 3uy))
+        for _ in 1 .. 200 do
+            if session.Tx.Queued < 40 then
+                bridge.Read slot
+                Thread.Sleep 1
+        Assert.True(session.Tx.Queued >= 40)
+        let carrier = SessionCarrier(session, bridge)
+        let fast = RatePath(0us, fastRate)
+        let slow = RatePath(1us, slowRate)
+        carrier.AddPath fast
+        carrier.AddPath slow
+        for _ in 1 .. 40 do carrier.WriteBatch 256 |> ignore
+        fastTotal <- fastTotal + fast.Frames
+        slowTotal <- slowTotal + slow.Frames
+        bridge.CloseAll()
+    struct (fastTotal, slowTotal)
+
+[<Fact>]
+let ``weighted paths commit at least 1000 actual frames across sessions`` () =
+    let struct (fast, slow) = longWeightedSessions 4_000_000L 1_000_000L
+    Assert.True(fast + slow >= 1000, sprintf "committed %d" (fast + slow))
+    Assert.True(slow > 0)
+    Assert.InRange(float fast / float slow, 3.2, 4.8)
+
+[<Fact>]
+let ``unknown rate paths commit at least 1000 actual frames across sessions`` () =
+    let struct (a, b) = longWeightedSessions 0L 0L
+    Assert.True(a + b >= 1000, sprintf "committed %d" (a + b))
+    Assert.True(a > 0 && b > 0)
+    Assert.InRange(float a / float b, 0.8, 1.25)
+
+[<Fact>]
+let ``weighted path blocked by send backlog resumes after backlog drains`` () =
+    use listener = listen ()
+    let struct (session, bridge) = clientOnBridge ()
+    let struct (app, local) = loopPair listener
+    use app = app
+    Assert.True(bridge.TryAdd local)
+    let slot = bridge.Opened.NextUp -1
+    app.Send(Array.create 60000 3uy) |> ignore
+    for _ in 1 .. 200 do
+        if session.Tx.Queued < 40 then
+            bridge.Read slot
+            Thread.Sleep 1
+    Assert.True(session.Tx.Queued >= 40)
+    let carrier = SessionCarrier(session, bridge)
+    let fast = RatePath(0us, 4_000_000L, unsent = 300000)
+    let slow = RatePath(1us, 1_000_000L)
+    carrier.AddPath fast
+    carrier.AddPath slow
+    for _ in 1 .. 3 do carrier.WriteBatch 4 |> ignore
+    Assert.Equal(0, fast.Frames)
+    Assert.True(slow.Frames > 0)
+    fast.Unsent <- 0
+    for _ in 1 .. 3 do carrier.WriteBatch 4 |> ignore
+    Assert.True(fast.Frames > 0)
+    bridge.CloseAll()
+
 /// In-memory carrier path. `CommitFrame` hands the sealed frame to the peer path;
 /// `Receive` (called by `Service`) delivers it to that peer session. Credit and
 /// WIN_ACK therefore come from the real peer, not from a hand-fed `OnPeerCredit`.

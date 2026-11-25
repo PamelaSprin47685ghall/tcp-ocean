@@ -34,6 +34,7 @@ type PathRefresher(maxAgeNs: int64, perTick: int, perTickIdle: int, tickNs: int6
     let slowStreak = Dictionary<uint16, int>()
     let slowZombieSamples = 3
     let mutable lastTickNs = 0L
+    let mutable lastRotateNs = 0L
     let mutable started = 0L
     let mutable replaced = 0L
     let mutable failed = 0L
@@ -183,6 +184,54 @@ type PathRefresher(maxAgeNs: int64, perTick: int, perTickIdle: int, tickNs: int6
                     for id in out do inFlight.Add id |> ignore
                     started <- started + int64 n
                     out
+
+    /// Absolute plateau, not "slower than the median". A mature path that keeps a
+    /// low retransmission rate and a positive delivery rate is a policer candidate
+    /// even when every peer sits on the same ceiling. `cv` is the coefficient of
+    /// variation of that path's own recent samples; a negative cv means "not enough
+    /// samples", which is not a plateau.
+    static member IsPlateau(h: PathHealth, cv: float) =
+        h.Valid && h.DeliveryRate > 0L && h.RetransRate < 0.05 && h.CaState < 4uy
+        && h.RttUs > 0u && cv >= 0.0 && cv <= 0.25
+        && (h.NotSentBytes > 0 || h.UnackedBytes > 0u)
+
+    /// Under load, replace a few tuples on a clock even when none is an outlier.
+    /// A uniform policer never produces a median outlier, and a fresh 5-tuple often
+    /// gets a short burst the old one has already lost. Idle sessions still return
+    /// nothing: rotation is not a reason to churn a quiet session.
+    /// `plateau` ids are refreshed first; remaining room goes to the oldest due ids.
+    member this.DueRotation(nowNs: int64, paths: struct (uint16 * PathHealth)[], plateau: uint16[],
+                            ready: bool, idle: bool, rotateNs: int64) : uint16[] =
+        if not this.Enabled || not ready || idle || rotateNs <= 0L then Array.empty
+        elif nowNs - lastRotateNs < tickNs then Array.empty
+        else
+            lastRotateNs <- nowNs
+            let room = min perTick (maxInFlight - inFlight.Count)
+            if room <= 0 then Array.empty
+            else
+                let picked = ResizeArray<uint16>(room)
+                for id in plateau do
+                        if picked.Count < room && not (inFlight.Contains id) && dueAt.ContainsKey id then
+                            picked.Add id
+                if picked.Count < room then
+                    let oldest = ResizeArray<struct (int64 * uint16)>()
+                    for i in 0 .. paths.Length - 1 do
+                        let struct (id, _) = paths.[i]
+                        if not (inFlight.Contains id) && not (picked.Contains id) then
+                            match joinedAt.TryGetValue id with
+                            | true, at when nowNs - at >= rotateNs -> oldest.Add(struct (at, id))
+                            | _ -> ()
+                    oldest.Sort(fun (struct (a, x)) (struct (b, y)) ->
+                        if a <> b then compare a b else compare x y)
+                    let n = min (room - picked.Count) oldest.Count
+                    for i in 0 .. n - 1 do
+                        let struct (_, id) = oldest.[i]
+                        picked.Add id
+                if picked.Count = 0 then Array.empty
+                else
+                    for id in picked do inFlight.Add id |> ignore
+                    started <- started + int64 picked.Count
+                    picked.ToArray()
 
     /// The refresh JOIN for id succeeded and the new connection replaces the old.
     member this.OnReplaced(id: uint16, nowNs: int64) =

@@ -3,6 +3,7 @@
     <Compile Include="Native.fs" />
     <Compile Include="Platform.fs" />
     <Compile Include="KernelTcpInfo.fs" />
+    <Compile Include="PathClass.fs" />
     <Compile Include="SocketTuning.fs" />
     <Compile Include="Poller.fs" />
     <Compile Include="Path.fs" />

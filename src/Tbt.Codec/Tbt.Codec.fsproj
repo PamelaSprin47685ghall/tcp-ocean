@@ -2,6 +2,7 @@
   <ItemGroup>
     <Compile Include="Gf16.fs" />
     <Compile Include="SplitMix64.fs" />
+    <Compile Include="WindowCodec.fs" />
     <Compile Include="CodeGraph.fs" />
     <Compile Include="StepRing.fs" />
     <Compile Include="Encoder.fs" />

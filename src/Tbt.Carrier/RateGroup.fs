@@ -1,8 +1,12 @@
-/// Rate control shared by the paths to one client address. The paths of a session cross the
-/// same bottleneck; a delivery-rate controller per path sees only its own share, and the sum
-/// of the per-path cwnds (each 2 x its BDP plus probing) keeps a standing queue there. The
-/// group measures the delivery rate of all its paths together and gates cwnd and pacing
-/// for the sum (spec 16.3 Q-2: in-flight bound for the bottleneck, not per path).
+/// Optional aggregate budget for the case where several paths really do share one
+/// bottleneck. That is a hypothesis, not the model: a per-tuple policer makes the
+/// sum of per-path windows the wrong cap, and a controller that always sums them
+/// backs off against the policer. Callers apply this group only after a session
+/// hint says the bottleneck is shared. Each direction keeps its own RateGroup;
+/// nothing here copies an uplink estimate onto a downlink group.
+///
+/// Per-path pacing lives in PathPacer / PathBudget. This type still sums members
+/// when it is engaged, because that is the shared-bottleneck bound.
 namespace Tbt.Carrier
 
 open System
@@ -488,7 +492,38 @@ type RateGroup(clock: IClock) =
         + " sample_mbit=" + (sampleRate * 8000.0).ToString("F1")
         + " copy_mbit=" + (copyRate * 8000.0).ToString("F1")
 
-/// Optional per-5-tuple pacer for the client uplink (e.g. PROFILE=rtt400 at 4 Mbit).
+/// In-flight bound of one path, from that path's own delivery rate and min RTT.
+/// Bytes, not a rate. Independent of every other path: engaging it does not shrink
+/// the session. No sample yet allows a 4-frame probe so the first measurement can
+/// complete. A policed path passes its plateau rate; the delay is the queue budget
+/// (20 ms), not a claim about the physical BDP.
+[<Sealed>]
+type PathBudget() =
+    static member QueueBytes(rateBps: int64, delayMs: int64, frameLength: int) =
+        if frameLength <= 0 then 0
+        elif rateBps <= 0L || delayMs <= 0L then 4 * frameLength
+        else
+            let raw =
+                if rateBps > Int64.MaxValue / delayMs then int64 Int32.MaxValue
+                else rateBps * delayMs / 1000L
+            let bytes = int (min (int64 Int32.MaxValue) (max (int64 (4 * frameLength)) raw))
+            min 131072 bytes
+
+    /// Slightly under the measured plateau so a shaped tuple is not driven into
+    /// its own tail drop. Returns bytes, not a rate.
+    static member PolicedQueue(capBps: int64, frameLength: int) =
+        let softened = if capBps <= 1L then 0L else capBps - capBps / 8L
+        PathBudget.QueueBytes(softened, 20L, frameLength)
+
+    /// Write-gate ceilings for a plateau. Twenty milliseconds at the cap, never the
+    /// 64 KiB floor that turned a slow tuple into hundreds of milliseconds of queue.
+    static member GateLimits(configuredMax: int) (capBps: int64) (frameLength: int) =
+        let configured = max SocketTuning.GatePass1Limit configuredMax
+        let pass2 = min configured (max 4096 (PathBudget.PolicedQueue(capBps, frameLength)))
+        let pass1 = min SocketTuning.GatePass1Limit (max 1024 (pass2 / 2))
+        struct (pass1, pass2)
+
+/// Optional per-5-tuple pacer for the client uplink (e.g. a tested 4 Mbit profile).
 /// Off when rateMbit <= 0 so the 20 ms / 200 Mbit matrix is not capped per path.
 /// Paces at 1.25× the configured rate; burst depth is about 1.25 BDP, or 4 frames
 /// before a min-RTT sample exists.

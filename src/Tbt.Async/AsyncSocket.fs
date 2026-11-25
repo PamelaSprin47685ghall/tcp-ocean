@@ -28,8 +28,9 @@ type BufferPool(bufferSize: int, poolSize: int) =
 
 /// Non-blocking socket operations with one completion callback each.
 ///
-/// One receive and one send may be in flight at a time. The callbacks run on
-/// the socket's completion thread; the caller must serialise its own state.
+/// One receive and one send may be in flight at a time. The two
+/// SocketAsyncEventArgs objects are allocated once and reused; the callbacks
+/// run on the socket's completion thread. The caller must serialise its own state.
 [<Sealed>]
 type AsyncSocket(socket: Socket, bufferSize: int) =
     do
@@ -38,15 +39,31 @@ type AsyncSocket(socket: Socket, bufferSize: int) =
 
     let sendBuffer: byte[] = Array.zeroCreate bufferSize
     let recvBuffer: byte[] = Array.zeroCreate bufferSize
+    let sendArgs = new SocketAsyncEventArgs()
+    let recvArgs = new SocketAsyncEventArgs()
     let mutable sendPending = 0
     let mutable recvPending = 0
     let mutable closed = 0
+    let mutable sendCallback: (int -> SocketError -> unit) | null = null
+    let mutable recvCallback: (int -> SocketError -> unit) | null = null
 
-    let finish (args: SocketAsyncEventArgs) (callback: int -> SocketError -> unit) =
-        let n = args.BytesTransferred
-        let err = args.SocketError
-        args.Dispose()
-        callback n err
+    do
+        sendArgs.SetBuffer(sendBuffer, 0, bufferSize)
+        recvArgs.SetBuffer(recvBuffer, 0, bufferSize)
+        sendArgs.Completed.Add(fun e ->
+            Volatile.Write(&sendPending, 0)
+            let cb = sendCallback
+            sendCallback <- null
+            match cb with
+            | null -> ()
+            | f -> f e.BytesTransferred e.SocketError)
+        recvArgs.Completed.Add(fun e ->
+            Volatile.Write(&recvPending, 0)
+            let cb = recvCallback
+            recvCallback <- null
+            match cb with
+            | null -> ()
+            | f -> f e.BytesTransferred e.SocketError)
 
     /// Start one receive. The callback owns the bytes in `RecvBuffer` until the
     /// next receive starts.
@@ -55,22 +72,20 @@ type AsyncSocket(socket: Socket, bufferSize: int) =
         elif Interlocked.CompareExchange(&recvPending, 1, 0) <> 0 then
             invalidOp "receive already pending"
         else
-            let args = new SocketAsyncEventArgs()
-            args.SetBuffer(recvBuffer, 0, bufferSize)
-            args.Completed.Add(fun e ->
-                Volatile.Write(&recvPending, 0)
-                finish e callback)
+            recvCallback <- callback
+            recvArgs.SetBuffer(0, bufferSize)
             let sync =
-                try socket.ReceiveAsync args
+                try socket.ReceiveAsync recvArgs
                 with ex ->
                     Volatile.Write(&recvPending, 0)
-                    args.Dispose()
+                    recvCallback <- null
                     callback 0 SocketError.SocketError
                     ignore ex
                     true
             if sync then
                 Volatile.Write(&recvPending, 0)
-                finish args callback
+                recvCallback <- null
+                callback recvArgs.BytesTransferred recvArgs.SocketError
 
     /// Start one send of `data` (copied into the send buffer).
     member _.SendAsync(data: ReadOnlySpan<byte>, callback: int -> SocketError -> unit) =
@@ -80,21 +95,19 @@ type AsyncSocket(socket: Socket, bufferSize: int) =
             invalidOp "send already pending"
         else
             data.CopyTo(Span(sendBuffer, 0, data.Length))
-            let args = new SocketAsyncEventArgs()
-            args.SetBuffer(sendBuffer, 0, data.Length)
-            args.Completed.Add(fun e ->
-                Volatile.Write(&sendPending, 0)
-                finish e callback)
+            sendCallback <- callback
+            sendArgs.SetBuffer(0, data.Length)
             let sync =
-                try socket.SendAsync args
+                try socket.SendAsync sendArgs
                 with _ ->
                     Volatile.Write(&sendPending, 0)
-                    args.Dispose()
+                    sendCallback <- null
                     callback 0 SocketError.SocketError
                     true
             if sync then
                 Volatile.Write(&sendPending, 0)
-                finish args callback
+                sendCallback <- null
+                callback sendArgs.BytesTransferred sendArgs.SocketError
 
     /// Bytes of the last completed receive.
     member _.RecvBuffer = ReadOnlySpan(recvBuffer)
@@ -104,6 +117,8 @@ type AsyncSocket(socket: Socket, bufferSize: int) =
     member _.Close() =
         if Interlocked.Exchange(&closed, 1) = 0 then
             try socket.Close() with _ -> ()
+            sendArgs.Dispose()
+            recvArgs.Dispose()
 
     interface IDisposable with
         member this.Dispose() = this.Close()

@@ -4,8 +4,8 @@ open Tbt.Cli.Common
 
 let private usage =
     "usage:\n"
-    + "  tbtun client --server HOST:PORT --listen ADDR:PORT --psk-file FILE [--paths 4] [--min-active-paths min(paths,64)] [--mss 1448] [--window 1024] [--window-clamp 600000] [--uplink-pace 0] [--tuple-mbit 0] [--gate-pass2 262144] [--notsent-lowat 16384] [--tx-slots 64] [--io-threads min(4,cpus)] [--user-timeout-ms 30000] [--new-repair 0] [--suites chacha20] [--x25519]\n"
-    + "  tbtun server --target HOST:PORT --psk-file FILE [--listen ADDR:PORT | --tun NAME --tun-listen ADDR:PORT] [--tun-txqueuelen 20000] [--tun-drain adaptive|full|main] [--tun-recv-budget 128] [--tun-recv-yield-us 2000] [--tun-sndbuf 2000000] [--max-paths 64] [--min-active-paths min(max-paths,64)] [--mss 1448] [--window 1024] [--window-clamp 600000] [--pace 0] [--gate-pass2 262144] [--notsent-lowat 16384] [--tx-slots 64] [--io-threads min(4,cpus)] [--user-timeout-ms 30000] [--new-repair 0] [--stats-s 0] [--suites chacha20] [--x25519]"
+    + "  tbtun client --server HOST:PORT --listen ADDR:PORT --psk-file FILE [--paths 4] [--server-ports PORTS] [--min-active-paths min(paths,64)] [--mss 1448] [--window 1024] [--window-clamp 600000] [--uplink-pace 0] [--tuple-mbit 0] [--gate-pass2 262144] [--notsent-lowat 16384] [--tx-slots 64] [--io-threads min(4,cpus)] [--user-timeout-ms 30000] [--path-rotate-s 60] [--new-repair 0] [--suites chacha20] [--x25519]\n"
+    + "  tbtun server --target HOST:PORT --psk-file FILE [--listen ADDR:PORT | --tun NAME --tun-listen ADDR:PORT] [--listen-ports PORTS] [--tun-txqueuelen 20000] [--tun-drain adaptive|full|main] [--tun-recv-budget 128] [--tun-recv-yield-us 2000] [--tun-sndbuf 2000000] [--max-paths 64] [--min-active-paths min(max-paths,64)] [--mss 1448] [--window 1024] [--window-clamp 600000] [--pace 0] [--gate-pass2 262144] [--notsent-lowat 16384] [--tx-slots 64] [--io-threads min(4,cpus)] [--user-timeout-ms 30000] [--new-repair 0] [--stats-s 0]\n"
 
 [<EntryPoint>]
 let main argv =

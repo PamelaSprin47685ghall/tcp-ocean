@@ -14,6 +14,7 @@
     <Compile Include="Vectors.fs" />
     <Compile Include="ReadySetTests.fs" />
     <Compile Include="CodecTests.fs" />
+    <Compile Include="WindowCodecTests.fs" />
     <Compile Include="WireTests.fs" />
     <Compile Include="CryptoTests.fs" />
     <Compile Include="RateGroupTests.fs" />
@@ -21,6 +22,7 @@
     <Compile Include="PathLinkHalfOpenTests.fs" />
     <Compile Include="KernelTcpInfoTests.fs" />
     <Compile Include="WriteGateRateTests.fs" />
+    <Compile Include="PathClassTests.fs" />
     <Compile Include="PollerTests.fs" />
     <Compile Include="PlatformTests.fs" />
   </ItemGroup>

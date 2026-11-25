@@ -2,8 +2,9 @@
   <PropertyGroup>
     <OutputType>Exe</OutputType>
     <AssemblyName>tbtun</AssemblyName>
-    <!-- Server NativeAOT stays on for Linux publish; the JIT client cross-builds without AOT. -->
-    <PublishAot Condition="'$(RuntimeIdentifier)' == '' or $(RuntimeIdentifier.StartsWith('linux-'))">true</PublishAot>
+    <!-- NativeAOT only when a Linux RID is set. A bare `dotnet build` / `dotnet publish`
+         (empty RID) stays JIT, matching the cross-build comment. -->
+    <PublishAot Condition="$(RuntimeIdentifier.StartsWith('linux-'))">true</PublishAot>
     <InvariantGlobalization>true</InvariantGlobalization>
     <UseSystemResourceKeys>true</UseSystemResourceKeys>
     <ServerGarbageCollector>false</ServerGarbageCollector>

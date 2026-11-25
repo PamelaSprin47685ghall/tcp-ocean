@@ -120,9 +120,26 @@ let describeOffer (suite: byte) (caps: uint16) =
     let dh = if (caps &&& Caps.X25519) <> 0us then "1" else "0"
     "suite=0x" + suite.ToString("x2") + "(" + Suite.name suite + ") x25519=" + dh
 
+/// Comma-separated TCP ports. Empty text is an empty list. A bad token is a usage error.
+let portList (text: string) =
+    if String.IsNullOrWhiteSpace text then Array.empty
+    else
+        let parts = text.Split(',')
+        Array.init parts.Length (fun i ->
+            let token = parts.[i].Trim()
+            match Int32.TryParse token with
+            | true, p when p >= 1 && p <= 65535 -> p
+            | _ -> failUsage ("bad port list: " + text))
+
+/// Inclusive integer option. A missing option uses `fallback`.
+let bounded (o: Options) (name: string) (fallback: int) (lo: int) (hi: int) =
+    let n = o.Int(name, fallback)
+    if n < lo || n > hi then failUsage ("option --" + name + " must be " + string lo + ".." + string hi + ", got: " + string n)
+    n
+
 /// host:port, or [IPv6]:port. Literal addresses keep their family. A host name
-/// uses the resolver's first result: no hardcoded AAAA preference, because a
-/// machine with no working IPv6 route must still be able to bind/connect by name.
+/// prefers an IPv4 result when one exists, and falls back to the first address
+/// otherwise: a machine with no working IPv6 route must not be stuck on AAAA.
 let endpoint (text: string) : IPEndPoint =
     let at = text.LastIndexOf ':'
     if at <= 0 then failUsage ("bad endpoint: " + text)
@@ -142,7 +159,11 @@ let endpoint (text: string) : IPEndPoint =
             with :? System.Net.Sockets.SocketException ->
                 failUsage ("endpoint did not resolve: " + text)
         if addresses.Length = 0 then failUsage ("endpoint did not resolve: " + text)
-        IPEndPoint(addresses.[0], port)
+        let chosen =
+            match Array.tryFind (fun (a: IPAddress) -> a.AddressFamily = AddressFamily.InterNetwork) addresses with
+            | Some v4 -> v4
+            | None -> addresses.[0]
+        IPEndPoint(chosen, port)
 
 /// PSK file: one key per line, 64 hex digits; '#' starts a comment.
 /// Every failure here is the operator's typing (path, permissions, digits), so each one is a

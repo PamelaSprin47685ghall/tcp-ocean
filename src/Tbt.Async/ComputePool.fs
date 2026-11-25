@@ -31,20 +31,25 @@ type ComputeWorker(workerId: int, taskQueue: MPMCTaskQueue, wake: SemaphoreSlim)
     let loop () =
         while Volatile.Read(&running) do
             wake.Wait()
-            match taskQueue.TryDequeue workerId with
-            | Some task ->
-                if not task.CancellationToken.IsCancellationRequested then
-                    let start = Stopwatch.GetTimestamp()
-                    try
-                        task.Work()
-                        stats.TasksExecuted <- stats.TasksExecuted + 1L
-                    with _ ->
-                        // A failing task must not kill the worker.
-                        stats.TasksFailed <- stats.TasksFailed + 1L
-                    stats.TotalWorkUs <- stats.TotalWorkUs + toUs (Stopwatch.GetTimestamp() - start)
-            | None ->
-                stats.IdleSpins <- stats.IdleSpins + 1L
-                ()
+            // A wake can land before the matching Enqueue is visible, or a stolen
+            // task can leave a sibling's wake with an empty queue. Drain until
+            // empty so a task that won the race is not stranded behind one wake.
+            let mutable go = true
+            while go && Volatile.Read(&running) do
+                match taskQueue.TryDequeue workerId with
+                | Some task ->
+                    if not task.CancellationToken.IsCancellationRequested then
+                        let start = Stopwatch.GetTimestamp()
+                        try
+                            task.Work()
+                            stats.TasksExecuted <- stats.TasksExecuted + 1L
+                        with _ ->
+                            // A failing task must not kill the worker.
+                            stats.TasksFailed <- stats.TasksFailed + 1L
+                        stats.TotalWorkUs <- stats.TotalWorkUs + toUs (Stopwatch.GetTimestamp() - start)
+                | None ->
+                    stats.IdleSpins <- stats.IdleSpins + 1L
+                    go <- false
 
     /// Stop the loop without waiting for the thread to join.
     member _.RequestStop() =
@@ -88,6 +93,15 @@ type ComputePool(workerCount: int, queueCapacity: int) =
     let workers = Array.init workerCount (fun i -> ComputeWorker(i, taskQueue, wake))
     let mutable started = false
 
+    let submit (priority: TaskPriority) (work: unit -> unit) (cancellationToken: CancellationToken option) =
+        let ok =
+            taskQueue.Enqueue
+                { Priority = priority
+                  Work = work
+                  CancellationToken = defaultArg cancellationToken CancellationToken.None }
+        if ok then wake.Release() |> ignore
+        ok
+
     member _.Start() =
         if not started then
             started <- true
@@ -98,29 +112,15 @@ type ComputePool(workerCount: int, queueCapacity: int) =
         for w in workers do w.Stop()
         started <- false
 
+    /// False when the high lane is full: the caller must retry or drop.
     member _.EnqueueRecovery(work: unit -> unit, ?cancellationToken: CancellationToken) =
-        taskQueue.Enqueue
-            { Priority = TaskPriority.High
-              Work = work
-              CancellationToken = defaultArg cancellationToken CancellationToken.None }
-        |> ignore
-        wake.Release() |> ignore
+        submit TaskPriority.High work cancellationToken
 
     member _.EnqueueEncoding(work: unit -> unit, ?cancellationToken: CancellationToken) =
-        taskQueue.Enqueue
-            { Priority = TaskPriority.Normal
-              Work = work
-              CancellationToken = defaultArg cancellationToken CancellationToken.None }
-        |> ignore
-        wake.Release() |> ignore
+        submit TaskPriority.Normal work cancellationToken
 
     member _.EnqueueBackground(work: unit -> unit, ?cancellationToken: CancellationToken) =
-        taskQueue.Enqueue
-            { Priority = TaskPriority.Low
-              Work = work
-              CancellationToken = defaultArg cancellationToken CancellationToken.None }
-        |> ignore
-        wake.Release() |> ignore
+        submit TaskPriority.Low work cancellationToken
 
     member _.PendingCount = taskQueue.ApproximateCount
     member _.WorkerCount = workerCount

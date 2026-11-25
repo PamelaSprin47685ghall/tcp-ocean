@@ -203,7 +203,7 @@ type FlowBridge(target: EndPoint voption) =
 
     /// Start a non-blocking connect; return its first result.
     ///
-    /// TCP_FASTOPEN_CONNECT is not set here. The local peer (mihomo, a test listener) does
+    /// TCP_FASTOPEN_CONNECT is not set here. The local peer in tests does
     /// not enable a TFO accept queue. With the option on, Linux answers connect(2) with
     /// EINPROGRESS while Socket.Connected is already true, and the first payload is either
     /// refused (ENOTCONN) or accepted into a SYN the peer never delivers. Carrier sockets
@@ -259,12 +259,15 @@ type FlowBridge(target: EndPoint voption) =
             n <- n + 1
             slot <- armed.NextUp slot
         n
-    member _.Read(slot: int, ?limit: int) =
+    member this.Read(slot: int, ?limit: int) =
+        this.ReadLimited(slot, defaultArg limit 4096)
+
+    member _.ReadLimited(slot: int, limit: int) =
         match locals.[slot] with
         | null -> ()
         | socket ->
             readCalls <- readCalls + 1L
-            let mutable budget = max 1 (defaultArg limit 4096)
+            let mutable budget = max 1 limit
             let mutable app = Span<byte>.Empty
             let mutable go = true
             while go && budget > 0 && session.FlowSending slot do

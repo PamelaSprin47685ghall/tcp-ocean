@@ -215,8 +215,14 @@ type SessionCarrier(session: Session, bridge: FlowBridge, ?uplinkPace: bool, ?tu
     let mutable lastActivityFrames = 0L
     let mutable lastActivityNs = 0L
     let mutable healthCursor = 0
-    // Keep the measured conservative default for general networks; callers may explicitly
-    // raise the floor for a tested multipath deployment.
+    /// Per-path class memory. Owner thread only; published as a snapshot for refresh.
+    let classTracks = Dictionary<uint16, PathClassTracker>()
+    let classSeen = Dictionary<uint16, int64>()
+    let mutable classSnap: struct (uint16 * PathVerdict)[] = Array.Empty()
+    let mutable sessionKind = PathKind.Unknown
+    let deficit = DeficitWheel(64)
+    // Floor of paths kept in the working set so a new tuple can be measured.
+    // It is an exploration width, not a promise that each of them gets 1/N of the frames.
     let defaultMinActivePaths = 16
     let minActivePaths = max 1 (defaultArg minActivePaths defaultMinActivePaths)
     let mutable activeTarget = minActivePaths
@@ -235,6 +241,16 @@ type SessionCarrier(session: Session, bridge: FlowBridge, ?uplinkPace: bool, ?tu
     /// keeps its exact meaning and no parser has to re-learn it.
     let peerDiagBuf = System.Text.StringBuilder(128)
     let describeBuf = System.Text.StringBuilder(4096)
+
+    let classOf (id: uint16) =
+        let snap = System.Threading.Volatile.Read(&classSnap)
+        let mutable found = ValueNone
+        let mutable i = 0
+        while i < snap.Length && found.IsNone do
+            let struct (pid, v) = snap.[i]
+            if pid = id then found <- ValueSome v
+            i <- i + 1
+        found
 
     let healthOf (link: IPath) : PathHealth =
         match link with
@@ -299,6 +315,61 @@ type SessionCarrier(session: Session, bridge: FlowBridge, ?uplinkPace: bool, ?tu
     /// bumps `pathVersion`, so comparing it is the actual identity test.
     let mutable rankVersion = -1L
 
+    /// Record a health sample once per kernel snapshot, then publish verdicts.
+    /// Rebuilding the rank table must not invent extra plateau samples.
+    let publishClass (pSnap: struct (uint16 * PathHealth)[]) =
+        let n = pSnap.Length
+        let kinds = Array.zeroCreate n
+        let verdicts = Array.zeroCreate n
+        let weights = Array.zeroCreate n
+        let mutable floor = Int64.MaxValue
+        let liveIds = HashSet<uint16>()
+        for i in 0 .. n - 1 do
+            let struct (id, h) = pSnap.[i]
+            liveIds.Add id |> ignore
+            let track =
+                match classTracks.TryGetValue id with
+                | true, t -> t
+                | _ ->
+                    let t = PathClassTracker(8)
+                    classTracks.[id] <- t
+                    t
+            let seen =
+                match classSeen.TryGetValue id with
+                | true, t -> t
+                | _ -> 0L
+            if h.Valid && h.SampledNs <> 0L && h.SampledNs <> seen then
+                track.Observe h.DeliveryRate
+                classSeen.[id] <- h.SampledNs
+            let v = track.Verdict h
+            verdicts.[i] <- struct (id, v)
+            kinds.[i] <- v.Kind
+            if v.Kind = PathKind.Policed && v.CapBps > 0L && v.CapBps < floor then floor <- v.CapBps
+            elif h.Valid && h.DeliveryRate > 0L && h.DeliveryRate < floor then floor <- h.DeliveryRate
+        if floor = Int64.MaxValue then floor <- 1L
+        for i in 0 .. n - 1 do
+            let struct (_, h) = pSnap.[i]
+            weights.[i] <- DeficitWheel.Share h.DeliveryRate floor
+        // Credit is added once per published sample, not once per frame.
+        deficit.Refill weights
+        let stale = ResizeArray<uint16>()
+        for id in classTracks.Keys do
+            if not (liveIds.Contains id) then stale.Add id
+        for id in stale do
+            classTracks.Remove id |> ignore
+            classSeen.Remove id |> ignore
+        let mutable inflated = 0
+        let mutable validN = 0
+        for i in 0 .. n - 1 do
+            let struct (_, h) = pSnap.[i]
+            if h.Valid then
+                validN <- validN + 1
+                if h.MinRttUs > 0u && h.RttUs >= h.MinRttUs * 3u / 2u && h.RetransRate >= 0.02 then
+                    inflated <- inflated + 1
+        let hint, _ = PathClass.sessionHint kinds inflated validN None
+        sessionKind <- hint
+        System.Threading.Volatile.Write(&classSnap, verdicts)
+
     let rebuildRanking () =
         // Snapshot and version from ONE critical section. Reading the version *after* taking the
         // snapshot (the previous form) leaves a window: a replacement landing in between makes
@@ -342,11 +413,17 @@ type SessionCarrier(session: Session, bridge: FlowBridge, ?uplinkPace: bool, ?tu
             let struct (_, _, idx) = keys.[i]
             rankedOrder.[i] <- idx
         hasHealthyPath <- healthy || n = 0
+        publishClass pSnap
         System.Threading.Volatile.Write(&pathHealthSnap, pSnap)
         System.Threading.Volatile.Write(&socketHealthSnap, sSnap.ToArray())
 
     let refreshHealthAndRank (nowNs: int64) =
         let mutable written = 0L
+        // No snapshot, no ranking, no class tables when the set is empty. BridgeTests
+        // measures this round at zero bytes once warm; an empty `ToArray` is the shared
+        // array, but the ranking below is not.
+        if paths.Count = 0 then ()
+        else
         let live = paths.ToArray()
         let n = live.Length
         let totalFrames = framesIn + framesOut
@@ -545,7 +622,10 @@ type SessionCarrier(session: Session, bridge: FlowBridge, ?uplinkPace: bool, ?tu
     let startupCap (fl: int) = 64 * fl
 
     let groupAllows (fl: int) (repair: bool) (bulk: bool) =
-        if repair then
+        // A policer is not a shared pipe. The aggregate window would back off the
+        // whole session because one tuple is shaped. Per-path gates still apply.
+        if sessionKind = PathKind.Policed then true
+        elif repair then
             if group.Ready && group.TryTakeRepair(fl, fl) then true
             else not group.Ready && uniqueInflight fl <= startupCap fl
         elif group.Ready && group.TryTake(fl, bulk) then true
@@ -555,6 +635,9 @@ type SessionCarrier(session: Session, bridge: FlowBridge, ?uplinkPace: bool, ?tu
     /// must not keep a dead slot or `PathPool` can never rejoin that id. Async
     /// paths already have their own `CheckAlive`.
     let mutable lastHalfOpenProbeNs = 0L
+
+    // Credits belong to path instances, not reusable path identifiers.
+    let weightedCredits = Dictionary<IPath, int64>(HashIdentity.Reference)
 
     let prune () =
         // Skip entirely when there is nothing to prune: no snapshot, no loop. (`ToArray` on an
@@ -572,6 +655,7 @@ type SessionCarrier(session: Session, bridge: FlowBridge, ?uplinkPace: bool, ?tu
                 if not dead.Alive then
                     match paths.TakeIf(fun p -> obj.ReferenceEquals(p, dead)) with
                     | Some v ->
+                        weightedCredits.Remove v |> ignore
                         (try v.Close() with _ -> ())
                         changed <- true
                     | None -> ()
@@ -620,7 +704,7 @@ type SessionCarrier(session: Session, bridge: FlowBridge, ?uplinkPace: bool, ?tu
         // Rebuild when the set changed at all — not merely when the count changed. A replacement
         // (PathRefresher's make-before-break) removes one path and adds another, so the count is
         // equal while `rankSnap` still holds the closed one and `rankedOrder` its position.
-        if rankVersion <> paths.Version || rankedOrder.Length <> rankSnap.Length then
+        if paths.Count > 0 && (rankVersion <> paths.Version || rankedOrder.Length <> rankSnap.Length) then
             rebuildRanking ()
         let live = rankSnap
         let mutable batchLimited = false
@@ -688,6 +772,24 @@ type SessionCarrier(session: Session, bridge: FlowBridge, ?uplinkPace: bool, ?tu
             // paths; after that every path is fair game again, and a stale verdict can only
             // cost one ranking position instead of the whole round.
             let mutable healthSkipBudget = max 1 scanLimit
+            let mutable maxRate = 0L
+            let mutable measured = 0
+            for k in 0 .. scanLimit - 1 do
+                let h = healthOf live.[rankedOrder.[k]]
+                if h.Valid && h.DeliveryRate > 0L then
+                    measured <- measured + 1
+                    maxRate <- max maxRate h.DeliveryRate
+            let weighted = measured >= 2 && maxRate > 0L
+            let refillCredit (link: IPath) =
+                let h = healthOf link
+                let rate = if h.Valid && h.DeliveryRate > 0L then h.DeliveryRate else max 1L (maxRate / 64L)
+                let quantum = max 1L (int64 (float fl * (float (min rate maxRate) / float maxRate)))
+                let mutable old = 0L
+                weightedCredits.TryGetValue(link, &old) |> ignore
+                weightedCredits.[link] <- min (int64 fl * 4L) (old + quantum)
+            if weighted then
+                for k in 0 .. scanLimit - 1 do
+                    refillCredit live.[rankedOrder.[k]]
             for pass in 1 .. 2 do
               if (pass = 1 || gated || healthSkipBudget <= 0) && not idle then
                 let mutable j = 0
@@ -696,8 +798,16 @@ type SessionCarrier(session: Session, bridge: FlowBridge, ?uplinkPace: bool, ?tu
                     let idx = rankedOrder.[rankPos]
                     let link = live.[idx]
                     let tier = pathTiers.[idx]
+                    let mutable credit = 0L
+                    let hasCredit = not weighted || (weightedCredits.TryGetValue(link, &credit) && credit >= int64 fl)
                     let skipForHealth = tier >= 2 && not allowDegraded && healthSkipBudget > 0
-                    if skipForHealth then
+                    if not hasCredit then
+                        // Another path may be blocked while this one is still
+                        // accumulating its fractional quantum. Advance the bounded
+                        // pass loop so an eligible slow path is not stranded.
+                        if weighted then progress <- true
+                    elif skipForHealth then
+                        deficit.Charge(idx, 1)
                         healthSkipBudget <- healthSkipBudget - 1
                         if pass = 1 then
                             batchNotSent.[idx] <- Int32.MaxValue
@@ -717,7 +827,15 @@ type SessionCarrier(session: Session, bridge: FlowBridge, ?uplinkPace: bool, ?tu
                         // Cached sample only. A positive DeliveryRate scales the queue; no sample
                         // uses the 16 KiB probe inside rateAwareLimits, not the 64 KiB cwnd floor.
                         let struct (pathPass1, pathPass2) =
-                            WriteGate.rateAwareLimits gatePass2 h.Valid h.DeliveryRate (int h.CaState)
+                            let policed =
+                                match classOf link.PathId with
+                                | ValueSome v when v.Kind = PathKind.Policed && v.Confidence >= 600 ->
+                                    ValueSome (PathBudget.GateLimits gatePass2 v.CapBps fl)
+                                | _ -> ValueNone
+                            match policed with
+                            | ValueSome limits -> limits
+                            | ValueNone ->
+                                WriteGate.rateAwareLimits gatePass2 h.Valid h.DeliveryRate (int h.CaState)
                         let mutable frame = Span<byte>.Empty
                         let notSent =
                             if pass = 1 then
@@ -735,6 +853,7 @@ type SessionCarrier(session: Session, bridge: FlowBridge, ?uplinkPace: bool, ?tu
                                 else gate2Pass <- gate2Pass + 1L
                                 true
                             else
+                                deficit.Charge(idx, 1)
                                 if pass = 1 then
                                     gate1Deny <- gate1Deny + 1L
                                     activeSaturated <- true
@@ -742,6 +861,7 @@ type SessionCarrier(session: Session, bridge: FlowBridge, ?uplinkPace: bool, ?tu
                                 batchLimited <- true
                                 false
                         let begun = admitted && link.TryBeginFrame(&frame)
+                        if weighted && not begun then weightedCredits.Remove link |> ignore
                         if admitted && not begun then
                             beginFail <- beginFail + 1L
                             batchLimited <- true
@@ -776,6 +896,8 @@ type SessionCarrier(session: Session, bridge: FlowBridge, ?uplinkPace: bool, ?tu
                             if produced then
                                 let uniqueDelta = session.Tx.UniqueRendered - uniqueBefore
                                 link.CommitFrame()
+                                if weighted then weightedCredits.[link] <- max 0L (credit - int64 fl)
+                                deficit.Charge(idx, fl)
                                 framesOut <- framesOut + 1L
                                 budget <- budget - 1
                                 progress <- true
@@ -799,9 +921,14 @@ type SessionCarrier(session: Session, bridge: FlowBridge, ?uplinkPace: bool, ?tu
                 // paths exist, expand scanLimit to all n paths immediately and grow activeTarget.
                 // A Tier-2 (TCP_CA_Loss) skip is deliberately not a saturation signal: see the
                 // note at the skip branch.
-                if pass = 1 && not expanded && scanLimit < n && budget > 0 && not idle && activeSaturated then
+                // A shared bottleneck does not get more paths. Extra tuples would queue
+                // at the same pipe. A policer does not set this hint, so it can still widen.
+                if pass = 1 && sessionKind <> PathKind.Physical && not expanded && scanLimit < n && budget > 0 && not idle && activeSaturated then
                     let prevLimit = scanLimit
                     scanLimit <- n
+                    if weighted then
+                        for k in prevLimit .. n - 1 do
+                            refillCredit live.[rankedOrder.[k]]
                     expanded <- true
                     overflowInWindow <- true
                     activeTarget <- min n (activeTarget + max 4 (activeTarget / 2))
@@ -834,6 +961,7 @@ type SessionCarrier(session: Session, bridge: FlowBridge, ?uplinkPace: bool, ?tu
                             if admitted && not begun then
                                 beginFail <- beginFail + 1L
                                 batchLimited <- true
+                            if weighted && not begun then weightedCredits.Remove link |> ignore
                             if begun then
                                 let mutable allowRepair = true
                                 let mutable charge = 0
@@ -862,6 +990,10 @@ type SessionCarrier(session: Session, bridge: FlowBridge, ?uplinkPace: bool, ?tu
                                 if produced then
                                     let uniqueDelta = session.Tx.UniqueRendered - uniqueBefore
                                     link.CommitFrame()
+                                    if weighted then
+                                        let mutable previous = 0L
+                                        weightedCredits.TryGetValue(link, &previous) |> ignore
+                                        weightedCredits.[link] <- max (-int64 fl * 4L) (previous - int64 fl)
                                     framesOut <- framesOut + 1L
                                     budget <- budget - 1
                                     progress <- true
@@ -909,7 +1041,7 @@ type SessionCarrier(session: Session, bridge: FlowBridge, ?uplinkPace: bool, ?tu
                     if interactive then hot.Add slot
                     if bridge.WantsRead slot then
                         if firstRead < 0 then firstRead <- slot
-                        bridge.Read(slot, limit = quantum)
+                        bridge.ReadLimited(slot, quantum)
             visited <- visited + 1
             let next = armed.NextAfter slot
             if next <= slot then wrapped <- true
@@ -952,6 +1084,24 @@ type SessionCarrier(session: Session, bridge: FlowBridge, ?uplinkPace: bool, ?tu
     /// Cached per-socket health snapshot for health-targeted CC nudge; safe from any thread.
     member _.SnapshotSocketHealth() = System.Threading.Volatile.Read(&socketHealthSnap)
     /// Current elastic active working set size.
+    member _.SessionKind = sessionKind
+    member _.SnapshotClass() = System.Threading.Volatile.Read(&classSnap)
+    /// Ids whose own samples sit on a quiet plateau. The refresher uses this so a
+    /// uniform policer, which has no median outlier, is still a rotation candidate.
+    member this.PlateauIds() =
+        let health = System.Threading.Volatile.Read(&pathHealthSnap)
+        let cls = this.SnapshotClass()
+        let ids = ResizeArray<uint16>()
+        for i in 0 .. health.Length - 1 do
+            let struct (id, h) = health.[i]
+            let mutable cv = -1.0
+            let mutable k = 0
+            while k < cls.Length && cv < 0.0 do
+                let struct (cid, v) = cls.[k]
+                if cid = id then cv <- v.Cv
+                k <- k + 1
+            if PathRefresher.IsPlateau(h, cv) then ids.Add id
+        ids.ToArray()
     member _.ActivePathTarget = min paths.Count (max (min paths.Count minActivePaths) activeTarget)
     /// Refresh cached health snapshots and rerank paths now (also called periodically in Service).
     member _.RefreshHealthNow() =
@@ -1274,6 +1424,7 @@ type SessionCarrier(session: Session, bridge: FlowBridge, ?uplinkPace: bool, ?tu
                 | Some victim ->
                     System.Threading.Interlocked.Increment(&pathVersion) |> ignore
                     publishIds ()
+                    weightedCredits.Remove victim |> ignore
                     pacers.Remove victim.PathId |> ignore
                     (try victim.Close() with _ -> ())
                 | None -> ()
@@ -1301,6 +1452,7 @@ type SessionCarrier(session: Session, bridge: FlowBridge, ?uplinkPace: bool, ?tu
         | Some victim ->
             System.Threading.Interlocked.Increment(&pathVersion) |> ignore
             publishIds ()
+            weightedCredits.Remove victim |> ignore
             pacers.Remove pathId |> ignore
             // Close outside the removal: `Close` may block in the socket. It cannot happen twice
             // — `TakeIf` already took this path out of the published set.
@@ -1509,6 +1661,7 @@ type SessionCarrier(session: Session, bridge: FlowBridge, ?uplinkPace: bool, ?tu
         // `AddPathNowOpen`'s recheck finds it and closes it too) — a double close on one socket.
         // After `DrainAll` each path has exactly one owner: whoever took it.
         let closing = paths.DrainAll()
+        weightedCredits.Clear()
         System.Threading.Interlocked.Increment(&pathVersion) |> ignore
         publishIds ()
         for link in closing do

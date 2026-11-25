@@ -106,16 +106,60 @@ let ``work stealing: owner pop and thief never share an item`` () =
     for i in 0 .. 63 do Assert.Equal(1, seen.[i])
 
 [<Fact>]
+let ``mpmc: concurrent producers never exceed a lane and every accepted task is dequeued`` () =
+    let capacity = 64
+    let producers = 8
+    let attemptsPerProducer = capacity * 4
+    let q = MPMCTaskQueue(capacity, 1)
+    let accepted = Array.zeroCreate<int> (producers * attemptsPerProducer)
+    let mutable acceptedCount = 0
+    let ready = new CountdownEvent(producers)
+    let go = new ManualResetEventSlim(false)
+    let workers =
+        Array.init producers (fun p ->
+            Thread(fun () ->
+                ready.Signal() |> ignore
+                go.Wait()
+                for a in 0 .. attemptsPerProducer - 1 do
+                    let slot = p * attemptsPerProducer + a
+                    let task =
+                        { Priority = TaskPriority.High
+                          Work = (fun () -> ())
+                          CancellationToken = CancellationToken.None }
+                    if q.Enqueue task then
+                        accepted.[slot] <- 1
+                        Interlocked.Increment(&acceptedCount) |> ignore))
+    for w in workers do w.Start()
+    ready.Wait() |> ignore
+    go.Set()
+    for w in workers do w.Join()
+    Assert.Equal(capacity, Volatile.Read(&acceptedCount))
+    Assert.Equal(capacity, q.ApproximateCount)
+    let mutable dequeued = 0
+    while (match q.TryDequeue 0 with Some _ -> dequeued <- dequeued + 1; true | None -> false) do ()
+    Assert.Equal(capacity, dequeued)
+    Assert.Equal(0, q.ApproximateCount)
+    Assert.Equal(capacity, accepted |> Array.sum)
+
+[<Fact>]
 let ``compute pool: one worker runs high, then normal, then low`` () =
     use pool = ComputePool.create 1 64
     let order = ConcurrentQueue<string>()
     use finished = new CountdownEvent(3)
-    pool.EnqueueBackground(fun () -> order.Enqueue "low"; finished.Signal() |> ignore)
-    pool.EnqueueEncoding(fun () -> order.Enqueue "normal"; finished.Signal() |> ignore)
-    pool.EnqueueRecovery(fun () -> order.Enqueue "high"; finished.Signal() |> ignore)
+    pool.EnqueueBackground(fun () -> order.Enqueue "low"; finished.Signal() |> ignore) |> ignore
+    pool.EnqueueEncoding(fun () -> order.Enqueue "normal"; finished.Signal() |> ignore) |> ignore
+    pool.EnqueueRecovery(fun () -> order.Enqueue "high"; finished.Signal() |> ignore) |> ignore
     pool.Start()
     Assert.True(finished.Wait 10000, "tasks did not finish")
     Assert.Equal<string[]>([| "high"; "normal"; "low" |], order.ToArray())
+
+[<Fact>]
+let ``compute pool: a full lane refuses the next task`` () =
+    // Do not start the pool: the workers would drain the lane and hide the bound.
+    use pool = ComputePool.create 1 2
+    Assert.True(pool.EnqueueRecovery(fun () -> ()))
+    Assert.True(pool.EnqueueRecovery(fun () -> ()))
+    Assert.False(pool.EnqueueRecovery(fun () -> ()))
 
 [<Fact>]
 let ``compute pool: four workers execute every task exactly once`` () =
@@ -126,10 +170,12 @@ let ``compute pool: four workers execute every task exactly once`` () =
     pool.Start()
     for i in 0 .. count - 1 do
         let index = i
-        match index % 3 with
-        | 0 -> pool.EnqueueRecovery(fun () -> Interlocked.Increment(&seen.[index]) |> ignore; finished.Signal() |> ignore)
-        | 1 -> pool.EnqueueEncoding(fun () -> Interlocked.Increment(&seen.[index]) |> ignore; finished.Signal() |> ignore)
-        | _ -> pool.EnqueueBackground(fun () -> Interlocked.Increment(&seen.[index]) |> ignore; finished.Signal() |> ignore)
+        let submit () =
+            match index % 3 with
+            | 0 -> pool.EnqueueRecovery(fun () -> Interlocked.Increment(&seen.[index]) |> ignore; finished.Signal() |> ignore)
+            | 1 -> pool.EnqueueEncoding(fun () -> Interlocked.Increment(&seen.[index]) |> ignore; finished.Signal() |> ignore)
+            | _ -> pool.EnqueueBackground(fun () -> Interlocked.Increment(&seen.[index]) |> ignore; finished.Signal() |> ignore)
+        while not (submit ()) do Thread.Yield() |> ignore
     Assert.True(finished.Wait 30000, "tasks did not finish")
     let mutable bad = 0
     for i in 0 .. count - 1 do

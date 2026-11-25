@@ -220,6 +220,19 @@ let ``X25519 and ChaCha8 together still let client and server exchange a cell`` 
     Assert.True(server.TryProduce(0us, Span frame) || not server.WantsToSend)
 
 [<Fact>]
+let ``server rejects unknown codec capability instead of silently selecting legacy codec`` () =
+    let hello =
+        { Version = 2uy; Suites = Suite.ChaCha20Poly1305Bit
+          Caps = SupportedCaps ||| 0x0800us; ClientId = id
+          UnixTimeMs = uint64 unixMs; MssClient = 1448us; MaxPaths = 256us }
+    let cn = Array.init 32 (fun i -> byte (i + 3))
+    let padding = Array.zeroCreate (ClientInit.BodyLength - 64)
+    let content = ClientInit.build (ReadOnlySpan psk) (ReadOnlySpan cn) hello ReadOnlySpan<byte>.Empty (ReadOnlySpan padding)
+    let frame = Bootstrap.frame (ReadOnlySpan content)
+    let accepted = ServerOffer([| psk |], SeededEntropy 9, 4096us, 256).TryAccept(ReadOnlySpan frame, unixMs, 1448)
+    Assert.True(accepted.IsNone)
+
+[<Fact>]
 let ``a CLIENT_INIT that sets X25519 with an all-zero public key is rejected`` () =
     let hello =
         { Version = 2uy; Suites = Suite.ChaCha20Poly1305Bit

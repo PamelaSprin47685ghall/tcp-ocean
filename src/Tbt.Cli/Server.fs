@@ -4,6 +4,7 @@ module Tbt.Cli.Server
 
 open System
 open System.Collections.Generic
+open System.Threading
 open System.Net
 open System.Diagnostics
 open System.Net.Sockets
@@ -162,8 +163,8 @@ let private runCore (o: Options) =
         match asyncGroup with
         | Some group -> group
         | None ->
-            // One IO thread per vCPU, at most four. Four threads on the 2-vCPU
-            // HND0 host only added context switches and split each wakeup's batch.
+            // One IO thread per vCPU, at most four. On a 2-vCPU host four threads
+            // only added context switches and split each wakeup's batch.
             let group = AsyncPollerGroup(o.Int("io-threads", min 4 (max 1 Environment.ProcessorCount)))
             group.Start()
             log ("async IO pool: " + string group.ThreadCount + " threads")
@@ -173,7 +174,9 @@ let private runCore (o: Options) =
     let target = endpoint (o.Text "target")
     let psks = readPsks (o.Text "psk-file")
     let mss = o.Int("mss", 1448)
-    let maxPaths = o.Int("max-paths", 64)
+    let maxPaths = bounded o "max-paths" 64 1 256
+    let maxSessions = bounded o "max-sessions" 32 1 4096
+    let maxPending = bounded o "max-pending" 64 1 4096
     /// A session whose every path dropped at once stays joinable this long (s).
     let noPathGraceNs = int64 (max 0 (o.Int("no-path-grace-s", 30))) * 1_000_000_000L
     let windowClamp = o.Int("window-clamp", SocketTuning.WindowClamp)
@@ -235,6 +238,7 @@ let private runCore (o: Options) =
                             offerAegis = offerAegis, offerChaCha20 = offerChaCha20)
     let pending = List<Pending>()
     let sessions = List<Entry>()
+    let mutable stop = 0
     /// Sessions reaped this round, still addressable for a JOIN for a short window.
     ///
     /// The blocking reap used to keep a dying session in `sessions` for up to its 5 s join, and a
@@ -286,6 +290,34 @@ let private runCore (o: Options) =
                 t
         else null
     if isNull listener && isNull tun then failwith "need --listen or --tun with --tun-listen"
+    let listenSocks =
+        let extras =
+            match listenAt with
+            | ValueSome at when o.Has "listen-ports" ->
+                portList (o.Text "listen-ports")
+                |> Array.choose (fun p ->
+                    if p = at.Port then None
+                    else
+                        let ep = IPEndPoint(at.Address, p)
+                        let s = new Socket(ep.AddressFamily, SocketType.Stream, ProtocolType.Tcp)
+                        s.SetSocketOption(SocketOptionLevel.Socket, SocketOptionName.ReuseAddress, true)
+                        s.Bind ep
+                        SocketTuning.fastOpenListen(s, 512)
+                        s.Listen 512
+                        s.Blocking <- false
+                        log ("server also on " + ep.ToString() + " (kernel TCP)")
+                        Some s)
+            | _ -> Array.empty
+        match listener with
+        | null -> extras
+        | l -> Array.append [| l |] extras
+    // Closing the listener unblocks a poll that would otherwise sit for up to 100 s.
+    use _signals = onInterrupt (fun () ->
+        Volatile.Write(&stop, 1)
+        log "shutdown requested"
+        match listener with
+        | null -> ()
+        | l -> try l.Close() with _ -> ())
 
     let kernelReply (link: PathLink) (frame: byte[]) =
         link.Queue(ReadOnlySpan responseHead)
@@ -450,10 +482,9 @@ let private runCore (o: Options) =
         let us = toUs (stamp () - a)
         winSvcUs <- winSvcUs + us
         if us > winSvcUsMax then winSvcUsMax <- us
-    while true do
-        match listener with
-        | null -> ()
-        | l -> poller.WatchRead l
+    let shuttingDown () = Volatile.Read &stop <> 0
+    while not (shuttingDown ()) do
+        for l in listenSocks do poller.WatchRead l
         match tun with
         | null -> ()
         | t -> poller.WatchFd t.Fd
@@ -515,14 +546,15 @@ let private runCore (o: Options) =
         clock.Tick() |> ignore
         let iterA = stamp ()
         let now = Environment.TickCount64
-        match listener with
-        | null -> ()
-        | l ->
+        for l in listenSocks do
             if poller.IsReadable l then
                 let mutable go = true
                 while go do
                     match tryAccept l with
                     | null -> go <- false
+                    | s when shuttingDown () || pending.Count >= maxPending || sessions.Count + retiring.Count >= maxSessions ->
+                        // A public scan must not hold a descriptor until the 60 s silent timeout.
+                        SocketTuning.closeGraceful s
                     | s ->
                         SocketTuning.pathWith(s, windowClamp, notsentLowat, userTimeoutMs)
                         s.Blocking <- false
@@ -653,10 +685,37 @@ let private runCore (o: Options) =
             | null -> ()
             | t -> log ("stats " + t.Describe())
             Tbt.Contracts.Trace.flush ()
+    log "draining"
+    match listener with
+    | null -> ()
+    | l -> try l.Close() with _ -> ()
+    for p in pending do p.Link.Close()
+    pending.Clear()
+    for e in sessions do
+        match e.Coordinator with
+        | Some co -> co.RequestClose()
+        | None -> e.Carrier.Close()
+    let deadline = Environment.TickCount64 + 5_000L
+    let mutable left = sessions |> Seq.exists (fun e -> e.Coordinator.IsSome && not e.Coordinator.Value.Stopped.IsSet)
+    while left && Environment.TickCount64 < deadline do
+        Thread.Sleep 20
+        left <- sessions |> Seq.exists (fun e -> e.Coordinator.IsSome && not e.Coordinator.Value.Stopped.IsSet)
+    for e in sessions do
+        match e.Coordinator with
+        | Some co -> if not co.Stopped.IsSet then e.Carrier.Close()
+        | None -> ()
+    match asyncGroup with
+    | Some g -> g.Stop()
+    | None -> ()
+    // TunStack has no Close. The process exit reclaims the fd; do not cast it.
+    match tun with
+    | null -> ()
+    | _ -> ()
+    log "stopped"
     0
 
 let run (o: Options) =
     if o.Has "help" then
-        Console.Error.WriteLine "usage: tbtun server --target HOST:PORT --psk-file FILE [--listen ADDR:PORT | --tun NAME --tun-listen ADDR:PORT] [--max-paths 64] [--min-active-paths min(max-paths,64)] [--window 1024] [--cc-nudge-s 0] [--cc-nudge-pick degraded|worst|oldest] [--stats-s 0]"
+        Console.Error.WriteLine "usage: tbtun server --target HOST:PORT --psk-file FILE [--listen ADDR:PORT | --tun NAME --tun-listen ADDR:PORT] [--listen-ports PORTS] [--max-paths 64] [--min-active-paths min(max-paths,64)] [--window 1024] [--cc-nudge-s 0] [--cc-nudge-pick degraded|worst|oldest] [--stats-s 0]"
         0
     else runCore o

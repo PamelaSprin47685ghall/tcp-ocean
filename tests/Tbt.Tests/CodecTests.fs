@@ -87,6 +87,21 @@ let ``vectorized multiply-add equals the scalar table on every coefficient`` () 
             b.[i] <- b.[i] ^^^ Gf16.MulByte.[c * 256 + int src.[i]]
         Assert.Equal<byte[]>(b, a)
 
+[<Fact>]
+let ``multiply-add and scale match scalar for all bytes and vector boundaries`` () =
+    for length in [| 0; 1; 15; 16; 17; 31; 32; 33; 63; 64; 65; 257 |] do
+        for coefficient in 0 .. 15 do
+            let source = Array.init length (fun i -> byte ((i * 73 + 11) &&& 255))
+            let initial = Array.init length (fun i -> byte ((i * 29 + 17) &&& 255))
+            let actual = Array.copy initial
+            Gf16.mulAddInto (byte coefficient) (ReadOnlySpan source) (Span actual)
+            let expected = Array.mapi (fun i x -> x ^^^ Gf16.MulByte.[coefficient * 256 + int source.[i]]) initial
+            Assert.Equal<byte[]>(expected, actual)
+            let scaled = Array.copy source
+            Gf16.scaleInPlace (byte coefficient) (Span scaled)
+            let expectedScale = source |> Array.map (fun x -> Gf16.MulByte.[coefficient * 256 + int x])
+            Assert.Equal<byte[]>(expectedScale, scaled)
+
 [<Theory>]
 [<InlineData(300, 0, 16)>]
 [<InlineData(300, 1, 16)>]

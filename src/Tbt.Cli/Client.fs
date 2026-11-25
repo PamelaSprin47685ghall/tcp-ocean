@@ -109,11 +109,19 @@ let private bootstrap (server: IPEndPoint) (host: string) (boot: byte[]) (window
 let private runCore (o: Options) =
     let asyncMode = AsyncMode.isEnabled ()
     let server = endpoint (o.Text "server")
+    let hopPorts =
+        if o.Has "server-ports" then portList (o.Text "server-ports")
+        else [| server.Port |]
+    let mutable hop = 0
+    let nextServer () =
+        let port = hopPorts.[hop % hopPorts.Length]
+        hop <- hop + 1
+        IPEndPoint(server.Address, port)
     let host = if o.Has "host" then o.Text "host" else server.Address.ToString()
     let listenAt = endpoint (o.Text "listen")
-    let psk = (readPsks (o.Text "psk-file")).[0]
-    let pathCount = o.Int("paths", 4)
-    let mss = o.Int("mss", 1448)
+    let psks = readPsks (o.Text "psk-file")
+    let pathCount = bounded o "paths" 4 1 256
+    let mss = bounded o "mss" 1448 576 9000
     let windowClamp = o.Int("window-clamp", SocketTuning.WindowClamp)
     let notsentLowat = SocketTuning.notsentLowatFor (o.Int("notsent-lowat", SocketTuning.NotSentLimit))
     let userTimeoutMs = SocketTuning.userTimeoutMsFor (o.Int("user-timeout-ms", SocketTuning.UserTimeoutMs))
@@ -132,11 +140,12 @@ let private runCore (o: Options) =
     let backoff = JoinBootstrap.backoffMs rttMs
     // Fresh ClientOffer on each attempt: a nonce the server already accepted is a replay.
     let mutable accepted = ValueNone
-    match JoinBootstrap.tryRepeated attempts backoff Thread.Sleep (fun _ ->
-        let offer = ClientOffer(psk, Guid.NewGuid(), entropy, uint64 (unixMs ()), mss, max 1 pathCount,
+    match JoinBootstrap.tryRepeated attempts backoff Thread.Sleep (fun attempt ->
+        // Rotate through every line in the PSK file: a peer that has rolled to a later key still joins.
+        let offer = ClientOffer(psks.[attempt % psks.Length], Guid.NewGuid(), entropy, uint64 (unixMs ()), mss, max 1 pathCount,
                                   offerX25519 = offerX25519, offerChaCha8 = offerChaCha8,
                                   offerAegis = offerAegis, offerChaCha20 = offerChaCha20)
-        let struct (link0, reply) = bootstrap server host offer.Frame windowClamp notsentLowat userTimeoutMs timeoutMs
+        let struct (link0, reply) = bootstrap (nextServer ()) host offer.Frame windowClamp notsentLowat userTimeoutMs timeoutMs
         match offer.TryAccept(ReadOnlySpan reply) with
         | ValueNone ->
             link0.Close()
@@ -215,7 +224,7 @@ let private runCore (o: Options) =
         let joinOnceAsync (id: uint16) (inc: uint32) : Task<PathLink> =
             task {
                 let join = JoinOffer(p.Keys.PathKey, entropy, p.Keys.SessionId, p.Symbol, p.Caps, maxPaths, id, inc, mss, p.Keys.Suite)
-                let! struct (link, ack) = bootstrapAsync server host join.Frame windowClamp notsentLowat userTimeoutMs timeoutMs joinCts.Token
+                let! struct (link, ack) = bootstrapAsync (nextServer ()) host join.Frame windowClamp notsentLowat userTimeoutMs timeoutMs joinCts.Token
                 if tryAcceptJoinReply join ack then
                     link.PathId <- id
                     link.Incarnation <- inc
@@ -362,7 +371,15 @@ let private runCore (o: Options) =
                         | None -> ()
                     let due =
                         if refreshBlind then refresher.Due(now, carrier.PathIds, true, sessionIdle)
-                        else refresher.DueDegraded(now, carrier.SnapshotPathHealth(), true, sessionIdle)
+                        else
+                            let degraded = refresher.DueDegraded(now, carrier.SnapshotPathHealth(), true, sessionIdle)
+                            let rotateS = o.Int("path-rotate-s", 60)
+                            if rotateS <= 0 || degraded.Length > 0 then degraded
+                            else
+                                let rotated =
+                                    refresher.DueRotation(now, carrier.SnapshotPathHealth(), carrier.PlateauIds(),
+                                                          true, sessionIdle, int64 rotateS * 1_000_000_000L)
+                                if rotated.Length > 0 then rotated else degraded
                     for id in due do
                         match pool.Reserve id with
                         | ValueSome inc ->
@@ -502,6 +519,6 @@ let private runCore (o: Options) =
 
 let run (o: Options) =
     if o.Has "help" then
-        Console.Error.WriteLine "usage: tbtun client --server HOST:PORT --listen ADDR:PORT --psk-file FILE [--paths 4] [--min-active-paths min(paths,64)] [--window 1024] [--join-concurrency 32] [--path-refresh-s 60] [--path-refresh-mode degraded|blind] [--stats-s 0]"
+        Console.Error.WriteLine "usage: tbtun client --server HOST:PORT --listen ADDR:PORT --psk-file FILE [--paths 4] [--server-ports PORTS] [--min-active-paths min(paths,64)] [--window 1024] [--join-concurrency 32] [--path-refresh-s 60] [--path-rotate-s 60] [--path-refresh-mode degraded|blind] [--stats-s 0]"
         0
     else runCore o
