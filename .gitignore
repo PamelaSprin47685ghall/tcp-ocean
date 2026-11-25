@@ -12,3 +12,6 @@ TestResults/
 *.trx
 *.coverage
 __pycache__/
+
+# Agent-local scratch state and design records (may reference site-specific deployments).
+.agent/
