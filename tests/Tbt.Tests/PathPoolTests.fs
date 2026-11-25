@@ -388,3 +388,12 @@ let ``PathPool Saturated reflects live exhaustion and clears when no requested s
     let present = HashSet<uint16>([ 0us; 1us ])
     Assert.Empty(pool.Request(10L, present))
     Assert.False(pool.Saturated)
+
+[<Fact>]
+let ``PathPool rebuilds an id only after the carrier stops reporting it`` () =
+    let pool = PathPool(1, 1, 0L, 0L, 1)
+    let present = HashSet<uint16>([ 0us ])
+    Assert.Empty(pool.Request(0L, present))
+    present.Remove 0us |> ignore
+    let rebuilt = pool.Request(0L, present) |> Array.map (fun struct (id, _) -> id)
+    Assert.Contains(0us, rebuilt)

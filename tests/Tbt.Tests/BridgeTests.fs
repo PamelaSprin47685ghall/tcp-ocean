@@ -1353,3 +1353,46 @@ let ``a working set with no healthy path still widens to every path`` () =
     let sent = carrier.WriteBatch 256
     Assert.True(sent > 0, "the healthy path outside the initial set must be reachable")
     bridge.CloseAll()
+
+[<Fact>]
+let ``an async path that receives FIN is removed and its id can be rebuilt`` () =
+    if not Platform.current.Value.HasEpoll then () else
+    use listener = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp)
+    listener.Bind(IPEndPoint(IPAddress.Loopback, 0))
+    listener.Listen 1
+    use local = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp)
+    local.Connect(listener.LocalEndPoint)
+    use peer = listener.Accept()
+    let struct (session, bridge) = clientOnBridge ()
+    use channel = new RxChannel()
+    use poller = new Poller()
+    let group = new AsyncPollerGroup(1)
+    let carrier = SessionCarrier(session, bridge, rxChannel = channel, asyncIo = group)
+    carrier.WakePathOps <- Some(fun () -> channel.Wake())
+    let link = new PathLink(local, SocketTuning.probe())
+    link.PathId <- 7us
+    link.FrameLength <- session.FrameLength
+    let path = AsyncPathLink.TakeOver(link, group, channel, 16)
+    group.Add(path :> IPathIo)
+    group.Start()
+    carrier.AddPath path
+    carrier.Watch poller
+    try
+        Assert.True(carrier.HasPath 7us)
+        peer.Shutdown(SocketShutdown.Both)
+        peer.Close()
+        let sw = Diagnostics.Stopwatch.StartNew()
+        while path.Alive && sw.ElapsedMilliseconds < 3000L do Thread.Sleep 20
+        Assert.False(path.Alive, "FIN/RST did not retire the async socket")
+        carrier.Service poller
+        Assert.False(carrier.HasPath 7us, "a closed async path remained in the session set")
+        let present = System.Collections.Generic.HashSet<uint16>()
+        for id in carrier.PathIds do present.Add id |> ignore
+        let pool = PathPool(8, 8, 0L, 0L, 1)
+        let ids = pool.Request(0L, present) |> Array.map (fun struct (id, _) -> id)
+        Assert.Contains(7us, ids)
+    finally
+        group.Stop()
+        bridge.CloseAll()
+
+

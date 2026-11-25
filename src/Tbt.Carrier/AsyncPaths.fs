@@ -478,7 +478,7 @@ type AsyncPathLink private (socket: Socket, probe: INotSentProbe, group: AsyncPo
                 let n = socket.Receive(Span(rxArr, rxEnd, bufferLength - rxEnd), SocketFlags.None, &err)
                 if err = SocketError.WouldBlock then false
                 elif err <> SocketError.Success || n = 0 then
-                    Volatile.Write(&alive, 0)
+                    this.FailSocket()
                     false
                 else
                     rxEnd <- rxEnd + n
@@ -553,7 +553,7 @@ type AsyncPathLink private (socket: Socket, probe: INotSentProbe, group: AsyncPo
                     Volatile.Write(&txBlocked, 1)
                     false
                 elif err <> SocketError.Success then
-                    Volatile.Write(&alive, 0)
+                    this.FailSocket()
                     false
                 elif n <= 0 then
                     // Zero without an error is the same readiness signal as WouldBlock: wait for
@@ -603,7 +603,7 @@ type AsyncPathLink private (socket: Socket, probe: INotSentProbe, group: AsyncPo
                             Volatile.Write(&txBlocked, 1)
                             go <- false
                         elif err <> SocketError.Success then
-                            Volatile.Write(&alive, 0)
+                            this.FailSocket()
                             go <- false
                         elif n <= 0 then
                             // Zero bytes with no error is not progress. Wait for writability again.
@@ -645,7 +645,11 @@ type AsyncPathLink private (socket: Socket, probe: INotSentProbe, group: AsyncPo
     member this.CheckAlive() =
         if Volatile.Read(&alive) = 1 then
             try
-                if socket.Poll(0, SelectMode.SelectError) then
+                // SelectError covers RST; SelectRead with no bytes is a FIN already accepted by
+                // the kernel. Either end is dead, and clearing only the alive flag would leave
+                // its id in the session set so PathPool would never rebuild it.
+                if socket.Poll(0, SelectMode.SelectError)
+                   || (socket.Poll(0, SelectMode.SelectRead) && socket.Available = 0) then
                     this.CloseSocketOnly()
                     false
                 else true
@@ -671,9 +675,14 @@ type AsyncPathLink private (socket: Socket, probe: INotSentProbe, group: AsyncPo
     member _.PendingTxBytes =
         max 0 (Volatile.Read(&txHead) - Volatile.Read(&txTail)) * Volatile.Read(&frameLength)
 
-    member private _.CloseSocketOnly() =
+    member private this.FailSocket() =
         if Interlocked.Exchange(&alive, 0) = 1 then
             try socket.Dispose () with _ -> ()
+            // The session thread owns PathSet. Without this wake it can remain blocked in its
+            // timer, keep the dead id present, and therefore never ask PathPool to rebuild it.
+            channel.Wake()
+
+    member private this.CloseSocketOnly() = this.FailSocket()
 
     member this.Close() =
         this.CloseSocketOnly()
