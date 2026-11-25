@@ -254,7 +254,34 @@ module WriteGate =
         // per path over 32 paths is 8 MB of kernel queue, which the live 24 %-loss run turned
         // into 500-790 ms of self-inflicted RTT (minrtt_ms 626 vs 113 ms physical), and a deep
         // queue is exactly what makes loss look like our own congestion.
+        // A sampled DeliveryRate must not use this floor: 64 KiB / 131 KiB/s is 488 ms of
+        // self-queue. `rateAwareLimits` owns that case.
         if cwndBytes = 0u then configuredMax
         else
             let want = int (min (uint32 Int32.MaxValue) cwndBytes)
             min configuredMax (min 98304 (max 65536 want))
+
+    /// Bytes a path may hold for `delayMs` at `rateBps`, saturated before the multiply wraps.
+    let private bytesFor (rateBps: int64) (delayMs: int64) =
+        if rateBps <= 0L || delayMs <= 0L then 0
+        elif rateBps > System.Int64.MaxValue / delayMs then System.Int32.MaxValue
+        else
+            let bytes = rateBps * delayMs / 1000L
+            if bytes > int64 System.Int32.MaxValue then System.Int32.MaxValue else int bytes
+
+    let private clamp (lo: int) (hi: int) (v: int) = min hi (max lo v)
+
+    /// Rate-scaled write-gate ceilings. `DeliveryRate` is already sampled by the 50 ms
+    /// health refresh, so this costs no syscall. A 131 KiB/s evening path keeps about
+    /// 6 KiB (40 ms), not the 64 KiB floor that queued for 488 ms. A 1.3 MiB/s daytime
+    /// path opens to its 40 ms budget, capped at 128 KiB. No sample uses a 16 KiB probe
+    /// so the first measurement can complete without a one-second self-queue.
+    let rateAwareLimits (configuredMax: int) (valid: bool) (deliveryRateBps: int64) (caState: int) =
+        let configured = max SocketTuning.GatePass1Limit configuredMax
+        if not valid || deliveryRateBps <= 0L then
+            struct (SocketTuning.GatePass1Limit, min configured 16384)
+        else
+            let pass1 = clamp 4096 16384 (bytesFor deliveryRateBps 12L)
+            let mutable pass2 = clamp 6144 131072 (bytesFor deliveryRateBps 40L)
+            if caState >= 3 then pass2 <- min pass2 8192
+            struct (pass1, min configured pass2)

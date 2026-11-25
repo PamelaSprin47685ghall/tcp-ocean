@@ -843,8 +843,9 @@ let ``elastic active working set holds at 32 when healthy and expands when pass 
     Assert.Equal(initial, carrier.ActivePathTarget)
     let tailFramesBefore = [| for i in initial .. 47 -> stubs.[i].Frames |] |> Array.sum
     Assert.Equal(0, tailFramesBefore)
-    // Simulate per-tuple shaping saturating the active working set (notSent > GatePass1Limit).
-    for i in 0 .. initial - 1 do stubs.[i].Unsent <- 8000
+    // A 2 MiB/s sample opens pass 1 to 16 KiB. Saturation is notSent above that ceiling,
+    // not the old 4 KiB constant.
+    for i in 0 .. initial - 1 do stubs.[i].Unsent <- 20_000
     let sent2 = carrier.WriteBatch 32
     Assert.True(sent2 > 0)
     Assert.True(carrier.ActivePathTarget > initial,
@@ -880,5 +881,6 @@ let ``observed backlog keeps an expanded working set and silence shrinks it`` ()
     pair.Clock.Now <- pair.Clock.Now + 2_000_000_000L
     carrier.Service poller
     Assert.True(carrier.ActivePathTarget < 64)
+
 
 

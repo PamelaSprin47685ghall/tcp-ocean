@@ -668,7 +668,8 @@ type SessionCarrier(session: Session, bridge: FlowBridge, ?uplinkPace: bool, ?tu
             // expand immediately or allow degraded paths so recovery never stalls.
             let mutable activeHasHealthy = false
             let mutable chk = 0
-            while chk < scanLimit && not activeHasHealthy do
+            let checkLimit = min n baseActive
+            while chk < checkLimit && not activeHasHealthy do
                 if pathTiers.[rankedOrder.[chk]] < 2 then activeHasHealthy <- true
                 chk <- chk + 1
             if not activeHasHealthy && scanLimit < n then
@@ -713,9 +714,10 @@ type SessionCarrier(session: Session, bridge: FlowBridge, ?uplinkPace: bool, ?tu
                             // needs widening loses it here.
                     else
                         let h = healthOf link
-                        let pathPass2 =
-                            if h.Valid && h.CwndBytes > 0u then WriteGate.adaptivePass2Limit gatePass2 h.CwndBytes
-                            else gatePass2
+                        // Cached sample only. A positive DeliveryRate scales the queue; no sample
+                        // uses the 16 KiB probe inside rateAwareLimits, not the 64 KiB cwnd floor.
+                        let struct (pathPass1, pathPass2) =
+                            WriteGate.rateAwareLimits gatePass2 h.Valid h.DeliveryRate (int h.CaState)
                         let mutable frame = Span<byte>.Empty
                         let notSent =
                             if pass = 1 then
@@ -727,7 +729,8 @@ type SessionCarrier(session: Session, bridge: FlowBridge, ?uplinkPace: bool, ?tu
                         let eligible = pass = 1 || (notSent <> 0 && notSent <> Int32.MaxValue)
                         let admitted =
                             if not eligible then false
-                            elif WriteGate.admitsWith pathPass2 pass notSent then
+                            elif (if pass <= 1 then notSent >= 0 && notSent <= pathPass1
+                                      else notSent < 0 || notSent <= pathPass2) then
                                 if pass = 1 then gate1Pass <- gate1Pass + 1L
                                 else gate2Pass <- gate2Pass + 1L
                                 true
@@ -813,14 +816,13 @@ type SessionCarrier(session: Session, bridge: FlowBridge, ?uplinkPace: bool, ?tu
                             healthSkips <- healthSkips + 1L
                         else
                             let h = healthOf link
-                            let pathPass2 =
-                                if h.Valid && h.CwndBytes > 0u then WriteGate.adaptivePass2Limit gatePass2 h.CwndBytes
-                                else gatePass2
+                            let struct (pathPass1, _) =
+                                WriteGate.rateAwareLimits gatePass2 h.Valid h.DeliveryRate (int h.CaState)
                             let v = link.UnsentBytes
                             batchNotSent.[idx] <- v
                             if v <> 0 then gated <- true
                             let admitted =
-                                if WriteGate.admitsWith pathPass2 1 v then
+                                if v >= 0 && v <= pathPass1 then
                                     gate1Pass <- gate1Pass + 1L
                                     true
                                 else
@@ -890,9 +892,15 @@ type SessionCarrier(session: Session, bridge: FlowBridge, ?uplinkPace: bool, ?tu
                 readable <- readable + 1
             slot <- armed.NextUp slot
         let quantum = if readable <= 1 then 4096 else FlowBridge.Quantum
+        // `NextUp` does not wrap. A cursor left at maxSlot+1 made the next round
+        // start past every armed flow and then never visit them again.
+        let start = if readable > 1 then bridge.ReadCursor &&& 255 else -1
+        let mutable slot = if start < 0 then armed.NextUp -1 else armed.NextAfter (start - 1)
+        let stop = slot
+        let mutable wrapped = false
         let mutable visited = 0
-        let mutable slot = if readable > 1 then armed.NextUp (bridge.ReadCursor - 1) else armed.NextUp -1
-        while slot >= 0 && visited < 256 do
+        let mutable firstRead = -1
+        while slot >= 0 && visited < 256 && not (wrapped && slot = stop) do
             slotVisits <- slotVisits + 1L
             match bridge.Local slot with
             | null -> ()
@@ -900,10 +908,14 @@ type SessionCarrier(session: Session, bridge: FlowBridge, ?uplinkPace: bool, ?tu
                 if session.IsInteractive slot = interactive then
                     if interactive then hot.Add slot
                     if bridge.WantsRead slot then
+                        if firstRead < 0 then firstRead <- slot
                         bridge.Read(slot, limit = quantum)
-                        if readable > 1 then bridge.ReadCursor <- slot + 1
             visited <- visited + 1
-            slot <- armed.NextUp slot
+            let next = armed.NextAfter slot
+            if next <= slot then wrapped <- true
+            slot <- next
+        if readable > 1 && firstRead >= 0 then
+            bridge.ReadCursor <- (firstRead + 1) &&& 255
 
     /// Send at most 256 frames in batches; the interactive input is read again between batches.
     let writeRound () =

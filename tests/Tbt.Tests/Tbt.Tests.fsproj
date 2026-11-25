@@ -20,6 +20,7 @@
     <Compile Include="PathPoolTests.fs" />
     <Compile Include="PathLinkHalfOpenTests.fs" />
     <Compile Include="KernelTcpInfoTests.fs" />
+    <Compile Include="WriteGateRateTests.fs" />
     <Compile Include="PollerTests.fs" />
     <Compile Include="PlatformTests.fs" />
   </ItemGroup>

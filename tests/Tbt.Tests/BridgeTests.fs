@@ -1053,6 +1053,217 @@ type private StatePath(id: uint16, caState: byte) =
         member _.Health = health
         member _.RefreshHealth(_, _) = ()
 
+/// In-memory carrier path. `CommitFrame` hands the sealed frame to the peer path;
+/// `Receive` (called by `Service`) delivers it to that peer session. Credit and
+/// WIN_ACK therefore come from the real peer, not from a hand-fed `OnPeerCredit`.
+type private RelayPath(id: uint16) =
+    let buf = Array.zeroCreate<byte> 8192
+    let inbox = System.Collections.Generic.Queue<byte[]>()
+    let mutable owner = Unchecked.defaultof<IPathOwner>
+    let mutable other: RelayPath option = None
+    member this.Link(peer: RelayPath) = other <- Some peer
+    member _.Push(frame: byte[]) = inbox.Enqueue frame
+    interface IPath with
+        member val PathId = id with get, set
+        member val FrameLength = 0 with get, set
+        member _.Alive = true
+        member _.Attach(o: IPathOwner) = owner <- o
+        member _.Backlog with set (_: int) = ()
+        member _.Watch(_, _) = ()
+        member _.UnsentBytes = 0
+        member _.Receive(_) =
+            while inbox.Count > 0 do
+                let frame = inbox.Dequeue()
+                owner.OnFrame(id, Span frame) |> ignore
+        member p.TryBeginFrame(frame: byref<Span<byte>>) =
+            let n = (p :> IPath).FrameLength
+            if n <= 0 || n > buf.Length then false
+            else
+                frame <- Span(buf, 0, n)
+                true
+        member p.CommitFrame() =
+            match other with
+            | None -> ()
+            | Some peer ->
+                let n = (p :> IPath).FrameLength
+                peer.Push(Array.sub buf 0 n)
+        member _.Close() = ()
+
+let private drainSocks (socks: Socket[]) (got: int[]) =
+    let buf = Array.zeroCreate<byte> 65536
+    for i in 0 .. socks.Length - 1 do
+        if not (isNull socks.[i]) then
+            try
+                let mutable go = true
+                while go do
+                    let n = socks.[i].Receive(buf, 0, buf.Length, SocketFlags.None)
+                    if n > 0 then got.[i] <- got.[i] + n else go <- false
+            with :? SocketException -> ()
+
+let private acceptSome (listener: Socket) (socks: Socket[]) (start: int) (limit: int) =
+    let mutable i = start
+    let mutable go = true
+    while i < limit && go do
+        try
+            let s = listener.Accept()
+            s.Blocking <- false
+            s.ReceiveBufferSize <- 1 <<< 20
+            socks.[i] <- s
+            i <- i + 1
+        with :? SocketException -> go <- false
+    i
+
+[<Fact>]
+let ``both ends recycle credit so four flows pass 512 KiB and a reused slot carries another 256 KiB`` () =
+    let config = { SessionConfig.defaults with WindowSteps = 1024 }
+    let entropy = SeededEntropy 21
+    let offer = ClientOffer(psk, Guid(Array.create 16 7uy), entropy, uint64 unixMs, 1448, 256)
+    let accepted = (ServerOffer([| psk |], entropy, uint16 config.WindowSteps, 256)).TryAccept(ReadOnlySpan offer.Frame, unixMs, 1448)
+    let serverParams = accepted.Value.Params
+    let struct (clientParams, _) = offer.TryAccept(ReadOnlySpan accepted.Value.Reply).Value
+    let clock = ManualClock()
+    let clientBridge = FlowBridge ValueNone
+    let client = Session(Role.Client, clientParams, clientBridge, clock, config)
+    clientBridge.Attach client
+    use sink = listen ()
+    sink.Blocking <- false
+    let sinkEp = sink.LocalEndPoint :?> IPEndPoint
+    let serverBridge = FlowBridge(ValueSome sinkEp)
+    let server = Session(Role.Server, serverParams, serverBridge, clock, config)
+    serverBridge.Attach server
+    use poller = new Poller()
+    let clientCarrier = SessionCarrier(client, clientBridge)
+    let serverCarrier = SessionCarrier(server, serverBridge)
+    let clientPath = RelayPath 0us
+    let serverPath = RelayPath 0us
+    clientPath.Link serverPath
+    serverPath.Link clientPath
+    (clientPath :> IPath).FrameLength <- client.FrameLength
+    (serverPath :> IPath).FrameLength <- server.FrameLength
+    clientCarrier.AddPath clientPath
+    serverCarrier.AddPath serverPath
+    use appListener = listen ()
+    let apps = Array.init 4 (fun _ -> loopPair appListener)
+    let slots = Array.zeroCreate<int> 4
+    for i in 0 .. 3 do
+        let struct (_, local) = apps.[i]
+        Assert.True(clientBridge.TryAdd local)
+    let mutable opened = clientBridge.Opened.NextUp -1
+    let mutable nslot = 0
+    while opened >= 0 && nslot < 4 do
+        slots.[nslot] <- opened
+        nslot <- nslot + 1
+        opened <- clientBridge.Opened.NextUp opened
+    let first = Array.create (512 * 1024) 9uy
+    for i in 0 .. 3 do
+        let struct (app, _) = apps.[i]
+        Assert.Equal(first.Length, app.Send first)
+    let sinks = Array.zeroCreate<Socket> 4
+    let got = Array.zeroCreate<int> 4
+    let mutable accepted = 0
+    let sw = Diagnostics.Stopwatch.StartNew()
+    while Array.sum got < 4 * 512 * 1024 && sw.ElapsedMilliseconds < 8000L do
+        clock.Now <- clock.Now + 1_000_000L
+        clientCarrier.Service poller
+        serverCarrier.Service poller
+        accepted <- acceptSome sink sinks accepted 4
+        drainSocks sinks got
+    Assert.True((accepted = 4), sprintf "server accepted %d" accepted)
+    Assert.True(got |> Array.forall (fun n -> n >= 512 * 1024), sprintf "delivered %A" got)
+    let lo = Array.min got
+    let hi = Array.max got
+    Assert.True(lo * 10 >= hi * 7, sprintf "unfair %A" got)
+    for i in 0 .. 3 do
+        let struct (app, _) = apps.[i]
+        app.Dispose()
+    for i in 0 .. 3 do
+        if not (isNull sinks.[i]) then sinks.[i].Dispose()
+    let sw2 = Diagnostics.Stopwatch.StartNew()
+    while clientBridge.Opened.Count > 0 && sw2.ElapsedMilliseconds < 5000L do
+        let mutable s = clientBridge.Opened.NextUp -1
+        while s >= 0 do
+            clientBridge.Read s
+            s <- clientBridge.Opened.NextUp s
+        let mutable t = serverBridge.Opened.NextUp -1
+        while t >= 0 do
+            serverBridge.Read t
+            t <- serverBridge.Opened.NextUp t
+        clock.Now <- clock.Now + 1_000_000L
+        clientCarrier.Service poller
+        serverCarrier.Service poller
+    Assert.Equal(0, clientBridge.Opened.Count)
+    let apps2 = Array.init 4 (fun _ -> loopPair appListener)
+    let slots2 = Array.zeroCreate<int> 4
+    for i in 0 .. 3 do
+        let struct (_, local) = apps2.[i]
+        Assert.True(clientBridge.TryAdd local, "slot was not reused")
+    let mutable s = clientBridge.Opened.NextUp -1
+    let mutable k = 0
+    while s >= 0 && k < 4 do
+        slots2.[k] <- s
+        k <- k + 1
+        s <- clientBridge.Opened.NextUp s
+    Array.Sort slots2
+    // TryAllocate resumes at nextSlot (Flows.fs:643). Closed slots 0..3 are free, but the
+    // cursor has moved to 4, so the same session reuses the table at the next free ids.
+    Assert.Equal<int[]>([| 0; 1; 2; 3 |], slots)
+    Assert.Equal<int[]>([| 4; 5; 6; 7 |], slots2)
+    let second = Array.create (256 * 1024) 3uy
+    for i in 0 .. 3 do
+        let struct (app, _) = apps2.[i]
+        Assert.Equal(second.Length, app.Send second)
+    let sinks2 = Array.zeroCreate<Socket> 4
+    let got2 = Array.zeroCreate<int> 4
+    let mutable accepted2 = 0
+    let sw3 = Diagnostics.Stopwatch.StartNew()
+    while Array.sum got2 < 4 * 256 * 1024 && sw3.ElapsedMilliseconds < 8000L do
+        clock.Now <- clock.Now + 1_000_000L
+        clientCarrier.Service poller
+        serverCarrier.Service poller
+        accepted2 <- acceptSome sink sinks2 accepted2 4
+        drainSocks sinks2 got2
+    Assert.True(got2 |> Array.forall (fun n -> n >= 256 * 1024), sprintf "reused %A accepted=%d" got2 accepted2)
+    for struct (app, _) in apps do app.Dispose()
+    for struct (app, _) in apps2 do app.Dispose()
+    for s in sinks do if not (isNull s) then s.Dispose()
+    for s in sinks2 do if not (isNull s) then s.Dispose()
+    clientBridge.CloseAll()
+    serverBridge.CloseAll()
+
+[<Fact>]
+let ``a later service round still reads every flow after the cursor wraps`` () =
+    use listener = listen ()
+    let struct (session, bridge) = clientOnBridge ()
+    let pairs = Array.init 4 (fun _ -> loopPair listener)
+    for struct (_, local) in pairs do Assert.True(bridge.TryAdd local)
+    // One credit window is 64 KiB. The live defect stopped every flow at 52,800 B
+    // after the first round, so passing that mark on every flow is the regression.
+    let payload = Array.create (128 * 1024) 9uy
+    for struct (app, _) in pairs do app.Send payload |> ignore
+    use poller = new Poller()
+    let carrier = SessionCarrier(session, bridge)
+    for i in 0 .. 15 do carrier.AddPath(StatePath(uint16 i, 0uy))
+    for _ in 1 .. 80 do carrier.Service poller
+    let first = [| for i in 0 .. 3 -> session.Flows.[i].TxOffset |]
+    Assert.True(first |> Array.forall (fun n -> n >= 64_000UL), sprintf "first %A" first)
+    let lo = Array.min first
+    let hi = Array.max first
+    Assert.True(lo * 10UL >= hi * 7UL, sprintf "skew %A" first)
+    for struct (app, _) in pairs do app.Dispose()
+    bridge.CloseAll()
+    let struct (session2, bridge2) = clientOnBridge ()
+    let second = Array.init 4 (fun _ -> loopPair listener)
+    for struct (_, local) in second do Assert.True(bridge2.TryAdd local)
+    let again = Array.create (96 * 1024) 3uy
+    for struct (app, _) in second do app.Send again |> ignore
+    let carrier2 = SessionCarrier(session2, bridge2)
+    for i in 0 .. 15 do carrier2.AddPath(StatePath(uint16 i, 0uy))
+    for _ in 1 .. 80 do carrier2.Service poller
+    let reused = [| for i in 0 .. 3 -> session2.Flows.[i].TxOffset |]
+    Assert.True(reused |> Array.forall (fun n -> n >= 64_000UL), sprintf "reuse %A" reused)
+    for struct (app, _) in second do app.Dispose()
+    bridge2.CloseAll()
+
 [<Fact>]
 let ``four busy flows share a service round and an idle flow does not stop them`` () =
     use listener = listen ()
