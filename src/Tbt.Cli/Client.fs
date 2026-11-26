@@ -128,8 +128,17 @@ let private runCore (o: Options) =
     let userTimeoutMs = SocketTuning.userTimeoutMsFor (o.Int("user-timeout-ms", SocketTuning.UserTimeoutMs))
     let txSlots = SocketTuning.txSlotsFor (o.Int("tx-slots", 64))
     let fecAdaptive =
+        // Empty counts as unset: the e2e harness forwards the variable unconditionally.
         match System.Environment.GetEnvironmentVariable "TBTUN_FEC_ADAPTIVE" with
-        | null -> true
+        | null
+        | "" ->
+            // The erasure ledger judges a cell at its arrival deadline. In window mode a
+            // hole is closed by parity or a bitmap-NACK retransmission a round trip later,
+            // so loss recovery itself manufactures "late" cells: adaptive read its own
+            // repair latency as erasure, spiralled rho to 0.25+, and throughput collapsed
+            // to 20 Mbit/s where the fixed 0.25 ratio reaches 125 (e2e 20ms/200Mbit/5%).
+            // Fixed rho until the feedback separates queueing from repair delay.
+            not windowMode
         | v -> v <> "0"
     let config = { SessionConfig.defaults with Credit = creditFromOptions o; WindowSteps = o.Int("window", 1024); NewRepair = o.Int("new-repair", 0) <> 0; FecAdaptive = fecAdaptive }
     let entropy = SystemEntropy()
