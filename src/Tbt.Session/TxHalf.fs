@@ -88,6 +88,11 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: ICodecEn
     /// uplink and the downlink estimate their loss from their own NACKs and never
     /// copy each other's ratio.
     let mutable rho = rho0
+    // Window-mode hole-driven controller state. NACK bitmaps are exact measurements of
+    // the holes the receiver still has, so rho adapts to keep them rare-but-possible:
+    // too many holes means parity undershoots, zero holes everywhere means overshoot.
+    let mutable wndHoles = 0.0
+    let mutable wndNackReports = 0.0
     /// The peer's own measurement of this direction's cell loss. `RxHalf` counts
     /// every missing cell, including those FEC repaired, so this signal is
     /// unbiased: raising rho does not hide loss from the estimator.
@@ -141,22 +146,48 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: ICodecEn
             // the peer still reported real loss (e2e: rho 0.028 at 5 % loss, 13 Mbit/s against
             // 176 lossless). Queueing protection stays: the controller still cannot climb past
             // `target`, and `target` itself is capped by RhoMax.
-            let congested = not windowMode && rttRatio > 2.0
-            // A standing queue alone must never hold redundancy at zero while the peer still
-            // reports real loss and the path is not queued. Cover that erasure first.
-            let neededFloor = min 0.40 target
-            // Congestion (srtt well above minRtt) means the queue is ours. Climbing rho, or
-            // parking it at 0.30, feeds the queue that produced the report (live: 4 220 boosters,
-            // srtt 347 ms on a 115 ms path). Drain toward the floor; do not hold a 30 % tax.
-            let floor' = if windowMode then max 0.10 rhoFloor else rhoFloor
-            if congested && rho > max floor' target + 0.01 then
-                rho <- max (max floor' target) (rho - 0.04)
-            elif rho < max floor' neededFloor then
-                rho <- min (max floor' target) (rho + 0.06)
-            elif target > rho + 0.01 then
-                rho <- min target (rho + 0.08)
-            elif target < rho - 0.01 then
-                rho <- max target (rho - 0.02)
+            if windowMode then
+                // Hole-driven proportional control. The receiver's bitmap NACKs measure exactly
+                // how many source slots the first round failed to decode. More holes per window
+                // than the target means parity undershoots the wire loss; fewer means overshoot.
+                // Unlike the erasure ledger this signal cannot confuse queueing with loss — a
+                // hole is a hole regardless of why the first copy went missing — so the loop is
+                // stable by construction: rho only rises while parity is verifiably insufficient.
+                // Target 1.5 holes per 64-symbol window: at that point most windows finish in the
+                // first round and the rest close with a single bitmap-NACK roundtrip.
+                let targetHoles = 1.5
+                if wndNackReports >= 8.0 then
+                    let measured = wndHoles / wndNackReports
+                    if measured > targetHoles * 1.3 then rho <- min rhoMax (rho + 0.03)
+                    elif measured < targetHoles * 0.5 then rho <- max rhoFloor (rho - 0.015)
+                    wndHoles <- wndHoles * 0.5
+                    wndNackReports <- wndNackReports * 0.5
+                elif wndNackReports = 0.0 then
+                    // No holes at all for a whole adaptation round: either the link is clean or
+                    // parity is pure overhead. Drift down slowly; the rise above is much faster,
+                    // so a loss step is caught within a few windows while the tax on a clean
+                    // link decays toward the floor. rhoFloor is the safety net, not the target.
+                    rho <- max rhoFloor (rho - 0.005)
+                // decay the accumulators even when below the report threshold, so stale
+                // evidence from a previous traffic phase cannot steer a new one.
+                wndHoles <- wndHoles * 0.98
+                wndNackReports <- wndNackReports * 0.98
+            else
+                let congested = rttRatio > 2.0
+                // A standing queue alone must never hold redundancy at zero while the peer still
+                // reports real loss and the path is not queued. Cover that erasure first.
+                let neededFloor = min 0.40 target
+                // Congestion (srtt well above minRtt) means the queue is ours. Climbing rho, or
+                // parking it at 0.30, feeds the queue that produced the report (live: 4 220 boosters,
+                // srtt 347 ms on a 115 ms path). Drain toward the floor; do not hold a 30 % tax.
+                if congested && rho > max rhoFloor target + 0.01 then
+                    rho <- max (max rhoFloor target) (rho - 0.04)
+                elif rho < max rhoFloor neededFloor then
+                    rho <- min (max rhoFloor target) (rho + 0.06)
+                elif target > rho + 0.01 then
+                    rho <- min target (rho + 0.08)
+                elif target < rho - 0.01 then
+                    rho <- max target (rho - 0.02)
         // A reliable TCP carrier hides most loss behind retransmission, so the reported rate
         // must never be read as pure "wire" truth: cap it where the controller can still
         // trust it. Above this the parity ratio only adds queueing, which the live run showed
@@ -868,6 +899,11 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: ICodecEn
                         let mask =
                             if lane <> 0 then uint16 lane &&& uint16 ((1u <<< k) - 1u)
                             else uint16 ((1u <<< k) - 1u)
+                        // Hole feedback: each set lane bit is a measured hole the first round
+                        // failed to close. Accumulate a smoothed holes-per-window rate.
+                        if lane <> 0 then
+                            wndHoles <- wndHoles + float (System.Numerics.BitOperations.PopCount(uint32 lane))
+                            wndNackReports <- wndNackReports + 1.0
                         if mask <> 0us && not (windowRepairs.TryRequest(t, mask)) then
                             invalidOp "window repair capacity invariant violated"
         elif newRepair then

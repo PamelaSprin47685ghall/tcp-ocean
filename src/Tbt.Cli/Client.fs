@@ -131,25 +131,13 @@ let private runCore (o: Options) =
         // Empty counts as unset: the e2e harness forwards the variable unconditionally.
         match System.Environment.GetEnvironmentVariable "TBTUN_FEC_ADAPTIVE" with
         | null
-        | "" ->
-            // The erasure ledger judges a cell at its arrival deadline. In window mode a
-            // hole is closed by parity or a bitmap-NACK retransmission a round trip later,
-            // so loss recovery itself manufactures "late" cells: adaptive read its own
-            // repair latency as erasure, spiralled rho to 0.25+, and throughput collapsed
-            // to 20 Mbit/s where the fixed 0.25 ratio reaches 125 (e2e 20ms/200Mbit/5%).
-            // Fixed rho until the feedback separates queueing from repair delay.
-            not windowMode
+        | "" -> true
         | v -> v <> "0"
     let rho0 =
         // TBTUN_RHO overrides the fixed working point (experiment sweeps); the e2e harness
         // forwards environment variables, so empty counts as unset.
         match System.Environment.GetEnvironmentVariable "TBTUN_RHO" with
-        | null | "" ->
-            // Measured sweep at 5% loss (20ms/200Mbit, e2e): rho 0.10 downlink 21 Mbit/s,
-            // 0.15 -> 40, 0.25 -> 124, 0.30 -> 127 with uplink 114 (vs 62 at 0.25). At zero
-            // loss the 30% overhead still sustains 139 Mbit/s both directions on a 200 Mbit
-            // link. 0.30 is the fixed working point until adaptive erasure feedback is fixed.
-            if windowMode then 0.30 else SessionConfig.defaults.Rho
+        | null | "" -> SessionConfig.defaults.Rho
         | v -> float v
     let config = { SessionConfig.defaults with Credit = creditFromOptions o; WindowSteps = o.Int("window", 1024); NewRepair = o.Int("new-repair", 0) <> 0; FecAdaptive = fecAdaptive; Rho = rho0 }
     let entropy = SystemEntropy()
