@@ -675,7 +675,7 @@ type RxHalf(symbolSize: int, field: CodeField, decoder: ICodecDecoder, opener: C
         let mutable b2 = 0UL
         let mutable b3 = 0UL
         let mutable j = 0
-        while j < 256 && lo + 1UL + uint64 j < hi do
+        while j < 256 && lo < hi && uint64 j < hi - lo - 1UL do
             if decoder.IsStepComplete(lo + 1UL + uint64 j) then
                 let bit = 1UL <<< (j % 64)
                 if j < 64 then b0 <- b0 ||| bit

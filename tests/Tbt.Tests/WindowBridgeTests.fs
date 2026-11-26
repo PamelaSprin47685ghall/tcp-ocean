@@ -166,6 +166,19 @@ let ``released windows reject late data and parity without consuming capacity`` 
     Assert.Equal(allocated, rx.AllocatedBytes)
 
 [<Fact>]
+let ``copy rejects stale windows even if exposed pool reopens them`` () =
+    let rx = WindowReceive(32, 1, 1L <<< 20)
+    let value = fill 32 12
+    Assert.True(rx.AddSource(0UL, 0, 1, value))
+    rx.ReleaseThrough 4UL
+    Assert.True(rx.Pool.TryOpen(0UL, 64))
+    let decoder = rx.Pool.TryGet(0UL).Value
+    Assert.True(decoder.Add(1UL, value))
+    let output = Array.zeroCreate<byte> 32
+    Assert.False(rx.TryCopyKnown(0UL, 0, Span output))
+    Assert.True(rx.Source(0UL, 0).IsEmpty)
+
+[<Fact>]
 let ``receiver exposes only accepted snapshot step lengths and forgets released windows`` () =
     // The receive API assumes authentication has already succeeded. A rejected
     // frame must never publish its metadata as accepted snapshot state.

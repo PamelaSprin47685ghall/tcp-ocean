@@ -308,9 +308,12 @@ type WindowReceive(symbolSize: int, maxWindows: int, maxBytes: int64, ?reserveCo
         match WindowBridge.tryIndex (step, slot) with
         | ValueNone -> false
         | ValueSome index ->
-            match pool.TryGet(WindowBridge.windowId step) with
-            | ValueSome decoder -> decoder.TryCopyKnown(index, dst)
-            | ValueNone -> false
+            let id = WindowBridge.windowId step
+            if id < releasedBefore then false
+            else
+                match pool.TryGet id with
+                | ValueSome decoder -> decoder.TryCopyKnown(index, dst)
+                | ValueNone -> false
 
     /// Release only windows fully below the exclusive delivered step frontier.
     member _.ReleaseThrough(ackStep: uint64) =

@@ -584,7 +584,8 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: ICodecEn
                 if ack > CodeGraph.HistorySpan then encoder.Release(ack - CodeGraph.HistorySpan)
             // The grant is relative to THIS report's own ack: a late (reordered) report with an
             // older ack must not be applied to a newer peerAck (that would amplify the grant).
-            let limit = ack + uint64 grant
+            let available = UInt64.MaxValue - ack
+            let limit = if uint64 grant > available then UInt64.MaxValue else ack + uint64 grant
             if limit > grantLimit then grantLimit <- limit
 
     /// Set the first grant (SERVER_INIT rx_win_grant0 or the peer's first cell).

@@ -589,6 +589,7 @@ let ``a duplicate DATA cell cannot withdraw the same pending rebuild twice`` () 
 [<Fact>]
 let ``nack waits before deadline when frontier is near uint64 maximum`` () =
     let frontier = UInt64.MaxValue - 10UL
+    let mutable bitmapQueries = 0
     let decoder =
         { new Tbt.Codec.ICodecDecoder with
             member _.Frontier = frontier
@@ -600,7 +601,9 @@ let ``nack waits before deadline when frontier is near uint64 maximum`` () =
             member _.FreeRows = 0
             member _.StaleRows = 0L
             member _.RowMemoryBytes = 0L
-            member _.IsStepComplete _ = false
+            member _.IsStepComplete _ =
+                bitmapQueries <- bitmapQueries + 1
+                false
             member _.WasRecovered(_, _) = false
             member _.AcknowledgeRecovered(_, _) = ()
             member _.StepKnownCount _ = 0
@@ -621,6 +624,9 @@ let ``nack waits before deadline when frontier is near uint64 maximum`` () =
     let mutable span = 0
     let mutable deficit = 0
     Assert.False(rx.TryNack(1_000_000L, &span, &deficit))
+    let struct (b0, b1, b2, b3) = rx.FillDecodedBitmap()
+    Assert.Equal(0UL, b0 ||| b1 ||| b2 ||| b3)
+    Assert.Equal(0, bitmapQueries)
 
 /// Drive one RxHalf deadline ledger with controllable virtual time.
 ///
