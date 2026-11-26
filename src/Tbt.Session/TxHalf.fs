@@ -948,7 +948,15 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: ICodecEn
             if sent <= 0L then Int64.MaxValue
             else
                 let reference = max sent lastRepairNs.[si]
-                let wait = max 200_000_000L (min 4_000_000_000L (int64 this.RepairWaitNs))
+                // The floor must scale with the path: a hard 200 ms floor retransmitted every
+                // step before its acknowledgement could possibly return at rtt400 (measured:
+                // 16 757 stale frames flooding the client, ack starved, downlink stuck at
+                // 17 Mbit/s lossless). RepairWaitNs already floors at 1.05 x minRTT once a
+                // sample exists; before the first sample the 200 ms default RTT seed stands.
+                // The wait itself already scales with the measured RTT (1.05x minRTT or
+                // srtt+4rttvar); before the first sample the seed is 200ms. The floor only
+                // guards against a pathological underestimate, never below one full RTT.
+                let wait = max 200_000_000L (min 8_000_000_000L (max (int64 this.RepairWaitNs) (int64 (1.05 * srttNs))))
                 if reference > Int64.MaxValue - wait then Int64.MaxValue else reference + wait
 
     /// Nanoseconds until HeartbeatDue can turn true, or Int64.MaxValue while the
