@@ -124,6 +124,29 @@ let ``partial step acknowledgement retains the active window`` () =
     Assert.Equal(0L, rx.AllocatedBytes)
 
 [<Fact>]
+let ``released windows reject late data and parity without consuming capacity`` () =
+    let rx = WindowReceive(32, 1, 1L <<< 20)
+    let source = fill 32 7
+    let struct (oldParity, _) = WindowBridge.snapshotParity 0UL 0 [|1|]
+    Assert.Equal(WindowCodec.AddOutcome.Innovative, rx.TryAddSource(0UL, 0, 1, source))
+    rx.ReleaseThrough 3UL
+    Assert.Equal(WindowCodec.AddOutcome.Duplicate, rx.TryAddSource(0UL, 0, 1, source))
+    Assert.Equal(WindowCodec.AddOutcome.OutOfCapacity, rx.TryAddSource(4UL, 0, 1, source))
+    rx.ReleaseThrough 4UL
+    Assert.Equal(0L, rx.AllocatedBytes)
+    Assert.Equal(WindowCodec.AddOutcome.Invalid, rx.TryAddSource(0UL, 0, 1, source))
+    Assert.Equal(WindowCodec.AddOutcome.Invalid, rx.TryAddParity(oldParity, source))
+    Assert.Equal(0, rx.Count)
+    Assert.Equal(0L, rx.AllocatedBytes)
+    rx.ReleaseThrough 1UL
+    Assert.Equal(WindowCodec.AddOutcome.Invalid, rx.TryAddSource(0UL, 0, 1, source))
+    Assert.Equal(WindowCodec.AddOutcome.Innovative, rx.TryAddSource(4UL, 0, 1, source))
+    let allocated = rx.AllocatedBytes
+    Assert.Equal(WindowCodec.AddOutcome.Invalid, rx.TryAddParity(oldParity, source))
+    Assert.Equal(1, rx.Count)
+    Assert.Equal(allocated, rx.AllocatedBytes)
+
+[<Fact>]
 let ``steady receiver calls allocate no managed memory`` () =
     let rx = WindowReceive(32, 2, 1L <<< 20)
     let source = fill 32 4

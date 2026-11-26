@@ -215,6 +215,7 @@ type WindowSnapshotTracker(windowId: uint64) =
 type WindowReceive(symbolSize: int, maxWindows: int, maxBytes: int64) =
     let pool = WindowCodec.WindowCodecPool(symbolSize, maxWindows, maxBytes)
     let trackers = System.Collections.Generic.Dictionary<uint64, WindowSnapshotState>(maxWindows)
+    let mutable releasedBefore = 0UL
 
     let current id =
         match trackers.TryGetValue id with
@@ -222,7 +223,7 @@ type WindowReceive(symbolSize: int, maxWindows: int, maxBytes: int64) =
         | _ -> WindowSnapshotState.empty
 
     let add (id: uint64) (data: byte[]) (candidate: WindowSnapshotState) (mask: uint64) =
-        if isNull (box data) || data.Length <> symbolSize then WindowCodec.AddOutcome.Invalid
+        if id < releasedBefore || isNull (box data) || data.Length <> symbolSize then WindowCodec.AddOutcome.Invalid
         else
             let mutable opened = false
             if pool.TryGet(id).IsNone then opened <- pool.TryOpen(id, 64)
@@ -280,9 +281,10 @@ type WindowReceive(symbolSize: int, maxWindows: int, maxBytes: int64) =
     /// Release only windows fully below the exclusive delivered step frontier.
     member _.ReleaseThrough(ackStep: uint64) =
         let completed = ackStep / uint64 WindowBridge.StepsPerWindow
-        if completed > 0UL then
+        if completed > releasedBefore then
             pool.ReleaseThrough(completed - 1UL)
             let removed = ResizeArray<uint64>()
             for KeyValue(id, _) in trackers do
                 if id < completed then removed.Add id
             for id in removed do trackers.Remove id |> ignore
+            releasedBefore <- completed
