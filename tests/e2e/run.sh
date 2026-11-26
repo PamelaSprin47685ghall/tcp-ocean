@@ -196,7 +196,7 @@ if (( paths > max_paths )); then
 fi
 user=$(id -un)
 dotnet_root=${DOTNET_ROOT:-$(dirname "$(readlink -f "$(command -v dotnet)")")}
-in_ns() { local ns=$1; shift; sudo ip netns exec "tbe_$ns" sudo -u "$user" env DOTNET_ROOT="$dotnet_root" TBT_TRACE="${TBT_TRACE:-}" PING_TRACE="${PING_TRACE:-}" ECHO_PROBE_LOG="${ECHO_PROBE_LOG:-}" TBTUN_ASYNC_MODE="${TBTUN_ASYNC_MODE:-}" TBTUN_FEC_ADAPTIVE="${TBTUN_FEC_ADAPTIVE:-}" DOTNET_EnableHWIntrinsic="${DOTNET_EnableHWIntrinsic:-}" "$@"; }
+in_ns() { local ns=$1; shift; sudo ip netns exec "tbe_$ns" sudo -u "$user" env DOTNET_ROOT="$dotnet_root" TBT_TRACE="${TBT_TRACE:-}" PING_TRACE="${PING_TRACE:-}" ECHO_PROBE_LOG="${ECHO_PROBE_LOG:-}" TBTUN_ASYNC_MODE="${TBTUN_ASYNC_MODE:-}" TBTUN_FEC_ADAPTIVE="${TBTUN_FEC_ADAPTIVE:-}" TBTUN_RHO="${TBTUN_RHO:-}" DOTNET_EnableHWIntrinsic="${DOTNET_EnableHWIntrinsic:-}" "$@"; }
 
 # Processes whose executable is under the work directory (or iperf3/python3 started here).
 pids_of() {

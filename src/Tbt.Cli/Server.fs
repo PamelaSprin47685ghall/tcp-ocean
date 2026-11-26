@@ -238,7 +238,18 @@ let private runCore (o: Options) =
             // Fixed rho until the feedback separates queueing from repair delay.
             not windowMode
         | v -> v <> "0"
-    let config = { SessionConfig.defaults with Credit = creditFromOptions o; WindowSteps = o.Int("window", 1024); MaxPaths = maxPaths; NewRepair = o.Int("new-repair", 0) <> 0; FecAdaptive = fecAdaptive }
+    let rho0 =
+        // TBTUN_RHO overrides the fixed working point (experiment sweeps); the e2e harness
+        // forwards environment variables, so empty counts as unset.
+        match System.Environment.GetEnvironmentVariable "TBTUN_RHO" with
+        | null | "" ->
+            // Measured sweep at 5% loss (20ms/200Mbit, e2e): rho 0.10 downlink 21 Mbit/s,
+            // 0.15 -> 40, 0.25 -> 124, 0.30 -> 127 with uplink 114 (vs 62 at 0.25). At zero
+            // loss the 30% overhead still sustains 139 Mbit/s both directions on a 200 Mbit
+            // link. 0.30 is the fixed working point until adaptive erasure feedback is fixed.
+            if windowMode then 0.30 else SessionConfig.defaults.Rho
+        | v -> float v
+    let config = { SessionConfig.defaults with Credit = creditFromOptions o; WindowSteps = o.Int("window", 1024); MaxPaths = maxPaths; NewRepair = o.Int("new-repair", 0) <> 0; FecAdaptive = fecAdaptive; Rho = rho0 }
     let entropy = SystemEntropy()
     let clock = CachedClock(SystemClock())
     let probe = SocketTuning.probe ()
