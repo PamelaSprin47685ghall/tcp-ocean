@@ -15,6 +15,7 @@
     <Compile Include="WindowGrant.fs" />
     <Compile Include="WindowCustody.fs" />
     <Compile Include="WindowTxStore.fs" />
+    <Compile Include="WindowCodecAdapters.fs" />
     <Compile Include="WindowRepairLedger.fs" />
     <Compile Include="WindowRepairDispatch.fs" />
     <Compile Include="WindowParityDispatch.fs" />
