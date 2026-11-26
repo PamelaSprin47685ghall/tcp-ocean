@@ -66,6 +66,10 @@ module SessionConfig =
     let defaults =
         { Rho = 0.25; WindowSteps = 4096; MaxRows = 16384; MaxPaths = 288; TxQueueCells = 512
           Credit = CreditPolicy.defaults; NewRepair = false
+          // RhoMax 0.55: the hole-driven window controller cannot overrun this into a queueing
+          // spiral because it only climbs while windows verifiably fail first-round decode; at 15 %
+          // loss rho 0.55 leaves 0.3 % of windows undecoded against 7.4 % at the old 0.38 cap.
+          // The legacy path keeps RhoGain-driven targets below the cap as before.
           // RhoMax 0.38 / RhoGain 1.05: the earlier 0.45/1.35 pair was sized from a *reported*
           // erasure that a queueing path inflates well above its physical loss (live: 16 % on the
           // wire, 0.32-0.64 reported, because a 32-path set queues past the cell deadline). With
@@ -74,7 +78,7 @@ module SessionConfig =
           // is a self-feeding loop (live: rho 0.406, srtt 748-825 ms, probes p50 829 ms). 0.38 still
           // leaves 5-6 parities per 16 sources for genuine 24 % loss, and 1.05 keeps a 0 % link at
           // the floor.
-          FecAdaptive = false; RhoMin = 0.01; RhoMax = 0.38; RhoFloor = 0.02; RhoGain = 1.05
+          FecAdaptive = false; RhoMin = 0.01; RhoMax = 0.55; RhoFloor = 0.02; RhoGain = 1.05
           FecWindowCells = 64 }
 
 /// The negotiated result of the main handshake that a session needs.
