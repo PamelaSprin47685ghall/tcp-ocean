@@ -44,7 +44,15 @@ module SmallStep =
 type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: ICodecEncoder, sealer: CellSealer,
             rho0: float, fecAdaptive: bool, rhoMin: float, rhoMax: float, rhoFloor: float,
             rhoGain: float, fecWindowCells: int,
-            maxPaths: int, queueLimit: int, clock: IClock) =
+            maxPaths: int, queueLimit: int, clock: IClock, ?useWindowCodec: bool) =
+    let windowMode = defaultArg useWindowCodec false
+    let windowEncoder =
+        if windowMode then
+            match box encoder with
+            | :? IWindowEncoderMeta as codec -> Some codec
+            | _ -> invalidArg (nameof encoder) "window mode requires IWindowEncoderMeta"
+        else None
+    let windowRepairs = WindowRepairDispatch(encoder.Capacity)
     /// Per-step rings. A power of two that covers the encoder window: at the default
     /// 4096-step window this is 4096 slots instead of a fixed 65536, which removed about
     /// 3 MiB of per-session arrays that no window could ever index.
@@ -581,7 +589,10 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: ICodecEn
                 if ack > 0UL then peerSeenHi <- max peerSeenHi (ack - 1UL)
                 clampSrttToObservedMin ()
                 refreshUniqueArrived ()
-                if ack > CodeGraph.HistorySpan then encoder.Release(ack - CodeGraph.HistorySpan)
+                if windowMode then
+                    windowRepairs.AdvanceAck ack |> ignore
+                    encoder.Release ack
+                elif ack > CodeGraph.HistorySpan then encoder.Release(ack - CodeGraph.HistorySpan)
             // The grant is relative to THIS report's own ack: a late (reordered) report with an
             // older ack must not be applied to a newer peerAck (that would amplify the grant).
             let available = UInt64.MaxValue - ack
@@ -674,7 +685,7 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: ICodecEn
     /// late-but-healthy cell is never retransmitted on a guess.
     member private this.ArmProvenHole(t: uint64) =
         let si = int (t % uint64 sealNs.Length)
-        if t >= peerAck && t < encoder.Head && encoder.StepUsed t > 0
+        if not windowMode && t >= peerAck && t < encoder.Head && encoder.StepUsed t > 0
            && not peerDecoded.[si] && repairs.Count < repairCapacity then
             let now = clock.FreshNs()
             let minRtt = min minCurNs minPrevNs
@@ -818,7 +829,17 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: ICodecEn
     /// with no later evidence — the longer tail timer has passed. When the 256 seeds
     /// of a step are used, its DATA cells go again.
     member this.OnNack(tLo: uint64, span: int, deficit: int) =
-        if newRepair then
+        if windowMode then
+            let count = min (max 0 span) CodeGraph.MaxBoosterSpan
+            for j in 0 .. count - 1 do
+                if uint64 j <= UInt64.MaxValue - tLo then
+                    let t = tLo + uint64 j
+                    let k = if t >= peerAck && t < encoder.Head then encoder.StepUsed t else 0
+                    if k > 0 && deficit > 0 then
+                        let mask = uint16 ((1u <<< k) - 1u)
+                        if not (windowRepairs.TryRequest(t, mask)) then
+                            invalidOp "window repair capacity invariant violated"
+        elif newRepair then
             let span = int (min (uint64 (min span CodeGraph.MaxBoosterSpan)) (encoder.Head - min tLo encoder.Head))
             let minRtt = min minCurNs minPrevNs
             if minRtt = Int64.MaxValue || tLo < peerAck || span < 1 || deficit < 1 then ()
@@ -883,15 +904,32 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: ICodecEn
     member _.HeartbeatDue =
         let now = clock.NowNs()
         peerAck < encoder.Head && encoder.Head > 0UL && queue.Count = 0 && urgent.Count = 0 && repairs.Count = 0
+        && (not windowMode || windowRepairs.Count = 0)
         && now - lastSourceNs >= 50_000_000L && now - lastHeartbeatNs >= 50_000_000L
+
+    /// Window-mode tail fallback is armed even before the first RTT sample.
+    /// Only the oldest unacknowledged step is retried, with a bounded cadence.
+    member private this.WindowRepairDeadline =
+        if not windowMode || peerAck >= encoder.Head || windowRepairs.Count > 0 then Int64.MaxValue
+        else
+            let si = int (peerAck % uint64 firstSendNs.Length)
+            let sent = firstSendNs.[si]
+            if sent <= 0L then Int64.MaxValue
+            else
+                let reference = max sent lastRepairNs.[si]
+                let wait = max 200_000_000L (min 4_000_000_000L (int64 this.RepairWaitNs))
+                if reference > Int64.MaxValue - wait then Int64.MaxValue else reference + wait
 
     /// Nanoseconds until HeartbeatDue can turn true, or Int64.MaxValue while the
     /// tail rule does not apply. A session can sleep until this instant instead of
     /// polling to discover that the heartbeat is due.
-    member _.NextHeartbeatNs =
-        if peerAck < encoder.Head && encoder.Head > 0UL && queue.Count = 0 && urgent.Count = 0 && repairs.Count = 0 then
-            max lastSourceNs lastHeartbeatNs + 50_000_000L
-        else Int64.MaxValue
+    member this.NextHeartbeatNs =
+        let heartbeat =
+            if peerAck < encoder.Head && encoder.Head > 0UL && queue.Count = 0 && urgent.Count = 0 && repairs.Count = 0
+               && (not windowMode || windowRepairs.Count = 0) then
+                max lastSourceNs lastHeartbeatNs + 50_000_000L
+            else Int64.MaxValue
+        min heartbeat this.WindowRepairDeadline
 
     /// Render and seal a HEARTBEAT for path.
     member this.RenderHeartbeat(frame: Span<byte>, path: uint16, ackLo: uint64, grant: uint16, erasureQ16: uint16) =
@@ -911,7 +949,19 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: ICodecEn
     /// Callers that used to rely on `HasCandidate` doing this as a side effect call this
     /// first. `HasCandidate` itself only looks.
     member this.Prepare () =
-        if newRepair then this.DrainDueRepairs()
+        if windowMode then
+            let now = clock.FreshNs()
+            if now >= this.WindowRepairDeadline && peerAck < encoder.Head then
+                let step = peerAck
+                let k = encoder.StepUsed step
+                if k > 0 then
+                    let mask = uint16 ((1u <<< k) - 1u)
+                    if windowRepairs.TryRequest(step, mask) then
+                        let si = int (step % uint64 lastRepairNs.Length)
+                        lastRepairNs.[si] <- now
+                    else
+                        invalidOp "window repair capacity invariant violated"
+        elif newRepair then this.DrainDueRepairs()
         let mutable c = Unchecked.defaultof<Candidate>
         while repairs.TryPeek(&c)
               && (c.Step + uint64 (max 1uy c.Span) <= peerAck
@@ -929,11 +979,11 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: ICodecEn
     /// True when a BOOSTER (or other repair cell) is at the head of the send queues.
     member this.RepairWaiting =
         this.Prepare()
-        repairs.Count > 0
+        repairs.Count > 0 || (windowMode && windowRepairs.Count > 0)
 
     /// True when a cell waits. No queue mutation: `Prepare` is the step that drains.
     member this.HasCandidate =
-        repairs.Count > 0 || urgent.Count > 0 || queue.Count > 0
+        repairs.Count > 0 || urgent.Count > 0 || queue.Count > 0 || (windowMode && windowRepairs.Count > 0)
 
     /// Seal a rendered frame with the next counter of this direction (one counter seals
     /// one plaintext only).
@@ -976,20 +1026,42 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: ICodecEn
         let mutable ok = false
         this.Prepare()
         while not done' && this.HasCandidate do
+            let mutable repairStep = 0UL
+            let mutable repairSlot = 0
+            let windowRepair = windowMode && allowRepair && windowRepairs.TryBegin(&repairStep, &repairSlot)
             if not allowRepair && repairs.Count > 0 && urgent.Count = 0 && queue.Count = 0 then
                 done' <- true
+            elif not allowRepair && windowMode && windowRepairs.Count > 0 && urgent.Count = 0 && queue.Count = 0 then
+                done' <- true
             else
-                c <- if allowRepair && repairs.Count > 0 then repairs.Dequeue() elif urgent.Count > 0 then urgent.Dequeue() else queue.Dequeue()
+                c <- if windowRepair then { Kind = CellType.Data; Step = repairStep; Index = byte repairSlot; Span = 0uy; Round = 0uy }
+                     elif allowRepair && repairs.Count > 0 then repairs.Dequeue() elif urgent.Count > 0 then urgent.Dequeue() else queue.Dequeue()
                 let t = c.Step
                 let k = encoder.StepUsed t
                 let symbol = frame.Slice(Layout.SymbolOffset, symbolSize)
+                let mutable windowMeta = Unchecked.defaultof<Meta>
+                let mutable windowParity = false
                 let rendered =
                     if k = 0 then false
                     elif c.Kind = CellType.Data then
                         encoder.Source(t, int c.Index).CopyTo symbol
                         true
+                    elif windowMode && c.Kind = CellType.Parity then
+                        let codec = windowEncoder.Value
+                        let p = codec.NextParityIndex(t / 4UL)
+                        if p < 0 then
+                            let mask = uint16 ((1u <<< k) - 1u)
+                            if not (windowRepairs.TryRequest(t, mask)) then
+                                invalidOp "window repair capacity invariant violated"
+                            false
+                        else
+                            windowParity <- codec.TryRenderWindowParity(t, p, symbol, &windowMeta)
+                            windowParity
                     elif c.Kind = CellType.Booster then encoder.TryRenderBooster(t, int c.Span, int c.Index, symbol)
                     else encoder.TryRenderParity(t, int c.Index, field, false, symbol)
+                if windowRepair && not rendered then
+                    windowRepairs.Complete false |> ignore
+                    done' <- true
                 if rendered && TraceGate.On && traced.[index t] then
                     Trace.record Trace.Send t path (if c.Kind = CellType.Data then 0 elif c.Kind = CellType.Parity then 1 else 2)
                 if rendered && c.Kind = CellType.Booster then
@@ -1013,15 +1085,23 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: ICodecEn
                         let r = CodeGraph.Strides.[i]
                         kHist.[i] <- if t < r then 0 else (let h = encoder.StepUsed(t - r) in if h = 0 then 16 else h)
                     let meta =
-                        { Type = c.Kind; Flags = stepFlags.[index t]; Slot = c.Index; StepUsed = byte k
-                          Aux = uint16 stepParities.[index t]; RxWinGrant = grant; StepId = t; AckStepLo = ackLo
-                          CarrierWm = carrierWm.[int path]; KHist = Meta.packKHist (ReadOnlySpan kHist); ErasureQ16 = erasureQ16 }
+                        if windowParity then
+                            { windowMeta with RxWinGrant = grant; AckStepLo = ackLo
+                                              CarrierWm = carrierWm.[int path]; ErasureQ16 = erasureQ16 }
+                        else
+                            { Type = c.Kind; Flags = stepFlags.[index t]; Slot = c.Index; StepUsed = byte k
+                              Aux = uint16 stepParities.[index t]; RxWinGrant = grant; StepId = t; AckStepLo = ackLo
+                              CarrierWm = carrierWm.[int path]; KHist = (if windowMode then 0u else Meta.packKHist (ReadOnlySpan kHist)); ErasureQ16 = erasureQ16 }
                     FrameMath.writeChunkHeader symbolSize frame
                     Meta.write meta (frame.Slice(Layout.MetaOffset, Layout.MetaLength))
                     frame.[frame.Length - 2] <- 13uy
                     frame.[frame.Length - 1] <- 10uy
                     if t > carrierWm.[int path] then carrierWm.[int path] <- t
                     this.Seal(frame, path)
+                    if windowParity then windowEncoder.Value.CommitParityIndex(t / 4UL)
+                    if windowRepair then
+                        lastRepairNs.[int (t % uint64 lastRepairNs.Length)] <- clock.FreshNs()
+                        windowRepairs.Complete true |> ignore
                     let first =
                         if c.Kind <> CellType.Data then true
                         else
@@ -1052,7 +1132,7 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: ICodecEn
         // Only BOOSTERs: a repeated DATA cell (the seeds of a range ran out) stays queued for
         // TryRenderNext, which renders it with its own step meta.
         this.Prepare()
-        while not found && repairs.TryPeek(&c) && c.Kind = CellType.Booster do
+        while not windowMode && not found && repairs.TryPeek(&c) && c.Kind = CellType.Booster do
             repairs.Dequeue() |> ignore
             if encoder.StepUsed c.Step > 0 && encoder.TryRenderBooster(c.Step, int c.Span, int c.Index, symbol) then
                 meta <- { Type = CellType.Booster; Flags = MetaFlags.Fill; Slot = c.Index; StepUsed = c.Span
@@ -1065,8 +1145,17 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: ICodecEn
                 found <- true
         // Parity: the oldest steps first; a few steps, then PAD.
         let mutable t = max peerAck encoder.Tail
-        let last = min encoder.Head (t + 4UL)
-        while not found && t < last do
+        let last = min encoder.Head (t + min 4UL (UInt64.MaxValue - t))
+        if windowMode && t < last then
+            let codec = windowEncoder.Value
+            let p = codec.NextParityIndex(t / 4UL)
+            let mutable snapshot = Unchecked.defaultof<Meta>
+            if p >= 0 && codec.TryRenderWindowParity(t, p, symbol, &snapshot) then
+                meta <- { snapshot with Flags = snapshot.Flags ||| MetaFlags.Fill
+                                        RxWinGrant = grant; AckStepLo = ackLo
+                                        CarrierWm = carrierWm.[int path]; ErasureQ16 = erasureQ16 }
+                found <- true
+        while not windowMode && not found && t < last do
             let k = encoder.StepUsed t
             let p = int fillParity.[index t]
             if k > 0 && p < 48 && not peerDecoded.[int (t % uint64 peerDecoded.Length)]
@@ -1092,6 +1181,7 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: ICodecEn
         frame.[frame.Length - 2] <- 13uy
         frame.[frame.Length - 1] <- 10uy
         this.Seal(frame, path)
+        if windowMode && found then windowEncoder.Value.CommitParityIndex(t / 4UL)
         fillsSent <- fillsSent + 1L
         meta.Type
 
