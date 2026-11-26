@@ -91,6 +91,32 @@ let ``callback failure retains source rather than silently releasing it`` () =
     Assert.False((rx :> ISourceStore).Source(3UL, 0).IsEmpty)
 
 [<Fact>]
+let ``explicit matrix reserve is reused after complete custody release`` () =
+    let perWindow = 64L * 8L + 65L * 32L
+    let rx = WindowCustody(32, 1, perWindow, reserveCount = 1)
+    Assert.Equal(perWindow, rx.ReservedBytes)
+    Assert.Equal(1, rx.IdleReservedCount)
+    rx.NextGrant() |> ignore
+    for step in 0UL .. 3UL do
+        Assert.Equal(WindowCodec.AddOutcome.Innovative, rx.AddSource(step, 0, 1, Array.create 32 1uy))
+        Assert.True(rx.TakeKnown(step, 0))
+    Assert.Equal(0, rx.IdleReservedCount)
+    rx.Advance()
+    Assert.Equal(1, rx.IdleReservedCount)
+    rx.NextGrant() |> ignore
+    Assert.Equal(WindowCodec.AddOutcome.Innovative, rx.AddSource(4UL, 0, 1, Array.create 32 2uy))
+    Assert.Equal(0, rx.IdleReservedCount)
+    Assert.Equal(perWindow, rx.ReservedBytes)
+
+[<Fact>]
+let ``matrix reserve rejects invalid counts and insufficient bytes`` () =
+    let perWindow = 64L * 8L + 65L * 32L
+    Assert.Throws<ArgumentException>(fun () -> WindowCustody(32, 1, perWindow, reserveCount = 2) |> ignore) |> ignore
+    Assert.Throws<ArgumentException>(fun () -> WindowReceive(32, 1, perWindow - 1L, reserveCount = 1) |> ignore) |> ignore
+    let lazyRx = WindowCustody(32, 1, perWindow)
+    Assert.Equal(0L, lazyRx.ReservedBytes)
+
+[<Fact>]
 let ``advertised window cannot exceed decoder byte budget`` () =
     Assert.Throws<ArgumentException>(fun () -> WindowCustody(1344, 2, 1000L) |> ignore) |> ignore
     let rx = WindowCustody(32, 1, 10000L)

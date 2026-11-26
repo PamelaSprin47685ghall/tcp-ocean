@@ -214,8 +214,8 @@ type WindowSnapshotTracker(windowId: uint64) =
         else ValueSome (int ((state.PackedLengths >>> (4 * offset)) &&& 15us) + 1)
 
 [<Sealed>]
-type WindowReceive(symbolSize: int, maxWindows: int, maxBytes: int64) =
-    let pool = WindowCodec.WindowCodecPool(symbolSize, maxWindows, maxBytes)
+type WindowReceive(symbolSize: int, maxWindows: int, maxBytes: int64, ?reserveCount: int) =
+    let pool = WindowCodec.WindowCodecPool(symbolSize, maxWindows, maxBytes, ?reserveCount = reserveCount)
     let trackers = System.Collections.Generic.Dictionary<uint64, WindowSnapshotState>(maxWindows)
     let mutable releasedBefore = 0UL
 

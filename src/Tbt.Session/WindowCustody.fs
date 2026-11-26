@@ -11,8 +11,8 @@ open Tbt.Wire
 /// decoder row payload only, not allocations, flow buffers, or operating-system memory.
 /// This type is not connected to Session or to the wire handshake.
 [<Sealed>]
-type WindowCustody(symbolSize: int, maxWindows: int, maxBytes: int64) =
-    let receiver = WindowReceive(symbolSize, maxWindows, maxBytes)
+type WindowCustody(symbolSize: int, maxWindows: int, maxBytes: int64, ?reserveCount: int) =
+    let receiver = WindowReceive(symbolSize, maxWindows, maxBytes, ?reserveCount = reserveCount)
     let progress = WindowRxProgress(maxWindows * 4)
     let grant = WindowGrantTracker(maxWindows)
     do
@@ -22,6 +22,9 @@ type WindowCustody(symbolSize: int, maxWindows: int, maxBytes: int64) =
     let mutable limit = 0UL
 
     member _.AllocatedBytes = receiver.AllocatedBytes
+    /// Reserved matrix payload; excludes object overhead and other session buffers.
+    member _.ReservedBytes = receiver.Pool.ReservedBytes
+    member _.IdleReservedCount = receiver.Pool.IdleReservedCount
     member _.DecodedFrontier = progress.DecodedFrontier
     member _.CustodyFrontier = progress.CustodyFrontier
     member _.PublishedLimit = limit
