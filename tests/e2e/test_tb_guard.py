@@ -162,6 +162,65 @@ class GuardChecks(unittest.TestCase):
             subprocess.run(['bash', '-n', str(HERE / name)], check=True)
 
 
+class RunStopChecks(unittest.TestCase):
+    def stop_body(self):
+        text = (HERE / 'run.sh').read_text()
+        self.assertIn('stop() {', text)
+        body = text.split('stop() {', 1)[1].split('\n}', 1)[0]
+        return 'stop() {' + body + '\n}'
+
+    def run_stop(self, pid_tokens):
+        with tempfile.TemporaryDirectory() as td:
+            root = Path(td)
+            work = root / 'work'
+            work.mkdir()
+            (work / 'server-mux.log').write_text('closed by peer\n')
+            (root / 'pids.seq').write_text(pid_tokens + '\n')
+            (root / 'pidx').write_text('0\n')
+            trace = root / 'trace.log'
+            harness = root / 'harness.sh'
+            harness.write_text(f'''#!/usr/bin/env bash
+set -euo pipefail
+work={str(work)!r}
+PIDS={str(root / 'pids.seq')!r}
+IDX={str(root / 'pidx')!r}
+TRACE={str(trace)!r}
+status=0
+stop_pause() {{ :; }}
+sudo() {{ echo "sudo $*" >> "$TRACE"; return 0; }}
+xargs() {{ while IFS= read -r _pid; do echo "xargs $_pid" >> "$TRACE"; done; }}
+sleep() {{ echo "sleep $1" >> "$TRACE"; }}
+pids_of() {{
+    local want=$1 idx token
+    if [[ $want == */jit/tbtun || $want != */aot/tbtun ]]; then return 0; fi
+    idx=$(cat "$IDX")
+    idx=$((idx + 1))
+    echo "$idx" > "$IDX"
+    token=$(cut -d' ' -f"$idx" < "$PIDS")
+    if [[ -n $token && $token != _ ]]; then echo "$token"; fi
+}}
+{self.stop_body()}
+stop mux
+echo SHOULD_REACH_NEXT_SESSION
+''', encoding='utf-8')
+            result = subprocess.run(['bash', str(harness)], capture_output=True, text=True)
+            return result, trace.read_text()
+
+    def test_stop_waits_for_delayed_server_exit(self):
+        result, trace = self.run_stop('123 123 _')
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn('SHOULD_REACH_NEXT_SESSION', result.stdout)
+        self.assertNotIn('did not exit after SIGTERM', result.stderr)
+        self.assertIn('sleep 0.1', trace)
+
+    def test_stop_fails_before_next_session_when_server_never_exits(self):
+        result, trace = self.run_stop(' '.join(['123'] * 110))
+        self.assertEqual(result.returncode, 1, result.stdout + result.stderr)
+        self.assertNotIn('SHOULD_REACH_NEXT_SESSION', result.stdout)
+        self.assertIn('did not exit after SIGTERM', result.stderr)
+        self.assertIn('sleep 0.1', trace)
+
+
 if __name__ == '__main__':
     print('Offline mocks and bash syntax only. No network testbed is run.', flush=True)
     unittest.main(verbosity=2)

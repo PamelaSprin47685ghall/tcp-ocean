@@ -504,7 +504,15 @@ stop() {
     sleep 0.3
     if grep -q "closed by peer" "$work/server-$1.log"; then echo "session close($1): ok"
     else echo "FAILED: session close($1): the server did not log a close by the peer"; status=1; fi
-    pids_of "$work/aot/tbtun" | xargs -r sudo kill; sleep 0.5
+    pids_of "$work/aot/tbtun" | xargs -r sudo kill
+    # A TUN queue remains attached until its owner exits. Do not start the next
+    # server on a timer while the previous server is still draining.
+    for _ in $(seq 100); do
+        [[ -z $(pids_of "$work/aot/tbtun") ]] && return 0
+        sleep 0.1
+    done
+    echo "FAILED: server($1) did not exit after SIGTERM; refusing to start another session" >&2
+    return 1
 }
 goodput() { python3 -c 'import json,sys; d=json.load(sys.stdin); print("%.1f" % (d["end"]["sum_received"]["bits_per_second"]/1e6))'; }
 
