@@ -153,15 +153,15 @@ let ``released windows reject late data and parity without consuming capacity`` 
     Assert.Equal(WindowCodec.AddOutcome.OutOfCapacity, rx.TryAddSource(4UL, 0, 1, source))
     rx.ReleaseThrough 4UL
     Assert.Equal(0L, rx.AllocatedBytes)
-    Assert.Equal(WindowCodec.AddOutcome.Invalid, rx.TryAddSource(0UL, 0, 1, source))
-    Assert.Equal(WindowCodec.AddOutcome.Invalid, rx.TryAddParity(oldParity, source))
+    Assert.Equal(WindowCodec.AddOutcome.Stale, rx.TryAddSource(0UL, 0, 1, source))
+    Assert.Equal(WindowCodec.AddOutcome.Stale, rx.TryAddParity(oldParity, source))
     Assert.Equal(0, rx.Count)
     Assert.Equal(0L, rx.AllocatedBytes)
     rx.ReleaseThrough 1UL
-    Assert.Equal(WindowCodec.AddOutcome.Invalid, rx.TryAddSource(0UL, 0, 1, source))
+    Assert.Equal(WindowCodec.AddOutcome.Stale, rx.TryAddSource(0UL, 0, 1, source))
     Assert.Equal(WindowCodec.AddOutcome.Innovative, rx.TryAddSource(4UL, 0, 1, source))
     let allocated = rx.AllocatedBytes
-    Assert.Equal(WindowCodec.AddOutcome.Invalid, rx.TryAddParity(oldParity, source))
+    Assert.Equal(WindowCodec.AddOutcome.Stale, rx.TryAddParity(oldParity, source))
     Assert.Equal(1, rx.Count)
     Assert.Equal(allocated, rx.AllocatedBytes)
 

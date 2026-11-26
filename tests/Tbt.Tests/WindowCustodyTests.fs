@@ -61,7 +61,7 @@ let ``custody retains source while referenced and refuses old frames after relea
     Assert.Equal(12UL, rx.PublishedLimit)
     Assert.Equal(WindowCodec.AddOutcome.Innovative, rx.AddSource(8UL, 0, 1, Array.zeroCreate 32))
     Assert.True((rx :> ISourceStore).Source(0UL, 0).IsEmpty)
-    Assert.Equal(WindowCodec.AddOutcome.Invalid, rx.AddSource(0UL, 0, 1, Array.zeroCreate 32))
+    Assert.Equal(WindowCodec.AddOutcome.Stale, rx.AddSource(0UL, 0, 1, Array.zeroCreate 32))
 
 [<Fact>]
 let ``custody accepts sliced spans with the same grant and conflict rules`` () =

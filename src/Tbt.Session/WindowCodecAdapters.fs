@@ -51,6 +51,11 @@ type WindowStepEncoder(symbolSize: int, capacitySteps: int) =
             target <- Span<byte>.Empty
             false
         else
+            // Idempotent: a caller may begin a slot and abandon it without commit (a read
+            // error or WouldBlock between TryBeginSource and CommitSource). The owner thread
+            // serializes begin/commit, so re-offering the same slot simply hands back the same
+            // staging area; whatever garbage it holds is what Seal would have stored anyway —
+            // exactly the legacy StepRing contract for a slot nobody finished filling.
             opened <- true
             filled <- filled ||| (1us <<< slot)
             target <- Span(staging, slot * symbolSize, symbolSize)
@@ -59,7 +64,11 @@ type WindowStepEncoder(symbolSize: int, capacitySteps: int) =
         if not opened then invalidOp "no step is being filled"
         if k < 1 || k > 16 then invalidArg (nameof k) "step_used out of range"
         if head = UInt64.MaxValue then invalidOp "step number exhausted"
-        if filled <> uint16 ((1u <<< k) - 1u) then invalidOp "sources must be a contiguous prefix"
+        // Slots at or beyond k may carry residue of a begun-but-abandoned fill (a read error
+        // between TryBeginSource and CommitSource). The legacy ring silently drops such slots:
+        // they were never committed to the stream, so they are not part of this step. Require
+        // only the committed prefix; clear the rest with the bitset below.
+        if filled &&& uint16 ((1u <<< k) - 1u) <> uint16 ((1u <<< k) - 1u) then invalidOp "sources must be a contiguous prefix"
         for slot = 0 to k - 1 do
             if not (store.TryWrite(head, slot, ReadOnlySpan(staging, slot * symbolSize, symbolSize))) then
                 invalidOp "window source storage cannot accept sealed step"

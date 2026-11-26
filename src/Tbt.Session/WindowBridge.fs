@@ -225,7 +225,8 @@ type WindowReceive(symbolSize: int, maxWindows: int, maxBytes: int64, ?reserveCo
         | _ -> WindowSnapshotState.empty
 
     let add (id: uint64) (data: ReadOnlySpan<byte>) (candidate: WindowSnapshotState) (mask: uint64) =
-        if id < releasedBefore || data.Length <> symbolSize then WindowCodec.AddOutcome.Invalid
+        if id < releasedBefore then WindowCodec.AddOutcome.Stale
+        elif data.Length <> symbolSize then WindowCodec.AddOutcome.Invalid
         else
             let mutable opened = false
             if pool.TryGet(id).IsNone then opened <- pool.TryOpen(id, 64)

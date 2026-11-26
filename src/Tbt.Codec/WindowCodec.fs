@@ -90,6 +90,9 @@ type AddOutcome =
     | Duplicate
     | Invalid
     | OutOfCapacity
+    /// A correct frame of a window the receiver has already released. A legitimate
+    /// retransmission, never a contradiction: the caller must drop it silently.
+    | Stale
 
 /// Fixed-size reduced echelon matrix. AllocatedBytes counts array payloads,
 /// not CLR object headers, transient output copies, or caller-owned sources.
@@ -147,6 +150,9 @@ type Decoder(count: int, symbolSize: int, maxBytes: int64) =
         | Duplicate -> false
         | Invalid -> invalidOp "invalid or contradictory equation"
         | OutOfCapacity -> invalidOp "decoder row capacity exhausted"
+        // The bare matrix has no notion of windows: staleness is decided by the caller,
+        // so TryAdd itself never produces Stale. The case exists for the envelope type.
+        | Stale -> invalidOp "stale is a receiver-level outcome, never produced by TryAdd"
     /// Borrow a solved source row without allocating. The caller must keep this
     /// window alive and must not call Release while the span is in use. Adding
     /// equations leaves solved unit rows unchanged; the decoder is owner-thread only.

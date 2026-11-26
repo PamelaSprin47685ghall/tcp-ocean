@@ -803,7 +803,11 @@ type RxHalf(symbolSize: int, field: CodeField, decoder: ICodecDecoder, opener: C
             | _ -> None
         let accepted =
             match windowResult with
-            | Some WindowCodec.AddOutcome.Invalid | Some WindowCodec.AddOutcome.OutOfCapacity -> false
+            | Some WindowCodec.AddOutcome.Invalid
+            | Some WindowCodec.AddOutcome.OutOfCapacity
+            // A correct retransmission of a released window is neither evidence for the
+            // erasure ledger nor a conflict: the step numbers it carries are history.
+            | Some WindowCodec.AddOutcome.Stale -> false
             | _ -> true
         if not stale && accepted then noteTimelyArrival now m
         // Every cell of a traced step, not only a booster or the end-of-burst marker. The
