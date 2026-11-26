@@ -81,12 +81,12 @@ type Options(args: string[]) =
         | _ -> fallback
     member _.Has(name: string) = values.ContainsKey name
 
-/// Window coding is not yet connected to the session data plane.
-/// Reject explicit requests rather than silently using the legacy codec.
-let validateCodec (o: Options) =
+/// --codec legacy|window. Bit 11 and the window record are offered only for "window";
+/// an unknown name is the operator's mistake and must not silently run legacy.
+let windowCodec (o: Options) =
     match o.TextOr("codec", "legacy").Trim().ToLowerInvariant() with
-    | "legacy" -> ()
-    | "window" -> failUsage "--codec window is not implemented yet"
+    | "legacy" -> false
+    | "window" -> true
     | _ -> failUsage "option --codec must be legacy or window"
 
 /// The floor that keeps enough independent tuples open: explicit when given,

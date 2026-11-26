@@ -4,6 +4,7 @@ open System
 open Xunit
 open Tbt.Crypto.Bootstrap
 open Tbt.Cli.Common
+open Tbt.Session
 
 [<Fact>]
 let ``omitting --suites and --x25519 keeps the historical default offer`` () =
@@ -88,17 +89,29 @@ let ``a valid psk-file still parses into 32-byte keys with comments stripped`` (
         Assert.All(keys.[1], fun b -> Assert.Equal(0xBBuy, b)))
 
 [<Fact>]
-let ``an explicit window codec is refused instead of silently running legacy`` () =
-    let message = usageMessage (fun () -> validateCodec (Options([| "--codec"; "window" |])))
-    Assert.Contains("--codec window", message)
+let ``an explicit window codec selects window mode rather than silently running legacy`` () =
+    Assert.True(windowCodec (Options([| "--codec"; "window" |])))
+    Assert.True(windowCodec (Options([| "--codec"; " WiNdOw " |])))
 
 [<Fact>]
-let ``an unknown codec name is a usage error and legacy stays accepted`` () =
+let ``an unknown codec name is a usage error and legacy stays the default`` () =
     Assert.Contains("legacy or window",
-                    usageMessage (fun () -> validateCodec (Options([| "--codec"; "bogus" |]))))
-    validateCodec (Options([| |]))
-    validateCodec (Options([| "--codec"; "legacy" |]))
-    validateCodec (Options([| "--codec"; " LeGaCy " |]))
+                    usageMessage (fun () -> windowCodec (Options([| "--codec"; "bogus" |]))))
+    Assert.False(windowCodec (Options([| |])))
+    Assert.False(windowCodec (Options([| "--codec"; "legacy" |])))
+    Assert.False(windowCodec (Options([| "--codec"; " LeGaCy " |])))
+
+[<Fact>]
+let ``window geometry stays inside the receiver budget and never feeds a legacy span`` () =
+    // 1448-byte symbols: 128 windows (512 steps) fit in 16 MiB, so the configured 1024 is capped.
+    Assert.Equal(512, WindowGeometry.stepsFor 1448 1024)
+    // A large MSS shrinks the window instead of allocating past the budget.
+    Assert.Equal(116, WindowGeometry.stepsFor 9000 1024)
+    Assert.True(int64 (WindowGeometry.stepsFor 9000 1024) / 4L * 64L * 9000L <= (16L <<< 20))
+    // The configured span still binds when it is smaller.
+    Assert.Equal(64, WindowGeometry.stepsFor 1448 64)
+    // Symbols that cannot hold four windows are refused, not silently over-allocated.
+    Assert.Throws<ArgumentException>(fun () -> WindowGeometry.stepsFor 200_000 1024 |> ignore) |> ignore
 
 [<Fact>]
 let ``bounded options reject values outside the declared range`` () =

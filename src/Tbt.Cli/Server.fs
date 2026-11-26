@@ -156,7 +156,7 @@ type private Entry(carrier: SessionCarrier, maxPaths: int, admission: JoinAdmiss
     member e.Target = { Carrier = carrier; Admission = admission }
 
 let private runCore (o: Options) =
-    validateCodec o
+    let windowMode = windowCodec o
     let asyncMode = AsyncMode.isEnabled ()
     if asyncMode then log "async mode: one poller and one thread per session (TBTUN_ASYNC_MODE)"
     let mutable asyncGroup: AsyncPollerGroup option = None
@@ -234,9 +234,15 @@ let private runCore (o: Options) =
     let clock = CachedClock(SystemClock())
     let probe = SocketTuning.probe ()
     let struct (offerAegis, offerChaCha8, offerChaCha20, offerX25519) = offerFromOptions o
-    let offer = ServerOffer(psks, entropy, uint16 config.WindowSteps, maxPaths,
+    /// The initial step grant must not exceed the receiver's own window: a peer that honours
+    /// a larger grant would send past what this end can hold and the cells would be refused.
+    let grant0 =
+        if windowMode then uint16 (WindowGeometry.stepsFor mss config.WindowSteps)
+        else uint16 config.WindowSteps
+    let offer = ServerOffer(psks, entropy, grant0, maxPaths,
                             offerX25519 = offerX25519, offerChaCha8 = offerChaCha8,
-                            offerAegis = offerAegis, offerChaCha20 = offerChaCha20)
+                            offerAegis = offerAegis, offerChaCha20 = offerChaCha20,
+                            ?windowOffer = (if windowMode then Some Tbt.Crypto.Bootstrap.WindowOffer.defaults else None))
     let pending = List<Pending>()
     let sessions = List<Entry>()
     let mutable stop = 0

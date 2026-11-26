@@ -107,7 +107,7 @@ let private bootstrap (server: IPEndPoint) (host: string) (boot: byte[]) (window
         reraise()
 
 let private runCore (o: Options) =
-    validateCodec o
+    let windowMode = windowCodec o
     let asyncMode = AsyncMode.isEnabled ()
     let server = endpoint (o.Text "server")
     let hopPorts =
@@ -145,7 +145,8 @@ let private runCore (o: Options) =
         // Rotate through every line in the PSK file: a peer that has rolled to a later key still joins.
         let offer = ClientOffer(psks.[attempt % psks.Length], Guid.NewGuid(), entropy, uint64 (unixMs ()), mss, max 1 pathCount,
                                   offerX25519 = offerX25519, offerChaCha8 = offerChaCha8,
-                                  offerAegis = offerAegis, offerChaCha20 = offerChaCha20)
+                                  offerAegis = offerAegis, offerChaCha20 = offerChaCha20,
+                                  ?windowOffer = (if windowMode then Some Tbt.Crypto.Bootstrap.WindowOffer.defaults else None))
         let struct (link0, reply) = bootstrap (nextServer ()) host offer.Frame windowClamp notsentLowat userTimeoutMs timeoutMs
         match offer.TryAccept(ReadOnlySpan reply) with
         | ValueNone ->

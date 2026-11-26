@@ -86,6 +86,20 @@ type SessionParams =
       /// SERVER_INIT rx_win_grant0: the client may send up steps below it at once.
       Grant0: uint16 }
 
+/// Geometry of the sliding-window codec, shared by the session and the CLI grant so the
+/// initial window can never promise more steps than the receiver keeps.
+module WindowGeometry =
+    /// Steps (4-step windows x 16 slots) that fit the receiver's byte budget at this symbol
+    /// size, capped at 128 windows and by the configured span. Raises when not even four
+    /// windows fit: a window session at that MSS cannot stay inside MaxDecoderBytes.
+    let stepsFor (symbolSize: int) (configuredSteps: int) =
+        let perWindow = int64 symbolSize * int64 CodeGraph.SlotsPerStep * 4L
+        let fit = int (WindowCodec.WindowSessionCodec.MaxDecoderBytes / perWindow)
+        if fit < 4 then
+            invalidArg "symbolSize"
+                (String.Format("window codec does not fit: {0}-byte symbols leave room for {1} windows", symbolSize, fit))
+        min 128 (min (max 4 (configuredSteps / 4)) fit) * 4
+
 [<Sealed>]
 type private DecoderStore(decoder: ICodecDecoder) =
     interface ISourceStore with
@@ -107,18 +121,25 @@ type RxPreOpener(pre: CellPreOpener, epoch: unit -> int, snapshot: unit -> struc
 
 [<Sealed>]
 type Session(role: Role, p: SessionParams, port: IFlowPort, clock: IClock, config: SessionConfig) =
-    do
-        // Negotiation alone does not install the window-code data path.
-        if p.Caps &&& Caps.WindowCode <> 0us then
-            invalidArg "p" "window codec data path is not implemented"
     let s = p.Symbol
     let keys = p.Keys
     let client = role = Role.Client
     let txDir = if client then Direction.Up else Direction.Down
     let rxDir = if client then Direction.Down else Direction.Up
+    /// Bit 11 plus the echoed window record: both ends run the sliding-window sparse GF(2)
+    /// codec instead of the fixed-stride CodeGraph. The handshake already refused any peer
+    /// that did not echo the same record (Handshake.windowAgreed), so the bit here is final.
+    let windowMode = p.Caps &&& Caps.WindowCode <> 0us
+    /// The step span of the window codec: 4-step windows inside the receiver's byte budget,
+    /// capped at 128 windows. `WindowGeometry` is shared with the CLI so the granted initial
+    /// window can never exceed what the session actually keeps.
+    let effectiveSteps = if windowMode then WindowGeometry.stepsFor s config.WindowSteps else config.WindowSteps
+    let windowWindows = effectiveSteps / 4
     // URG-1 aside, bulk steps use GF(16) up and GF(2) down unless DL16 is on (spec 5.6a).
+    // The window codec is sparse GF(2) only.
     let fieldOf (d: Direction) =
-        if d = Direction.Up || p.Caps &&& Caps.Dl16 <> 0us then CodeField.Gf16 else CodeField.Gf2
+        if windowMode then CodeField.Gf2
+        elif d = Direction.Up || p.Caps &&& Caps.Dl16 <> 0us then CodeField.Gf16 else CodeField.Gf2
     let mask (hp: byte[]) : IHeaderMask =
         if p.Caps &&& Caps.HpMask = 0us then NoHeaderMask()
         else HeaderMasks.Create(p.Keys.Suite, ReadOnlySpan hp)
@@ -140,19 +161,31 @@ type Session(role: Role, p: SessionParams, port: IFlowPort, clock: IClock, confi
         publishRx ()
     let sealer = CellSealer(txDir, s, txKeys, mask (if client then keys.HpUp else keys.HpDown))
     let opener = CellOpener(rxDir, s, rxKeys, mask (if client then keys.HpDown else keys.HpUp))
-    let encoder = Encoder((if client then keys.GraphSeedUp else keys.GraphSeedDown), s, config.WindowSteps) :> ICodecEncoder
-    let decoder = Decoder((if client then keys.GraphSeedDown else keys.GraphSeedUp), s, config.WindowSteps, config.MaxRows) :> ICodecDecoder
+    let encoder: ICodecEncoder =
+        if windowMode then WindowStepEncoder(s, effectiveSteps) :> ICodecEncoder
+        else Encoder((if client then keys.GraphSeedUp else keys.GraphSeedDown), s, config.WindowSteps) :> ICodecEncoder
+    /// The window receiver has no legacy `ICodecDecoder` surface: it keeps its own
+    /// authenticated snapshot metadata, custody and grant. Only one of the two exists.
+    let windowDecoder =
+        if windowMode then Some (WindowSnapshotDecoder(s, windowWindows, WindowCodec.WindowSessionCodec.MaxDecoderBytes)) else None
+    let decoder: ICodecDecoder =
+        match windowDecoder with
+        | Some _ -> Unchecked.defaultof<ICodecDecoder>
+        | None -> Decoder((if client then keys.GraphSeedDown else keys.GraphSeedUp), s, config.WindowSteps, config.MaxRows) :> ICodecDecoder
     let tx =
         TxHalf(txDir, s, fieldOf txDir, encoder, sealer, config.Rho, config.FecAdaptive,
                config.RhoMin, config.RhoMax, config.RhoFloor, config.RhoGain,
-               config.FecWindowCells, config.MaxPaths, config.TxQueueCells, clock) :> ITxHalf
+               config.FecWindowCells, config.MaxPaths, config.TxQueueCells, clock, useWindowCodec = windowMode) :> ITxHalf
     do
         // The new per-step / evidence / tail-timer scheduler is opt-in. Off is
         // main's span OnNack exactly. When on, the server also uses RACK evidence.
         if config.NewRepair then
             tx.NewRepair <- true
             if not client then tx.EvidenceRepair <- true
-    let rx = RxHalf(s, fieldOf rxDir, decoder, opener, config.WindowSteps, config.MaxPaths) :> IRxHalf
+    let rx: IRxHalf =
+        match windowDecoder with
+        | Some wd -> RxHalf(s, CodeField.Gf2, Unchecked.defaultof<ICodecDecoder>, opener, effectiveSteps, config.MaxPaths, windowDecoder = wd) :> IRxHalf
+        | None -> RxHalf(s, fieldOf rxDir, decoder, opener, config.WindowSteps, config.MaxPaths) :> IRxHalf
     let both = Caps.FlowState ||| Caps.FlowState2
     let credit = { config.Credit with Enabled = config.Credit.Enabled && p.Caps &&& both = both }
     let hhfWindowNs = 100_000_000L
@@ -168,7 +201,13 @@ type Session(role: Role, p: SessionParams, port: IFlowPort, clock: IClock, confi
     let mutable reportedTxQueues = -1L
     let mutable windowsShrunk = false
     let mutable interactiveSources = 0L
-    let flows = FlowTable(port, DecoderStore decoder, Action<uint64, int>(fun t d -> rx.StepUndelivered(t, d)), credit)
+    /// Sources are borrowed from whichever decoder owns them; the flow table registers the
+    /// bytes it keeps and the window receiver releases a window only once nothing holds it.
+    let sourceStore: ISourceStore =
+        match windowDecoder with
+        | Some wd -> wd :> ISourceStore
+        | None -> DecoderStore decoder :> ISourceStore
+    let flows = FlowTable(port, sourceStore, Action<uint64, int>(fun t d -> rx.StepUndelivered(t, d)), credit)
     let governor = MemoryGovernor(MemTier.budgetBytes (MemTier.ofCaps p.Caps))
     let flowStatePeriodNs = 10_000_000L
     let snapshotPeriodNs = 1_000_000_000L
@@ -258,7 +297,7 @@ type Session(role: Role, p: SessionParams, port: IFlowPort, clock: IClock, confi
             { TLo = rx.AckStepLo; Deficit = uint16 nackDeficit; Span = byte (max 1 nackSpan)
               NackFlags = (if nackDeficit > 0 then 1uy else 0uy)
               ErasureMeanQ16 = rx.ErasureQ16; ErasureP95Q16 = rx.ErasureP95Q16
-              THi = (if decoder.SeenEnd > 0UL then decoder.SeenEnd - 1UL else 0UL)
+              THi = (if rx.SeenEnd > 0UL then rx.SeenEnd - 1UL else 0UL)
               RxTimeUs = uint64 (now / 1000L); PathCount = 0
               DecodedBitmap0 = bmp0; DecodedBitmap1 = bmp1; DecodedBitmap2 = bmp2; DecodedBitmap3 = bmp3
               CtrlAckHi = ctrl.AckHi; CtrlAckBitmap = ctrl.AckBitmap }
@@ -815,9 +854,13 @@ type Session(role: Role, p: SessionParams, port: IFlowPort, clock: IClock, confi
         // ReserveBytes is the delivery queue's rented chunks, not its credit commitment.
         let stride = int64 encoder.SymbolSize * int64 Tbt.Codec.CodeGraph.SlotsPerStep
         let encoderBytes = stride * int64 encoder.Capacity
-        let decoderBytes = stride * int64 config.WindowSteps
+        // Window mode owns its matrix accounting (the custody pool); there is no ring decoder.
+        let decoderBytes = if windowMode then 0L else stride * int64 config.WindowSteps
         let flowBytes = flows.ReserveBytes
-        let rowBytes = decoder.RowMemoryBytes
+        let rowBytes =
+            match windowDecoder with
+            | Some wd -> wd.AllocatedBytes
+            | None -> decoder.RowMemoryBytes
         if encoderBytes <> reportedEncoder then
             governor.Report(GovernorModules.EncoderRing, encoderBytes)
             reportedEncoder <- encoderBytes

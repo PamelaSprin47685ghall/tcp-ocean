@@ -56,15 +56,20 @@ let psk = Array.init 32 (fun i -> byte (i * 3 + 1))
 let unixMs = 1_800_000_000_000L
 
 /// Both ends of a session joined by in-memory paths.
-type Pair(config: SessionConfig, paths: int, loss: float, seed: int, ?wrapClock: ManualClock -> IClock) =
+type Pair(config: SessionConfig, paths: int, loss: float, seed: int, ?wrapClock: ManualClock -> IClock, ?window: bool) =
     let inner = ManualClock()
     let clock: IClock =
         match wrapClock with
         | Some f -> f inner
         | None -> inner :> IClock
     let entropy = SeededEntropy seed
-    let offer = ClientOffer(psk, Guid(Array.create 16 7uy), entropy, uint64 unixMs, 1448, 256)
-    let accepted = (ServerOffer([| psk |], entropy, uint16 config.WindowSteps, 256)).TryAccept(ReadOnlySpan offer.Frame, unixMs, 1448)
+    let windowMode = defaultArg window false
+    let windowOffer = if windowMode then Some WindowOffer.defaults else None
+    let grant0 =
+        if windowMode then uint16 (WindowGeometry.stepsFor 1448 config.WindowSteps)
+        else uint16 config.WindowSteps
+    let offer = ClientOffer(psk, Guid(Array.create 16 7uy), entropy, uint64 unixMs, 1448, 256, ?windowOffer = windowOffer)
+    let accepted = (ServerOffer([| psk |], entropy, grant0, 256, ?windowOffer = windowOffer)).TryAccept(ReadOnlySpan offer.Frame, unixMs, 1448)
     let serverParams = accepted.Value.Params
     let struct (clientParams, _) = offer.TryAccept(ReadOnlySpan accepted.Value.Reply).Value
     let clientPort = RecordingPort()
@@ -213,6 +218,23 @@ let ``echo returns every byte in order and closes both ends`` (loss: float, path
         Assert.True(pair.Dropped > 0)
         Assert.True(pair.Server.Rx.Counters.Recovered > 0L)
         Assert.True(pair.Client.Rx.Counters.Recovered > 0L)
+
+[<Theory>]
+[<InlineData(0.0, 4, 6)>]
+[<InlineData(0.05, 8, 3)>]
+let ``window codec echoes every byte in order through both directions`` (loss: float, paths: int, seed: int) =
+    let pair = Pair(SessionConfig.defaults, paths, loss, seed, window = true)
+    let payload = Array.init 200_000 (fun i -> byte (i * 11 + i / 253))
+    let slot = echo pair payload 40_000
+    Assert.Equal<byte[]>(payload, pair.ServerPort.Data.[slot].ToArray())
+    Assert.Equal<byte[]>(payload, pair.ClientPort.Data.[slot].ToArray())
+    Assert.Contains(slot, pair.ClientPort.Finished)
+    Assert.Contains(slot, pair.ClientPort.Closed)
+    if loss > 0.0 then
+        Assert.True(pair.Dropped > 0)
+        // Repairs came back as window parity, never as a legacy booster.
+        Assert.Equal(0L, pair.Client.Tx.BoostersSent)
+        Assert.Equal(0L, pair.Server.Tx.BoostersSent)
 
 [<Fact>]
 let ``a blocked local reader stops its flow through the flow credit, then resumes`` () =

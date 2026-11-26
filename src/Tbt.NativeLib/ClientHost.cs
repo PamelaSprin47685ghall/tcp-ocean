@@ -201,7 +201,7 @@ internal static class ClientHost
                     o.Psk, Guid.NewGuid(), entropy,
                     (ulong)DateTimeOffset.UtcNow.ToUnixTimeMilliseconds(),
                     o.Mss, Math.Max(1, o.PathCount),
-                    null, null, null, null, null);
+                    null, null, null, null, null, null);
                 boot = offer.Frame;
                 var got = Bootstrap(socket, o, boot);
                 if (got.Error != 0)

@@ -9,7 +9,9 @@ open Tbt.Crypto
 open Tbt.Wire
 
 [<Sealed>]
-type RxHalf(symbolSize: int, field: CodeField, decoder: ICodecDecoder, opener: CellOpener, capacitySteps: int, maxPaths: int) =
+type RxHalf(symbolSize: int, field: CodeField, decoder: ICodecDecoder, opener: CellOpener, capacitySteps: int, maxPaths: int, ?windowDecoder: WindowSnapshotDecoder) =
+    let window = windowDecoder
+    do if window.IsNone && isNull (box decoder) then nullArg (nameof decoder)
     let counters = RxCounters()
     let hold = ParityHold(symbolSize, 2 * capacitySteps)
     /// Per path: highest step of a DATA or PARITY cell seen, and when the path last gave one.
@@ -76,6 +78,13 @@ type RxHalf(symbolSize: int, field: CodeField, decoder: ICodecDecoder, opener: C
     let reorderSteps = uint64 (max 64 (capacitySteps / 2))
     let mutable flows: FlowTable = Unchecked.defaultof<_>
     let index (t: uint64) = int (t % uint64 capacitySteps)
+    let frontier () = match window with Some wd -> wd.Frontier | None -> decoder.Frontier
+    let seenEnd () = match window with Some wd -> wd.SeenEnd | None -> decoder.SeenEnd
+    let stepUsed t = match window with Some wd -> ValueOption.defaultValue 0 (wd.StepUsed t) | None -> decoder.StepUsed t
+    let isComplete t = match window with Some wd -> wd.IsStepComplete t | None -> decoder.IsStepComplete t
+    let source t s = match window with Some wd -> wd.Source(t, s) | None -> decoder.Source(t, s)
+    let wasRecovered t s = match window with Some wd -> wd.WasRecovered(t, s) | None -> decoder.WasRecovered(t, s)
+    let acknowledgeRecovered t s = match window with Some wd -> wd.AcknowledgeRecovered(t, s) | None -> decoder.AcknowledgeRecovered(t, s)
 
     // --- Timely (deadline) erasure accounting ---------------------------------------
     // Spec 6.9.4/6.10: the FEC controller's only input is the cell erasure rate of this
@@ -255,7 +264,7 @@ type RxHalf(symbolSize: int, field: CodeField, decoder: ICodecDecoder, opener: C
         if timelyStep.[i] = t && not timelyDone.[i] then
             let mutable target = int timelyTarget.[i]
             if target = 0 then
-                let k = decoder.StepUsed t
+                let k = stepUsed t
                 if k > 0 && k <= CodeGraph.SlotsPerStep then
                     target <- k
                     timelyTarget.[i] <- byte k
@@ -402,7 +411,7 @@ type RxHalf(symbolSize: int, field: CodeField, decoder: ICodecDecoder, opener: C
     /// not: at 165 Mbit/s and 40 ms RTT one path holds about 600 steps, and treating those
     /// cells as lost made a clean link report 33 % erasure and inflate rho to its ceiling.
     let foldEstimate () =
-        let f = decoder.Frontier
+        let f = frontier ()
         // The fold can only move when the frontier or some path's highest step moved:
         // rescanning every path on every cell was a full O(paths) walk per cell.
         let mutable stable = estimateFloor
@@ -450,7 +459,7 @@ type RxHalf(symbolSize: int, field: CodeField, decoder: ICodecDecoder, opener: C
     /// `OnCoded`, `Service` and `TryNack`. One record per call, `aux` = steps crossed.
     let traceFrontier (before: uint64) =
         if TraceGate.On then
-            let after = decoder.Frontier
+            let after = frontier ()
             if after > before then
                 Trace.record Trace.Ack after 0us (int (min 2147483647UL (after - before)))
 
@@ -459,16 +468,29 @@ type RxHalf(symbolSize: int, field: CodeField, decoder: ICodecDecoder, opener: C
         let mutable s = 0
         let mutable recovered = false
         let mutable e = Unchecked.defaultof<SourceEnvelope>
-        while decoder.TryTakeKnown(&t, &s, &recovered) do
-            if recovered then counters.Recovered <- counters.Recovered + 1L
-            if TraceGate.On then Trace.record Trace.Known t 0us (if recovered then 1 else 0)
-            // Timeliness of this source: a recovered slot was certainly erased, a direct
-            // slot is erased when it arrived past the step's deadline (spec 6.10).
-            observeTimely now t recovered
-            let symbol = decoder.Source(t, s)
-            if not (SourceEnvelope.tryRead symbol &e) then counters.EnvelopeErrors <- counters.EnvelopeErrors + 1L
-            elif e.Flags.HasFlag StreamFlags.Pad then ()
-            elif flows.OnSource(t, s, e) then flows.Pump(int e.FlowSlot)
+        let mutable more = match window with Some wd -> wd.TryTakeKnown(&t, &s, &recovered) | None -> decoder.TryTakeKnown(&t, &s, &recovered)
+        while more do
+            try
+                if recovered then
+                    counters.Recovered <- counters.Recovered + 1L
+                    // A parity may recover a whole step before any DATA for it arrived.
+                    // Start that step's timing ledger with its authenticated length.
+                    if window.IsSome && timelyStep.[index t] <> t then
+                        let k = stepUsed t
+                        if k > 0 then
+                            let synthetic = { Type = CellType.Data; Flags = MetaFlags.None; Slot = byte s; StepUsed = byte k
+                                              Aux = 0us; RxWinGrant = 0us; StepId = t; AckStepLo = 0UL
+                                              CarrierWm = 0UL; KHist = 0u; ErasureQ16 = 0us }
+                            noteTimelyArrival now synthetic
+                if TraceGate.On then Trace.record Trace.Known t 0us (if recovered then 1 else 0)
+                observeTimely now t recovered
+                let symbol = source t s
+                if not (SourceEnvelope.tryRead symbol &e) then counters.EnvelopeErrors <- counters.EnvelopeErrors + 1L
+                elif e.Flags.HasFlag StreamFlags.Pad then ()
+                elif flows.OnSource(t, s, e) then flows.Pump(int e.FlowSlot)
+            finally
+                match window with Some wd -> wd.FinishKnown t | None -> ()
+            more <- match window with Some wd -> wd.TryTakeKnown(&t, &s, &recovered) | None -> decoder.TryTakeKnown(&t, &s, &recovered)
 
     let offerParity (m: Meta) (symbol: ReadOnlySpan<byte>) =
         counters.ParitiesUsed <- counters.ParitiesUsed + 1L
@@ -477,7 +499,7 @@ type RxHalf(symbolSize: int, field: CodeField, decoder: ICodecDecoder, opener: C
     /// Evidence that the frontier step lost cells: every active path already gave a cell of
     /// a later step. TCP keeps the order on a path, so nothing sent earlier is still on the way.
     let lossEvident (now: int64) =
-        let f = decoder.Frontier
+        let f = frontier ()
         let mutable any = false
         let mutable all = true
         for k in 0 .. pathLiveCount - 1 do
@@ -489,7 +511,7 @@ type RxHalf(symbolSize: int, field: CodeField, decoder: ICodecDecoder, opener: C
 
     /// Give held parities to the decoder when it needs them; drop those it cannot use.
     let serviceHold (now: int64) (force: bool) =
-        let f = decoder.Frontier
+        let f = frontier ()
         if f <> lastFrontier then
             lastFrontier <- f
             frontierSince <- now
@@ -506,8 +528,8 @@ type RxHalf(symbolSize: int, field: CodeField, decoder: ICodecDecoder, opener: C
             while advanced && round < 4 do
                 round <- round + 1
                 advanced <- false
-                let curF = decoder.Frontier
-                if curF < decoder.SeenEnd && decoder.Deficit(curF, 1) > 0 then
+                let curF = frontier ()
+                if curF < seenEnd () && decoder.Deficit(curF, 1) > 0 then
                     let mutable i = 0
                     while not advanced && i < hold.Occupied do
                         let mutable hm = Unchecked.defaultof<Meta>
@@ -524,7 +546,7 @@ type RxHalf(symbolSize: int, field: CodeField, decoder: ICodecDecoder, opener: C
         let mutable symbol = ReadOnlySpan<byte>.Empty
         let mutable go = true
         while go && hold.TryPeek(&m, &addedNs, &symbol) do
-            let curF = decoder.Frontier
+            let curF = frontier ()
             // The frontier's own parities were already taken above, wherever they sat, so
             // this fifo branch only has to serve the tail cases. Draining the whole hold as
             // soon as the frontier waits a few ms was tried on 2026-11-20 (2 ms) and rolled
@@ -550,13 +572,16 @@ type RxHalf(symbolSize: int, field: CodeField, decoder: ICodecDecoder, opener: C
     member _.Attach(table: FlowTable) = flows <- table
 
     /// ack_step_lo: every step below it is decoded, checked and handed over (spec 6.9.1).
-    member _.AckStepLo = decoder.Frontier
+    member _.AckStepLo = frontier ()
 
     /// rx_win_grant: the peer may send steps below decoder base + window (never decreases).
     member _.Grant =
-        let limit = decoder.BaseStep + uint64 capacitySteps
-        let ack = decoder.Frontier
-        if limit <= ack then 0us else uint16 (min 65535UL (limit - ack))
+        match window with
+        | Some wd -> wd.NextGrant()
+        | None ->
+            let limit = decoder.BaseStep + uint64 capacitySteps
+            let ack = frontier ()
+            if limit <= ack then 0us else uint16 (min 65535UL (limit - ack))
 
     /// Cell erasure rate of this direction (spec 6.10): the mean over the recent due
     /// cells, counting a cell the carrier delivered only after its deadline. This is the
@@ -668,15 +693,15 @@ type RxHalf(symbolSize: int, field: CodeField, decoder: ICodecDecoder, opener: C
     /// its own. The sender needs it to stop repairing steps that already arrived, and to
     /// tell a proven hole from a merely reordered cell.
     member _.FillDecodedBitmap() =
-        let lo = decoder.Frontier
-        let hi = decoder.SeenEnd
+        let lo = frontier ()
+        let hi = seenEnd ()
         let mutable b0 = 0UL
         let mutable b1 = 0UL
         let mutable b2 = 0UL
         let mutable b3 = 0UL
         let mutable j = 0
         while j < 256 && lo < hi && uint64 j < hi - lo - 1UL do
-            if decoder.IsStepComplete(lo + 1UL + uint64 j) then
+            if isComplete (lo + 1UL + uint64 j) then
                 let bit = 1UL <<< (j % 64)
                 if j < 64 then b0 <- b0 ||| bit
                 elif j < 128 then b1 <- b1 ||| bit
@@ -695,15 +720,16 @@ type RxHalf(symbolSize: int, field: CodeField, decoder: ICodecDecoder, opener: C
     member _.StepUndelivered(t: uint64, delta: int) =
         let i = index t
         undelivered.[i] <- undelivered.[i] + delta
+        match window with Some wd -> wd.StepUndelivered(t, delta) | None -> ()
 
     /// Free decoder storage that no equation and no flow needs any more.
     member _.Release() =
-        let f = decoder.Frontier
+        let f = frontier ()
         while deliveredFloor < f && undelivered.[index deliveredFloor] = 0 do
             deliveredFloor <- deliveredFloor + 1UL
         let history = CodeGraph.HistorySpan + 64UL
         let floor = if f > history then f - history else 0UL
-        decoder.Release(min floor deliveredFloor)
+        match window with Some wd -> wd.Advance(clockNs) | None -> decoder.Release(min floor deliveredFloor)
         foldEstimate ()
 
     /// Receive pipeline steps 2..7 for one whole frame of path. Return the authenticated
@@ -748,7 +774,7 @@ type RxHalf(symbolSize: int, field: CodeField, decoder: ICodecDecoder, opener: C
         // Snapshot before the decoder sees this cell: OfferSource/OfferParity/OfferBooster
         // advance the frontier when the step completes, so a snapshot taken later (inside
         // drainKnown) would already include the advance caused by this very cell.
-        let frontierAtEntry = decoder.Frontier
+        let frontierAtEntry = frontier ()
         let p = int path
         lastCellNs <- now
         if now > clockNs then clockNs <- now
@@ -770,13 +796,22 @@ type RxHalf(symbolSize: int, field: CodeField, decoder: ICodecDecoder, opener: C
             timelyStep.[si] <> UInt64.MaxValue
             && timelyStep.[si] > m.StepId
             && timelyStep.[si] - m.StepId >= uint64 capacitySteps
-        if not stale then noteTimelyArrival now m
+        let windowResult =
+            match window, m.Type with
+            | Some wd, CellType.Data -> Some (wd.OfferSourceAt(m.StepId, int m.Slot, int m.StepUsed, symbol, now))
+            | Some wd, CellType.Parity -> Some (wd.OfferWindowParityAt(m, symbol, now))
+            | _ -> None
+        let accepted =
+            match windowResult with
+            | Some WindowCodec.AddOutcome.Invalid | Some WindowCodec.AddOutcome.OutOfCapacity -> false
+            | _ -> true
+        if not stale && accepted then noteTimelyArrival now m
         // Every cell of a traced step, not only a booster or the end-of-burst marker. The
         // probe's own DATA cell is the one whose arrival time decides whether the delay is
         // in the carrier or in the decoder, and it used to be the one record missing.
         if TraceGate.On then
             Trace.record Trace.Arrive m.StepId path (if m.Type = CellType.Data then 0 elif m.Type = CellType.Parity then 1 else 2)
-        if p < maxPaths && (m.Type = CellType.Data || m.Type = CellType.Parity) then
+        if accepted && p < maxPaths && (m.Type = CellType.Data || m.Type = CellType.Parity) then
             if pathSeenNs.[p] = 0L && pathLiveCount < maxPaths then
                 // Register the path once; the fold and the loss evidence walk this list
                 // instead of scanning all 288 ids for every cell.
@@ -787,6 +822,7 @@ type RxHalf(symbolSize: int, field: CodeField, decoder: ICodecDecoder, opener: C
                 pathStamp <- pathStamp + 1L
             pathSeenNs.[p] <- now
         match m.Type with
+        | CellType.Data when not accepted -> ()
         | CellType.Data ->
             // A cell whose step's ring slot is already retired must not touch the fold
             // accounting. `count` keys on `index m.StepId`, so a stale cell writes the OLD
@@ -800,7 +836,7 @@ type RxHalf(symbolSize: int, field: CodeField, decoder: ICodecDecoder, opener: C
             // skipping it here.
             if not stale then
                 count m
-                noteHistory m.StepId m.KHist
+                if window.IsNone then noteHistory m.StepId m.KHist
             // The step's own cell arrived, already authenticated by the carrier path. If a
             // rebuild had covered this slot, that rebuild was a race across reordered paths,
             // not a missing cell: withdraw it while the step's deadline still stands. Once the
@@ -808,7 +844,7 @@ type RxHalf(symbolSize: int, field: CodeField, decoder: ICodecDecoder, opener: C
             // `settlePending`, so an arrival after it stays an erasure (the spec says so).
             let si = index m.StepId
             if pendingStep.[si] = m.StepId && pendingErased.[si] > 0 && now <= pendingDeadline.[si]
-               && decoder.WasRecovered(m.StepId, int m.Slot) then
+               && wasRecovered m.StepId (int m.Slot) then
                 pendingErased.[si] <- pendingErased.[si] - 1
                 pendingCancelled.[si] <- pendingCancelled.[si] + 1
                 // The source was not erased, so the step's own tally must say so: that tally
@@ -820,13 +856,15 @@ type RxHalf(symbolSize: int, field: CodeField, decoder: ICodecDecoder, opener: C
                 // Idempotent per slot: a repair copy or a TCP retransmission delivers the same
                 // DATA cell twice, and the second copy used to withdraw a second pending
                 // erasure while `WasRecovered` was still true.
-                decoder.AcknowledgeRecovered(m.StepId, int m.Slot)
+                acknowledgeRecovered m.StepId (int m.Slot)
                 counters.ErasureCancelled <- counters.ErasureCancelled + 1L
-            decoder.OfferSource(m.StepId, int m.Slot, int m.StepUsed, symbol) |> ignore
+            if window.IsNone then decoder.OfferSource(m.StepId, int m.Slot, int m.StepUsed, symbol) |> ignore
+        | CellType.Parity when window.IsSome ->
+            if accepted then counters.ParitiesUsed <- counters.ParitiesUsed + 1L
         | CellType.Parity ->
             if decoder.NoteStepUsed(m.StepId, int m.StepUsed) then
                 noteHistory m.StepId m.KHist
-                if m.StepId < decoder.Frontier then counters.ParitiesUnused <- counters.ParitiesUnused + 1L
+                if m.StepId < frontier () then counters.ParitiesUnused <- counters.ParitiesUnused + 1L
                 else
                     // Under real loss a held parity costs a frontier stall: the decoder
                     // cannot use it until the hold releases it, and the hold is a FIFO
@@ -836,22 +874,24 @@ type RxHalf(symbolSize: int, field: CodeField, decoder: ICodecDecoder, opener: C
                     // parity no one needs would cost elimination work for nothing.
                     let struct (due, erased) = windowTotals ()
                     let lossy = due >= 16 && erased * 20 >= due
-                    if lossy || m.StepId <= decoder.Frontier || m.StepId - decoder.Frontier <= 1UL then offerParity m symbol
+                    if lossy || m.StepId <= frontier () || m.StepId - frontier () <= 1UL then offerParity m symbol
                     else
                         if hold.IsFull then
                             let mutable hm = Unchecked.defaultof<Meta>
                             let mutable hns = 0L
                             let mutable hs = ReadOnlySpan<byte>.Empty
                             if hold.TryPeek(&hm, &hns, &hs) then
-                                if hm.StepId < decoder.Frontier then counters.ParitiesUnused <- counters.ParitiesUnused + 1L
+                                if hm.StepId < frontier () then counters.ParitiesUnused <- counters.ParitiesUnused + 1L
                                 else offerParity hm hs
                                 hold.Drop()
                         hold.Add(m, now, symbol)
+        | CellType.Booster when window.IsSome -> counters.Unsupported <- counters.Unsupported + 1L
         | CellType.Booster -> decoder.OfferBooster(m.StepId, int m.StepUsed, int m.Slot, symbol) |> ignore
         | _ -> counters.Unsupported <- counters.Unsupported + 1L
         drainKnown now
-        serviceHold now false
+        if window.IsNone then serviceHold now false
         drainKnown now
+        match window with Some wd -> wd.Advance(now) | None -> ()
         // Release() is the only other caller and runs on its own slow cadence; folding here
         // keeps the estimate advancing even when Release is skipped or rare.
         foldEstimate ()
@@ -859,39 +899,57 @@ type RxHalf(symbolSize: int, field: CodeField, decoder: ICodecDecoder, opener: C
 
     /// Timer: held parities go to the decoder once the frontier waited too long.
     member _.Service(now: int64) =
-        let frontierAtEntry = decoder.Frontier
+        let frontierAtEntry = frontier ()
         if now > clockNs then clockNs <- now
         // Settlement is time-driven, not frame-driven. On a quiet link no cell arrives, yet a
         // rebuild whose deadline has passed is a real erasure and must still be booked;
         // frame-only settlement silently dropped those to zero, so a direction that had
         // genuinely lost cells reported less and less erasure the longer it stayed idle.
         settlePending now
-        serviceHold now false
+        if window.IsNone then serviceHold now false
         drainKnown now
         traceFrontier frontierAtEntry
 
     /// HEARTBEAT: the sender has sealed step t (spec 5.8 tail rule).
-    member _.OnHeartbeat(t: uint64) = decoder.NoteSeen t |> ignore
+    member _.OnHeartbeat(t: uint64) =
+        match window with
+        | Some wd -> if t <> UInt64.MaxValue then wd.ObserveEnd(t + 1UL, clockNs) |> ignore
+        | None -> decoder.NoteSeen t |> ignore
 
     /// NACK state (spec 5.8): the frontier step lacks rank, and a step 65 or more later was
     /// seen or the lack lasted 20 ms. Held parities go to the decoder first. Return the
     /// span and rank deficit to report, or false when no NACK is due.
     member _.TryNack(now: int64, span: byref<int>, deficit: byref<int>) =
-        let frontierAtEntry = decoder.Frontier
-        let f = decoder.Frontier
-        if f >= decoder.SeenEnd then false
-        elif decoder.SeenEnd - f < 66UL && now - frontierSince < 20_000_000L then false
-        else
-            serviceHold now true
+        match window with
+        | Some wd ->
+            if now > clockNs then clockNs <- now
             drainKnown now
-            // The only place in TryNack where the frontier can move.
-            traceFrontier frontierAtEntry
-            let f = decoder.Frontier
-            if f >= decoder.SeenEnd then false
+            wd.Advance(now)
+            if wd.TryNackRange(now, &span) then
+                deficit <- max 1 (wd.Deficit(wd.Frontier, span))
+                true
+            else false
+        | None ->
+            let frontierAtEntry = frontier ()
+            let f = frontier ()
+            if f >= seenEnd () then false
+            elif seenEnd () - f < 66UL && now - frontierSince < 20_000_000L then false
             else
-                span <- int (min 4UL (decoder.SeenEnd - f))
-                deficit <- decoder.Deficit(f, span)
-                deficit > 0
+                serviceHold now true
+                drainKnown now
+                traceFrontier frontierAtEntry
+                let f = frontier ()
+                if f >= seenEnd () then false
+                else
+                    span <- int (min 4UL (seenEnd () - f))
+                    deficit <- decoder.Deficit(f, span)
+                    deficit > 0
+
+    new(symbolSize: int, opener: CellOpener, capacitySteps: int, maxPaths: int, windowDecoder: WindowSnapshotDecoder) =
+        RxHalf(symbolSize, CodeField.Gf2, Unchecked.defaultof<ICodecDecoder>, opener, capacitySteps, maxPaths, windowDecoder = windowDecoder)
+
+    interface ISourceStore with
+        member _.Source(step, slot) = source step slot
 
     interface IRxHalf with
         member _.Counters = counters
@@ -908,14 +966,14 @@ type RxHalf(symbolSize: int, field: CodeField, decoder: ICodecDecoder, opener: C
         member this.LastFoldedStep = this.LastFoldedStep
         member this.LastFoldedExpected = this.LastFoldedExpected
         member this.LastFoldedReceived = this.LastFoldedReceived
-        member _.PendingRows = decoder.PendingRows
-        member _.FreeRows = decoder.FreeRows
-        member _.RowsAllocated = decoder.RowsAllocated
-        member _.StaleRows = decoder.StaleRows
-        member _.BaseStep = decoder.BaseStep
-        member _.KConflicts = decoder.KConflicts
-        member _.SeenEnd = decoder.SeenEnd
-        member _.IsStepComplete(step) = decoder.IsStepComplete(step)
+        member _.PendingRows = match window with Some wd -> wd.ActiveWindows | None -> decoder.PendingRows
+        member _.FreeRows = match window with Some wd -> wd.FreeWindows | None -> decoder.FreeRows
+        member _.RowsAllocated = match window with Some wd -> wd.MaxWindows | None -> decoder.RowsAllocated
+        member _.StaleRows = match window with Some _ -> 0L | None -> decoder.StaleRows
+        member _.BaseStep = match window with Some wd -> wd.CustodyFrontier | None -> decoder.BaseStep
+        member _.KConflicts = match window with Some wd -> wd.Conflicts | None -> decoder.KConflicts
+        member _.SeenEnd = seenEnd ()
+        member _.IsStepComplete(step) = isComplete step
         member this.Attach(table) = this.Attach(table)
         member this.FillDecodedBitmap() = this.FillDecodedBitmap()
         member this.StepUndelivered(t, delta) = this.StepUndelivered(t, delta)

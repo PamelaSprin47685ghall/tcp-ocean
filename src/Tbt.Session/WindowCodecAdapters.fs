@@ -158,6 +158,9 @@ type WindowSnapshotDecoder(symbolSize: int, maxWindows: int, maxBytes: int64) =
     member _.AllocatedBytes = custody.AllocatedBytes
     member _.ReservedBytes = custody.ReservedBytes
     member _.MaxWindows = maxWindows
+    member _.ActiveWindows = custody.ActiveWindows
+    member _.FreeWindows = maxWindows - custody.ActiveWindows
+    member _.IdleReservedCount = custody.IdleReservedCount
     member _.SeenEnd = gap.SeenEnd
     member _.NextGrant() = custody.NextGrant()
     member _.StepUsed(step: uint64) = custody.TryStepUsed step
@@ -220,6 +223,27 @@ type WindowSnapshotDecoder(symbolSize: int, maxWindows: int, maxBytes: int64) =
         | WindowCodec.AddOutcome.Invalid -> conflicts <- conflicts + 1L
         | _ -> ()
         result
+    /// Record progress only for accepted authenticated metadata. Time is supplied by
+    /// the owner and the gap tracker rejects backwards time.
+    member this.OfferSourceAt(step: uint64, slot: int, used: int, symbol: ReadOnlySpan<byte>, nowNs: int64) =
+        let result = this.OfferSource(step, slot, used, symbol)
+        match result with
+        | WindowCodec.AddOutcome.Innovative | WindowCodec.AddOutcome.Duplicate when step <> UInt64.MaxValue ->
+            gap.ObserveSealed(step, custody.PublishedLimit, nowNs) |> ignore
+            gap.Advance(custody.DecodedFrontier, nowNs) |> ignore
+        | _ -> ()
+        result
+    member this.OfferWindowParityAt(meta: Meta, symbol: ReadOnlySpan<byte>, nowNs: int64) =
+        let result = this.OfferWindowParity(meta, symbol)
+        match result with
+        | WindowCodec.AddOutcome.Innovative | WindowCodec.AddOutcome.Duplicate ->
+            // AddParity has already validated Aux and checked the addition against grant.
+            let steps = (uint64 meta.Aux - 1UL) / 16UL + 1UL
+            let last = meta.StepId + steps - 1UL
+            gap.ObserveSealed(last, custody.PublishedLimit, nowNs) |> ignore
+            gap.Advance(custody.DecodedFrontier, nowNs) |> ignore
+        | _ -> ()
+        result
     member _.TryTakeKnown(step: byref<uint64>, slot: byref<int>, isRecovered: byref<bool>) =
         if known.Count = 0 then false
         else
@@ -247,7 +271,9 @@ type WindowSnapshotDecoder(symbolSize: int, maxWindows: int, maxBytes: int64) =
         gap.Advance(custody.DecodedFrontier, nowNs) |> ignore
         let floor = custody.CustodyFrontier - custody.CustodyFrontier % 4UL
         recovered.RemoveWhere(Predicate<_>(fun struct (s, _) -> s < floor)) |> ignore
-    member _.TryNackRange(nowNs: int64, span: byref<int>) = gap.TryRange(nowNs, &span)
+    member _.TryNackRange(nowNs: int64, span: byref<int>) =
+        gap.Advance(custody.DecodedFrontier, nowNs) |> ignore
+        gap.TryRange(nowNs, &span)
     interface ISourceStore with
         member _.Source(step, slot) = (custody :> ISourceStore).Source(step, slot)
     interface IWindowDecoderSnapshot with

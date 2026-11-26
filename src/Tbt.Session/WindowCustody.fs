@@ -23,6 +23,7 @@ type WindowCustody(symbolSize: int, maxWindows: int, maxBytes: int64, ?reserveCo
     let mutable deliveringWindow = false
 
     member _.AllocatedBytes = receiver.AllocatedBytes
+    member _.ActiveWindows = receiver.Count
     /// Reserved matrix payload; excludes object overhead and other session buffers.
     member _.ReservedBytes = receiver.Pool.ReservedBytes
     member _.IdleReservedCount = receiver.Pool.IdleReservedCount
