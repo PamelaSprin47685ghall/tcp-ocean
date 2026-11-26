@@ -114,6 +114,42 @@ type WindowSnapshotDecoder(symbolSize: int, maxWindows: int, maxBytes: int64) =
     member _.NextGrant() = custody.NextGrant()
     member _.StepUsed(step: uint64) = custody.TryStepUsed step
     member _.Missing(step: uint64) = custody.MissingKnown step
+    /// Only authenticated, fully decoded steps are complete. Unknown lengths
+    /// must not be mistaken for empty or completed steps.
+    member _.IsStepComplete(step: uint64) =
+        match custody.MissingKnown step with
+        | ValueSome mask -> mask = 0us
+        | ValueNone -> false
+    member _.StepKnownCount(step: uint64) =
+        match custody.TryStepUsed step, custody.MissingKnown step with
+        | ValueSome used, ValueSome missing ->
+            used - System.Numerics.BitOperations.PopCount(uint32 missing)
+        | _ -> 0
+    /// Bit j represents step fromStep+j. No wrap past the step number limit.
+    member this.BuildDecodedBitmap(fromStep: uint64) =
+        let mutable a = 0UL
+        let mutable b = 0UL
+        let mutable c = 0UL
+        let mutable d = 0UL
+        for j = 0 to 255 do
+            if uint64 j <= UInt64.MaxValue - fromStep && this.IsStepComplete(fromStep + uint64 j) then
+                let bit = 1UL <<< (j % 64)
+                match j / 64 with
+                | 0 -> a <- a ||| bit
+                | 1 -> b <- b ||| bit
+                | 2 -> c <- c ||| bit
+                | _ -> d <- d ||| bit
+        struct (a, b, c, d)
+    /// Unknown step lengths are conservatively treated as up to 16 missing slots.
+    member _.Deficit(tLo: uint64, span: int) =
+        if span < 0 || span > 256 then invalidArg (nameof span) "must be in 0..256"
+        let mutable total = 0
+        for i = 0 to span - 1 do
+            if uint64 i <= UInt64.MaxValue - tLo then
+                match custody.MissingKnown(tLo + uint64 i) with
+                | ValueSome missing -> total <- total + System.Numerics.BitOperations.PopCount(uint32 missing)
+                | ValueNone -> total <- total + 16
+        total
     member _.ObserveEnd(endExclusive: uint64, nowNs: int64) =
         if endExclusive = 0UL then true
         else gap.ObserveSealed(endExclusive - 1UL, custody.PublishedLimit, nowNs)

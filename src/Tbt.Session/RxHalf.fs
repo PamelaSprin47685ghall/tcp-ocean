@@ -836,7 +836,7 @@ type RxHalf(symbolSize: int, field: CodeField, decoder: ICodecDecoder, opener: C
                     // parity no one needs would cost elimination work for nothing.
                     let struct (due, erased) = windowTotals ()
                     let lossy = due >= 16 && erased * 20 >= due
-                    if lossy || m.StepId <= decoder.Frontier + 1UL then offerParity m symbol
+                    if lossy || m.StepId <= decoder.Frontier || m.StepId - decoder.Frontier <= 1UL then offerParity m symbol
                     else
                         if hold.IsFull then
                             let mutable hm = Unchecked.defaultof<Meta>

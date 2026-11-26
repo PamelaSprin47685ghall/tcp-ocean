@@ -73,6 +73,26 @@ let private drainAndCheck (dec: WindowSnapshotDecoder) (filled: ResizeArray<uint
         Assert.True(seen.Contains(struct (step, slot)), sprintf "missing source %d/%d" step slot)
 
 [<Fact>]
+let ``decoder reports authenticated completion and unknown-step deficits without wrapping`` () =
+    let enc, _ = buildStream ()
+    let dec = makeDecoder ()
+    Assert.False(dec.IsStepComplete 0UL)
+    Assert.Equal(16, dec.Deficit(0UL, 1))
+    sendData enc dec 0UL 0
+    Assert.Equal(1, dec.StepKnownCount 0UL)
+    Assert.Equal(15, dec.Deficit(0UL, 1))
+    for slot = 1 to 15 do sendData enc dec 0UL slot
+    Assert.True(dec.IsStepComplete 0UL)
+    Assert.Equal(16, dec.StepKnownCount 0UL)
+    let struct (a, b, c, d) = dec.BuildDecodedBitmap 0UL
+    Assert.Equal(1UL, a)
+    Assert.Equal(0UL, b ||| c ||| d)
+    let struct (x, y, z, w) = dec.BuildDecodedBitmap UInt64.MaxValue
+    Assert.Equal(0UL, x ||| y ||| z ||| w)
+    Assert.Equal(16, dec.Deficit(UInt64.MaxValue, 2))
+    Assert.Throws<ArgumentException>(fun () -> dec.Deficit(0UL, 257) |> ignore) |> ignore
+
+[<Fact>]
 let ``maximum reservation fits the matrix payload budget`` () =
     let dec = WindowSnapshotDecoder(1344, 160, budget)
     Assert.True(dec.ReservedBytes > 0L)
