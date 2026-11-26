@@ -209,6 +209,15 @@ let ``async tx slots hold a full burst on a long-RTT path`` () =
     Assert.Equal(256, SocketTuning.txSlotsFor 512)
 
 [<Fact>]
+let ``window clamp failures are reported and never claimed as applied`` () =
+    let socket = new Socket(AddressFamily.InterNetwork, SocketType.Stream, ProtocolType.Tcp)
+    socket.Dispose()
+    let r = SocketTuning.applyWindowClamp(socket, 600000)
+    Assert.Equal(600000, r.Requested)
+    Assert.False(r.Applied)
+    Assert.False(String.IsNullOrWhiteSpace r.Error)
+
+[<Fact>]
 let ``linux stores twice the requested receive buffer`` () =
     Assert.Equal(8_000_000, SocketTuning.flowRecvWinFor SocketTuning.FlowRecvBuf)
     Assert.Equal(425_984, SocketTuning.flowRecvWinFor 212_992)

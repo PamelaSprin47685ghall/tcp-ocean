@@ -140,6 +140,7 @@ type WindowReceive(symbolSize: int, maxWindows: int, maxBytes: int64) =
                     decoder.Add(mask, data)
                 | ValueNone -> false
 
-    /// Delivered through this window id. Storage goes back to the pool budget.
+    /// Release only windows fully below the exclusive delivered step frontier.
     member _.ReleaseThrough(ackStep: uint64) =
-        if ackStep > 0UL then pool.ReleaseThrough(WindowBridge.windowId (ackStep - 1UL))
+        let completed = ackStep / uint64 WindowBridge.StepsPerWindow
+        if completed > 0UL then pool.ReleaseThrough(completed - 1UL)

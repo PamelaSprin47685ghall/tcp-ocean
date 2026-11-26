@@ -136,6 +136,34 @@ module SocketTuning =
             | :? SocketException -> false
             | :? ObjectDisposedException -> false
 
+    /// Result of requesting TCP_WINDOW_CLAMP. Applied means setsockopt succeeded;
+    /// it does not report the effective or advertised receive window.
+    [<Struct>]
+    type WindowClampResult =
+        { Requested: int
+          Applied: bool
+          Supported: bool
+          Error: string }
+
+    /// Set TCP_WINDOW_CLAMP without hiding the outcome. Unsupported platforms report
+    /// Supported=false. Both SocketException and ObjectDisposedException are results,
+    /// not success, so startup diagnostics can distinguish a failed clamp from a request.
+    let applyWindowClamp (socket: Socket, clamp: int) =
+        let c = Platform.current.Value
+        if not c.HasTcpWindowClamp then
+            { Requested = clamp; Applied = false; Supported = false
+              Error = "TCP_WINDOW_CLAMP unavailable on this platform" }
+        else
+            try
+                socket.SetRawSocketOption(6, 10, ReadOnlySpan(BitConverter.GetBytes clamp))
+                { Requested = clamp; Applied = true; Supported = true; Error = "" }
+            with
+            | :? SocketException as e ->
+                { Requested = clamp; Applied = false; Supported = true
+                  Error = string e.SocketErrorCode }
+            | :? ObjectDisposedException as e ->
+                { Requested = clamp; Applied = false; Supported = true; Error = e.Message }
+
     /// Settings for a path socket: no Nagle, small unsent queue (Linux TCP_NOTSENT_LOWAT).
     /// clamp is TCP_WINDOW_CLAMP in bytes (default WindowClamp, spec ch. 9).
     let pathWith (socket: Socket, clamp: int, notsentLowat: int, userTimeoutMs: int) =
@@ -161,11 +189,12 @@ module SocketTuning =
             // has nothing unacknowledged and is never touched.
             try socket.SetRawSocketOption(6, 18, ReadOnlySpan(BitConverter.GetBytes userTimeoutMs))
             with :? SocketException -> ()
-        if c.HasTcpWindowClamp then
-            // TCP_WINDOW_CLAMP; autotuning stays on (no SO_RCVBUF, spec 3.6).
-            try socket.SetRawSocketOption(6, 10, ReadOnlySpan(BitConverter.GetBytes clamp))
-            with :? SocketException -> ()
-        elif OperatingSystem.IsWindows() then
+        let clampResult = applyWindowClamp(socket, clamp)
+        if not clampResult.Applied && clampResult.Supported then
+            Console.Error.WriteLine(
+                "tbtun: TCP_WINDOW_CLAMP request " + string clampResult.Requested
+                + " failed (" + clampResult.Error + "); startup logs still show the request only")
+        if (not c.HasTcpWindowClamp) && OperatingSystem.IsWindows() then
             // Coarse send-queue cap when SIO_TCP_INFO / notsent is not implemented (D13).
             try socket.SendBufferSize <- 384 * 1024
             with :? SocketException -> ()

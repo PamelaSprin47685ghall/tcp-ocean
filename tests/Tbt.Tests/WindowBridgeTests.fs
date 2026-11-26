@@ -38,6 +38,20 @@ let ``step and slot map onto one 64-symbol window and back`` () =
     Assert.Equal(64, WindowBridge.tailLength 4 0)
 
 [<Fact>]
+let ``partial step acknowledgement retains the active window`` () =
+    let rx = WindowReceive(32, 8, 1L <<< 20)
+    let original = fill 32 4
+    Assert.True(rx.AddSource(0UL, 0, 64, original))
+    for ack in 1UL .. 3UL do
+        rx.ReleaseThrough ack
+        match rx.Pool.TryGet 0UL with
+        | ValueSome decoder -> Assert.Equal<byte[]>(original, decoder.TryGet(0).Value)
+        | ValueNone -> failwith "active window was released"
+    rx.ReleaseThrough 4UL
+    Assert.True(rx.Pool.TryGet 0UL |> ValueOption.isNone)
+    Assert.Equal(0L, rx.AllocatedBytes)
+
+[<Fact>]
 let ``parity meta round-trips and an out-of-order source recovers across the window`` () =
     let size = 32
     let tail = 50
