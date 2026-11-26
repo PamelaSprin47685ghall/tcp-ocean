@@ -49,6 +49,7 @@ let private sendParities (enc: WindowStepEncoder) (dec: WindowSnapshotDecoder) (
         let mutable meta = Unchecked.defaultof<Meta>
         if (enc :> IWindowEncoderMeta).TryRenderWindowParity(origin, p, Span<byte>(dst), &meta) then
             dec.OfferWindowParity(meta, ReadOnlySpan<byte>(dst)) |> ignore
+            (enc :> IWindowEncoderMeta).CommitParityIndex(origin / 4UL)
             sent <- sent + 1
         else
             p <- count
@@ -91,6 +92,44 @@ let ``decoder reports authenticated completion and unknown-step deficits without
     Assert.Equal(0UL, x ||| y ||| z ||| w)
     Assert.Equal(16, dec.Deficit(UInt64.MaxValue, 2))
     Assert.Throws<ArgumentException>(fun () -> dec.Deficit(0UL, 257) |> ignore) |> ignore
+
+[<Fact>]
+let ``window snapshot interface preserves authenticated parity outcomes`` () =
+    let enc, _ = buildStream ()
+    let dec = makeDecoder ()
+    let snapshot = dec :> IWindowDecoderSnapshot
+    Assert.True(snapshot.SafeGrant > 0us)
+    let dst = Array.zeroCreate<byte> symbolSize
+    let mutable meta = Unchecked.defaultof<Meta>
+    Assert.True((enc :> IWindowEncoderMeta).TryRenderWindowParity(0UL, 0, Span dst, &meta))
+    Assert.Equal(EquationResult.Innovative, snapshot.OfferWindowParity(meta, ReadOnlySpan dst))
+    Assert.Equal(EquationResult.Redundant, snapshot.OfferWindowParity(meta, ReadOnlySpan dst))
+    let malformed = { meta with KHist = meta.KHist ||| 0x800000u }
+    Assert.Equal(EquationResult.Useless, snapshot.OfferWindowParity(malformed, ReadOnlySpan dst))
+    Assert.True(dec.Conflicts > 0L)
+
+[<Fact>]
+let ``parity index is committed only after a successful send`` () =
+    let enc, _ = buildStream ()
+    let api = enc :> IWindowEncoderMeta
+    let bytes = Array.zeroCreate<byte> symbolSize
+    let retry = Array.zeroCreate<byte> symbolSize
+    let mutable meta = Unchecked.defaultof<Meta>
+    let mutable again = Unchecked.defaultof<Meta>
+    Assert.Equal(0, api.NextParityIndex 0UL)
+    Assert.True(api.TryRenderWindowParity(0UL, 0, Span bytes, &meta))
+    Assert.Equal(0, api.NextParityIndex 0UL)
+    Assert.True(api.TryRenderWindowParity(0UL, 0, Span retry, &again))
+    Assert.Equal<byte[]>(bytes, retry)
+    Assert.Equal(meta, again)
+    api.CommitParityIndex 0UL
+    for p = 1 to 47 do
+        Assert.Equal(p, api.NextParityIndex 0UL)
+        Assert.True(api.TryRenderWindowParity(0UL, p, Span bytes, &meta))
+        api.CommitParityIndex 0UL
+    Assert.Equal(-1, api.NextParityIndex 0UL)
+    enc.Release 4UL
+    Assert.Equal(-1, api.NextParityIndex 0UL)
 
 [<Fact>]
 let ``maximum reservation fits the matrix payload budget`` () =

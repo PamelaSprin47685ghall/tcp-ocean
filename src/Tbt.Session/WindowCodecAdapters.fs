@@ -7,7 +7,19 @@ open Tbt.Wire
 
 /// Window parity needs authenticated metadata unavailable to the legacy codec API.
 type IWindowEncoderMeta =
+    abstract NextParityIndex: uint64 -> int
+    abstract CommitParityIndex: uint64 -> unit
     abstract TryRenderWindowParity: uint64 * int * Span<byte> * byref<Meta> -> bool
+
+/// Window metadata and custody operations unavailable in the legacy decoder API.
+type IWindowDecoderSnapshot =
+    abstract OfferWindowParity: Meta * ReadOnlySpan<byte> -> EquationResult
+    abstract StepUndelivered: uint64 * int -> unit
+    abstract FinishKnown: uint64 -> unit
+    abstract SafeGrant: uint16
+    abstract ObserveEndAt: uint64 * int64 -> bool
+    abstract AdvanceAt: int64 -> unit
+    abstract TryNackRange: int64 * byref<int> -> bool
 
 /// Experimental adapter. Legacy parity and booster methods cannot represent window metadata.
 [<Sealed>]
@@ -19,6 +31,10 @@ type WindowStepEncoder(symbolSize: int, capacitySteps: int) =
     let maxWindows = capacitySteps / 4
     let store = WindowTxStore(symbolSize, maxWindows)
     let staging = Array.zeroCreate<byte> (16 * symbolSize)
+    // Rendering consumes the store's index; retain the frame until commit so a
+    // failed send can retry exactly the same authenticated parity metadata.
+    let parityPending = Dictionary<uint64, struct (int * byte[] * Meta)>()
+    let parityCursor = Dictionary<uint64, int>()
     let mutable head = 0UL
     let mutable tail = 0UL
     let mutable opened = false
@@ -60,18 +76,50 @@ type WindowStepEncoder(symbolSize: int, capacitySteps: int) =
     member _.Source(t: uint64, slot: int) : ReadOnlySpan<byte> =
         if t < tail || t >= head then ReadOnlySpan<byte>.Empty
         else (store :> ISourceStore).Source(t, slot)
-    member _.TryRenderWindowParity(t: uint64, p: int, dst: Span<byte>, meta: byref<Meta>) =
-        if t < tail || t >= head then false
+    member _.NextParityIndex(windowId: uint64) =
+        let mutable index = 0
+        parityCursor.TryGetValue(windowId, &index) |> ignore
+        if head = 0UL || windowId < tail / 4UL || windowId > (head - 1UL) / 4UL || index >= 48 then -1 else index
+    member _.CommitParityIndex(windowId: uint64) =
+        match parityPending.TryGetValue windowId with
+        | true, struct (index, _, _) ->
+            parityPending.Remove windowId |> ignore
+            parityCursor.[windowId] <- index + 1
+        | _ -> invalidOp "no rendered parity is awaiting commit"
+    member this.TryRenderWindowParity(t: uint64, p: int, dst: Span<byte>, meta: byref<Meta>) =
+        let id = WindowBridge.windowId t
+        if t < tail || t >= head || dst.Length <> symbolSize || p <> this.NextParityIndex id then false
         else
-            match store.TryRenderParity(WindowBridge.windowId t, p, dst) with
-            | ValueSome result -> meta <- result; true
-            | ValueNone -> false
+            match parityPending.TryGetValue id with
+            | true, struct (_, bytes, saved) ->
+                ReadOnlySpan<byte>(bytes).CopyTo(dst)
+                meta <- saved
+                true
+            | _ ->
+                let bytes = Array.zeroCreate<byte> symbolSize
+                match store.TryRenderParity(id, p, Span<byte>(bytes)) with
+                | ValueSome result ->
+                    parityPending.Add(id, struct (p, bytes, result))
+                    ReadOnlySpan<byte>(bytes).CopyTo(dst)
+                    meta <- result
+                    true
+                | ValueNone -> false
     member _.Release(below: uint64) =
         let complete = (min below head / 4UL) * 4UL
         if complete > tail then
             store.ReleaseThrough(complete, true)
+            let obsolete = ResizeArray<uint64>()
+            for KeyValue(id, _) in parityCursor do
+                if id < complete / 4UL then obsolete.Add id
+            for id in obsolete do parityCursor.Remove id |> ignore
+            obsolete.Clear()
+            for KeyValue(id, _) in parityPending do
+                if id < complete / 4UL then obsolete.Add id
+            for id in obsolete do parityPending.Remove id |> ignore
             tail <- complete
     interface IWindowEncoderMeta with
+        member x.NextParityIndex(id) = x.NextParityIndex id
+        member x.CommitParityIndex(id) = x.CommitParityIndex id
         member x.TryRenderWindowParity(t, p, dst, meta) = x.TryRenderWindowParity(t, p, dst, &meta)
     interface ICodecEncoder with
         member x.SymbolSize = x.SymbolSize
@@ -202,3 +250,16 @@ type WindowSnapshotDecoder(symbolSize: int, maxWindows: int, maxBytes: int64) =
     member _.TryNackRange(nowNs: int64, span: byref<int>) = gap.TryRange(nowNs, &span)
     interface ISourceStore with
         member _.Source(step, slot) = (custody :> ISourceStore).Source(step, slot)
+    interface IWindowDecoderSnapshot with
+        member x.OfferWindowParity(meta, symbol) =
+            match x.OfferWindowParity(meta, symbol) with
+            | WindowCodec.AddOutcome.Innovative -> EquationResult.Innovative
+            | WindowCodec.AddOutcome.Duplicate -> EquationResult.Redundant
+            | WindowCodec.AddOutcome.OutOfCapacity -> EquationResult.OutOfWindow
+            | _ -> EquationResult.Useless
+        member x.StepUndelivered(step, delta) = x.StepUndelivered(step, delta)
+        member x.FinishKnown(step) = x.FinishKnown(step)
+        member x.SafeGrant = x.NextGrant()
+        member x.ObserveEndAt(endExclusive, nowNs) = x.ObserveEnd(endExclusive, nowNs)
+        member x.AdvanceAt(nowNs) = x.Advance(nowNs)
+        member x.TryNackRange(nowNs, span) = x.TryNackRange(nowNs, &span)

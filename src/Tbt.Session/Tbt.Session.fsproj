@@ -3,12 +3,6 @@
     <Compile Include="Flows.fs" />
     <Compile Include="HalfInterfaces.fs" />
     <Compile Include="ControlLog.fs" />
-    <Compile Include="TxHalf.fs" />
-    <Compile Include="ParityHold.fs" />
-    <Compile Include="RxHalf.fs" />
-    <Compile Include="MemoryGovernor.fs" />
-    <Compile Include="Session.fs" />
-    <Compile Include="Handshake.fs" />
     <Compile Include="WindowBridge.fs" />
     <Compile Include="WindowRxBackend.fs" />
     <Compile Include="WindowRxGapTracker.fs" />
@@ -20,6 +14,12 @@
     <Compile Include="WindowRepairDispatch.fs" />
     <Compile Include="WindowParityDispatch.fs" />
     <Compile Include="WindowTxAdapter.fs" />
+    <Compile Include="TxHalf.fs" />
+    <Compile Include="ParityHold.fs" />
+    <Compile Include="RxHalf.fs" />
+    <Compile Include="MemoryGovernor.fs" />
+    <Compile Include="Session.fs" />
+    <Compile Include="Handshake.fs" />
     <Compile Include="JoinBootstrap.fs" />
   </ItemGroup>
   <ItemGroup>
