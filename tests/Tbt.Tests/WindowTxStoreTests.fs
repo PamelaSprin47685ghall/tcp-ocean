@@ -7,6 +7,37 @@ open Tbt.Session
 let private symbol n = Array.init 32 (fun i -> byte ((i + n * 17) % 256))
 
 [<Fact>]
+let ``reserved source is invisible until commit and cancellation frees capacity`` () =
+    let tx = WindowTxStore(32, 1)
+    let mutable slot = Span<byte>.Empty
+    Assert.True(tx.TryBeginWrite(0UL, 0, &slot))
+    slot.Fill(42uy)
+    Assert.True((tx :> ISourceStore).Source(0UL, 0).IsEmpty)
+    Assert.False(tx.TryWrite(0UL, 1, ReadOnlySpan(symbol 1)))
+    Assert.False(tx.CommitWrite(0UL, 1))
+    tx.ReleaseThrough(4UL, true)
+    Assert.Equal(1, tx.Count)
+    Assert.True(tx.CommitWrite(0UL, 0))
+    Assert.True((tx :> ISourceStore).Source(0UL, 0).SequenceEqual(ReadOnlySpan(Array.create 32 42uy)))
+    Assert.True(tx.SealStep(0UL, 1))
+    tx.ReleaseThrough(4UL, true)
+    Assert.True(tx.TryBeginWrite(4UL, 0, &slot))
+    tx.CancelWrite()
+    Assert.Equal(0, tx.Count)
+    Assert.False(tx.CommitWrite(4UL, 0))
+
+[<Fact>]
+let ``a step cannot seal while a source in that step is reserved`` () =
+    let tx = WindowTxStore(32, 1)
+    Assert.True(tx.TryWrite(0UL, 0, ReadOnlySpan(symbol 1)))
+    let mutable slot = Span<byte>.Empty
+    Assert.True(tx.TryBeginWrite(0UL, 1, &slot))
+    Assert.False(tx.SealStep(0UL, 1))
+    slot.Fill(7uy)
+    Assert.True(tx.CommitWrite(0UL, 1))
+    Assert.True(tx.SealStep(0UL, 2))
+
+[<Fact>]
 let ``sealed partial steps render parity that recovers an entirely lost step`` () =
     let tx = WindowTxStore(32, 2)
     let a, b, c = symbol 1, symbol 2, symbol 3

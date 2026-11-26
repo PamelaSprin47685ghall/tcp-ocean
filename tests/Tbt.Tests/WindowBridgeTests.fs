@@ -144,6 +144,22 @@ let ``steady receiver calls allocate no managed memory`` () =
     Assert.Equal<byte[]>(source, dst)
 
 [<Fact>]
+let ``receiver distinguishes duplicate invalid and capacity without losing data`` () =
+    let rx = WindowReceive(32, 1, 1L <<< 20)
+    let a = fill 32 17
+    let b = fill 32 18
+    Assert.Equal(WindowCodec.AddOutcome.Innovative, rx.TryAddSource(0UL, 0, 1, a))
+    Assert.Equal(WindowCodec.AddOutcome.Duplicate, rx.TryAddSource(0UL, 0, 1, a))
+    Assert.Equal(WindowCodec.AddOutcome.Invalid, rx.TryAddSource(0UL, 0, 1, b))
+    Assert.Equal(WindowCodec.AddOutcome.Invalid, rx.TryAddSource(0UL, 0, 2, a))
+    Assert.Equal(WindowCodec.AddOutcome.OutOfCapacity, rx.TryAddSource(4UL, 0, 1, b))
+    let dst = Array.zeroCreate<byte> 32
+    Assert.True(rx.TryCopyKnown(0UL, 0, Span dst))
+    Assert.Equal<byte[]>(a, dst)
+    rx.ReleaseThrough 4UL
+    Assert.Equal(WindowCodec.AddOutcome.Innovative, rx.TryAddSource(4UL, 0, 1, b))
+
+[<Fact>]
 let ``receive rejects conflicting authenticated snapshots and retains original sources`` () =
     let rx = WindowReceive(32, 2, 1L <<< 20)
     let a = fill 32 17

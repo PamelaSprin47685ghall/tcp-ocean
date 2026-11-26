@@ -25,17 +25,62 @@ type private TxWindow(symbolSize: int) =
 type WindowTxStore(symbolSize: int, maxWindows: int) =
     let windows = Dictionary<uint64, TxWindow>()
     let mutable releasedBefore = 0UL
+    // One owner-thread reservation at a time. The returned span is valid only
+    // until CommitWrite or CancelWrite; it must not escape that interval.
+    let mutable reservedStep = 0UL
+    let mutable reservedSlot = -1
     do
         if symbolSize <= 0 || symbolSize > Int32.MaxValue / 64 then invalidArg (nameof symbolSize) "invalid symbol size"
         if maxWindows <= 0 then invalidArg (nameof maxWindows) "must be positive"
 
     member _.Count = windows.Count
 
+    /// Reserves one writable slot; it is invisible to readers until committed.
+    member _.TryBeginWrite(step: uint64, slot: int, target: byref<Span<byte>>) =
+        target <- Span<byte>.Empty
+        let id = WindowBridge.windowId step
+        match WindowBridge.tryIndex (step, slot) with
+        | ValueNone -> false
+        | ValueSome _ when reservedSlot >= 0 || id < releasedBefore -> false
+        | ValueSome index ->
+            let mutable w = Unchecked.defaultof<TxWindow>
+            let found = windows.TryGetValue(id, &w)
+            if not found && windows.Count >= maxWindows then false
+            else
+                if not found then
+                    w <- TxWindow(symbolSize)
+                    windows.Add(id, w)
+                let bit = 1UL <<< index
+                if int (step % 4UL) < w.SealedCount || w.Present &&& bit <> 0UL then false
+                else
+                    reservedStep <- step
+                    reservedSlot <- slot
+                    target <- Span(w.Bytes, index * symbolSize, symbolSize)
+                    true
+
+    member _.CommitWrite(step: uint64, slot: int) =
+        if reservedSlot <> slot || reservedSlot < 0 || reservedStep <> step then false
+        else
+            let w = windows.[WindowBridge.windowId step]
+            let index = int (step % 4UL) * 16 + slot
+            w.Present <- w.Present ||| (1UL <<< index)
+            reservedSlot <- -1
+            true
+
+    member _.CancelWrite() =
+        if reservedSlot >= 0 then
+            let id = WindowBridge.windowId reservedStep
+            let w = windows.[id]
+            let index = int (reservedStep % 4UL) * 16 + reservedSlot
+            Span(w.Bytes, index * symbolSize, symbolSize).Clear()
+            reservedSlot <- -1
+            if w.Present = 0UL && w.SealedCount = 0 then windows.Remove id |> ignore
+
     member _.TryWrite(step: uint64, slot: int, data: ReadOnlySpan<byte>) =
         let id = WindowBridge.windowId step
         match WindowBridge.tryIndex (step, slot) with
         | ValueNone -> false
-        | ValueSome index when id < releasedBefore || data.Length <> symbolSize -> false
+        | ValueSome _ when reservedSlot >= 0 || id < releasedBefore || data.Length <> symbolSize -> false
         | ValueSome index ->
             let mutable w = Unchecked.defaultof<TxWindow>
             let found = windows.TryGetValue(id, &w)
@@ -58,7 +103,8 @@ type WindowTxStore(symbolSize: int, maxWindows: int) =
         | false, _ -> false
         | true, w ->
             let offset = int (step % 4UL)
-            if stepUsed < 1 || stepUsed > 16 || offset <> w.SealedCount then false
+            if reservedSlot >= 0 && reservedStep = step then false
+            elif stepUsed < 1 || stepUsed > 16 || offset <> w.SealedCount then false
             else
                 let actual = (w.Present >>> (offset * 16)) &&& 0xFFFFUL
                 let expected = (1UL <<< stepUsed) - 1UL
@@ -90,7 +136,7 @@ type WindowTxStore(symbolSize: int, maxWindows: int) =
 
     /// Caller must establish absence of outstanding source references before release.
     member _.ReleaseThrough(peerAck: uint64, noPendingReferences: bool) =
-        if noPendingReferences then
+        if noPendingReferences && reservedSlot < 0 then
             let before = peerAck / 4UL
             let remove = ResizeArray<uint64>()
             for KeyValue(id, _) in windows do
