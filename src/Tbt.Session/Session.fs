@@ -107,6 +107,10 @@ type RxPreOpener(pre: CellPreOpener, epoch: unit -> int, snapshot: unit -> struc
 
 [<Sealed>]
 type Session(role: Role, p: SessionParams, port: IFlowPort, clock: IClock, config: SessionConfig) =
+    do
+        // Negotiation alone does not install the window-code data path.
+        if p.Caps &&& Caps.WindowCode <> 0us then
+            invalidArg "p" "window codec data path is not implemented"
     let s = p.Symbol
     let keys = p.Keys
     let client = role = Role.Client

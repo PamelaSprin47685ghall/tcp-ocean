@@ -123,6 +123,17 @@ let private handshake (x25519: bool) (chaCha8: bool) (aegis: bool) (seedC: int) 
     let serverParams = accepted.Value.Params
     struct (clientParams, serverParams, sh)
 
+[<Fact>]
+let ``negotiated window codec cannot construct a legacy data session`` () =
+    let offer = ClientOffer(psk, id, SeededEntropy 301, uint64 unixMs, 1448, 256, windowOffer = WindowOffer.defaults)
+    let server = ServerOffer([| psk |], SeededEntropy 302, 4096us, 256, windowOffer = WindowOffer.defaults)
+    let accepted = server.TryAccept(ReadOnlySpan offer.Frame, unixMs, 1448).Value
+    let struct (client, _) = offer.TryAccept(ReadOnlySpan accepted.Reply).Value
+    for (role, parameters) in [ Role.Client, client; Role.Server, accepted.Params ] do
+        let ex = Assert.Throws<ArgumentException>(fun () ->
+            Session(role, parameters, RecordingPort(), ManualClock(), SessionConfig.defaults) |> ignore)
+        Assert.Contains("window codec data path is not implemented", ex.Message)
+
 let private frameRoundTrip (cp: SessionParams) (sp: SessionParams) =
     Assert.Equal(cp.Keys.Suite, sp.Keys.Suite)
     Assert.Equal<byte[]>(cp.Keys.UpKey 0u, sp.Keys.UpKey 0u)
