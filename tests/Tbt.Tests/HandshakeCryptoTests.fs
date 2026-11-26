@@ -236,10 +236,21 @@ let ``window offer is negotiated only when both ends echo the same record`` () =
     Assert.Equal(Caps.WindowCode, accepted.Value.Params.Caps &&& Caps.WindowCode)
 
 [<Fact>]
-let ``window parameter mismatch is rejected rather than decoded as the legacy code`` () =
-    let other = { WindowOffer.defaults with SymbolCount = 32us }
-    let struct (_, accepted) = windowHandshake WindowOffer.defaults other
-    Assert.True(accepted.IsNone)
+let ``unsupported window parameters are rejected even when peers match`` () =
+    let p = WindowOffer.defaults
+    let unsupported =
+        [| { p with Version = 2uy }; { p with WindowSteps = 3uy }
+           { p with Field = 1uy }; { p with Degree = 8uy }; { p with SymbolCount = 32us } |]
+    Assert.True(WindowOffer.isValid p)
+    for other in unsupported do
+        Assert.False(WindowOffer.isValid other)
+        let padding = Array.zeroCreate WindowOffer.Length
+        WindowOffer.write (Span padding) other
+        Assert.True(WindowOffer.tryRead (ReadOnlySpan padding) |> ValueOption.isNone)
+        Assert.Throws<ArgumentException>(fun () ->
+            ClientOffer(psk, id, SeededEntropy 301, uint64 unixMs, 1448, 256, windowOffer = other) |> ignore) |> ignore
+        Assert.Throws<ArgumentException>(fun () ->
+            ServerOffer([| psk |], SeededEntropy 302, 4096us, 256, windowOffer = other) |> ignore) |> ignore
 
 [<Fact>]
 let ``window version mismatch is rejected`` () =

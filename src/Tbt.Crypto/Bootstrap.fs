@@ -98,6 +98,7 @@ module WindowOffer =
     [<Literal>]
     let DefaultSymbols = 64us
 
+    /// Policy 3: degree(k) = min(k, 8, max(3, k / 8)), not a fixed degree.
     [<Literal>]
     let DefaultDegree = 3uy
 
@@ -114,9 +115,9 @@ module WindowOffer =
           Degree = DefaultDegree; SymbolCount = DefaultSymbols }
 
     let isValid (p: Params) =
-        p.Version = Version && p.WindowSteps >= 1uy && p.WindowSteps <= 16uy
-        && p.Field = FieldGf2 && p.Degree >= 1uy && p.Degree <= 8uy
-        && p.SymbolCount >= 1us && p.SymbolCount <= 64us
+        p.Version = Version && p.WindowSteps = DefaultSteps
+        && p.Field = FieldGf2 && p.Degree = DefaultDegree
+        && p.SymbolCount = DefaultSymbols
 
     let write (dst: Span<byte>) (p: Params) =
         if dst.Length < Length then invalidArg (nameof dst) "need 8 bytes"

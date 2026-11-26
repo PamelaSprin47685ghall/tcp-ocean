@@ -38,6 +38,78 @@ let ``step and slot map onto one 64-symbol window and back`` () =
     Assert.Equal(64, WindowBridge.tailLength 4 0)
 
 [<Fact>]
+let ``sealed snapshots preserve sparse slots even when a step is wholly lost`` () =
+    let struct (tail, history, mask) = WindowBridge.sealSnapshot [| 1; 16; 3 |]
+    Assert.Equal(35us, tail)
+    Assert.Equal(0x2F0u, history)
+    Assert.Equal(1UL ||| (0xFFFFUL <<< 16) ||| (7UL <<< 32), mask)
+    // No DATA from the second step is needed to reconstruct its active slots.
+    Assert.Equal(ValueSome mask, WindowBridge.trySnapshot tail history)
+    for lengths in [| [|1|]; [|16|]; [|1; 1|]; [|16; 16; 16; 16|]; [|3; 1; 16; 7|] |] do
+        let struct (t, h, expected) = WindowBridge.sealSnapshot lengths
+        Assert.Equal(ValueSome expected, WindowBridge.trySnapshot t h)
+
+[<Fact>]
+let ``sealed snapshots reject malformed boundary and unused bits`` () =
+    Assert.True(WindowBridge.trySnapshot 0us 0u |> ValueOption.isNone)
+    Assert.True(WindowBridge.trySnapshot 65us 0u |> ValueOption.isNone)
+    Assert.True(WindowBridge.trySnapshot 1us 1u |> ValueOption.isNone)
+    Assert.True(WindowBridge.trySnapshot 1us 0x10u |> ValueOption.isNone)
+    Assert.True(WindowBridge.trySnapshot 1us 0x10000u |> ValueOption.isNone)
+    Assert.Throws<ArgumentException>(fun () -> WindowBridge.sealSnapshot [||] |> ignore) |> ignore
+    Assert.Throws<ArgumentException>(fun () -> WindowBridge.sealSnapshot [|1; 0|] |> ignore) |> ignore
+    Assert.Throws<ArgumentException>(fun () -> WindowBridge.sealSnapshot [|17|] |> ignore) |> ignore
+
+[<Fact>]
+let ``snapshot parity derives identical masks from authenticated sparse metadata`` () =
+    for lengths in [| [|1; 16; 3|]; [|16; 16; 16; 16|]; [|1|] |] do
+        for idx in [|0; 7; 47|] do
+            let struct (meta, mask) = WindowBridge.snapshotParity 2UL idx lengths
+            let struct (_, _, active) = WindowBridge.sealSnapshot lengths
+            Assert.NotEqual(0UL, mask)
+            Assert.Equal(0UL, mask &&& ~~~active)
+            let buf = Array.zeroCreate 40
+            Meta.write meta (Span buf)
+            let mutable parsed = Unchecked.defaultof<Meta>
+            Assert.True(Meta.tryRead (ReadOnlySpan buf) &parsed)
+            Assert.Equal(ValueSome mask, WindowBridge.trySnapshotParityMask parsed)
+            Assert.Equal(ValueSome mask, WindowBridge.trySnapshotParityMask meta)
+    let struct (oldMeta, oldMask) = WindowBridge.snapshotParity 2UL 7 [|1; 16|]
+    let struct (newMeta, _) = WindowBridge.snapshotParity 2UL 7 [|1; 16; 3|]
+    Assert.Equal(ValueSome oldMask, WindowBridge.trySnapshotParityMask oldMeta)
+    Assert.NotEqual(oldMeta.Aux, newMeta.Aux)
+    Assert.True(WindowBridge.trySnapshotParityMask { oldMeta with KHist = oldMeta.KHist ||| 0x10000u } |> ValueOption.isNone)
+    Assert.True(WindowBridge.trySnapshotParityMask { oldMeta with Slot = 48uy } |> ValueOption.isNone)
+    Assert.True(WindowBridge.trySnapshotParityMask { oldMeta with StepId = 9UL } |> ValueOption.isNone)
+    Assert.True(WindowBridge.trySnapshotParityMask { oldMeta with Aux = 0us } |> ValueOption.isNone)
+
+[<Fact>]
+let ``snapshot tracker handles reordering duplicates and atomic conflicts`` () =
+    let tracker = WindowSnapshotTracker(2UL)
+    let struct (short, _) = WindowBridge.snapshotParity 2UL 0 [| 1; 16 |]
+    let struct (long, _) = WindowBridge.snapshotParity 2UL 1 [| 1; 16; 3; 7 |]
+    let struct (bad, _) = WindowBridge.snapshotParity 2UL 2 [| 1; 15; 3 |]
+    Assert.True(tracker.TryData(10UL, 2, 3))
+    Assert.True(tracker.TrySnapshot short)
+    Assert.True(tracker.TrySnapshot long)
+    Assert.True(tracker.TrySnapshot short)
+    Assert.True(tracker.TrySnapshot long)
+    Assert.False(tracker.TrySnapshot bad)
+    Assert.Equal(ValueSome 16, tracker.StepUsed 1)
+    Assert.Equal(ValueSome 7, tracker.StepUsed 3)
+    Assert.False(tracker.TryData(11UL, 0, 8))
+    Assert.False(tracker.TryData(12UL, 0, 1))
+    Assert.False(tracker.TryData(8UL, -1, 1))
+    Assert.Equal(ValueSome 1, tracker.StepUsed 0)
+    let fresh = WindowSnapshotTracker(2UL)
+    Assert.True(fresh.TryData(10UL, 0, 4))
+    Assert.False(fresh.TrySnapshot long)
+    Assert.Equal(ValueNone, fresh.StepUsed 0)
+    Assert.Equal(ValueSome 4, fresh.StepUsed 2)
+    Assert.False(fresh.TrySnapshot { long with KHist = long.KHist ||| 0x10000u })
+    Assert.Equal(ValueNone, fresh.StepUsed 1)
+
+[<Fact>]
 let ``partial step acknowledgement retains the active window`` () =
     let rx = WindowReceive(32, 8, 1L <<< 20)
     let original = fill 32 4

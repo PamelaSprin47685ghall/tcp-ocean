@@ -54,6 +54,39 @@ module WindowBridge =
         elif lastStepUsed = 0 then sealedStepsInWindow * SlotsPerStep
         else sealedStepsInWindow * SlotsPerStep + lastStepUsed
 
+    /// Encode a nonempty prefix of sealed step lengths into authenticated parity fields.
+    /// Aux is the exclusive physical-slot boundary; KHist stores four k-1 nibbles.
+    let sealSnapshot (stepLengths: int[]) =
+        if isNull (box stepLengths) || stepLengths.Length < 1 || stepLengths.Length > StepsPerWindow then
+            invalidArg (nameof stepLengths) "expected one to four sealed steps"
+        let mutable history = 0u
+        let mutable active = 0UL
+        for i = 0 to stepLengths.Length - 1 do
+            let k = stepLengths.[i]
+            if k < 1 || k > SlotsPerStep then invalidArg (nameof stepLengths) "step length must be 1..16"
+            history <- history ||| (uint32 (k - 1) <<< (4 * i))
+            active <- active ||| (((1UL <<< k) - 1UL) <<< (i * SlotsPerStep))
+        let tail = (stepLengths.Length - 1) * SlotsPerStep + stepLengths.[stepLengths.Length - 1]
+        struct (uint16 tail, history, active)
+
+    /// Validate and decode a parity snapshot. It must already have been authenticated.
+    let trySnapshot (tail: uint16) (history: uint32) =
+        if tail < 1us || tail > uint16 SymbolsPerWindow || history &&& 0xFFFF0000u <> 0u then ValueNone
+        else
+            let count = (int tail - 1) / SlotsPerStep + 1
+            let usedBits = count * 4
+            let allowed = (1u <<< usedBits) - 1u
+            if history &&& ~~~allowed <> 0u then ValueNone
+            else
+                let last = int ((history >>> ((count - 1) * 4)) &&& 15u) + 1
+                if (count - 1) * SlotsPerStep + last <> int tail then ValueNone
+                else
+                    let mutable active = 0UL
+                    for i = 0 to count - 1 do
+                        let k = int ((history >>> (4 * i)) &&& 15u) + 1
+                        active <- active ||| (((1UL <<< k) - 1UL) <<< (i * SlotsPerStep))
+                    ValueSome active
+
     /// DATA meta for a systematic source. KHist stays zero: the window code does not
     /// use the old stride history, and a zero field is legal for an old reader.
     let sourceMeta (step: uint64) (slot: int) (stepUsed: int) =
@@ -103,6 +136,64 @@ module WindowBridge =
                   FirstStep = meta.StepId
                   ParityIdx = int meta.Slot
                   Tail = int meta.Aux }
+
+    /// Rebuild coefficients from one authenticated, immutable parity snapshot.
+    /// This experimental API is not wired into WindowReceive or the live protocol.
+    let trySnapshotParityMask (meta: Meta) =
+        if meta.Type <> CellType.Parity || meta.Slot >= 48uy
+           || meta.StepId % uint64 StepsPerWindow <> 0UL then ValueNone
+        else
+            match trySnapshot meta.Aux meta.KHist with
+            | ValueNone -> ValueNone
+            | ValueSome active ->
+                let count = int (System.Numerics.BitOperations.PopCount active)
+                let degree = WindowCodec.WindowSessionCodec.degree count
+                let seed = WindowCodec.WindowSessionCodec.paritySeed (windowId meta.StepId) (int meta.Slot) (int meta.Aux)
+                ValueSome (WindowCodec.coefficientsFromMask active degree seed)
+
+    /// Build parity metadata and its coefficients from the same sealed-step snapshot.
+    let snapshotParity (id: uint64) (parityIdx: int) (stepLengths: int[]) =
+        if id > UInt64.MaxValue / uint64 StepsPerWindow then invalidArg (nameof id) "window origin overflows"
+        let struct (tail, history, _) = sealSnapshot stepLengths
+        let meta = parityMeta { WindowId = id; FirstStep = firstStep id; ParityIdx = parityIdx; Tail = int tail }
+        let meta = { meta with KHist = history }
+        match trySnapshotParityMask meta with
+        | ValueSome mask -> struct (meta, mask)
+        | ValueNone -> invalidOp "invalid sealed parity snapshot"
+
+/// Tracks authenticated step lengths for one window; updates are atomic on conflict.
+[<Sealed>]
+type WindowSnapshotTracker(windowId: uint64) =
+    let lengths: byte[] = Array.zeroCreate WindowBridge.StepsPerWindow
+
+    member _.TryData(step: uint64, slot: int, stepUsed: int) =
+        if WindowBridge.windowId step <> windowId || stepUsed < 1 || stepUsed > 16
+           || slot < 0 || slot >= stepUsed then false
+        else
+            let i = int (step % uint64 WindowBridge.StepsPerWindow)
+            if lengths.[i] <> 0uy && int lengths.[i] <> stepUsed then false
+            else
+                lengths.[i] <- byte stepUsed
+                true
+
+    /// The caller authenticates the frame before supplying its metadata.
+    member _.TrySnapshot(meta: Meta) =
+        if WindowBridge.windowId meta.StepId <> windowId
+           || (WindowBridge.trySnapshotParityMask meta |> ValueOption.isNone) then false
+        else
+            let count = (int meta.Aux - 1) / WindowBridge.SlotsPerStep + 1
+            let mutable valid = true
+            for i = 0 to count - 1 do
+                let k = byte (int ((meta.KHist >>> (4 * i)) &&& 15u) + 1)
+                if lengths.[i] <> 0uy && lengths.[i] <> k then valid <- false
+            if valid then
+                for i = 0 to count - 1 do
+                    lengths.[i] <- byte (int ((meta.KHist >>> (4 * i)) &&& 15u) + 1)
+            valid
+
+    member _.StepUsed(offset: int) =
+        if offset < 0 || offset >= WindowBridge.StepsPerWindow then invalidArg (nameof offset) "outside window"
+        if lengths.[offset] = 0uy then ValueNone else ValueSome(int lengths.[offset])
 
 [<Sealed>]
 type WindowReceive(symbolSize: int, maxWindows: int, maxBytes: int64) =

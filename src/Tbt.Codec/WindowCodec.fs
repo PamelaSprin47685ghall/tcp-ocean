@@ -15,15 +15,15 @@ let private validMask count =
     if count < 1 || count > 64 then invalidArg "count" "must be in 1..64"
     if count = 64 then UInt64.MaxValue else (1UL <<< count) - 1UL
 
-/// Deterministically choose exactly degree distinct symbols without replacement.
-let coefficients (count: int) (degree: int) (seed: uint64) =
-    validMask count |> ignore
-    if degree < 1 || degree > count then invalidArg "degree" "must be in 1..count"
+/// Deterministically choose exactly degree distinct active slots without replacement.
+let coefficientsFromMask (activeMask: uint64) (degree: int) (seed: uint64) =
+    let count = int (BitOperations.PopCount activeMask)
+    if count = 0 then invalidArg "activeMask" "must not be empty"
+    if degree < 1 || degree > count then invalidArg "degree" "must be in 1..active slot count"
     let mutable rng = SplitMix64.Rng(seed)
     let mutable result = 0UL
     let mutable remaining = degree
-    // Partial Fisher-Yates via selection from the remaining bit set; bounded work.
-    let mutable available = validMask count
+    let mutable available = activeMask
     while remaining > 0 do
         let mutable n = int (rng.Next() % uint64 (BitOperations.PopCount available))
         let mutable bits = available
@@ -35,6 +35,10 @@ let coefficients (count: int) (degree: int) (seed: uint64) =
         available <- available ^^^ bit
         remaining <- remaining - 1
     result
+
+/// Deterministically choose exactly degree distinct symbols without replacement.
+let coefficients (count: int) (degree: int) (seed: uint64) =
+    coefficientsFromMask (validMask count) degree seed
 
 /// GF(2) add. AVX2 covers 32 bytes, AdvSimd 16, Vector the host width, then a scalar tail.
 let xorInto (src: ReadOnlySpan<byte>) (dst: Span<byte>) =

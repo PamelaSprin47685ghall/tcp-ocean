@@ -27,6 +27,26 @@ let ``stateless coefficients match fixed seed and encode matches naive XOR`` () 
     Assert.Equal<byte[]>(xorSources sources a, WindowCodec.encode sources a)
 
 [<Fact>]
+let ``sparse active masks select only active distinct slots deterministically`` () =
+    let masks = [| 1UL; 1UL <<< 63; 0x8000000100010001UL; 0xAAAAAAAAAAAAAAAAUL; UInt64.MaxValue |]
+    for active in masks do
+        let count = int (System.Numerics.BitOperations.PopCount active)
+        for degree in 1 .. count do
+            for seed in [| 0UL; 1UL; UInt64.MaxValue |] do
+                let selected = WindowCodec.coefficientsFromMask active degree seed
+                Assert.Equal(selected, WindowCodec.coefficientsFromMask active degree seed)
+                Assert.NotEqual(0UL, selected)
+                Assert.Equal(0UL, selected &&& ~~~active)
+                Assert.Equal(degree, int (System.Numerics.BitOperations.PopCount selected))
+        Assert.Equal(active, WindowCodec.coefficientsFromMask active count 42UL)
+    Assert.Throws<ArgumentException>(fun () -> WindowCodec.coefficientsFromMask 0UL 1 0UL |> ignore) |> ignore
+    Assert.Throws<ArgumentException>(fun () -> WindowCodec.coefficientsFromMask 1UL 0 0UL |> ignore) |> ignore
+    Assert.Throws<ArgumentException>(fun () -> WindowCodec.coefficientsFromMask 1UL 2 0UL |> ignore) |> ignore
+    for count in 1 .. 64 do
+        let active = if count = 64 then UInt64.MaxValue else (1UL <<< count) - 1UL
+        Assert.Equal(WindowCodec.coefficients count 1 42UL, WindowCodec.coefficientsFromMask active 1 42UL)
+
+[<Fact>]
 let ``deterministic full rank burst recovery returns the original sources`` () =
     let src = sources 16 48 7
     let decoder = WindowCodec.Decoder(16, 48, 1L <<< 20)
