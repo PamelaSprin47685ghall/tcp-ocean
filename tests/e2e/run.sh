@@ -290,9 +290,13 @@ else
     #           --reflectionfree on our own assemblies.
     # Both are about the toolchain, not the product image, so only the e2e
     # AOT build relaxes them; product builds keep warnings as errors.
+    # Do not leave persistent MSBuild node-reuse/Roslyn server processes behind: they
+    # inherit fd 9 and keep the global netns flock locked, deadlocking the next run.
     dotnet publish "$repo/src/Tbt.Cli" -c Release -r linux-x64 -o "$work/aot" \
-        -p:NuGetAudit=false -p:SuppressTrimAnalysisWarnings=true >"$work/publish.log"
-    dotnet build "$repo/src/Tbt.Cli" -c Release -o "$work/jit" -p:NuGetAudit=false >"$work/build.log"
+        -p:NuGetAudit=false -p:SuppressTrimAnalysisWarnings=true \
+        --disable-build-servers -p:UseSharedCompilation=false >"$work/publish.log"
+    dotnet build "$repo/src/Tbt.Cli" -c Release -o "$work/jit" -p:NuGetAudit=false \
+        --disable-build-servers -p:UseSharedCompilation=false >"$work/build.log"
     git -C "$repo" rev-parse HEAD > "$work/aot/build-commit"
     git -C "$repo" rev-parse HEAD > "$work/jit/build-commit"
     if [[ -n $(git -C "$repo" status --porcelain) ]]; then
