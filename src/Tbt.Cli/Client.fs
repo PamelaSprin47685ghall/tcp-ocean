@@ -107,6 +107,7 @@ let private bootstrap (server: IPEndPoint) (host: string) (boot: byte[]) (window
         reraise()
 
 let private runCore (o: Options) =
+    validateCodec o
     let asyncMode = AsyncMode.isEnabled ()
     let server = endpoint (o.Text "server")
     let hopPorts =

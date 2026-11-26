@@ -156,6 +156,7 @@ type private Entry(carrier: SessionCarrier, maxPaths: int, admission: JoinAdmiss
     member e.Target = { Carrier = carrier; Admission = admission }
 
 let private runCore (o: Options) =
+    validateCodec o
     let asyncMode = AsyncMode.isEnabled ()
     if asyncMode then log "async mode: one poller and one thread per session (TBTUN_ASYNC_MODE)"
     let mutable asyncGroup: AsyncPollerGroup option = None

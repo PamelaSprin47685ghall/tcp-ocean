@@ -586,6 +586,42 @@ let ``a duplicate DATA cell cannot withdraw the same pending rebuild twice`` () 
     Assert.Equal(due, due2)
     Assert.Equal(rate, rate2)
 
+[<Fact>]
+let ``nack waits before deadline when frontier is near uint64 maximum`` () =
+    let frontier = UInt64.MaxValue - 10UL
+    let decoder =
+        { new Tbt.Codec.ICodecDecoder with
+            member _.Frontier = frontier
+            member _.SeenEnd = frontier + 1UL
+            member _.KConflicts = 0L
+            member _.BaseStep = frontier
+            member _.PendingRows = 0
+            member _.RowsAllocated = 0
+            member _.FreeRows = 0
+            member _.StaleRows = 0L
+            member _.RowMemoryBytes = 0L
+            member _.IsStepComplete _ = false
+            member _.WasRecovered(_, _) = false
+            member _.AcknowledgeRecovered(_, _) = ()
+            member _.StepKnownCount _ = 0
+            member _.BuildDecodedBitmap _ = struct (0UL, 0UL, 0UL, 0UL)
+            member _.Unknowns(_, _) = 1
+            member _.Deficit(_, _) = 1
+            member _.NoteSeen _ = true
+            member _.NoteStepUsed(_, _) = true
+            member _.OfferSource(_, _, _, _) = true
+            member _.OfferParity(_, _, _, _, _, _) = Tbt.Codec.EquationResult.Useless
+            member _.OfferBooster(_, _, _, _) = Tbt.Codec.EquationResult.Useless
+            member _.TryTakeKnown(_, _, _) = false
+            member _.StepUsed _ = 1
+            member _.Source(_, _) = ReadOnlySpan<byte>.Empty
+            member _.Release _ = () }
+    let opener = Tbt.Crypto.CellOpener(Tbt.Contracts.Direction.Up, 64, Tbt.Crypto.KeyTable(), Tbt.Crypto.NoHeaderMask())
+    let rx = RxHalf(64, CodeField.Gf16, decoder, opener, 64, 4)
+    let mutable span = 0
+    let mutable deficit = 0
+    Assert.False(rx.TryNack(1_000_000L, &span, &deficit))
+
 /// Drive one RxHalf deadline ledger with controllable virtual time.
 ///
 /// Three DATA cells of step 0 arrive (slots 0..2 of k=4) and a BOOSTER over the same step then

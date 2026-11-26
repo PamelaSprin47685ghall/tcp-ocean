@@ -88,6 +88,19 @@ let ``a valid psk-file still parses into 32-byte keys with comments stripped`` (
         Assert.All(keys.[1], fun b -> Assert.Equal(0xBBuy, b)))
 
 [<Fact>]
+let ``an explicit window codec is refused instead of silently running legacy`` () =
+    let message = usageMessage (fun () -> validateCodec (Options([| "--codec"; "window" |])))
+    Assert.Contains("--codec window", message)
+
+[<Fact>]
+let ``an unknown codec name is a usage error and legacy stays accepted`` () =
+    Assert.Contains("legacy or window",
+                    usageMessage (fun () -> validateCodec (Options([| "--codec"; "bogus" |]))))
+    validateCodec (Options([| |]))
+    validateCodec (Options([| "--codec"; "legacy" |]))
+    validateCodec (Options([| "--codec"; " LeGaCy " |]))
+
+[<Fact>]
 let ``bounded options reject values outside the declared range`` () =
     let o = Options([| "--paths"; "0" |])
     Assert.Contains("1..256", usageMessage (fun () -> bounded o "paths" 4 1 256))

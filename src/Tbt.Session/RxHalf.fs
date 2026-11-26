@@ -880,7 +880,7 @@ type RxHalf(symbolSize: int, field: CodeField, decoder: ICodecDecoder, opener: C
         let frontierAtEntry = decoder.Frontier
         let f = decoder.Frontier
         if f >= decoder.SeenEnd then false
-        elif decoder.SeenEnd < f + 66UL && now - frontierSince < 20_000_000L then false
+        elif decoder.SeenEnd - f < 66UL && now - frontierSince < 20_000_000L then false
         else
             serviceHold now true
             drainKnown now
