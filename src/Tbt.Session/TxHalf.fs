@@ -155,11 +155,31 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: ICodecEn
                 // stable by construction: rho only rises while parity is verifiably insufficient.
                 // Target 1.5 holes per 64-symbol window: at that point most windows finish in the
                 // first round and the rest close with a single bitmap-NACK roundtrip.
-                let targetHoles = 1.5
+                let targetHoles = 1.0
+                // Queueing note: drop-tail holes and wire-loss holes are indistinguishable to
+                // the sender, and every attempt to gate the climb on srtt collapsed real-loss
+                // throughput (drain: 5% loss 13 Mbit/s; freeze: 15% downlink 8 Mbit/s). The
+                // deadband + drift-down is the only stabilizer; TCP's own congestion control
+                // is what must answer queueing.
                 if wndNackReports >= 8.0 then
                     let measured = wndHoles / wndNackReports
-                    if measured > targetHoles * 1.3 then rho <- min rhoMax (rho + 0.03)
-                    elif measured < targetHoles * 0.5 then rho <- max rhoFloor (rho - 0.015)
+                    // Proportional control: step scales with the error relative to the target,
+                    // so a loss spike converges in one or two adaptation rounds instead of
+                    // creeping up 0.03 at a time. Clamped: one round never moves more than
+                    // 0.05 up / 0.06 down — drop-tail queue holes in carrier testbeds are
+                    // indistinguishable from wire loss to the sender, so a slow climb caps how
+                    // fast parity-induced queueing can compound itself there.
+                    let err = (measured - targetHoles) / targetHoles
+                    let step = 0.04 * err |> max -0.06 |> min 0.05
+                    if measured < targetHoles * 0.3 then
+                        // deep undershoot: parity clearly overshoots, step down faster
+                        rho <- max rhoFloor (rho - 0.02)
+                    elif abs err >= 0.3 then
+                        // Deadband: without it, a measured rate marginally above target
+                        // ratchets rho upward in small steps every round until it parks at
+                        // the cap (zero-loss e2e: rho pinned at 0.55 on TUN drop-tail holes,
+                        // uplink 156 -> 121 Mbit/s). Only errors large enough to matter move rho.
+                        rho <- rho + step |> max rhoFloor |> min rhoMax
                     wndHoles <- wndHoles * 0.5
                     wndNackReports <- wndNackReports * 0.5
                 elif wndNackReports = 0.0 then
