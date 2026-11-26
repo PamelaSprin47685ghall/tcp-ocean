@@ -191,6 +191,13 @@ type WindowSnapshotTracker(windowId: uint64) =
                     lengths.[i] <- byte (int ((meta.KHist >>> (4 * i)) &&& 15u) + 1)
             valid
 
+    member this.Copy() =
+        let copy = WindowSnapshotTracker(windowId)
+        for i = 0 to WindowBridge.StepsPerWindow - 1 do
+            if lengths.[i] <> 0uy then
+                copy.TryData(windowId * 4UL + uint64 i, 0, int lengths.[i]) |> ignore
+        copy
+
     member _.StepUsed(offset: int) =
         if offset < 0 || offset >= WindowBridge.StepsPerWindow then invalidArg (nameof offset) "outside window"
         if lengths.[offset] = 0uy then ValueNone else ValueSome(int lengths.[offset])
@@ -198,40 +205,52 @@ type WindowSnapshotTracker(windowId: uint64) =
 [<Sealed>]
 type WindowReceive(symbolSize: int, maxWindows: int, maxBytes: int64) =
     let pool = WindowCodec.WindowCodecPool(symbolSize, maxWindows, maxBytes)
+    let trackers = System.Collections.Generic.Dictionary<uint64, WindowSnapshotTracker>()
+
+    let add (id: uint64) (data: byte[]) (update: WindowSnapshotTracker -> bool) (mask: uint64) =
+        if isNull (box data) || data.Length <> symbolSize then false
+        else
+            let tracker =
+                match trackers.TryGetValue id with
+                | true, existing -> existing.Copy()
+                | _ -> WindowSnapshotTracker(id)
+            if not (update tracker) then false
+            elif pool.TryGet(id).IsNone && not (pool.TryOpen(id, 64)) then false
+            else
+                match pool.TryGet id with
+                | ValueNone -> false
+                | ValueSome decoder ->
+                    try
+                        let innovative = decoder.Add(mask, data)
+                        trackers.[id] <- tracker
+                        innovative
+                    with :? InvalidOperationException -> false
 
     member _.Pool = pool
     member _.Count = pool.Count
     member _.AllocatedBytes = pool.AllocatedBytes
 
-    /// Ingest one systematic source. Opens the window at the running tail length so a
-    /// symbol can land before the tail is sealed. False when the pool refuses the window.
-    member _.AddSource(step: uint64, slot: int, tail: int, data: byte[]) =
+    /// Only authenticated frames may be submitted. False includes duplicates and rejects.
+    member _.AddSource(step: uint64, slot: int, stepUsed: int, data: byte[]) =
         match WindowBridge.tryIndex (step, slot) with
         | ValueNone -> false
-        | ValueSome index when index >= tail -> false
         | ValueSome index ->
             let id = WindowBridge.windowId step
-            if pool.TryGet(id).IsNone && not (pool.TryOpen(id, tail)) then false
-            else
-                match pool.TryGet id with
-                | ValueSome decoder -> decoder.Add(1UL <<< index, data)
-                | ValueNone -> false
+            add id data (fun tracker -> tracker.TryData(step, slot, stepUsed)) (1UL <<< index)
 
-    /// Ingest one parity symbol whose mask is rebuilt from the meta, not from the wire.
     member _.AddParity(meta: Meta, data: byte[]) =
-        match WindowBridge.tryParity meta with
+        match WindowBridge.trySnapshotParityMask meta with
         | ValueNone -> false
-        | ValueSome p ->
-            let id = p.WindowId
-            if pool.TryGet(id).IsNone && not (pool.TryOpen(id, p.Tail)) then false
-            else
-                match pool.TryGet id with
-                | ValueSome decoder ->
-                    let mask = WindowCodec.WindowSessionCodec.parityMask id p.ParityIdx p.Tail
-                    decoder.Add(mask, data)
-                | ValueNone -> false
+        | ValueSome mask ->
+            let id = WindowBridge.windowId meta.StepId
+            add id data (fun tracker -> tracker.TrySnapshot meta) mask
 
     /// Release only windows fully below the exclusive delivered step frontier.
     member _.ReleaseThrough(ackStep: uint64) =
         let completed = ackStep / uint64 WindowBridge.StepsPerWindow
-        if completed > 0UL then pool.ReleaseThrough(completed - 1UL)
+        if completed > 0UL then
+            pool.ReleaseThrough(completed - 1UL)
+            let removed = ResizeArray<uint64>()
+            for KeyValue(id, _) in trackers do
+                if id < completed then removed.Add id
+            for id in removed do trackers.Remove id |> ignore

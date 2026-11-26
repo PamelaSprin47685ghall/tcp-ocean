@@ -141,7 +141,21 @@ let ``every tail length 1..64 recovers a dropped source without waiting for 64``
         Assert.True(WindowCodec.WindowSessionCodec.degree k >= 1 && WindowCodec.WindowSessionCodec.degree k <= min 8 k)
 
 [<Fact>]
-let ``window pool refuses a 33rd window and frees storage at the ack frontier`` () =
+let ``160 full windows respect the decoder payload budget and backpressure`` () =
+    let symbolSize = 1344
+    let pool = WindowCodec.WindowCodecPool(symbolSize, 160, WindowCodec.WindowSessionCodec.MaxDecoderBytes)
+    for id in 0UL .. 159UL do
+        Assert.True(pool.TryOpen(id, 64))
+    Assert.False(pool.TryOpen(160UL, 64))
+    let expected = 160L * (64L * 8L + 65L * int64 symbolSize)
+    Assert.Equal(expected, pool.AllocatedBytes)
+    Assert.True(pool.AllocatedBytes <= WindowCodec.WindowSessionCodec.MaxDecoderBytes)
+    pool.ReleaseThrough 0UL
+    Assert.True(pool.TryOpen(160UL, 64))
+    Assert.Equal(expected, pool.AllocatedBytes)
+
+[<Fact>]
+let ``window pool enforces its window count and frees storage at the ack frontier`` () =
     let size = 32
     let one = int64 8 * 8L + 9L * int64 size
     let pool = WindowCodec.WindowCodecPool(size, WindowCodec.WindowSessionCodec.MaxWindows, one * int64 WindowCodec.WindowSessionCodec.MaxWindows)
@@ -154,7 +168,7 @@ let ``window pool refuses a 33rd window and frees storage at the ack frontier`` 
     Assert.Equal(int64 (WindowCodec.WindowSessionCodec.MaxWindows - 2) * one, pool.AllocatedBytes)
     Assert.True(pool.TryGet 2UL |> ValueOption.isNone)
     Assert.True(pool.TryGet 3UL |> ValueOption.isSome)
-    Assert.True(pool.TryOpen(100UL, 8))
+    Assert.True(pool.TryOpen(1000UL, 8))
     let tight = WindowCodec.WindowCodecPool(size, 4, one * 2L)
     Assert.True(tight.TryOpen(1UL, 8))
     Assert.True(tight.TryOpen(2UL, 8))

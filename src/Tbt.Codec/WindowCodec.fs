@@ -144,7 +144,7 @@ module WindowSessionCodec =
     let MaxSymbols = 64
 
     [<Literal>]
-    let MaxWindows = 32
+    let MaxWindows = 160
 
     /// 16 MiB hard cap on decoder row storage across live windows.
     [<Literal>]
@@ -182,7 +182,7 @@ type WindowCodecPool(symbolSize: int, maxWindows: int, maxBytes: int64) =
     do
         if symbolSize < 1 then invalidArg (nameof symbolSize) "must be positive"
         if maxWindows < 1 || maxWindows > WindowSessionCodec.MaxWindows then
-            invalidArg (nameof maxWindows) "must be in 1..32"
+            invalidArg (nameof maxWindows) "must be in 1..160"
         if maxBytes < 1L || maxBytes > WindowSessionCodec.MaxDecoderBytes then
             invalidArg (nameof maxBytes) "must be in 1..16MiB"
 

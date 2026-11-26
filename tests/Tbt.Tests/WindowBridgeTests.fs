@@ -113,7 +113,7 @@ let ``snapshot tracker handles reordering duplicates and atomic conflicts`` () =
 let ``partial step acknowledgement retains the active window`` () =
     let rx = WindowReceive(32, 8, 1L <<< 20)
     let original = fill 32 4
-    Assert.True(rx.AddSource(0UL, 0, 64, original))
+    Assert.True(rx.AddSource(0UL, 0, 1, original))
     for ack in 1UL .. 3UL do
         rx.ReleaseThrough ack
         match rx.Pool.TryGet 0UL with
@@ -122,6 +122,19 @@ let ``partial step acknowledgement retains the active window`` () =
     rx.ReleaseThrough 4UL
     Assert.True(rx.Pool.TryGet 0UL |> ValueOption.isNone)
     Assert.Equal(0L, rx.AllocatedBytes)
+
+[<Fact>]
+let ``receive rejects conflicting authenticated snapshots and retains original sources`` () =
+    let rx = WindowReceive(32, 2, 1L <<< 20)
+    let a = fill 32 17
+    Assert.True(rx.AddSource(0UL, 0, 2, a))
+    let struct (bad, _) = WindowBridge.snapshotParity 0UL 0 [| 3 |]
+    Assert.False(rx.AddParity(bad, Array.zeroCreate 32))
+    Assert.False(rx.AddSource(0UL, 1, 3, fill 32 18))
+    match rx.Pool.TryGet 0UL with
+    | ValueSome decoder -> Assert.Equal<byte[]>(a, decoder.TryGet(0).Value)
+    | ValueNone -> failwith "window lost after rejected frame"
+    Assert.True(rx.AddSource(0UL, 1, 2, fill 32 18))
 
 [<Fact>]
 let ``parity meta round-trips and an out-of-order source recovers across the window`` () =
@@ -134,25 +147,22 @@ let ``parity meta round-trips and an out-of-order source recovers across the win
         for slot = 15 downto 0 do
             let index = int (step - 8UL) * 16 + slot
             if index < tail && index % 7 <> 0 then
-                Assert.True(rx.AddSource(step, slot, tail, sources.[index]))
+                Assert.True(rx.AddSource(step, slot, 16, sources.[index]))
     let mutable restored = false
     let mutable p = 0
     while not restored && p < 48 do
-        let mask = WindowCodec.WindowSessionCodec.parityMask 2UL p tail
+        let struct (meta, mask) = WindowBridge.snapshotParity 2UL p [|16;16;16;2|]
         let mutable covers = false
         for idx = 0 to tail - 1 do
             if idx % 7 = 0 && mask &&& (1UL <<< idx) <> 0UL then covers <- true
         if covers then
-            let parity = { WindowId = 2UL; FirstStep = 8UL; ParityIdx = p; Tail = tail }
-            let meta = WindowBridge.parityMeta parity
             let buf = Array.zeroCreate 40
             Meta.write meta (Span buf)
             let mutable back = Unchecked.defaultof<Meta>
             Assert.True(Meta.tryRead (ReadOnlySpan buf) &back)
-            match WindowBridge.tryParity back with
-            | ValueSome got -> Assert.Equal(parity, got)
-            | ValueNone -> failwith "parity meta rejected"
-            let symbol = WindowCodec.WindowSessionCodec.encodeParity 2UL p (Array.sub sources 0 tail)
+            Assert.Equal(ValueSome mask, WindowBridge.trySnapshotParityMask back)
+            let padded = Array.init 64 (fun i -> if i < tail then sources.[i] else Array.zeroCreate size)
+            let symbol = WindowCodec.encode padded mask
             rx.AddParity(back, symbol) |> ignore
             match rx.Pool.TryGet 2UL with
             | ValueSome decoder ->
