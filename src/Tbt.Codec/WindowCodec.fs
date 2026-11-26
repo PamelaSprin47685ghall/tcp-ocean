@@ -6,6 +6,10 @@ module Tbt.Codec.WindowCodec
 open System
 open System.Collections.Generic
 open System.Numerics
+open System.Runtime.InteropServices
+open System.Runtime.Intrinsics
+open System.Runtime.Intrinsics.Arm
+open System.Runtime.Intrinsics.X86
 
 let private validMask count =
     if count < 1 || count > 64 then invalidArg "count" "must be in 1..64"
@@ -32,6 +36,33 @@ let coefficients (count: int) (degree: int) (seed: uint64) =
         remaining <- remaining - 1
     result
 
+/// GF(2) add. AVX2 covers 32 bytes, AdvSimd 16, Vector the host width, then a scalar tail.
+let xorInto (src: ReadOnlySpan<byte>) (dst: Span<byte>) =
+    if src.Length <> dst.Length then invalidArg (nameof src) "length mismatch"
+    let mutable i = 0
+    if Avx2.IsSupported then
+        let n = src.Length / 32
+        let sv = MemoryMarshal.Cast<byte, Vector256<byte>>(src.Slice(0, n * 32))
+        let dv = MemoryMarshal.Cast<byte, Vector256<byte>>(dst.Slice(0, n * 32))
+        for j = 0 to n - 1 do dv.[j] <- dv.[j] ^^^ sv.[j]
+        i <- n * 32
+    elif AdvSimd.IsSupported then
+        let n = src.Length / 16
+        let sv = MemoryMarshal.Cast<byte, Vector128<byte>>(src.Slice(0, n * 16))
+        let dv = MemoryMarshal.Cast<byte, Vector128<byte>>(dst.Slice(0, n * 16))
+        for j = 0 to n - 1 do dv.[j] <- dv.[j] ^^^ sv.[j]
+        i <- n * 16
+    let sv = MemoryMarshal.Cast<byte, Vector<byte>>(src.Slice i)
+    let dv = MemoryMarshal.Cast<byte, Vector<byte>>(dst.Slice i)
+    for j = 0 to sv.Length - 1 do dv.[j] <- dv.[j] ^^^ sv.[j]
+    for k = i + sv.Length * Vector<byte>.Count to src.Length - 1 do
+        dst.[k] <- dst.[k] ^^^ src.[k]
+
+/// Same bytes as xorInto, forced scalar. Tests use this as the equivalence oracle.
+let xorIntoScalar (src: ReadOnlySpan<byte>) (dst: Span<byte>) =
+    if src.Length <> dst.Length then invalidArg (nameof src) "length mismatch"
+    for i = 0 to src.Length - 1 do dst.[i] <- dst.[i] ^^^ src.[i]
+
 /// XOR selected sources. Systematic symbols are sent directly by the caller.
 let encode (sources: byte[][]) (mask: uint64) =
     if isNull (box sources) then nullArg "sources"
@@ -43,8 +74,7 @@ let encode (sources: byte[][]) (mask: uint64) =
     let output = Array.zeroCreate<byte> size
     for i = 0 to sources.Length - 1 do
         if isNull (box sources.[i]) || sources.[i].Length <> size then invalidArg "sources" "symbol lengths differ"
-        if mask &&& (1UL <<< i) <> 0UL then
-            for j = 0 to size - 1 do output.[j] <- output.[j] ^^^ sources.[i].[j]
+        if mask &&& (1UL <<< i) <> 0UL then xorInto (ReadOnlySpan sources.[i]) (Span output)
     output
 
 /// Fixed-size reduced echelon matrix. AllocatedBytes counts array payloads,
@@ -60,7 +90,7 @@ type Decoder(count: int, symbolSize: int, maxBytes: int64) =
     let scratch = Array.zeroCreate<byte> symbolSize
     let mutable rank = 0
     let xorRow (dst: byte[]) dstOffset srcOffset =
-        for j = 0 to symbolSize - 1 do dst.[dstOffset+j] <- dst.[dstOffset+j] ^^^ payload.[srcOffset+j]
+        xorInto (ReadOnlySpan(payload, srcOffset, symbolSize)) (Span(dst, dstOffset, symbolSize))
     let checkIndex index =
         if index < 0 || index >= count then invalidArg "index" "outside window"
     /// True when rank increases; false for a consistent dependent equation.

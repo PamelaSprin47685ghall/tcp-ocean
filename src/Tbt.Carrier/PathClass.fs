@@ -61,9 +61,11 @@ module PathClass =
             let quiet = retransRate < lowRetrans && caState < 4uy
             let lossy = caState >= 4uy || retransRate >= 0.15
             if flat && quiet && not lossy then
+                // A quiet plateau may be application-limited. It is a candidate,
+                // not enough evidence for the caller's high-confidence gate.
                 { Kind = PathKind.Policed
                   CapBps = mean
-                  Confidence = min 1000 (400 + count * 80)
+                  Confidence = min 500 (200 + count * 40)
                   Cv = cv }
             elif lossy && not flat then
                 { Kind = PathKind.Physical
@@ -105,7 +107,7 @@ module PathClass =
             | _ -> false
         if known < 2 then PathKind.Unknown, 0
         elif correlated && stalled && physical > 0 then PathKind.Physical, min 1000 (500 + physical * 50)
-        elif policed >= 2 && not correlated && (grew || addedPathsRaisedGoodput.IsNone) && physical = 0 then
+        elif policed >= 2 && not correlated && grew && physical = 0 then
             PathKind.Policed, min 1000 (400 + policed * 40)
         elif physical > 0 && policed > 0 then PathKind.Mixed, 300
         else PathKind.Unknown, 100

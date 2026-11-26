@@ -15,6 +15,7 @@
     <Compile Include="ReadySetTests.fs" />
     <Compile Include="CodecTests.fs" />
     <Compile Include="WindowCodecTests.fs" />
+    <Compile Include="WindowBridgeTests.fs" />
     <Compile Include="WireTests.fs" />
     <Compile Include="CryptoTests.fs" />
     <Compile Include="RateGroupTests.fs" />

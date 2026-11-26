@@ -20,7 +20,8 @@ let ``a flat quiet rate is a policer candidate and a lossy rate is not`` () =
     let quiet = PathClass.ofSamples flat 6 0.01 0uy true
     Assert.Equal(PathKind.Policed, quiet.Kind)
     Assert.Equal(400_000L, quiet.CapBps)
-    Assert.True(quiet.Confidence >= 600)
+    // A flat rate alone may be application-limited; do not activate the gate.
+    Assert.True(quiet.Confidence < 600)
     let lossy = PathClass.ofSamples flat 6 0.40 4uy true
     Assert.NotEqual(PathKind.Policed, lossy.Kind)
     let cold = PathClass.ofSamples flat 2 0.0 0uy true
@@ -29,8 +30,12 @@ let ``a flat quiet rate is a policer candidate and a lossy rate is not`` () =
 [<Fact>]
 let ``uniform plateaus are not a shared bottleneck and correlated stalls are`` () =
     let policed = [| PathKind.Policed; PathKind.Policed; PathKind.Policed; PathKind.Unknown |]
-    let kind, conf = PathClass.sessionHint policed 0 4 None
-    Assert.Equal(PathKind.Policed, kind)
+    let kind, _ = PathClass.sessionHint policed 0 4 None
+    Assert.Equal(PathKind.Unknown, kind)
+    let noGain, _ = PathClass.sessionHint policed 0 4 (Some false)
+    Assert.Equal(PathKind.Unknown, noGain)
+    let confirmed, conf = PathClass.sessionHint policed 0 4 (Some true)
+    Assert.Equal(PathKind.Policed, confirmed)
     Assert.True(conf >= 400)
     let mixed = [| PathKind.Physical; PathKind.Physical; PathKind.Policed |]
     let stalled, _ = PathClass.sessionHint mixed 3 3 (Some false)
