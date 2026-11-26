@@ -1288,8 +1288,8 @@ type SessionCarrier(session: Session, bridge: FlowBridge, ?uplinkPace: bool, ?tu
           // pending nor idle is the leak that silently turns FEC off once rowsAllocated hits
           // maxRows, and `stale` counts equations Release had to throw away because the
           // decode window fell behind. Both were invisible for three live rounds.
-          .Append(" dec_rows=").Append(rx.Decoder.PendingRows).Append('/').Append(rx.Decoder.FreeRows)
-          .Append('/').Append(rx.Decoder.RowsAllocated).Append(" dec_stale=").Append(rx.Decoder.StaleRows)
+          .Append(" dec_rows=").Append(rx.PendingRows).Append('/').Append(rx.FreeRows)
+          .Append('/').Append(rx.RowsAllocated).Append(" dec_stale=").Append(rx.StaleRows)
           .Append(" minrtt_ms=").Append(if tx.MinRttNs = Int64.MaxValue then "-" else string (tx.MinRttNs / 1_000_000L))
           .Append(" rtt_skipped=").Append(tx.RttSkipped)
           .Append(" rho=").Append(tx.Rho.ToString("F3", Globalization.CultureInfo.InvariantCulture))
@@ -1322,7 +1322,7 @@ type SessionCarrier(session: Session, bridge: FlowBridge, ?uplinkPace: bool, ?tu
           .Append(" spurious_repairs=").Append(tx.SpuriousRepairs)
           .Append(" ctrl=").Append(session.CtrlSent).Append('/').Append(session.CtrlExecuted).Append('/').Append(session.CtrlRejected)
           .Append(" close=").Append(int session.CloseState)
-          .Append(" rx_ack=").Append(rx.AckStepLo).Append(" rx_base=").Append(rx.Decoder.BaseStep)
+          .Append(" rx_ack=").Append(rx.AckStepLo).Append(" rx_base=").Append(rx.BaseStep)
           .Append(" recovered=").Append(rx.Counters.Recovered)
           .Append(" interactive=").Append(session.InteractiveSources).Append('/').Append(session.Tx.UrgentSteps)
           .Append(" efloor=").Append(rx.EstimateFloor).Append(" efolds=").Append(rx.EstimateFolds)

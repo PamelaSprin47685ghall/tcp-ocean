@@ -8,55 +8,6 @@ open Tbt.Codec
 open Tbt.Crypto
 open Tbt.Wire
 
-/// Receive counters (spec 6.6 failure targets).
-[<Sealed>]
-type RxCounters() =
-    member val Cells = 0L with get, set
-    member val FramingErrors = 0L with get, set
-    member val ProtoErrors = 0L with get, set
-    member val EnvelopeErrors = 0L with get, set
-    member val Recovered = 0L with get, set
-    member val Unsupported = 0L with get, set
-    /// Parities given to the decoder, and parities dropped unused (spec 5.9 note in ParityHold).
-    member val ParitiesUsed = 0L with get, set
-    member val ParitiesUnused = 0L with get, set
-    /// Cumulative erasure evidence for this receive direction, split by what proved it.
-    ///
-    /// `ErasureQ16` says how much was erased; these say why, which is the difference between
-    /// a link that loses cells and a link that only delivers them out of order. A source the
-    /// decoder had to rebuild is certain proof the cell did not arrive; a source marked late
-    /// by the step clock alone is weaker, because normal multi-path queueing also puts a cell
-    /// after its step's deadline. Splitting the two turns "reported loss is 0.24 on a lossless
-    /// link" from an unattributable number into a measurement.
-    ///
-    /// All three are session-cumulative. The rate the controller reads is the 10 ms window in
-    /// `ErasureQ16`/`ErasureP95Q16`, not a ratio of these; compare their deltas between two
-    /// stats lines to see what the recent erasures were made of.
-    member val TimelyDue = 0L with get, set
-    member val ErasureRecovered = 0L with get, set
-    member val ErasureLateClock = 0L with get, set
-    /// Rebuilds withdrawn because the source's own DATA cell arrived inside the deadline.
-    /// A rebuild means the decoder solved the slot by elimination before the cell showed up;
-    /// the spec's erasure is "not delivered and authenticated before the deadline", so an
-    /// arrival inside the deadline makes that rebuild a latency artefact, not an erasure.
-    member val ErasureCancelled = 0L with get, set
-    /// Sources booked into the 10 ms windows by `settlePendingSlot` — i.e. the deadline
-    /// settlements of PENDING REBUILDS only.
-    ///
-    /// This is deliberately NOT the whole window. A source that arrives directly is booked by
-    /// `observeTimely` (one accounted source, erased or not) and never passes through
-    /// `settlePendingSlot`, so `Missing/Due` here is a strict subset of what `winDue`/
-    /// `winErased` contain. Do not present it as the window's own total, and do not divide it
-    /// and call the result the reported erasure rate: `ErasureQ16`/`ErasureP95Q16` are the
-    /// window's answer, this pair only says how the rebuild part settled.
-    ///
-    /// `due` counts every accounted source of the settled step (missing + vindicated), `missing`
-    /// only those whose cell never arrived by the deadline. `ErasureRecovered` above counts
-    /// reports, not outcomes: a rebuild is reported before its deadline decides, and
-    /// `ErasureCancelled` subtracts the ones a timely arrival vindicated.
-    member val RebuildSettledDue = 0L with get, set
-    member val RebuildSettledMissing = 0L with get, set
-
 [<Sealed>]
 type RxHalf(symbolSize: int, field: CodeField, decoder: Decoder, opener: CellOpener, capacitySteps: int, maxPaths: int) =
     let counters = RxCounters()
@@ -941,3 +892,37 @@ type RxHalf(symbolSize: int, field: CodeField, decoder: Decoder, opener: CellOpe
                 span <- int (min 4UL (decoder.SeenEnd - f))
                 deficit <- decoder.Deficit(f, span)
                 deficit > 0
+
+    interface IRxHalf with
+        member _.Counters = counters
+        member this.AckStepLo = this.AckStepLo
+        member this.Grant = this.Grant
+        member this.ErasureQ16 = this.ErasureQ16
+        member this.ErasureP95Q16 = this.ErasureP95Q16
+        member this.P95Candidates = this.P95Candidates
+        member this.P95SmallWindows = this.P95SmallWindows
+        member this.P95PickDue = this.P95PickDue
+        member this.P95PickErased = this.P95PickErased
+        member this.EstimateFloor = this.EstimateFloor
+        member this.EstimateFolds = this.EstimateFolds
+        member this.LastFoldedStep = this.LastFoldedStep
+        member this.LastFoldedExpected = this.LastFoldedExpected
+        member this.LastFoldedReceived = this.LastFoldedReceived
+        member _.PendingRows = decoder.PendingRows
+        member _.FreeRows = decoder.FreeRows
+        member _.RowsAllocated = decoder.RowsAllocated
+        member _.StaleRows = decoder.StaleRows
+        member _.BaseStep = decoder.BaseStep
+        member _.KConflicts = decoder.KConflicts
+        member _.SeenEnd = decoder.SeenEnd
+        member _.IsStepComplete(step) = decoder.IsStepComplete(step)
+        member this.Attach(table) = this.Attach(table)
+        member this.FillDecodedBitmap() = this.FillDecodedBitmap()
+        member this.StepUndelivered(t, delta) = this.StepUndelivered(t, delta)
+        member this.Release() = this.Release()
+        member this.Open(frame, path) = this.Open(frame, path)
+        member this.OpenPre(frame, counter) = this.OpenPre(frame, counter)
+        member this.OnCoded(meta, symbol, path, now) = this.OnCoded(meta, symbol, path, now)
+        member this.Service(now) = this.Service(now)
+        member this.OnHeartbeat(step) = this.OnHeartbeat(step)
+        member this.TryNack(now, span, deficit) = this.TryNack(now, &span, &deficit)

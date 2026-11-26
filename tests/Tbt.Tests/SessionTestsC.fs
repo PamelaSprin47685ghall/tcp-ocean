@@ -1010,7 +1010,7 @@ let ``every decoded bit names a step the decoder really completed`` () =
             let bits = if j < 64 then b0 elif j < 128 then b1 elif j < 192 then b2 else b3
             if (bits >>> (j % 64)) &&& 1UL <> 0UL then
                 setBits <- setBits + 1
-                Assert.True(rx.Decoder.IsStepComplete(lo + 1UL + uint64 j), sprintf "bit %d set for a step not complete" j)
+                Assert.True(rx.IsStepComplete(lo + 1UL + uint64 j), sprintf "bit %d set for a step not complete" j)
     // A bitmap that is always zero would satisfy every per-bit check vacuously.
     Assert.True(setBits > 0, "no decoded bit was ever reported")
     Assert.True(pair.Server.Rx.AckStepLo > 0UL)

@@ -1099,6 +1099,68 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
     /// carrier_wm of path (largest DATA/PARITY step sent on it).
     member _.CarrierWm(path: uint16) = carrierWm.[int path]
 
+    interface ITxHalf with
+        member this.Rho = this.Rho
+        member this.CellLoss = this.CellLoss
+        member this.QueueMemoryBytes = this.QueueMemoryBytes
+        member this.PeerAck = this.PeerAck
+        member this.GrantLimit = this.GrantLimit
+        member this.Head = this.Head
+        member this.Queued = this.Queued
+        member this.UrgentQueued = this.UrgentQueued
+        member this.UrgentFull = this.UrgentFull
+        member this.UrgentSteps = this.UrgentSteps
+        member this.UrgentSources = this.UrgentSources
+        member this.CellsSent = this.CellsSent
+        member this.SealedCells = this.SealedCells
+        member this.DroppedAcked = this.DroppedAcked
+        member this.QueueHigh = this.QueueHigh
+        member this.UniqueAcked = this.UniqueAcked
+        member this.UniqueArrived = this.UniqueArrived
+        member this.UniqueRendered = this.UniqueRendered
+        member this.CanFill = this.CanFill
+        member this.CanFillUrgent = this.CanFillUrgent
+        member this.CanFillClose = this.CanFillClose
+        member this.NoteUrgentFull() = this.NoteUrgentFull()
+        member this.TryBeginSource(symbol: byref<Span<byte>>) = this.TryBeginSource(&symbol)
+        member this.TryBeginSource(symbol: byref<Span<byte>>, interactive, ?forClose) = this.TryBeginSource(&symbol, interactive, ?forClose = forClose)
+        member this.CommitSource(e, interactive) = this.CommitSource(e, interactive)
+        member this.Flush() = this.Flush()
+        member this.OnPeerAck(ack, grant) = this.OnPeerAck(ack, grant)
+        member this.InitialGrant(limit) = this.InitialGrant(limit)
+        member this.OnPeerErasure(q16, ?q95) = this.OnPeerErasure(q16, ?q95 = q95)
+        member this.SrttNs = this.SrttNs
+        member this.MinRttNs = this.MinRttNs
+        member this.RttSkipped = this.RttSkipped
+        member this.RepairRepeats = this.RepairRepeats
+        member this.RepairWaitNs = this.RepairWaitNs
+        member this.NewRepair with get() = this.NewRepair and set v = this.NewRepair <- v
+        member this.EvidenceRepair with get() = this.EvidenceRepair and set v = this.EvidenceRepair <- v
+        member this.ReoWndNs = this.ReoWndNs
+        member this.PeerSeenHi = this.PeerSeenHi
+        member this.BoostersSent = this.BoostersSent
+        member this.SpuriousRepairs = this.SpuriousRepairs
+        member this.OnPeerSeen(thi) = this.OnPeerSeen(thi)
+        member this.OnPeerDecodedBitmap(a, b, c, d, e) = this.OnPeerDecodedBitmap(a, b, c, d, e)
+        member this.OnNack(t, span, deficit) = this.OnNack(t, span, deficit)
+        member this.HeartbeatDue = this.HeartbeatDue
+        member this.NextHeartbeatNs = this.NextHeartbeatNs
+        member this.RenderHeartbeat(frame, path, ack, grant, erasure) = this.RenderHeartbeat(frame, path, ack, grant, erasure)
+        member this.Prepare() = this.Prepare()
+        member this.RepairWaiting = this.RepairWaiting
+        member this.HasCandidate = this.HasCandidate
+        member this.Seal(frame, path) = this.Seal(frame, path)
+        member this.NextCounter = this.NextCounter
+        member this.LastOnPath(path) = this.LastOnPath(path)
+        member this.SetCutLimit(limit, reserve) = this.SetCutLimit(limit, reserve)
+        member this.ClearCutLimit() = this.ClearCutLimit()
+        member this.CanSeal = this.CanSeal
+        member this.CanSealPayload = this.CanSealPayload
+        member this.TryRenderNext(frame, path, ack, grant, erasure, ?allowRepair) = this.TryRenderNext(frame, path, ack, grant, erasure, ?allowRepair = allowRepair)
+        member this.RenderFill(frame, path, ack, grant, erasure) = this.RenderFill(frame, path, ack, grant, erasure)
+        member this.FillsSent = this.FillsSent
+        member this.CarrierWm(path) = this.CarrierWm(path)
+
 /// Unpaced send order (server downlink, or client with UPLINK_PACE off).
 /// Repairs must not preempt unsent originals: a BOOSTER-first storm can freeze
 /// tx_head and starve new data (20/200 0% 64-flow echo with --new-repair).

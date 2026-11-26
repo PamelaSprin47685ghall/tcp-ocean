@@ -145,14 +145,14 @@ type Session(role: Role, p: SessionParams, port: IFlowPort, clock: IClock, confi
     let tx =
         TxHalf(txDir, s, fieldOf txDir, encoder, sealer, config.Rho, config.FecAdaptive,
                config.RhoMin, config.RhoMax, config.RhoFloor, config.RhoGain,
-               config.FecWindowCells, config.MaxPaths, config.TxQueueCells, clock)
+               config.FecWindowCells, config.MaxPaths, config.TxQueueCells, clock) :> ITxHalf
     do
         // The new per-step / evidence / tail-timer scheduler is opt-in. Off is
         // main's span OnNack exactly. When on, the server also uses RACK evidence.
         if config.NewRepair then
             tx.NewRepair <- true
             if not client then tx.EvidenceRepair <- true
-    let rx = RxHalf(s, fieldOf rxDir, decoder, opener, config.WindowSteps, config.MaxPaths)
+    let rx = RxHalf(s, fieldOf rxDir, decoder, opener, config.WindowSteps, config.MaxPaths) :> IRxHalf
     let both = Caps.FlowState ||| Caps.FlowState2
     let credit = { config.Credit with Enabled = config.Credit.Enabled && p.Caps &&& both = both }
     let hhfWindowNs = 100_000_000L
@@ -697,7 +697,7 @@ type Session(role: Role, p: SessionParams, port: IFlowPort, clock: IClock, confi
                 rx.OnCoded(m, Span<byte>.op_Implicit (frame.Slice(Layout.SymbolOffset, s)), path, clock.NowNs())
                 rx.Release()
                 // Two k for one step can never decode: fail now, not stall forever.
-                if rx.Decoder.KConflicts > 0L && fault.Length = 0 then fault <- "peer step_used conflict"
+                if rx.KConflicts > 0L && fault.Length = 0 then fault <- "peer step_used conflict"
             | CellType.WinAck ->
                 let mutable h = Unchecked.defaultof<WinAckHead>
                 if WinAck.tryReadHead (Span<byte>.op_Implicit (frame.Slice(Layout.SymbolOffset, s))) &h then
