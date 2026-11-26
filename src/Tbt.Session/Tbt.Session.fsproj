@@ -17,6 +17,7 @@
     <Compile Include="WindowRepairLedger.fs" />
     <Compile Include="WindowRepairDispatch.fs" />
     <Compile Include="WindowParityDispatch.fs" />
+    <Compile Include="WindowTxAdapter.fs" />
     <Compile Include="JoinBootstrap.fs" />
   </ItemGroup>
   <ItemGroup>

@@ -20,6 +20,7 @@
     <Compile Include="WindowCustodyTests.fs" />
     <Compile Include="WindowGrantTests.fs" />
     <Compile Include="WindowTxStoreTests.fs" />
+    <Compile Include="WindowTxAdapterTests.fs" />
     <Compile Include="WindowRepairLedgerTests.fs" />
     <Compile Include="WindowRepairDispatchTests.fs" />
     <Compile Include="WindowParityDispatchTests.fs" />

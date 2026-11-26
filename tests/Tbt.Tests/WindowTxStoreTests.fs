@@ -7,6 +7,23 @@ open Tbt.Session
 let private symbol n = Array.init 32 (fun i -> byte ((i + n * 17) % 256))
 
 [<Fact>]
+let ``step length is visible only after sealing and disappears on release`` () =
+    let tx = WindowTxStore(32, 1)
+    Assert.True(tx.TryStepUsed(0UL).IsNone)
+    Assert.True(tx.TryWrite(0UL, 0, ReadOnlySpan(symbol 1)))
+    Assert.True(tx.TryStepUsed(0UL).IsNone)
+    Assert.True(tx.SealStep(0UL, 1))
+    Assert.Equal(ValueSome 1, tx.TryStepUsed(0UL))
+    Assert.True(tx.TryStepUsed(1UL).IsNone)
+    Assert.True(tx.TryWrite(1UL, 0, ReadOnlySpan(symbol 2)))
+    Assert.True(tx.TryWrite(1UL, 1, ReadOnlySpan(symbol 3)))
+    Assert.True(tx.SealStep(1UL, 2))
+    Assert.Equal(ValueSome 2, tx.TryStepUsed(1UL))
+    tx.ReleaseThrough(4UL, true)
+    Assert.True(tx.TryStepUsed(0UL).IsNone)
+    Assert.True(tx.TryStepUsed(1UL).IsNone)
+
+[<Fact>]
 let ``reserved source is invisible until commit and cancellation frees capacity`` () =
     let tx = WindowTxStore(32, 1)
     let mutable slot = Span<byte>.Empty

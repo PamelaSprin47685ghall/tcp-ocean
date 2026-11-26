@@ -35,6 +35,13 @@ type WindowTxStore(symbolSize: int, maxWindows: int) =
 
     member _.Count = windows.Count
 
+    /// Return the authenticated DATA step length only after that step is sealed.
+    member _.TryStepUsed(step: uint64) =
+        match windows.TryGetValue(WindowBridge.windowId step) with
+        | true, w when int (step % 4UL) < w.SealedCount ->
+            ValueSome w.Lengths.[int (step % 4UL)]
+        | _ -> ValueNone
+
     /// Reserves one writable slot; it is invisible to readers until committed.
     member _.TryBeginWrite(step: uint64, slot: int, target: byref<Span<byte>>) =
         target <- Span<byte>.Empty
