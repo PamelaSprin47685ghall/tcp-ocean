@@ -247,6 +247,16 @@ type WindowReceive(symbolSize: int, maxWindows: int, maxBytes: int64) =
     member _.Count = pool.Count
     member _.AllocatedBytes = pool.AllocatedBytes
 
+    /// Length learned from accepted, already-authenticated DATA or PARITY metadata.
+    /// The caller must authenticate frames before passing them to this receiver.
+    member _.TryStepUsed(step: uint64) =
+        let id = WindowBridge.windowId step
+        let mutable state = WindowSnapshotState.empty
+        let offset = int (step % 4UL)
+        if id < releasedBefore || not (trackers.TryGetValue(id, &state))
+           || state.KnownMask &&& (1uy <<< offset) = 0uy then ValueNone
+        else ValueSome (int ((state.PackedLengths >>> (4 * offset)) &&& 15us) + 1)
+
     member _.TryAddSource(step: uint64, slot: int, stepUsed: int, data: byte[]) =
         match WindowBridge.tryIndex (step, slot) with
         | ValueSome index when slot < stepUsed ->

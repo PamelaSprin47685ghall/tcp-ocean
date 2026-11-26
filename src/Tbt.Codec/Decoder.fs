@@ -21,6 +21,34 @@ type EquationResult =
     /// The equation covers a step outside the decode window; it was dropped.
     | OutOfWindow = 3
 
+/// Decoder operations required by the session receive path.
+type ICodecDecoder =
+    abstract Frontier: uint64
+    abstract KConflicts: int64
+    abstract BaseStep: uint64
+    abstract SeenEnd: uint64
+    abstract PendingRows: int
+    abstract RowsAllocated: int
+    abstract FreeRows: int
+    abstract StaleRows: int64
+    abstract RowMemoryBytes: int64
+    abstract IsStepComplete: uint64 -> bool
+    abstract WasRecovered: uint64 * int -> bool
+    abstract AcknowledgeRecovered: uint64 * int -> unit
+    abstract StepKnownCount: uint64 -> int
+    abstract BuildDecodedBitmap: uint64 -> struct (uint64 * uint64 * uint64 * uint64)
+    abstract Unknowns: uint64 * int -> int
+    abstract Deficit: uint64 * int -> int
+    abstract NoteSeen: uint64 -> bool
+    abstract NoteStepUsed: uint64 * int -> bool
+    abstract OfferSource: uint64 * int * int * ReadOnlySpan<byte> -> bool
+    abstract OfferParity: uint64 * int * CodeField * bool * int * ReadOnlySpan<byte> -> EquationResult
+    abstract OfferBooster: uint64 * int * int * ReadOnlySpan<byte> -> EquationResult
+    abstract TryTakeKnown: byref<uint64> * byref<int> * byref<bool> -> bool
+    abstract StepUsed: uint64 -> int
+    abstract Source: uint64 * int -> ReadOnlySpan<byte>
+    abstract Release: uint64 -> unit
+
 /// One pending equation: sum of Coefs[i] * x[Cols[i]] = Payload. Cols sorted ascending.
 [<Sealed; AllowNullLiteral>]
 type private Row(symbolSize: int) =
@@ -659,3 +687,30 @@ type Decoder(graphSeed: uint64, symbolSize: int, capacitySteps: int, maxRows: in
             rowMemoryBytes <- rowMemoryBytes - r.OwnedBytes
             rowsAllocated <- rowsAllocated - 1
             drop <- drop - 1
+
+    interface ICodecDecoder with
+        member x.Frontier = x.Frontier
+        member x.KConflicts = x.KConflicts
+        member x.BaseStep = x.BaseStep
+        member x.SeenEnd = x.SeenEnd
+        member x.PendingRows = x.PendingRows
+        member x.RowsAllocated = x.RowsAllocated
+        member x.FreeRows = x.FreeRows
+        member x.StaleRows = x.StaleRows
+        member x.RowMemoryBytes = x.RowMemoryBytes
+        member x.IsStepComplete t = x.IsStepComplete t
+        member x.WasRecovered(t, s) = x.WasRecovered(t, s)
+        member x.AcknowledgeRecovered(t, s) = x.AcknowledgeRecovered(t, s)
+        member x.StepKnownCount t = x.StepKnownCount t
+        member x.BuildDecodedBitmap t = x.BuildDecodedBitmap t
+        member x.Unknowns(t, span) = x.Unknowns(t, span)
+        member x.Deficit(t, span) = x.Deficit(t, span)
+        member x.NoteSeen t = x.NoteSeen t
+        member x.NoteStepUsed(t, k) = x.NoteStepUsed(t, k)
+        member x.OfferSource(t, slot, k, symbol) = x.OfferSource(t, slot, k, symbol)
+        member x.OfferParity(t, p, field, urgent, k, payload) = x.OfferParity(t, p, field, urgent, k, payload)
+        member x.OfferBooster(t, span, seq, payload) = x.OfferBooster(t, span, seq, payload)
+        member x.TryTakeKnown(t, slot, recovered) = x.TryTakeKnown(&t, &slot, &recovered)
+        member x.StepUsed t = x.StepUsed t
+        member x.Source(t, slot) = x.Source(t, slot)
+        member x.Release below = x.Release below

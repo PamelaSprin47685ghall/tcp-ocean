@@ -41,7 +41,7 @@ module SmallStep =
         m
 
 [<Sealed>]
-type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder, sealer: CellSealer,
+type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: ICodecEncoder, sealer: CellSealer,
             rho0: float, fecAdaptive: bool, rhoMin: float, rhoMax: float, rhoFloor: float,
             rhoGain: float, fecWindowCells: int,
             maxPaths: int, queueLimit: int, clock: IClock) =

@@ -87,7 +87,7 @@ type SessionParams =
       Grant0: uint16 }
 
 [<Sealed>]
-type private DecoderStore(decoder: Decoder) =
+type private DecoderStore(decoder: ICodecDecoder) =
     interface ISourceStore with
         member _.Source(step, slot) = decoder.Source(step, slot)
 
@@ -140,8 +140,8 @@ type Session(role: Role, p: SessionParams, port: IFlowPort, clock: IClock, confi
         publishRx ()
     let sealer = CellSealer(txDir, s, txKeys, mask (if client then keys.HpUp else keys.HpDown))
     let opener = CellOpener(rxDir, s, rxKeys, mask (if client then keys.HpDown else keys.HpUp))
-    let encoder = Encoder((if client then keys.GraphSeedUp else keys.GraphSeedDown), s, config.WindowSteps)
-    let decoder = Decoder((if client then keys.GraphSeedDown else keys.GraphSeedUp), s, config.WindowSteps, config.MaxRows)
+    let encoder = Encoder((if client then keys.GraphSeedUp else keys.GraphSeedDown), s, config.WindowSteps) :> ICodecEncoder
+    let decoder = Decoder((if client then keys.GraphSeedDown else keys.GraphSeedUp), s, config.WindowSteps, config.MaxRows) :> ICodecDecoder
     let tx =
         TxHalf(txDir, s, fieldOf txDir, encoder, sealer, config.Rho, config.FecAdaptive,
                config.RhoMin, config.RhoMax, config.RhoFloor, config.RhoGain,

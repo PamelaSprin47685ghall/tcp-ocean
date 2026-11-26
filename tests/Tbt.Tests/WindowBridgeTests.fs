@@ -152,6 +152,33 @@ let ``released windows reject late data and parity without consuming capacity`` 
     Assert.Equal(allocated, rx.AllocatedBytes)
 
 [<Fact>]
+let ``receiver exposes only accepted snapshot step lengths and forgets released windows`` () =
+    // The receive API assumes authentication has already succeeded. A rejected
+    // frame must never publish its metadata as accepted snapshot state.
+    let rx = WindowReceive(32, 2, 1L <<< 20)
+    let struct (meta, mask) = WindowBridge.snapshotParity 0UL 0 [| 1; 16; 3 |]
+    Assert.Equal(ValueNone, rx.TryStepUsed 1UL)
+    let sources = Array.init 64 (fun i -> fill 32 (i + 1))
+    let parity = WindowCodec.encode sources mask
+    Assert.Equal(WindowCodec.AddOutcome.Innovative, rx.TryAddParity(meta, parity))
+    Assert.Equal(ValueSome 1, rx.TryStepUsed 0UL)
+    Assert.Equal(ValueSome 16, rx.TryStepUsed 1UL) // no DATA for this step
+    Assert.Equal(ValueSome 3, rx.TryStepUsed 2UL)
+    Assert.Equal(ValueNone, rx.TryStepUsed 3UL)
+    let struct (conflict, _) = WindowBridge.snapshotParity 0UL 1 [| 1; 15; 3; 7 |]
+    Assert.Equal(WindowCodec.AddOutcome.Invalid, rx.TryAddParity(conflict, parity))
+    Assert.Equal(ValueSome 16, rx.TryStepUsed 1UL)
+    Assert.Equal(ValueNone, rx.TryStepUsed 3UL)
+    Assert.Equal(WindowCodec.AddOutcome.Invalid, rx.TryAddParity({ meta with KHist = 0x10000u }, parity))
+    Assert.Equal(ValueSome 3, rx.TryStepUsed 2UL)
+    rx.ReleaseThrough 3UL
+    Assert.Equal(ValueSome 16, rx.TryStepUsed 1UL)
+    rx.ReleaseThrough 4UL
+    Assert.Equal(ValueNone, rx.TryStepUsed 0UL)
+    Assert.Equal(ValueNone, rx.TryStepUsed 1UL)
+    Assert.Equal(ValueNone, rx.TryStepUsed 2UL)
+
+[<Fact>]
 let ``steady receiver calls allocate no managed memory`` () =
     let rx = WindowReceive(32, 2, 1L <<< 20)
     let source = fill 32 4

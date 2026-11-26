@@ -6,6 +6,21 @@ open System
 open Tbt.Contracts
 open Tbt.Codec.CodeGraph
 
+/// Encoder contract; parity and booster semantics remain protocol-specific.
+type ICodecEncoder =
+    abstract SymbolSize: int
+    abstract Capacity: int
+    abstract Head: uint64
+    abstract Tail: uint64
+    abstract HeldSteps: int
+    abstract TryGetFillSlot: slot: int * symbol: byref<Span<byte>> -> bool
+    abstract Seal: k: int -> uint64
+    abstract StepUsed: t: uint64 -> int
+    abstract Source: t: uint64 * slot: int -> ReadOnlySpan<byte>
+    abstract TryRenderParity: t: uint64 * p: int * field: CodeField * urgent: bool * dst: Span<byte> -> bool
+    abstract TryRenderBooster: tLo: uint64 * span: int * seq: int * dst: Span<byte> -> bool
+    abstract Release: below: uint64 -> unit
+
 [<Sealed>]
 type Encoder(graphSeed: uint64, symbolSize: int, capacitySteps: int) =
     let ring = StepRing(capacitySteps, symbolSize)
@@ -97,3 +112,17 @@ type Encoder(graphSeed: uint64, symbolSize: int, capacitySteps: int) =
         while tail < limit do
             ring.Free tail
             tail <- tail + 1UL
+
+    interface ICodecEncoder with
+        member x.SymbolSize = x.SymbolSize
+        member x.Capacity = x.Capacity
+        member x.Head = x.Head
+        member x.Tail = x.Tail
+        member x.HeldSteps = x.HeldSteps
+        member x.TryGetFillSlot(slot, symbol) = x.TryGetFillSlot(slot, &symbol)
+        member x.Seal(k) = x.Seal(k)
+        member x.StepUsed(t) = x.StepUsed(t)
+        member x.Source(t, slot) = x.Source(t, slot)
+        member x.TryRenderParity(t, p, field, urgent, dst) = x.TryRenderParity(t, p, field, urgent, dst)
+        member x.TryRenderBooster(t, span, seq, dst) = x.TryRenderBooster(t, span, seq, dst)
+        member x.Release(below) = x.Release(below)

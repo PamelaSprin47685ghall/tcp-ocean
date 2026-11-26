@@ -9,7 +9,7 @@ open Tbt.Crypto
 open Tbt.Wire
 
 [<Sealed>]
-type RxHalf(symbolSize: int, field: CodeField, decoder: Decoder, opener: CellOpener, capacitySteps: int, maxPaths: int) =
+type RxHalf(symbolSize: int, field: CodeField, decoder: ICodecDecoder, opener: CellOpener, capacitySteps: int, maxPaths: int) =
     let counters = RxCounters()
     let hold = ParityHold(symbolSize, 2 * capacitySteps)
     /// Per path: highest step of a DATA or PARITY cell seen, and when the path last gave one.
