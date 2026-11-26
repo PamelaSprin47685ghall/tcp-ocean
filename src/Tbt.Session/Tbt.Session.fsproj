@@ -9,6 +9,7 @@
     <Compile Include="Session.fs" />
     <Compile Include="Handshake.fs" />
     <Compile Include="WindowBridge.fs" />
+    <Compile Include="WindowRxBackend.fs" />
     <Compile Include="WindowGrant.fs" />
     <Compile Include="WindowTxStore.fs" />
     <Compile Include="JoinBootstrap.fs" />

@@ -31,7 +31,9 @@ module WindowBridge =
 
     let windowId (step: uint64) = step / uint64 StepsPerWindow
 
-    let firstStep (id: uint64) = id * uint64 StepsPerWindow
+    let firstStep (id: uint64) =
+        if id > UInt64.MaxValue / uint64 StepsPerWindow then invalidArg (nameof id) "window origin overflows"
+        id * uint64 StepsPerWindow
 
     /// Index inside the 64-symbol window. False when the slot is outside a 16-slot step.
     let tryIndex (step: uint64, slot: int) =
@@ -90,7 +92,7 @@ module WindowBridge =
     /// DATA meta for a systematic source. KHist stays zero: the window code does not
     /// use the old stride history, and a zero field is legal for an old reader.
     let sourceMeta (step: uint64) (slot: int) (stepUsed: int) =
-        if stepUsed < 1 || stepUsed > SlotsPerStep || slot >= stepUsed then
+        if stepUsed < 1 || stepUsed > SlotsPerStep || slot < 0 || slot >= stepUsed then
             invalidArg (nameof slot) "slot outside step_used"
         { Type = CellType.Data
           Flags = MetaFlags.None

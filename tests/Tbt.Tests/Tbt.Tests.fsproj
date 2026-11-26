@@ -16,6 +16,7 @@
     <Compile Include="CodecTests.fs" />
     <Compile Include="WindowCodecTests.fs" />
     <Compile Include="WindowBridgeTests.fs" />
+    <Compile Include="WindowRxBackendTests.fs" />
     <Compile Include="WindowGrantTests.fs" />
     <Compile Include="WindowTxStoreTests.fs" />
     <Compile Include="WireTests.fs" />

@@ -33,9 +33,14 @@ let ``step and slot map onto one 64-symbol window and back`` () =
                 Assert.Equal(slot, back)
             | ValueNone -> failwith "in-range slot rejected"
     Assert.True(WindowBridge.tryIndex(4UL, 16) |> ValueOption.isNone)
+    Assert.Throws<ArgumentException>(fun () -> WindowBridge.sourceMeta 4UL (-1) 1 |> ignore) |> ignore
     Assert.Equal(48, WindowBridge.tailLength 3 0)
     Assert.Equal(50, WindowBridge.tailLength 3 2)
     Assert.Equal(64, WindowBridge.tailLength 4 0)
+    Assert.Equal(UInt64.MaxValue - 3UL, WindowBridge.firstStep (UInt64.MaxValue / 4UL))
+    Assert.Throws<ArgumentException>(fun () -> WindowBridge.firstStep (UInt64.MaxValue / 4UL + 1UL) |> ignore) |> ignore
+    let overflow = { WindowId = UInt64.MaxValue / 4UL + 1UL; FirstStep = 0UL; ParityIdx = 0; Tail = 1 }
+    Assert.Throws<ArgumentException>(fun () -> WindowBridge.parityMeta overflow |> ignore) |> ignore
 
 [<Fact>]
 let ``sealed snapshots preserve sparse slots even when a step is wholly lost`` () =
