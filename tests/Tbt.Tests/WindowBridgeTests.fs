@@ -22,6 +22,20 @@ let ``xor path matches the scalar oracle on aligned and odd lengths`` () =
         Assert.Equal<byte[]>(scalar, simd)
 
 [<Fact>]
+let ``span slices preserve receiver results and reject contradictory inputs`` () =
+    let rx = WindowReceive(32, 2, 1L <<< 20)
+    let data = fill 40 9
+    let body = ReadOnlySpan<byte>(data, 4, 32)
+    Assert.Equal(WindowCodec.AddOutcome.Innovative, rx.TryAddSource(0UL, 0, 1, body))
+    let struct (meta, _) = WindowBridge.snapshotParity 0UL 0 [| 1 |]
+    Assert.Equal(WindowCodec.AddOutcome.Duplicate, rx.TryAddParity(meta, body))
+    data.[4] <- data.[4] ^^^ 1uy
+    Assert.Equal(WindowCodec.AddOutcome.Invalid, rx.TryAddSource(0UL, 0, 1, body))
+    Assert.Equal(WindowCodec.AddOutcome.Invalid, rx.TryAddParity(meta, body))
+    Assert.Equal(1, rx.Count)
+    Assert.Equal(WindowCodec.AddOutcome.Invalid, rx.TryAddSource(0UL, 0, 1, Unchecked.defaultof<byte[]>))
+
+[<Fact>]
 let ``step and slot map onto one 64-symbol window and back`` () =
     for step in 8UL .. 11UL do
         for slot = 0 to 15 do

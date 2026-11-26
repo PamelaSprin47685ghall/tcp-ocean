@@ -21,6 +21,8 @@
     <Compile Include="WindowGrantTests.fs" />
     <Compile Include="WindowTxStoreTests.fs" />
     <Compile Include="WindowRepairLedgerTests.fs" />
+    <Compile Include="WindowRepairDispatchTests.fs" />
+    <Compile Include="WindowParityDispatchTests.fs" />
     <Compile Include="WireTests.fs" />
     <Compile Include="CryptoTests.fs" />
     <Compile Include="RateGroupTests.fs" />

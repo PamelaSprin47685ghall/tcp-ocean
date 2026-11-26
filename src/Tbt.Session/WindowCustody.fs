@@ -34,12 +34,16 @@ type WindowCustody(symbolSize: int, maxWindows: int, maxBytes: int64) =
         g
 
     /// Metadata and payload must have passed AEAD authentication before this call.
-    member _.AddSource(step: uint64, slot: int, used: int, data: byte[]) =
+    member _.AddSource(step: uint64, slot: int, used: int, data: ReadOnlySpan<byte>) =
         if step >= limit then WindowCodec.AddOutcome.Invalid
         else receiver.TryAddSource(step, slot, used, data)
 
+    member this.AddSource(step: uint64, slot: int, used: int, data: byte[]) =
+        if isNull (box data) then WindowCodec.AddOutcome.Invalid
+        else this.AddSource(step, slot, used, ReadOnlySpan data)
+
     /// A parity snapshot must describe only steps already covered by the grant.
-    member _.AddParity(meta: Meta, data: byte[]) =
+    member _.AddParity(meta: Meta, data: ReadOnlySpan<byte>) =
         match WindowBridge.trySnapshotParityMask meta with
         | ValueNone -> WindowCodec.AddOutcome.Invalid
         | ValueSome _ ->
@@ -47,6 +51,10 @@ type WindowCustody(symbolSize: int, maxWindows: int, maxBytes: int64) =
             if meta.StepId > UInt64.MaxValue - steps || meta.StepId + steps > limit then
                 WindowCodec.AddOutcome.Invalid
             else receiver.TryAddParity(meta, data)
+
+    member this.AddParity(meta: Meta, data: byte[]) =
+        if isNull (box data) then WindowCodec.AddOutcome.Invalid
+        else this.AddParity(meta, ReadOnlySpan data)
 
     /// Deliver a source while holding a temporary custody reference. The callback
     /// registers any durable flow references via StepUndelivered. If it throws,

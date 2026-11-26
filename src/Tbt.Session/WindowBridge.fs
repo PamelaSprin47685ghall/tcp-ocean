@@ -224,15 +224,15 @@ type WindowReceive(symbolSize: int, maxWindows: int, maxBytes: int64) =
         | true, state -> state
         | _ -> WindowSnapshotState.empty
 
-    let add (id: uint64) (data: byte[]) (candidate: WindowSnapshotState) (mask: uint64) =
-        if id < releasedBefore || isNull (box data) || data.Length <> symbolSize then WindowCodec.AddOutcome.Invalid
+    let add (id: uint64) (data: ReadOnlySpan<byte>) (candidate: WindowSnapshotState) (mask: uint64) =
+        if id < releasedBefore || data.Length <> symbolSize then WindowCodec.AddOutcome.Invalid
         else
             let mutable opened = false
             if pool.TryGet(id).IsNone then opened <- pool.TryOpen(id, 64)
             match pool.TryGet id with
             | ValueNone -> WindowCodec.AddOutcome.OutOfCapacity
             | ValueSome decoder ->
-                match decoder.TryAdd(mask, ReadOnlySpan data) with
+                match decoder.TryAdd(mask, data) with
                 | WindowCodec.AddOutcome.Innovative ->
                     trackers.[id] <- candidate
                     WindowCodec.AddOutcome.Innovative
@@ -257,7 +257,7 @@ type WindowReceive(symbolSize: int, maxWindows: int, maxBytes: int64) =
            || state.KnownMask &&& (1uy <<< offset) = 0uy then ValueNone
         else ValueSome (int ((state.PackedLengths >>> (4 * offset)) &&& 15us) + 1)
 
-    member _.TryAddSource(step: uint64, slot: int, stepUsed: int, data: byte[]) =
+    member _.TryAddSource(step: uint64, slot: int, stepUsed: int, data: ReadOnlySpan<byte>) =
         match WindowBridge.tryIndex (step, slot) with
         | ValueSome index when slot < stepUsed ->
             let id = WindowBridge.windowId step
@@ -266,10 +266,14 @@ type WindowReceive(symbolSize: int, maxWindows: int, maxBytes: int64) =
             | ValueNone -> WindowCodec.AddOutcome.Invalid
         | _ -> WindowCodec.AddOutcome.Invalid
 
+    member this.TryAddSource(step: uint64, slot: int, stepUsed: int, data: byte[]) =
+        if isNull (box data) then WindowCodec.AddOutcome.Invalid
+        else this.TryAddSource(step, slot, stepUsed, ReadOnlySpan data)
+
     member this.AddSource(step: uint64, slot: int, stepUsed: int, data: byte[]) =
         this.TryAddSource(step, slot, stepUsed, data) = WindowCodec.AddOutcome.Innovative
 
-    member _.TryAddParity(meta: Meta, data: byte[]) =
+    member _.TryAddParity(meta: Meta, data: ReadOnlySpan<byte>) =
         match WindowBridge.trySnapshotParityMask meta with
         | ValueNone -> WindowCodec.AddOutcome.Invalid
         | ValueSome mask ->
@@ -278,6 +282,10 @@ type WindowReceive(symbolSize: int, maxWindows: int, maxBytes: int64) =
             match WindowSnapshotState.tryAdvanceSnapshot (current id) (byte ((1 <<< count) - 1)) (uint16 meta.KHist) with
             | ValueSome candidate -> add id data candidate mask
             | ValueNone -> WindowCodec.AddOutcome.Invalid
+
+    member this.TryAddParity(meta: Meta, data: byte[]) =
+        if isNull (box data) then WindowCodec.AddOutcome.Invalid
+        else this.TryAddParity(meta, ReadOnlySpan data)
 
     member this.AddParity(meta: Meta, data: byte[]) =
         this.TryAddParity(meta, data) = WindowCodec.AddOutcome.Innovative

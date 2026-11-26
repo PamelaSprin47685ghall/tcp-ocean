@@ -211,6 +211,26 @@ let ``TryCopyKnown copies solved symbols into caller span without allocating`` (
     Assert.Equal<byte[]>(src.[0], dst)
 
 [<Fact>]
+let ``reserved matrices survive release and enforce the full budget`` () =
+    let one = 64L * 8L + 65L * 32L
+    let pool = WindowCodec.WindowCodecPool(32, 2, one * 2L, reserveCount = 2)
+    Assert.Equal(one * 2L, pool.ReservedBytes)
+    Assert.Equal(2, pool.IdleReservedCount)
+    Assert.True(pool.TryOpen(1UL, 64))
+    Assert.True(pool.TryOpen(2UL, 64))
+    Assert.False(pool.TryOpen(3UL, 64))
+    let d = pool.TryGet(1UL).Value
+    Assert.True(d.Add(1UL, Array.create 32 7uy))
+    Assert.True(pool.Remove(1UL))
+    Assert.Equal(1, pool.IdleReservedCount)
+    Assert.True(pool.TryOpen(3UL, 64))
+    Assert.Equal(0, pool.TryGet(3UL).Value.Rank)
+    pool.ReleaseThrough(3UL)
+    Assert.Equal(2, pool.IdleReservedCount)
+    Assert.Equal(0L, pool.AllocatedBytes)
+    Assert.Throws<ArgumentException>(fun () -> WindowCodec.WindowCodecPool(32, 2, one * 2L - 1L, reserveCount = 2) |> ignore) |> ignore
+
+[<Fact>]
 let ``pool Remove returns exact bytes and rolls back a freshly opened window`` () =
     let size = 32
     let one = int64 8 * 8L + 9L * int64 size

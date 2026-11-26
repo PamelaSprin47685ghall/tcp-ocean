@@ -218,9 +218,12 @@ module WindowSessionCodec =
 /// Live windows, each sealed at its own k. Release returns a window's row storage
 /// as soon as the caller has delivered it (ack frontier).
 [<Sealed>]
-type WindowCodecPool(symbolSize: int, maxWindows: int, maxBytes: int64) =
-    let windows = Dictionary<uint64, Decoder>()
+type WindowCodecPool(symbolSize: int, maxWindows: int, maxBytes: int64, ?reserveCount: int) =
+    let windows = Dictionary<uint64, Decoder>(maxWindows)
     let mutable used = 0L
+    let reservedCount = defaultArg reserveCount 0
+    let free = Stack<Decoder>(maxWindows)
+    let reserved = HashSet<Decoder>()
     do
         if symbolSize < 1 then invalidArg (nameof symbolSize) "must be positive"
         if maxWindows < 1 || maxWindows > WindowSessionCodec.MaxWindows then
@@ -229,9 +232,20 @@ type WindowCodecPool(symbolSize: int, maxWindows: int, maxBytes: int64) =
             invalidArg (nameof maxBytes) "must be in 1..16MiB"
 
     let decoderBytes k = int64 k * 8L + (int64 k + 1L) * int64 symbolSize
+    let reservedBytes = int64 reservedCount * decoderBytes 64
+    do
+        if reservedCount < 0 || reservedCount > maxWindows then invalidArg (nameof reserveCount) "outside window capacity"
+        if reservedBytes > maxBytes then invalidArg (nameof maxBytes) "reserved matrices exceed budget"
+        for _ = 1 to reservedCount do
+            let decoder = Decoder(64, symbolSize, decoderBytes 64)
+            reserved.Add decoder |> ignore
+            free.Push decoder
 
     member _.Count = windows.Count
+    /// Live matrix payload bytes. Reserved idle payload is reported separately.
     member _.AllocatedBytes = used
+    member _.ReservedBytes = reservedBytes
+    member _.IdleReservedCount = free.Count
     member _.MaxBytes = maxBytes
 
     /// Open a sealed window of k sources. False when the window cap or byte cap would be exceeded.
@@ -241,9 +255,12 @@ type WindowCodecPool(symbolSize: int, maxWindows: int, maxBytes: int64) =
         elif windows.Count >= maxWindows then false
         else
             let bytes = decoderBytes k
-            if used > maxBytes - bytes then false
+            let reuse = k = 64 && free.Count > 0
+            let idleBytes = int64 free.Count * decoderBytes 64
+            if not reuse && (used + idleBytes > maxBytes - bytes) then false
             else
-                windows.Add(windowId, Decoder(k, symbolSize, bytes))
+                let decoder = if reuse then free.Pop() else Decoder(k, symbolSize, bytes)
+                windows.Add(windowId, decoder)
                 used <- used + bytes
                 true
 
@@ -259,6 +276,7 @@ type WindowCodecPool(symbolSize: int, maxWindows: int, maxBytes: int64) =
         | true, decoder ->
             used <- used - decoder.AllocatedBytes
             decoder.Release()
+            if reserved.Contains decoder then free.Push decoder
             windows.Remove windowId |> ignore
             true
         | _ -> false
@@ -273,6 +291,7 @@ type WindowCodecPool(symbolSize: int, maxWindows: int, maxBytes: int64) =
             | true, decoder ->
                 used <- used - decoder.AllocatedBytes
                 decoder.Release()
+                if reserved.Contains decoder then free.Push decoder
                 windows.Remove id |> ignore
             | _ -> ()
         if windows.Count = 0 then used <- 0L

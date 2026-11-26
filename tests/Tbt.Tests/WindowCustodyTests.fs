@@ -32,6 +32,21 @@ let ``custody retains source while referenced and refuses old frames after relea
     Assert.Equal(WindowCodec.AddOutcome.Invalid, rx.AddSource(0UL, 0, 1, Array.zeroCreate 32))
 
 [<Fact>]
+let ``custody accepts sliced spans with the same grant and conflict rules`` () =
+    let rx = WindowCustody(32, 1, 10000L)
+    let bytes = Array.init 40 byte
+    let slice = ReadOnlySpan<byte>(bytes, 4, 32)
+    Assert.Equal(WindowCodec.AddOutcome.Invalid, rx.AddSource(0UL, 0, 1, slice))
+    rx.NextGrant() |> ignore
+    Assert.Equal(WindowCodec.AddOutcome.Innovative, rx.AddSource(0UL, 0, 1, slice))
+    let struct (meta, _) = WindowBridge.snapshotParity 0UL 0 [| 1 |]
+    Assert.Equal(WindowCodec.AddOutcome.Duplicate, rx.AddParity(meta, slice))
+    bytes.[4] <- bytes.[4] ^^^ 1uy
+    Assert.Equal(WindowCodec.AddOutcome.Invalid, rx.AddParity(meta, slice))
+    Assert.Equal(WindowCodec.AddOutcome.Invalid, rx.AddSource(0UL, 0, 1, Unchecked.defaultof<byte[]>))
+    Assert.True((rx :> ISourceStore).Source(0UL, 0).SequenceEqual(ReadOnlySpan<byte>(Array.init 32 (fun i -> byte (i + 4)))))
+
+[<Fact>]
 let ``missing slots track registered sources without inventing unknown step lengths`` () =
     let rx = WindowCustody(32, 1, 10000L)
     rx.NextGrant() |> ignore
