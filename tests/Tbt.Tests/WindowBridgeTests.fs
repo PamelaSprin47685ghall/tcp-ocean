@@ -124,6 +124,26 @@ let ``partial step acknowledgement retains the active window`` () =
     Assert.Equal(0L, rx.AllocatedBytes)
 
 [<Fact>]
+let ``steady receiver calls allocate no managed memory`` () =
+    let rx = WindowReceive(32, 2, 1L <<< 20)
+    let source = fill 32 4
+    let dst = Array.zeroCreate<byte> 32
+    let struct (meta, _) = WindowBridge.snapshotParity 0UL 0 [|1|]
+    Assert.True(rx.AddSource(0UL, 0, 1, source))
+    for _ = 1 to 100 do
+        rx.AddSource(0UL, 0, 1, source) |> ignore
+        rx.AddParity(meta, source) |> ignore
+        rx.TryCopyKnown(0UL, 0, Span dst) |> ignore
+    let before = GC.GetAllocatedBytesForCurrentThread()
+    for _ = 1 to 1000 do
+        rx.AddSource(0UL, 0, 1, source) |> ignore
+        rx.AddParity(meta, source) |> ignore
+        rx.TryCopyKnown(0UL, 0, Span dst) |> ignore
+    let allocated = GC.GetAllocatedBytesForCurrentThread() - before
+    Assert.Equal(0L, allocated)
+    Assert.Equal<byte[]>(source, dst)
+
+[<Fact>]
 let ``receive rejects conflicting authenticated snapshots and retains original sources`` () =
     let rx = WindowReceive(32, 2, 1L <<< 20)
     let a = fill 32 17

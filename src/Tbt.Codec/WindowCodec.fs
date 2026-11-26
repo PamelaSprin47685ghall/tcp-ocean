@@ -81,6 +81,16 @@ let encode (sources: byte[][]) (mask: uint64) =
         if mask &&& (1UL <<< i) <> 0UL then xorInto (ReadOnlySpan sources.[i]) (Span output)
     output
 
+/// Outcome of adding one equation, reported as a struct so the receive path
+/// stays allocation free. Invalid never mutates stored rows; OutOfCapacity means
+/// no pivot can be assigned because all rows are already committed.
+[<Struct>]
+type AddOutcome =
+    | Innovative
+    | Duplicate
+    | Invalid
+    | OutOfCapacity
+
 /// Fixed-size reduced echelon matrix. AllocatedBytes counts array payloads,
 /// not CLR object headers, transient output copies, or caller-owned sources.
 [<Sealed>]
@@ -97,30 +107,53 @@ type Decoder(count: int, symbolSize: int, maxBytes: int64) =
         xorInto (ReadOnlySpan(payload, srcOffset, symbolSize)) (Span(dst, dstOffset, symbolSize))
     let checkIndex index =
         if index < 0 || index >= count then invalidArg "index" "outside window"
-    /// True when rank increases; false for a consistent dependent equation.
-    /// Contradictory dependent equations throw without modifying stored rows.
-    member _.Add(mask: uint64, data: byte[]) =
-        if mask = 0UL || mask &&& ~~~allowed <> 0UL then invalidArg "mask" "invalid coefficients"
-        if isNull (box data) || data.Length <> symbolSize then invalidArg "data" "wrong symbol size"
-        Array.Copy(data, scratch, symbolSize)
-        let mutable bits = mask
-        for i = 0 to count - 1 do
-            if bits &&& (1UL <<< i) <> 0UL && masks.[i] <> 0UL then
-                bits <- bits ^^^ masks.[i]
-                xorRow scratch 0 (i * symbolSize)
-        if bits = 0UL then
-            if scratch |> Array.exists ((<>) 0uy) then invalidOp "contradictory equation"
-            false
+    /// Structural, atomic add. Scratch is the only line touched before the row
+    /// is known to be independent; a contradiction leaves masks/payload/rank intact.
+    member this.TryAdd(mask: uint64, data: ReadOnlySpan<byte>) : AddOutcome =
+        if mask = 0UL || mask &&& ~~~allowed <> 0UL then Invalid
+        elif data.Length <> symbolSize then Invalid
         else
-            let pivot = BitOperations.TrailingZeroCount bits
-            masks.[pivot] <- bits
-            Array.Copy(scratch, 0, payload, pivot * symbolSize, symbolSize)
+            data.CopyTo(Span scratch)
+            let mutable bits = mask
             for i = 0 to count - 1 do
-                if i <> pivot && masks.[i] &&& (1UL <<< pivot) <> 0UL then
-                    masks.[i] <- masks.[i] ^^^ bits
-                    xorRow payload (i * symbolSize) (pivot * symbolSize)
-            rank <- rank + 1
+                if bits &&& (1UL <<< i) <> 0UL && masks.[i] <> 0UL then
+                    bits <- bits ^^^ masks.[i]
+                    xorRow scratch 0 (i * symbolSize)
+            if bits = 0UL then
+                let mutable nonzero = false
+                let mutable j = 0
+                while not nonzero && j < symbolSize do
+                    if scratch.[j] <> 0uy then nonzero <- true
+                    j <- j + 1
+                if nonzero then Invalid else Duplicate
+            elif rank >= count then
+                OutOfCapacity
+            else
+                let pivot = BitOperations.TrailingZeroCount bits
+                masks.[pivot] <- bits
+                Array.Copy(scratch, 0, payload, pivot * symbolSize, symbolSize)
+                for i = 0 to count - 1 do
+                    if i <> pivot && masks.[i] &&& (1UL <<< pivot) <> 0UL then
+                        masks.[i] <- masks.[i] ^^^ bits
+                        xorRow payload (i * symbolSize) (pivot * symbolSize)
+                rank <- rank + 1
+                Innovative
+    /// Legacy signature. True when a new row was committed, false for a
+    /// consistent dependent equation. Contradictions throw without state change.
+    member this.Add(mask: uint64, data: byte[]) =
+        if isNull (box data) then nullArg "data"
+        match this.TryAdd(mask, ReadOnlySpan data) with
+        | Innovative -> true
+        | Duplicate -> false
+        | Invalid -> invalidOp "invalid or contradictory equation"
+        | OutOfCapacity -> invalidOp "decoder row capacity exhausted"
+    member _.TryCopyKnown(index: int, dst: Span<byte>) =
+        checkIndex index
+        if dst.Length <> symbolSize then invalidArg "dst" "wrong symbol size"
+        if masks.[index] = (1UL <<< index) then
+            ReadOnlySpan(payload, index * symbolSize, symbolSize).CopyTo dst
             true
+        else false
     member _.TryGet(index: int) =
         checkIndex index
         if masks.[index] = (1UL <<< index) then
@@ -209,6 +242,17 @@ type WindowCodecPool(symbolSize: int, maxWindows: int, maxBytes: int64) =
         match windows.TryGetValue windowId with
         | true, decoder -> ValueSome decoder
         | _ -> ValueNone
+
+    /// Remove one window and return its exact byte budget. Used to roll back a
+    /// freshly opened window when a later validation/add step fails. Idempotent.
+    member _.Remove(windowId: uint64) =
+        match windows.TryGetValue windowId with
+        | true, decoder ->
+            used <- used - decoder.AllocatedBytes
+            decoder.Release()
+            windows.Remove windowId |> ignore
+            true
+        | _ -> false
 
     /// Drop every window whose id is at or below the acknowledged frontier.
     member _.ReleaseThrough(ackWindow: uint64) =

@@ -161,89 +161,115 @@ module WindowBridge =
         | ValueSome mask -> struct (meta, mask)
         | ValueNone -> invalidOp "invalid sealed parity snapshot"
 
-/// Tracks authenticated step lengths for one window; updates are atomic on conflict.
+[<Struct>]
+type WindowSnapshotState =
+    { KnownMask: byte
+      PackedLengths: uint16 }
+
+module WindowSnapshotState =
+    let empty = { KnownMask = 0uy; PackedLengths = 0us }
+
+    let tryAdvanceData (state: WindowSnapshotState) (stepOffset: int) (stepUsed: int) =
+        if stepOffset < 0 || stepOffset >= 4 || stepUsed < 1 || stepUsed > 16 then ValueNone
+        else
+            let bit = 1uy <<< stepOffset
+            let shift = stepOffset * 4
+            let value = uint16 (stepUsed - 1)
+            if state.KnownMask &&& bit <> 0uy && ((state.PackedLengths >>> shift) &&& 15us) <> value then ValueNone
+            else ValueSome { KnownMask = state.KnownMask ||| bit; PackedLengths = state.PackedLengths ||| (value <<< shift) }
+
+    let tryAdvanceSnapshot (state: WindowSnapshotState) (snapshotMask: byte) (packedLengths: uint16) =
+        if snapshotMask &&& 0xF0uy <> 0uy then ValueNone
+        else
+            let mutable next = ValueSome state
+            for i = 0 to 3 do
+                if snapshotMask &&& (1uy <<< i) <> 0uy then
+                    match next with
+                    | ValueSome s -> next <- tryAdvanceData s i (int ((packedLengths >>> (4 * i)) &&& 15us) + 1)
+                    | ValueNone -> ()
+            next
+
+/// Compatibility wrapper for consumers which need a mutable tracker.
 [<Sealed>]
 type WindowSnapshotTracker(windowId: uint64) =
-    let lengths: byte[] = Array.zeroCreate WindowBridge.StepsPerWindow
-
+    let mutable state = WindowSnapshotState.empty
     member _.TryData(step: uint64, slot: int, stepUsed: int) =
-        if WindowBridge.windowId step <> windowId || stepUsed < 1 || stepUsed > 16
-           || slot < 0 || slot >= stepUsed then false
+        if WindowBridge.windowId step <> windowId || slot < 0 || slot >= stepUsed then false
         else
-            let i = int (step % uint64 WindowBridge.StepsPerWindow)
-            if lengths.[i] <> 0uy && int lengths.[i] <> stepUsed then false
-            else
-                lengths.[i] <- byte stepUsed
-                true
-
-    /// The caller authenticates the frame before supplying its metadata.
+            match WindowSnapshotState.tryAdvanceData state (int (step % 4UL)) stepUsed with
+            | ValueSome s -> state <- s; true
+            | ValueNone -> false
     member _.TrySnapshot(meta: Meta) =
-        if WindowBridge.windowId meta.StepId <> windowId
-           || (WindowBridge.trySnapshotParityMask meta |> ValueOption.isNone) then false
+        if WindowBridge.windowId meta.StepId <> windowId || (WindowBridge.trySnapshotParityMask meta |> ValueOption.isNone) then false
         else
-            let count = (int meta.Aux - 1) / WindowBridge.SlotsPerStep + 1
-            let mutable valid = true
-            for i = 0 to count - 1 do
-                let k = byte (int ((meta.KHist >>> (4 * i)) &&& 15u) + 1)
-                if lengths.[i] <> 0uy && lengths.[i] <> k then valid <- false
-            if valid then
-                for i = 0 to count - 1 do
-                    lengths.[i] <- byte (int ((meta.KHist >>> (4 * i)) &&& 15u) + 1)
-            valid
-
-    member this.Copy() =
-        let copy = WindowSnapshotTracker(windowId)
-        for i = 0 to WindowBridge.StepsPerWindow - 1 do
-            if lengths.[i] <> 0uy then
-                copy.TryData(windowId * 4UL + uint64 i, 0, int lengths.[i]) |> ignore
-        copy
-
+            let count = (int meta.Aux - 1) / 16 + 1
+            match WindowSnapshotState.tryAdvanceSnapshot state (byte ((1 <<< count) - 1)) (uint16 meta.KHist) with
+            | ValueSome s -> state <- s; true
+            | ValueNone -> false
     member _.StepUsed(offset: int) =
-        if offset < 0 || offset >= WindowBridge.StepsPerWindow then invalidArg (nameof offset) "outside window"
-        if lengths.[offset] = 0uy then ValueNone else ValueSome(int lengths.[offset])
+        if offset < 0 || offset >= 4 then invalidArg (nameof offset) "outside window"
+        if state.KnownMask &&& (1uy <<< offset) = 0uy then ValueNone
+        else ValueSome (int ((state.PackedLengths >>> (4 * offset)) &&& 15us) + 1)
 
 [<Sealed>]
 type WindowReceive(symbolSize: int, maxWindows: int, maxBytes: int64) =
     let pool = WindowCodec.WindowCodecPool(symbolSize, maxWindows, maxBytes)
-    let trackers = System.Collections.Generic.Dictionary<uint64, WindowSnapshotTracker>()
+    let trackers = System.Collections.Generic.Dictionary<uint64, WindowSnapshotState>(maxWindows)
 
-    let add (id: uint64) (data: byte[]) (update: WindowSnapshotTracker -> bool) (mask: uint64) =
+    let current id =
+        match trackers.TryGetValue id with
+        | true, state -> state
+        | _ -> WindowSnapshotState.empty
+
+    let add (id: uint64) (data: byte[]) (candidate: WindowSnapshotState) (mask: uint64) =
         if isNull (box data) || data.Length <> symbolSize then false
         else
-            let tracker =
-                match trackers.TryGetValue id with
-                | true, existing -> existing.Copy()
-                | _ -> WindowSnapshotTracker(id)
-            if not (update tracker) then false
-            elif pool.TryGet(id).IsNone && not (pool.TryOpen(id, 64)) then false
-            else
-                match pool.TryGet id with
-                | ValueNone -> false
-                | ValueSome decoder ->
-                    try
-                        let innovative = decoder.Add(mask, data)
-                        trackers.[id] <- tracker
-                        innovative
-                    with :? InvalidOperationException -> false
+            let mutable opened = false
+            if pool.TryGet(id).IsNone then opened <- pool.TryOpen(id, 64)
+            match pool.TryGet id with
+            | ValueNone -> false
+            | ValueSome decoder ->
+                match decoder.TryAdd(mask, ReadOnlySpan data) with
+                | WindowCodec.AddOutcome.Innovative ->
+                    trackers.[id] <- candidate
+                    true
+                | WindowCodec.AddOutcome.Duplicate ->
+                    trackers.[id] <- candidate
+                    false
+                | _ ->
+                    if opened then pool.Remove id |> ignore
+                    false
 
     member _.Pool = pool
     member _.Count = pool.Count
     member _.AllocatedBytes = pool.AllocatedBytes
 
-    /// Only authenticated frames may be submitted. False includes duplicates and rejects.
     member _.AddSource(step: uint64, slot: int, stepUsed: int, data: byte[]) =
         match WindowBridge.tryIndex (step, slot) with
-        | ValueNone -> false
-        | ValueSome index ->
+        | ValueSome index when slot < stepUsed ->
             let id = WindowBridge.windowId step
-            add id data (fun tracker -> tracker.TryData(step, slot, stepUsed)) (1UL <<< index)
+            match WindowSnapshotState.tryAdvanceData (current id) (int (step % 4UL)) stepUsed with
+            | ValueSome candidate -> add id data candidate (1UL <<< index)
+            | ValueNone -> false
+        | _ -> false
 
     member _.AddParity(meta: Meta, data: byte[]) =
         match WindowBridge.trySnapshotParityMask meta with
         | ValueNone -> false
         | ValueSome mask ->
             let id = WindowBridge.windowId meta.StepId
-            add id data (fun tracker -> tracker.TrySnapshot meta) mask
+            let count = (int meta.Aux - 1) / 16 + 1
+            match WindowSnapshotState.tryAdvanceSnapshot (current id) (byte ((1 <<< count) - 1)) (uint16 meta.KHist) with
+            | ValueSome candidate -> add id data candidate mask
+            | ValueNone -> false
+
+    member _.TryCopyKnown(step: uint64, slot: int, dst: Span<byte>) =
+        match WindowBridge.tryIndex (step, slot) with
+        | ValueNone -> false
+        | ValueSome index ->
+            match pool.TryGet(WindowBridge.windowId step) with
+            | ValueSome decoder -> decoder.TryCopyKnown(index, dst)
+            | ValueNone -> false
 
     /// Release only windows fully below the exclusive delivered step frontier.
     member _.ReleaseThrough(ackStep: uint64) =

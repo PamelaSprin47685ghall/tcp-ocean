@@ -176,3 +176,71 @@ let ``window pool enforces its window count and frees storage at the ack frontie
     tight.ReleaseThrough 1UL
     Assert.True(tight.TryOpen(3UL, 8))
     Assert.True(tight.AllocatedBytes <= tight.MaxBytes)
+
+[<Fact>]
+let ``TryAdd structural outcomes are atomic and never pollute stored rows`` () =
+    let src = sources 8 16 21
+    let d = WindowCodec.Decoder(8, 16, 1L <<< 16)
+    let mask = 1UL ||| 2UL
+    Assert.Equal(WindowCodec.AddOutcome.Innovative, d.TryAdd(mask, ReadOnlySpan(xorSources src mask)))
+    Assert.Equal(1, d.Rank)
+    Assert.Equal(WindowCodec.AddOutcome.Duplicate, d.TryAdd(mask, ReadOnlySpan(xorSources src mask)))
+    Assert.Equal(1, d.Rank)
+    // contradictory equation returns Invalid and leaves rank + rows intact
+    let bad = Array.copy (xorSources src mask)
+    bad.[0] <- bad.[0] ^^^ 1uy
+    Assert.Equal(WindowCodec.AddOutcome.Invalid, d.TryAdd(mask, ReadOnlySpan bad))
+    Assert.Equal(1, d.Rank)
+    // the original equation is still consistent: state was not polluted
+    Assert.Equal(WindowCodec.AddOutcome.Duplicate, d.TryAdd(mask, ReadOnlySpan(xorSources src mask)))
+    Assert.Equal(WindowCodec.AddOutcome.Invalid, d.TryAdd(0UL, ReadOnlySpan(Array.zeroCreate<byte> 16)))
+    Assert.Equal(WindowCodec.AddOutcome.Invalid, d.TryAdd(UInt64.MaxValue, ReadOnlySpan(Array.zeroCreate<byte> 16)))
+
+[<Fact>]
+let ``TryCopyKnown copies solved symbols into caller span without allocating`` () =
+    let src = sources 8 16 33
+    let d = WindowCodec.Decoder(8, 16, 1L <<< 16)
+    let dst = Array.zeroCreate<byte> 16
+    Assert.False(d.TryCopyKnown(0, Span dst))
+    d.TryAdd(1UL, ReadOnlySpan src.[0]) |> ignore
+    Assert.True(d.TryCopyKnown(0, Span dst))
+    Assert.Equal<byte[]>(src.[0], dst)
+    // overwrite with a different value: copy must fully replace the span
+    Array.fill dst 0 16 0xFFuy
+    Assert.True(d.TryCopyKnown(0, Span dst))
+    Assert.Equal<byte[]>(src.[0], dst)
+
+[<Fact>]
+let ``pool Remove returns exact bytes and rolls back a freshly opened window`` () =
+    let size = 32
+    let one = int64 8 * 8L + 9L * int64 size
+    let pool = WindowCodec.WindowCodecPool(size, 4, one * 4L)
+    Assert.True(pool.TryOpen(7UL, 8))
+    Assert.Equal(one, pool.AllocatedBytes)
+    Assert.True(pool.Remove(7UL))
+    Assert.Equal(0L, pool.AllocatedBytes)
+    Assert.False(pool.Remove(7UL))
+    Assert.False(pool.TryGet(7UL) |> ValueOption.isSome)
+    Assert.True(pool.TryOpen(8UL, 8))
+    Assert.Equal(one, pool.AllocatedBytes)
+
+[<Fact>]
+let ``steady TryAdd and TryCopyKnown allocate zero bytes on the hot path`` () =
+    let count = 16
+    let size = 48
+    let src = sources count size 77
+    let d = WindowCodec.Decoder(count, size, 1L <<< 20)
+    let dst = Array.zeroCreate<byte> size
+    // warm up all rows and all allocation sites before measuring
+    for i = 0 to count - 1 do
+        d.TryAdd(1UL <<< i, ReadOnlySpan src.[i]) |> ignore
+        d.TryCopyKnown(i, Span dst) |> ignore
+    let mutable outcome = WindowCodec.AddOutcome.Invalid
+    let before = GC.GetAllocatedBytesForCurrentThread()
+    for _ = 1 to 64 do
+        for i = 0 to count - 1 do
+            outcome <- d.TryAdd(1UL <<< i, ReadOnlySpan src.[i])
+            d.TryCopyKnown(i, Span dst) |> ignore
+    let after = GC.GetAllocatedBytesForCurrentThread()
+    Assert.Equal(WindowCodec.AddOutcome.Duplicate, outcome)
+    Assert.Equal(0L, after - before)
