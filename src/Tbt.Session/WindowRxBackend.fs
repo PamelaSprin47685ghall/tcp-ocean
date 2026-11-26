@@ -37,6 +37,15 @@ type WindowRxProgress(maxSteps: int) =
                 true
         | _ -> false
 
+    /// Return the missing source slots for an observed step.
+    /// Unknown steps return ValueNone rather than an invented length.
+    member _.Missing(step: uint64) =
+        match steps.TryGetValue step with
+        | true, struct (used, known, _) ->
+            let expected = uint16 ((1u <<< used) - 1u)
+            ValueSome (expected &&& ~~~known)
+        | _ -> ValueNone
+
     /// FlowTable calls this for references into the source store.
     member _.StepUndelivered(step: uint64, delta: int) =
         match steps.TryGetValue step with

@@ -147,6 +147,15 @@ type Decoder(count: int, symbolSize: int, maxBytes: int64) =
         | Duplicate -> false
         | Invalid -> invalidOp "invalid or contradictory equation"
         | OutOfCapacity -> invalidOp "decoder row capacity exhausted"
+    /// Borrow a solved source row without allocating. The caller must keep this
+    /// window alive and must not call Release while the span is in use. Adding
+    /// equations leaves solved unit rows unchanged; the decoder is owner-thread only.
+    /// An empty span means that the index is not yet solved.
+    member _.Source(index: int) : ReadOnlySpan<byte> =
+        checkIndex index
+        if masks.[index] = (1UL <<< index) then
+            ReadOnlySpan(payload, index * symbolSize, symbolSize)
+        else ReadOnlySpan<byte>.Empty
     member _.TryCopyKnown(index: int, dst: Span<byte>) =
         checkIndex index
         if dst.Length <> symbolSize then invalidArg "dst" "wrong symbol size"

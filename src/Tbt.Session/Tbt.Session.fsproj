@@ -12,7 +12,9 @@
     <Compile Include="WindowBridge.fs" />
     <Compile Include="WindowRxBackend.fs" />
     <Compile Include="WindowGrant.fs" />
+    <Compile Include="WindowCustody.fs" />
     <Compile Include="WindowTxStore.fs" />
+    <Compile Include="WindowRepairLedger.fs" />
     <Compile Include="JoinBootstrap.fs" />
   </ItemGroup>
   <ItemGroup>

@@ -199,6 +199,27 @@ let ``steady receiver calls allocate no managed memory`` () =
     Assert.Equal<byte[]>(source, dst)
 
 [<Fact>]
+let ``borrowed solved sources survive other reads and elimination until release`` () =
+    let rx = WindowReceive(32, 2, 1L <<< 20)
+    let a, b, c = fill 32 1, fill 32 2, fill 32 3
+    Assert.True(rx.Source(0UL, 0).IsEmpty)
+    Assert.True(rx.Source(0UL, -1).IsEmpty)
+    Assert.True(rx.AddSource(0UL, 0, 3, a))
+    Assert.True(rx.AddSource(0UL, 1, 3, b))
+    let first = rx.Source(0UL, 0)
+    let second = rx.Source(0UL, 1)
+    Assert.True(first.SequenceEqual(ReadOnlySpan a))
+    Assert.True(second.SequenceEqual(ReadOnlySpan b))
+    // Adding another independent equation cannot change already solved rows.
+    Assert.True(rx.AddSource(0UL, 2, 3, c))
+    Assert.True(first.SequenceEqual(ReadOnlySpan a))
+    Assert.True(second.SequenceEqual(ReadOnlySpan b))
+    Assert.True(rx.Source(0UL, 2).SequenceEqual(ReadOnlySpan c))
+    rx.ReleaseThrough 4UL
+    Assert.True(rx.Source(0UL, 0).IsEmpty)
+    Assert.True(rx.Source(0UL, 1).IsEmpty)
+
+[<Fact>]
 let ``receiver distinguishes duplicate invalid and capacity without losing data`` () =
     let rx = WindowReceive(32, 1, 1L <<< 20)
     let a = fill 32 17

@@ -282,6 +282,20 @@ type WindowReceive(symbolSize: int, maxWindows: int, maxBytes: int64) =
     member this.AddParity(meta: Meta, data: byte[]) =
         this.TryAddParity(meta, data) = WindowCodec.AddOutcome.Innovative
 
+    /// Borrow a solved symbol until its window is released. The owner must not
+    /// release the window while a consumer is using this span. Unknown or stale
+    /// slots return an empty span; separate slots never share scratch storage.
+    member _.Source(step: uint64, slot: int) : ReadOnlySpan<byte> =
+        match WindowBridge.tryIndex (step, slot) with
+        | ValueNone -> ReadOnlySpan<byte>.Empty
+        | ValueSome index ->
+            let id = WindowBridge.windowId step
+            if id < releasedBefore then ReadOnlySpan<byte>.Empty
+            else
+                match pool.TryGet id with
+                | ValueSome decoder -> decoder.Source index
+                | ValueNone -> ReadOnlySpan<byte>.Empty
+
     member _.TryCopyKnown(step: uint64, slot: int, dst: Span<byte>) =
         match WindowBridge.tryIndex (step, slot) with
         | ValueNone -> false
