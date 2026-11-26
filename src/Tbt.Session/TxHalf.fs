@@ -857,14 +857,14 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: Encoder,
                             let si = int (t % uint64 repairCount.Length)
                             if repairs.Count < repairCapacity && encoder.StepUsed t > 0 then
                                 let before = repairs.Count
-                                if repairCount.[si] + n <= 256 then
-                                    for i in 0 .. n - 1 do
-                                        if repairs.Count < repairCapacity then
-                                            repairs.Enqueue
-                                                { Kind = CellType.Booster; Step = t
-                                                  Index = byte (repairCount.[si] + i)
-                                                  Span = 1uy; Round = byte n }
-                                    repairCount.[si] <- repairCount.[si] + n
+                                let count = min n (repairCapacity - repairs.Count)
+                                if repairCount.[si] + count <= 256 then
+                                    for i in 0 .. count - 1 do
+                                        repairs.Enqueue
+                                            { Kind = CellType.Booster; Step = t
+                                              Index = byte (repairCount.[si] + i)
+                                              Span = 1uy; Round = byte count }
+                                    repairCount.[si] <- repairCount.[si] + count
                                 else
                                     for s in 0 .. encoder.StepUsed t - 1 do
                                         if repairs.Count < repairCapacity then

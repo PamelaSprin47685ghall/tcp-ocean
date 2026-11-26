@@ -70,8 +70,76 @@ module Caps =
     [<Literal>]
     let JoinAck2 = 0x0400us
 
+    /// Sliding-window systematic GF(2) codec. Bit 11. Off unless both ends offer it.
+    [<Literal>]
+    let WindowCode = 0x0800us
+
     [<Literal>]
     let Reserved = 0xF800us
+
+/// Eight bytes at the start of CLIENT_INIT padding (body+64) and SERVER_INIT padding (body+84).
+/// Magic rejects accidental matches in the CSPRNG pad. Both ends must echo the same record.
+module WindowOffer =
+    [<Literal>]
+    let Length = 8
+
+    [<Literal>]
+    let Magic = 0x5743us
+
+    [<Literal>]
+    let Version = 1uy
+
+    [<Literal>]
+    let FieldGf2 = 0uy
+
+    [<Literal>]
+    let DefaultSteps = 4uy
+
+    [<Literal>]
+    let DefaultSymbols = 64us
+
+    [<Literal>]
+    let DefaultDegree = 3uy
+
+    [<Struct>]
+    type Params =
+        { Version: byte
+          WindowSteps: byte
+          Field: byte
+          Degree: byte
+          SymbolCount: uint16 }
+
+    let defaults =
+        { Version = Version; WindowSteps = DefaultSteps; Field = FieldGf2
+          Degree = DefaultDegree; SymbolCount = DefaultSymbols }
+
+    let isValid (p: Params) =
+        p.Version = Version && p.WindowSteps >= 1uy && p.WindowSteps <= 16uy
+        && p.Field = FieldGf2 && p.Degree >= 1uy && p.Degree <= 8uy
+        && p.SymbolCount >= 1us && p.SymbolCount <= 64us
+
+    let write (dst: Span<byte>) (p: Params) =
+        if dst.Length < Length then invalidArg (nameof dst) "need 8 bytes"
+        BinaryPrimitives.WriteUInt16LittleEndian(dst.Slice 0, Magic)
+        dst.[2] <- p.Version
+        dst.[3] <- p.WindowSteps
+        dst.[4] <- p.Field
+        dst.[5] <- p.Degree
+        BinaryPrimitives.WriteUInt16LittleEndian(dst.Slice 6, p.SymbolCount)
+
+    let tryRead (src: ReadOnlySpan<byte>) =
+        if src.Length < Length then ValueNone
+        elif BinaryPrimitives.ReadUInt16LittleEndian(src.Slice 0) <> Magic then ValueNone
+        else
+            let p =
+                { Version = src.[2]; WindowSteps = src.[3]; Field = src.[4]
+                  Degree = src.[5]; SymbolCount = BinaryPrimitives.ReadUInt16LittleEndian(src.Slice 6) }
+            if isValid p then ValueSome p else ValueNone
+
+    /// Copy random pad, then stamp the offer at offset 0. Caller owns the buffer.
+    let stamp (padding: byte[]) (p: Params) =
+        write (Span padding) p
+        padding
 
 /// Suite numbers and the suite bitmap of CLIENT_INIT (spec 6.4.1).
 /// suites bit2 (0x04) announces 0x03; the spec reserved the number but did not
@@ -257,7 +325,8 @@ module ClientInit =
     let cookie (content: ReadOnlySpan<byte>) = content.Slice(40, 16)
 
     /// Open the body with one PSK. ValueNone on a tag failure or a bad version.
-    let tryOpen (psk: ReadOnlySpan<byte>) (content: ReadOnlySpan<byte>) =
+    /// Padding is body[64..], the region a window offer is stamped into.
+    let tryOpenFull (psk: ReadOnlySpan<byte>) (content: ReadOnlySpan<byte>) =
         let cn = clientNonce content
         match tryOpen (initClientKey psk cn) (content.Slice(56, BodyLength)) (content.Slice(1064, 16)) ReadOnlySpan<byte>.Empty with
         | ValueNone -> ValueNone
@@ -266,14 +335,21 @@ module ClientInit =
             if b.[0] <> 2uy then ValueNone
             else
                 ValueSome(
-                    { Version = b.[0]
-                      Suites = b.[1]
-                      Caps = BinaryPrimitives.ReadUInt16LittleEndian(b.Slice 2)
-                      ClientId = readGuid (b.Slice 4)
-                      UnixTimeMs = BinaryPrimitives.ReadUInt64LittleEndian(b.Slice 20)
-                      MssClient = BinaryPrimitives.ReadUInt16LittleEndian(b.Slice 28)
-                      MaxPaths = BinaryPrimitives.ReadUInt16LittleEndian(b.Slice 30) },
-                    body.[32 .. 63])
+                    struct (
+                        { Version = b.[0]
+                          Suites = b.[1]
+                          Caps = BinaryPrimitives.ReadUInt16LittleEndian(b.Slice 2)
+                          ClientId = readGuid (b.Slice 4)
+                          UnixTimeMs = BinaryPrimitives.ReadUInt64LittleEndian(b.Slice 20)
+                          MssClient = BinaryPrimitives.ReadUInt16LittleEndian(b.Slice 28)
+                          MaxPaths = BinaryPrimitives.ReadUInt16LittleEndian(b.Slice 30) },
+                        body.[32 .. 63],
+                        body.[64 ..]))
+
+    let tryOpen (psk: ReadOnlySpan<byte>) (content: ReadOnlySpan<byte>) =
+        match tryOpenFull psk content with
+        | ValueSome(struct (hello, pubKey, _)) -> ValueSome(hello, pubKey)
+        | ValueNone -> ValueNone
 
 /// SERVER_INIT content: server_nonce 32 | body 1032 | tag 16.
 module ServerInit =
@@ -304,24 +380,32 @@ module ServerInit =
         seal (initServerKey psk clientNonce serverNonce) (ReadOnlySpan body) ReadOnlySpan<byte>.Empty (cs.Slice(32, BodyLength)) (cs.Slice(1064, 16))
         c
 
-    let tryOpen (psk: ReadOnlySpan<byte>) (clientNonce: ReadOnlySpan<byte>) (content: ReadOnlySpan<byte>) =
+    /// Padding is body[84..]. A window echo is the first eight of those bytes.
+    let tryOpenFull (psk: ReadOnlySpan<byte>) (clientNonce: ReadOnlySpan<byte>) (content: ReadOnlySpan<byte>) =
         let sn = content.Slice(0, 32)
         match tryOpen (initServerKey psk clientNonce sn) (content.Slice(32, BodyLength)) (content.Slice(1064, 16)) ReadOnlySpan<byte>.Empty with
         | ValueNone -> ValueNone
         | ValueSome body ->
             let b = ReadOnlySpan body
             ValueSome(
-                { Status = b.[0]
-                  Suite = b.[1]
-                  Caps = BinaryPrimitives.ReadUInt16LittleEndian(b.Slice 2)
-                  SessionId = readGuid (b.Slice 4)
-                  Symbol = BinaryPrimitives.ReadUInt16LittleEndian(b.Slice 20)
-                  PathId = BinaryPrimitives.ReadUInt16LittleEndian(b.Slice 22)
-                  MaxPaths = BinaryPrimitives.ReadUInt16LittleEndian(b.Slice 24)
-                  RxWinGrant0 = BinaryPrimitives.ReadUInt16LittleEndian(b.Slice 26)
-                  EchoTimeMs = BinaryPrimitives.ReadUInt64LittleEndian(b.Slice 28)
-                  Cookie = BinaryPrimitives.ReadUInt128LittleEndian(b.Slice 68) },
-                body.[36 .. 67])
+                struct (
+                    { Status = b.[0]
+                      Suite = b.[1]
+                      Caps = BinaryPrimitives.ReadUInt16LittleEndian(b.Slice 2)
+                      SessionId = readGuid (b.Slice 4)
+                      Symbol = BinaryPrimitives.ReadUInt16LittleEndian(b.Slice 20)
+                      PathId = BinaryPrimitives.ReadUInt16LittleEndian(b.Slice 22)
+                      MaxPaths = BinaryPrimitives.ReadUInt16LittleEndian(b.Slice 24)
+                      RxWinGrant0 = BinaryPrimitives.ReadUInt16LittleEndian(b.Slice 26)
+                      EchoTimeMs = BinaryPrimitives.ReadUInt64LittleEndian(b.Slice 28)
+                      Cookie = BinaryPrimitives.ReadUInt128LittleEndian(b.Slice 68) },
+                    body.[36 .. 67],
+                    body.[84 ..]))
+
+    let tryOpen (psk: ReadOnlySpan<byte>) (clientNonce: ReadOnlySpan<byte>) (content: ReadOnlySpan<byte>) =
+        match tryOpenFull psk clientNonce content with
+        | ValueSome(struct (hello, pubKey, _)) -> ValueSome(hello, pubKey)
+        | ValueNone -> ValueNone
 
 /// Session keys (spec 6.5.5). Generation g keys come from PRK_g; PRK_0 also gives the
 /// fixed header-protection keys, graph seeds and K_path.

@@ -944,7 +944,11 @@ type SessionCarrier(session: Session, bridge: FlowBridge, ?uplinkPace: bool, ?tu
                         else
                             let h = healthOf link
                             let struct (pathPass1, _) =
-                                WriteGate.rateAwareLimits gatePass2 h.Valid h.DeliveryRate (int h.CaState)
+                                match classOf link.PathId with
+                                | ValueSome v when v.Kind = PathKind.Policed && v.Confidence >= 600 ->
+                                    PathBudget.GateLimits gatePass2 v.CapBps fl
+                                | _ ->
+                                    WriteGate.rateAwareLimits gatePass2 h.Valid h.DeliveryRate (int h.CaState)
                             let v = link.UnsentBytes
                             batchNotSent.[idx] <- v
                             if v <> 0 then gated <- true

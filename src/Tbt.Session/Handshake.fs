@@ -37,15 +37,29 @@ let private random (entropy: IEntropy) (n: int) =
     entropy.Fill(Span b)
     b
 
+/// True only when both ends offered bit 11 and echoed the same valid window record.
+let windowAgreed (offered: bool) (peerCaps: uint16) (padding: ReadOnlySpan<byte>) (mine: WindowOffer.Params) =
+    if not offered then peerCaps &&& Caps.WindowCode = 0us
+    else
+        peerCaps &&& Caps.WindowCode <> 0us
+        && match WindowOffer.tryRead padding with
+           | ValueSome peer -> peer = mine
+           | ValueNone -> false
+
 /// Client side of the main handshake on path 0. The CLIENT_INIT is rendered once (frozen).
+/// windowOffer, when set, stamps bit 11 and the parameter record. The peer must echo both
+/// or the handshake fails; a peer that does not understand the bit is rejected, not decoded
+/// as the legacy code. Default leaves bit 11 clear so an old peer still completes.
 [<Sealed>]
 type ClientOffer(psk: byte[], clientId: Guid, entropy: IEntropy, unixTimeMs: uint64, mssClient: int, maxPaths: int,
-                 ?memTier: uint16, ?offerX25519: bool, ?offerChaCha8: bool, ?offerAegis: bool, ?offerChaCha20: bool) =
+                 ?memTier: uint16, ?offerX25519: bool, ?offerChaCha8: bool, ?offerAegis: bool, ?offerChaCha20: bool,
+                 ?windowOffer: WindowOffer.Params) =
     let tier = defaultArg memTier MemTier.Ti1024
     let wantDh = defaultArg offerX25519 false
     let wantChaCha8 = defaultArg offerChaCha8 false
     let wantAegis = defaultArg offerAegis false
     let wantChaCha20 = defaultArg offerChaCha20 true
+    let window = match windowOffer with | Some p when WindowOffer.isValid p -> ValueSome p | Some _ -> invalidArg "windowOffer" "invalid window record" | None -> ValueNone
     do if not (MemTier.isKnown tier) then invalidArg "memTier" "unknown mem_tier"
     let clientNonce = random entropy 32
     let dhSecret, dhPublic =
@@ -55,14 +69,20 @@ type ClientOffer(psk: byte[], clientId: Guid, entropy: IEntropy, unixTimeMs: uin
             X25519.publicKey (ReadOnlySpan sk) (Span pk) |> ignore
             sk, pk
         else [||], Array.empty
-    let advertised = SupportedCaps ||| (if wantDh then Caps.X25519 else 0us)
-    let allowed = AllowedCaps &&& (if wantDh then ~~~0us else ~~~Caps.X25519)
+    let advertised = SupportedCaps ||| (if wantDh then Caps.X25519 else 0us) ||| (if window.IsSome then Caps.WindowCode else 0us)
+    let allowed =
+        (AllowedCaps &&& (if wantDh then ~~~0us else ~~~Caps.X25519))
+        ||| (if window.IsSome then Caps.WindowCode else 0us)
     let hello =
         { Version = 2uy; Suites = Suite.advertisedBits wantChaCha8 wantAegis wantChaCha20; Caps = MemTier.set advertised tier; ClientId = clientId
           UnixTimeMs = unixTimeMs; MssClient = uint16 mssClient; MaxPaths = uint16 maxPaths }
+    let pad = random entropy (ClientInit.BodyLength - 64)
     let content =
+        match window with
+        | ValueSome p -> WindowOffer.stamp pad p |> ignore
+        | ValueNone -> ()
         ClientInit.build (ReadOnlySpan psk) (ReadOnlySpan clientNonce) hello (ReadOnlySpan dhPublic)
-                         (ReadOnlySpan(random entropy (ClientInit.BodyLength - 64)))
+                         (ReadOnlySpan pad)
 
     member _.Frame = Bootstrap.frame (ReadOnlySpan content)
     member _.Hello = hello
@@ -72,12 +92,13 @@ type ClientOffer(psk: byte[], clientId: Guid, entropy: IEntropy, unixTimeMs: uin
         let si = Bootstrap.content frame
         if si.IsEmpty then ValueNone
         else
-            match ServerInit.tryOpen (ReadOnlySpan psk) (ReadOnlySpan clientNonce) si with
-            | ValueSome(h, serverPub) when h.Status = ServerStatus.Ok && Suite.isImplemented h.Suite
+            match ServerInit.tryOpenFull (ReadOnlySpan psk) (ReadOnlySpan clientNonce) si with
+            | ValueSome(struct (h, serverPub, pad)) when h.Status = ServerStatus.Ok && Suite.isImplemented h.Suite
                                && Suite.offers hello.Suites h.Suite && h.PathId = 0us
                                && Layout.isLegalSymbol (int h.Symbol) && h.Caps &&& ~~~allowed = 0us
                                && MemTier.isKnown (MemTier.ofCaps h.Caps)
-                               && h.Caps &&& Caps.JoinAck2 <> 0us ->
+                               && h.Caps &&& Caps.JoinAck2 <> 0us
+                               && windowAgreed window.IsSome h.Caps (ReadOnlySpan pad) (match window with ValueSome p -> p | ValueNone -> WindowOffer.defaults) ->
                 let useDh = wantDh && (h.Caps &&& Caps.X25519) <> 0us
                 let mutable ikm = psk
                 let shared = Array.zeroCreate X25519.KeyLength
@@ -126,12 +147,16 @@ type ServerAccept =
 /// Server side of the main handshake. psks: the configured client keys.
 [<Sealed>]
 type ServerOffer(psks: byte[][], entropy: IEntropy, grant0: uint16, maxPaths: int,
-                 ?offerX25519: bool, ?offerChaCha8: bool, ?offerAegis: bool, ?offerChaCha20: bool) =
+                 ?offerX25519: bool, ?offerChaCha8: bool, ?offerAegis: bool, ?offerChaCha20: bool,
+                 ?windowOffer: WindowOffer.Params) =
     let wantDh = defaultArg offerX25519 false
     let wantChaCha8 = defaultArg offerChaCha8 false
     let wantAegis = defaultArg offerAegis false
     let wantChaCha20 = defaultArg offerChaCha20 true
-    let allowed = AllowedCaps &&& (if wantDh then ~~~0us else ~~~Caps.X25519)
+    let window = match windowOffer with | Some p when WindowOffer.isValid p -> ValueSome p | Some _ -> invalidArg "windowOffer" "invalid window record" | None -> ValueNone
+    let allowed =
+        (AllowedCaps &&& (if wantDh then ~~~0us else ~~~Caps.X25519))
+        ||| (if window.IsSome then Caps.WindowCode else 0us)
     let caches = Array.init psks.Length (fun _ -> ReplayCache())
 
     /// Try the bootstrap frame as CLIENT_INIT (spec 6.5.9 step 1). ValueNone: not ours, or
@@ -146,17 +171,19 @@ type ServerOffer(psks: byte[][], entropy: IEntropy, grant0: uint16, maxPaths: in
             while result.IsNone && i < psks.Length do
                 let psk = psks.[i]
                 if (ReadOnlySpan(keyHint (ReadOnlySpan psk) cn)).SequenceEqual(ClientInit.hint ci) then
-                    match ClientInit.tryOpen (ReadOnlySpan psk) ci with
-                    | ValueSome(h, clientPub) when abs (int64 h.UnixTimeMs - unixTimeMs) <= 120_000L
+                    match ClientInit.tryOpenFull (ReadOnlySpan psk) ci with
+                    | ValueSome(struct (h, clientPub, pad)) when abs (int64 h.UnixTimeMs - unixTimeMs) <= 120_000L
                                            && Suite.select h.Suites wantAegis wantChaCha8 wantChaCha20 <> 0uy
                                            && h.Caps &&& Caps.JoinAck2 <> 0us && h.MssClient > 0us
                                            // Unknown wire capabilities may change decoding semantics. Do not
                                            // silently negotiate them away and accept a different protocol.
-                                           && h.Caps &&& Caps.Reserved = 0us
+                                           // Bit 11 is reserved unless this end offered the same window record.
+                                           && h.Caps &&& (Caps.Reserved &&& ~~~(if window.IsSome then Caps.WindowCode else 0us)) = 0us
+                                           && windowAgreed window.IsSome h.Caps (ReadOnlySpan pad) (match window with ValueSome p -> p | ValueNone -> WindowOffer.defaults)
                                            && MemTier.isKnown (MemTier.ofCaps h.Caps)
                                            && caches.[i].TryAdd(cn, unixTimeMs) ->
                         let symbol = FrameMath.symbolForMss (min (int h.MssClient) mssServer)
-                        let caps = flowStatePair (h.Caps &&& allowed)
+                        let caps = flowStatePair (h.Caps &&& allowed) ||| (if window.IsSome then Caps.WindowCode else 0us)
                         let useDh = wantDh && (caps &&& Caps.X25519) <> 0us
                         let suite = Suite.select h.Suites wantAegis wantChaCha8 wantChaCha20
                         let mutable ikm = psks.[i]
@@ -180,8 +207,12 @@ type ServerOffer(psks: byte[][], entropy: IEntropy, grant0: uint16, maxPaths: in
                                   Symbol = uint16 symbol; PathId = 0us; MaxPaths = uint16 paths
                                   RxWinGrant0 = grant0; EchoTimeMs = h.UnixTimeMs; Cookie = UInt128.Zero }
                             let sn = random entropy 32
+                            let replyPad = random entropy (ServerInit.BodyLength - 84)
+                            match window with
+                            | ValueSome p -> WindowOffer.stamp replyPad p |> ignore
+                            | ValueNone -> ()
                             let si = ServerInit.build (ReadOnlySpan psk) cn (ReadOnlySpan sn) sh (ReadOnlySpan serverPub)
-                                                      (ReadOnlySpan(random entropy (ServerInit.BodyLength - 84)))
+                                                      (ReadOnlySpan replyPad)
                             let keys = SessionKeys(ikm, cn.ToArray(), sn, sid, h.ClientId, sh.Suite, Layout.frameLength symbol,
                                                    ci.ToArray(), si)
                             result <- ValueSome

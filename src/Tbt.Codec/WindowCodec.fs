@@ -4,6 +4,7 @@
 module Tbt.Codec.WindowCodec
 
 open System
+open System.Collections.Generic
 open System.Numerics
 
 let private validMask count =
@@ -101,3 +102,90 @@ type Decoder(count: int, symbolSize: int, maxBytes: int64) =
         Array.Clear(payload)
         Array.Clear(scratch)
         rank <- 0
+
+/// A sealed tail is a window whose last k sources (1..64) are known. Parity masks
+/// are regenerated from (windowId, parity index, k); coefficients never travel on the wire.
+module WindowSessionCodec =
+    [<Literal>]
+    let MaxSymbols = 64
+
+    [<Literal>]
+    let MaxWindows = 32
+
+    /// 16 MiB hard cap on decoder row storage across live windows.
+    [<Literal>]
+    let MaxDecoderBytes = 16L <<< 20
+
+    let private checkK k =
+        if k < 1 || k > MaxSymbols then invalidArg (nameof k) "tail length must be in 1..64"
+
+    /// Degree stays in 1..min(8, k). A tail of 1 or 2 cannot take a degree of 3.
+    let degree (k: int) =
+        checkK k
+        min k (min 8 (max 3 (k / 8)))
+
+    /// Stateless seed: both ends derive the same mask without exchanging coefficients.
+    let paritySeed (windowId: uint64) (parityIdx: int) (k: int) =
+        checkK k
+        if parityIdx < 0 then invalidArg (nameof parityIdx) "negative"
+        SplitMix64.seedOf4 SplitMix64.Golden windowId (uint64 parityIdx) (uint64 k) SplitMix64.DomParity
+
+    let parityMask (windowId: uint64) (parityIdx: int) (k: int) =
+        let deg = degree k
+        coefficients k deg (paritySeed windowId parityIdx k)
+
+    /// One parity symbol for a sealed tail of exactly k sources.
+    let encodeParity (windowId: uint64) (parityIdx: int) (sources: byte[][]) =
+        if isNull (box sources) then nullArg (nameof sources)
+        encode sources (parityMask windowId parityIdx sources.Length)
+
+/// Live windows, each sealed at its own k. Release returns a window's row storage
+/// as soon as the caller has delivered it (ack frontier).
+[<Sealed>]
+type WindowCodecPool(symbolSize: int, maxWindows: int, maxBytes: int64) =
+    let windows = Dictionary<uint64, Decoder>()
+    let mutable used = 0L
+    do
+        if symbolSize < 1 then invalidArg (nameof symbolSize) "must be positive"
+        if maxWindows < 1 || maxWindows > WindowSessionCodec.MaxWindows then
+            invalidArg (nameof maxWindows) "must be in 1..32"
+        if maxBytes < 1L || maxBytes > WindowSessionCodec.MaxDecoderBytes then
+            invalidArg (nameof maxBytes) "must be in 1..16MiB"
+
+    let decoderBytes k = int64 k * 8L + (int64 k + 1L) * int64 symbolSize
+
+    member _.Count = windows.Count
+    member _.AllocatedBytes = used
+    member _.MaxBytes = maxBytes
+
+    /// Open a sealed window of k sources. False when the window cap or byte cap would be exceeded.
+    member _.TryOpen(windowId: uint64, k: int) =
+        if k < 1 || k > WindowSessionCodec.MaxSymbols then invalidArg (nameof k) "tail length must be in 1..64"
+        if windows.ContainsKey windowId then false
+        elif windows.Count >= maxWindows then false
+        else
+            let bytes = decoderBytes k
+            if used > maxBytes - bytes then false
+            else
+                windows.Add(windowId, Decoder(k, symbolSize, bytes))
+                used <- used + bytes
+                true
+
+    member _.TryGet(windowId: uint64) =
+        match windows.TryGetValue windowId with
+        | true, decoder -> ValueSome decoder
+        | _ -> ValueNone
+
+    /// Drop every window whose id is at or below the acknowledged frontier.
+    member _.ReleaseThrough(ackWindow: uint64) =
+        let drop = ResizeArray<uint64>()
+        for KeyValue(id, _) in windows do
+            if id <= ackWindow then drop.Add id
+        for id in drop do
+            match windows.TryGetValue id with
+            | true, decoder ->
+                used <- used - decoder.AllocatedBytes
+                decoder.Release()
+                windows.Remove id |> ignore
+            | _ -> ()
+        if windows.Count = 0 then used <- 0L

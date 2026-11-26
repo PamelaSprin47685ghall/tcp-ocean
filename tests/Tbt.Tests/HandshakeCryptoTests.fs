@@ -219,6 +219,68 @@ let ``X25519 and ChaCha8 together still let client and server exchange a cell`` 
     server.Tick()
     Assert.True(server.TryProduce(0us, Span frame) || not server.WantsToSend)
 
+let private windowHandshake (client: WindowOffer.Params) (server: WindowOffer.Params) =
+    let offer = ClientOffer(psk, id, SeededEntropy 301, uint64 unixMs, 1448, 256, windowOffer = client)
+    let accepted = (ServerOffer([| psk |], SeededEntropy 302, 4096us, 256, windowOffer = server))
+                       .TryAccept(ReadOnlySpan offer.Frame, unixMs, 1448)
+    struct (offer, accepted)
+
+[<Fact>]
+let ``window offer is negotiated only when both ends echo the same record`` () =
+    let struct (offer, accepted) = windowHandshake WindowOffer.defaults WindowOffer.defaults
+    Assert.True(accepted.IsSome)
+    Assert.Equal(Caps.WindowCode, offer.Hello.Caps &&& Caps.WindowCode)
+    let struct (clientParams, sh) = offer.TryAccept(ReadOnlySpan accepted.Value.Reply).Value
+    Assert.Equal(Caps.WindowCode, clientParams.Caps &&& Caps.WindowCode)
+    Assert.Equal(Caps.WindowCode, sh.Caps &&& Caps.WindowCode)
+    Assert.Equal(Caps.WindowCode, accepted.Value.Params.Caps &&& Caps.WindowCode)
+
+[<Fact>]
+let ``window parameter mismatch is rejected rather than decoded as the legacy code`` () =
+    let other = { WindowOffer.defaults with SymbolCount = 32us }
+    let struct (_, accepted) = windowHandshake WindowOffer.defaults other
+    Assert.True(accepted.IsNone)
+
+[<Fact>]
+let ``window version mismatch is rejected`` () =
+    let hello =
+        { Version = 2uy; Suites = Suite.ChaCha20Poly1305Bit
+          Caps = SupportedCaps ||| Caps.WindowCode; ClientId = id
+          UnixTimeMs = uint64 unixMs; MssClient = 1448us; MaxPaths = 256us }
+    let cn = Array.init 32 (fun i -> byte (i + 11))
+    let padding = Array.zeroCreate (ClientInit.BodyLength - 64)
+    let bad = { WindowOffer.defaults with Version = 9uy }
+    // Stamp is refused for an invalid record, so write the bytes directly.
+    padding.[2] <- bad.Version
+    System.Buffers.Binary.BinaryPrimitives.WriteUInt16LittleEndian(Span padding, WindowOffer.Magic)
+    padding.[3] <- WindowOffer.DefaultSteps
+    padding.[5] <- WindowOffer.DefaultDegree
+    System.Buffers.Binary.BinaryPrimitives.WriteUInt16LittleEndian(Span(padding, 6, 2), WindowOffer.DefaultSymbols)
+    let content = ClientInit.build (ReadOnlySpan psk) (ReadOnlySpan cn) hello ReadOnlySpan<byte>.Empty (ReadOnlySpan padding)
+    let frame = Bootstrap.frame (ReadOnlySpan content)
+    let accepted = (ServerOffer([| psk |], SeededEntropy 9, 4096us, 256, windowOffer = WindowOffer.defaults))
+                       .TryAccept(ReadOnlySpan frame, unixMs, 1448)
+    Assert.True(accepted.IsNone)
+
+[<Fact>]
+let ``an old peer that does not offer the window bit is refused when this end requires it`` () =
+    let offer = ClientOffer(psk, id, SeededEntropy 311, uint64 unixMs, 1448, 256, windowOffer = WindowOffer.defaults)
+    let accepted = (ServerOffer([| psk |], SeededEntropy 312, 4096us, 256))
+                       .TryAccept(ReadOnlySpan offer.Frame, unixMs, 1448)
+    Assert.True(accepted.IsNone)
+    let legacy = ClientOffer(psk, id, SeededEntropy 313, uint64 unixMs, 1448, 256)
+    let server = ServerOffer([| psk |], SeededEntropy 314, 4096us, 256, windowOffer = WindowOffer.defaults)
+    Assert.True(server.TryAccept(ReadOnlySpan legacy.Frame, unixMs, 1448).IsNone)
+
+[<Fact>]
+let ``default handshake still leaves the window bit clear`` () =
+    let offer = ClientOffer(psk, id, SeededEntropy 321, uint64 unixMs, 1448, 256)
+    Assert.Equal(0us, offer.Hello.Caps &&& Caps.WindowCode)
+    let accepted = (ServerOffer([| psk |], SeededEntropy 322, 4096us, 256))
+                       .TryAccept(ReadOnlySpan offer.Frame, unixMs, 1448)
+    Assert.True(accepted.IsSome)
+    Assert.Equal(0us, accepted.Value.Params.Caps &&& Caps.WindowCode)
+
 [<Fact>]
 let ``server rejects unknown codec capability instead of silently selecting legacy codec`` () =
     let hello =

@@ -222,6 +222,32 @@ type private ApiFixture(newRepair: bool) =
     member _.Expire() = pair.Clock.Now <- pair.Clock.Now + int64(ceil c.Tx.RepairWaitNs)+1L
 
 [<Fact>]
+let ``partial NACK queue keeps unused repair seeds available`` () =
+    let f=ApiFixture(false)
+    for _ in 1..8 do f.Add()
+    f.Drain() |> ignore
+    let tx=f.Client.Tx
+    // Two ranges of four steps, 31 rounds: 31 × 2 × 4 × 4 = 992.
+    // Each step has used 124 seeds. An extra five on step 4 leaves 27 slots.
+    for _ in 1..31 do
+        f.Expire()
+        tx.OnNack(0UL,4,4)
+        tx.OnNack(4UL,4,4)
+    f.Expire()
+    tx.OnNack(4UL,1,2)
+    f.Expire()
+    // Eight per step: the last step gets only three of the 27 free slots.
+    tx.OnNack(0UL,4,20)
+    let partial=f.Drain() |> Array.filter(fun m -> m.Type=CellType.Booster && m.StepId=3UL)
+    Assert.Equal(127,partial.Length)
+    Assert.Equal(126uy,partial.[126].Slot)
+    Assert.Equal(3us,partial.[126].Aux)
+    f.Expire()
+    tx.OnNack(3UL,1,1)
+    let next=f.Drain() |> Array.filter(fun m -> m.Type=CellType.Booster)
+    Assert.Equal<byte>([|127uy;128uy;129uy;130uy|],next |> Array.map(fun m -> m.Slot))
+
+[<Fact>]
 let ``DATA identity ring reuse keeps new absolute steps distinct`` () =
     let f=ApiFixture(false)
     let mutable expected=0L
