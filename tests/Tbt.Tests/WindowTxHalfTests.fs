@@ -68,7 +68,7 @@ let ``encrypted window frames recover a missing whole step`` () =
         | _ -> failwith "unexpected window frame"
     Assert.Equal(16, dataDropped)
     // Exhausted or rank-deficient parity is repaired by original DATA.
-    tx.OnNack(1UL, 1, 16)
+    tx.OnNack(1UL, 1, 16, 0UL)
     let mutable attempts = 0
     while tx.HasCandidate && attempts < 128 do
         Assert.True(tx.TryRenderNext(Span frame, 0us, 0UL, 16us, 0us))
@@ -125,7 +125,7 @@ let ``nack retransmits data with a fresh counter and fill is a pad`` () =
         Assert.True(tx.TryRenderNext(Span frame, 0us, 0UL, 16us, 0us))
         let _, counter = openFrame opener frame
         firstCounter <- counter
-    tx.OnNack(0UL, 1, 1)
+    tx.OnNack(0UL, 1, 1, 0UL)
     Assert.True(tx.TryRenderNext(Span frame, 0us, 0UL, 16us, 0us))
     let meta, counter = openFrame opener frame
     Assert.Equal(CellType.Data, meta.Type)
@@ -219,7 +219,7 @@ let ``exhausted window parity falls back to authenticated data repair`` () =
             Assert.True(WindowBridge.trySnapshotParityMask meta |> ValueOption.isSome)
         fills <- fills + 1
     Assert.True(exhausted, "48 parity indices must eventually be exhausted")
-    tx.OnNack(0UL, 1, 1)
+    tx.OnNack(0UL, 1, 1, 0UL)
     Assert.True(tx.TryRenderNext(Span frame, 0us, 0UL, 16us, 0us))
     let repaired = observe ()
     Assert.Equal(CellType.Data, repaired.Type)

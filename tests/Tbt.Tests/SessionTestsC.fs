@@ -171,7 +171,7 @@ let ``default repair is main's: a new range NACK enqueues BOOSTERs immediately``
     Assert.True(c.Tx.MinRttNs <> Int64.MaxValue)
     // Main: first NACK of a new range does not wait. The new scheduler would
     // arm the step and wait the tail timer (~1.25×minRTT).
-    c.Tx.OnNack(1UL, 1, 4)
+    c.Tx.OnNack(1UL, 1, 4, 0UL)
     Assert.True(c.Tx.RepairWaiting, "main OnNack must enqueue the first round now")
     Assert.True(c.Tx.RepairWaitNs = 1.05 * float c.Tx.MinRttNs, sprintf "wait %g" c.Tx.RepairWaitNs)
 
@@ -213,7 +213,7 @@ let ``a stale cached now cannot make a just-sealed step look RepairWait-expired`
         guard <- guard - 1
     Assert.True(c.Tx.Head > head0, "a new step must have been sealed while the cache was stale")
     let tLo = c.Tx.Head - 1UL
-    c.Tx.OnNack(tLo, 1, 4)
+    c.Tx.OnNack(tLo, 1, 4, 0UL)
     Assert.False(c.Tx.RepairWaiting,
         "FreshNs must stamp the seal at the advanced time; a stale cache would already be past seal+RepairWait")
 
@@ -272,10 +272,10 @@ let ``a NACK of the outstanding tail waits the long tail timer, not the short re
     // No later step has been seen: this is the tail. minRTT + reo_wnd is not enough.
     let evidenceAt = sealedAt + c.Tx.MinRttNs + c.Tx.ReoWndNs
     clock.Now <- evidenceAt
-    c.Tx.OnNack(tLo, 1, 4)
+    c.Tx.OnNack(tLo, 1, 4, 0UL)
     Assert.False(c.Tx.RepairWaiting, "no later-step evidence: the short reo window must not fire")
     clock.Now <- sealedAt + int64 c.Tx.RepairWaitNs
-    c.Tx.OnNack(tLo, 1, 4)
+    c.Tx.OnNack(tLo, 1, 4, 0UL)
     Assert.True(c.Tx.RepairWaiting, "tail timer passed; a repair round is due")
 
 [<Fact>]
@@ -300,10 +300,10 @@ let ``a step is presumed lost only after a later-sealed step is seen and the reo
     // The server has seen step 4 (WIN_ACK t_hi) while the frontier still sits at 1.
     c.Tx.OnPeerSeen 4UL
     Assert.Equal(4UL, c.Tx.PeerSeenHi)
-    c.Tx.OnNack(1UL, 1, 4)
+    c.Tx.OnNack(1UL, 1, 4, 0UL)
     Assert.False(c.Tx.RepairWaiting, "later step seen, but its arrival plus reo_wnd has not passed")
     clock.Now <- sealedAt + c.Tx.MinRttNs + c.Tx.ReoWndNs
-    c.Tx.OnNack(1UL, 1, 4)
+    c.Tx.OnNack(1UL, 1, 4, 0UL)
     Assert.True(c.Tx.RepairWaiting, "later-sealed step seen and reorder window passed")
     Assert.True(clock.Now < sealedAt + int64 c.Tx.RepairWaitNs, "evidence must not wait the tail timer")
 
@@ -327,13 +327,13 @@ let ``a NACK does not enqueue repairs before a minRTT sample exists`` () =
     let tLo = 1UL
     Assert.True(c.Tx.Head > tLo)
     clock.Now <- sealedAt + 200_000_000L
-    c.Tx.OnNack(tLo, 1, 4)
+    c.Tx.OnNack(tLo, 1, 4, 0UL)
     Assert.False(c.Tx.RepairWaiting, "no expected arrival until a minRTT sample")
     clock.Now <- sealedAt + 400_000_000L
     c.Tx.OnPeerAck(1UL, 100us)
     Assert.True(c.Tx.MinRttNs <> Int64.MaxValue)
     clock.Now <- sealedAt + int64 c.Tx.RepairWaitNs
-    c.Tx.OnNack(tLo, 1, 4)
+    c.Tx.OnNack(tLo, 1, 4, 0UL)
     Assert.True(c.Tx.RepairWaiting, "tail timer passed after a minRTT sample")
 
 [<Fact>]
@@ -365,7 +365,7 @@ let ``a NACK repairs only the steps of the range whose originals are due`` () =
     let span = int (c.Tx.Head - tLo)
     Assert.True(span >= 4, sprintf "span %d" span)
     clock.Now <- earlySealed + int64 wait
-    c.Tx.OnNack(tLo, span, 30)
+    c.Tx.OnNack(tLo, span, 30, 0UL)
     Assert.True(c.Tx.RepairWaiting, "due prefix should repair")
     let frame = Array.zeroCreate<byte> c.FrameLength
     let before = c.Tx.BoostersSent

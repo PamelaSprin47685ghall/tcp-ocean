@@ -33,7 +33,7 @@ let ``a growing NACK deficit does not skip the last-repair wait for that step`` 
     let tLo = 1UL
     let wait = c.Tx.RepairWaitNs
     clock.Now <- sealedAt + int64 wait
-    c.Tx.OnNack(tLo, 1, 4)
+    c.Tx.OnNack(tLo, 1, 4, 0UL)
     Assert.True(c.Tx.RepairWaiting)
     let frame = Array.zeroCreate<byte> c.FrameLength
     let mutable n = 0
@@ -43,11 +43,11 @@ let ``a growing NACK deficit does not skip the last-repair wait for that step`` 
     let afterFirst = c.Tx.BoostersSent
     Assert.True(afterFirst >= 1L)
     clock.Now <- clock.Now + 10_000_000L
-    c.Tx.OnNack(tLo, 1, 30)
+    c.Tx.OnNack(tLo, 1, 30, 0UL)
     Assert.False(c.Tx.RepairWaiting, "deficit growth must not skip this step's wait")
     Assert.Equal(afterFirst, c.Tx.BoostersSent)
     clock.Now <- clock.Now + int64 wait
-    c.Tx.OnNack(tLo, 1, 30)
+    c.Tx.OnNack(tLo, 1, 30, 0UL)
     Assert.True(c.Tx.RepairWaiting, "a later round is due once this step's wait has passed")
 
 [<Fact>]
@@ -82,10 +82,10 @@ let ``seeing a later step does not make a not-yet-due hole eligible`` () =
     Assert.True(c.Tx.Head > lateLo, sprintf "head %d lateLo %d" c.Tx.Head lateLo)
     let lateSealed = clock.Now
     c.Tx.OnPeerSeen lateLo
-    c.Tx.OnNack(lateLo, 1, 4)
+    c.Tx.OnNack(lateLo, 1, 4, 0UL)
     Assert.False(c.Tx.RepairWaiting, "t_hi of a just-sealed step must not create eligibility")
     clock.Now <- lateSealed + 1_000_000L
-    c.Tx.OnNack(lateLo, 1, 4)
+    c.Tx.OnNack(lateLo, 1, 4, 0UL)
     Assert.False(c.Tx.RepairWaiting, "reorder window after the later seal has not passed")
 
 [<Fact>]
@@ -109,7 +109,7 @@ let ``a never-repaired tail step is eligible on its own timer after another step
     Assert.True(c.Tx.Head >= 5UL, sprintf "head %d" c.Tx.Head)
     let wait = c.Tx.RepairWaitNs
     clock.Now <- sealedAt + int64 wait
-    c.Tx.OnNack(1UL, 1, 4)
+    c.Tx.OnNack(1UL, 1, 4, 0UL)
     Assert.True(c.Tx.RepairWaiting)
     let frame = Array.zeroCreate<byte> c.FrameLength
     let mutable n = 0
@@ -118,7 +118,7 @@ let ``a never-repaired tail step is eligible on its own timer after another step
         n <- n + 1
     let afterFirst = c.Tx.BoostersSent
     clock.Now <- clock.Now + 10_000_000L
-    c.Tx.OnNack(4UL, 1, 4)
+    c.Tx.OnNack(4UL, 1, 4, 0UL)
     Assert.True(c.Tx.RepairWaiting, "a due never-repaired tail step has its own deadline")
     Assert.True(c.Tx.BoostersSent = afterFirst, "boosters are queued, not yet sent")
     Assert.True(c.Tx.TryRenderNext(Span frame, 0us, 1UL, 100us, 0us, true))
@@ -145,7 +145,7 @@ let ``Karn still samples a never-repaired step after a neighbour was repaired`` 
     Assert.Equal(0L, c.Tx.RttSkipped)
     let wait = c.Tx.RepairWaitNs
     clock.Now <- sealedAt + int64 wait
-    c.Tx.OnNack(1UL, 1, 4)
+    c.Tx.OnNack(1UL, 1, 4, 0UL)
     Assert.True(c.Tx.RepairWaiting)
     let frame = Array.zeroCreate<byte> c.FrameLength
     let mutable n = 0
@@ -184,7 +184,7 @@ let ``a spurious repair widens the reorder window`` () =
     Assert.Equal(c.Tx.MinRttNs / 4L, reo0)
     c.Tx.OnPeerSeen 4UL
     clock.Now <- sealedAt + c.Tx.MinRttNs + reo0
-    c.Tx.OnNack(1UL, 1, 4)
+    c.Tx.OnNack(1UL, 1, 4, 0UL)
     Assert.True(c.Tx.RepairWaiting)
     let frame = Array.zeroCreate<byte> c.FrameLength
     Assert.True(c.Tx.TryRenderNext(Span frame, 0us, 1UL, 100us, 0us, allowRepair=true))
@@ -213,7 +213,7 @@ let ``an ack that arrives sooner than minRTT after a BOOSTER counts as a spuriou
     c.Tx.OnPeerAck(1UL, 100us)
     let tLo = 1UL
     clock.Now <- sealedAt + int64 c.Tx.RepairWaitNs
-    c.Tx.OnNack(tLo, 1, 4)
+    c.Tx.OnNack(tLo, 1, 4, 0UL)
     Assert.True(c.Tx.RepairWaiting)
     let frame = Array.zeroCreate<byte> c.FrameLength
     Assert.True(c.Tx.TryRenderNext(Span frame, 0us, 1UL, 100us, 0us, true))
@@ -347,7 +347,7 @@ let ``allowRepair false sends unsent originals while a BOOSTER waits`` () =
     clock.Now <- sealedAt + 400_000_000L
     c.Tx.OnPeerAck(1UL, 100us)
     clock.Now <- sealedAt + int64 c.Tx.RepairWaitNs
-    c.Tx.OnNack(1UL, 1, 4)
+    c.Tx.OnNack(1UL, 1, 4, 0UL)
     Assert.True(c.Tx.RepairWaiting)
     Assert.True(c.Tx.Queued > 0, "originals must still be waiting")
     let queued0 = c.Tx.Queued

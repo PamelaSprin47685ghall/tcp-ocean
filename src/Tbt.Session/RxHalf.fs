@@ -914,6 +914,12 @@ type RxHalf(symbolSize: int, field: CodeField, decoder: ICodecDecoder, opener: C
         drainKnown now
         traceFrontier frontierAtEntry
 
+    /// Per-step missing-slot bitmaps for steps t..t+3 (window mode); 0 outside window mode.
+    member _.MissingBitmaps(t: uint64) =
+        match window with
+        | Some wd -> wd.MissingBitmaps t
+        | None -> 0UL
+
     /// HEARTBEAT: the sender has sealed step t (spec 5.8 tail rule).
     member _.OnHeartbeat(t: uint64) =
         match window with
@@ -984,6 +990,7 @@ type RxHalf(symbolSize: int, field: CodeField, decoder: ICodecDecoder, opener: C
         member this.Release() = this.Release()
         member this.Open(frame, path) = this.Open(frame, path)
         member this.OpenPre(frame, counter) = this.OpenPre(frame, counter)
+        member x.MissingBitmaps(t) = x.MissingBitmaps t
         member this.OnCoded(meta, symbol, path, now) = this.OnCoded(meta, symbol, path, now)
         member this.Service(now) = this.Service(now)
         member this.OnHeartbeat(step) = this.OnHeartbeat(step)

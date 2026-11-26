@@ -48,7 +48,7 @@ type ITxHalf =
     abstract SpuriousRepairs: int64
     abstract OnPeerSeen: uint64 -> unit
     abstract OnPeerDecodedBitmap: uint64 * uint64 * uint64 * uint64 * uint64 -> unit
-    abstract OnNack: uint64 * int * int -> unit
+    abstract OnNack: tLo: uint64 * span: int * deficit: int * missingMasks: uint64 -> unit
     abstract HeartbeatDue: bool
     abstract NextHeartbeatNs: int64
     abstract RenderHeartbeat: Span<byte> * uint16 * uint64 * uint16 * uint16 -> unit
@@ -142,6 +142,7 @@ type IRxHalf =
     abstract IsStepComplete: uint64 -> bool
     abstract Attach: FlowTable -> unit
     abstract FillDecodedBitmap: unit -> struct (uint64 * uint64 * uint64 * uint64)
+    abstract MissingBitmaps: uint64 -> uint64
     abstract StepUndelivered: uint64 * int -> unit
     abstract Release: unit -> unit
     abstract Open: Span<byte> * uint16 -> Meta voption

@@ -23,7 +23,7 @@ let ``fill: a repeated DATA repair (BOOSTER seeds used up) does not crash the bo
     pair.Feed(c, slot, ReadOnlySpan(Array.create 4000 7uy), false) |> ignore
     let tLo = c.Tx.Head - 1UL
     // Five NACK rounds of 64 BOOSTERs: the 256 seeds run out, DATA cells go again.
-    for d in 60 .. 64 do c.Tx.OnNack(tLo, 1, d)
+    for d in 60 .. 64 do c.Tx.OnNack(tLo, 1, d, 0UL)
     let frame = Array.zeroCreate<byte> c.FrameLength
     for _ in 1 .. 400 do c.ProduceFill(0us, Span frame) |> ignore
     // The DATA repairs are still there for the normal path.

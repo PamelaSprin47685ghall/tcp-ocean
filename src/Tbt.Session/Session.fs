@@ -296,11 +296,13 @@ type Session(role: Role, p: SessionParams, port: IFlowPort, clock: IClock, confi
         let head =
             { TLo = rx.AckStepLo; Deficit = uint16 nackDeficit; Span = byte (max 1 nackSpan)
               NackFlags = (if nackDeficit > 0 then 1uy else 0uy)
+                          ||| (if nackDeficit > 0 && windowMode then 2uy else 0uy)
               ErasureMeanQ16 = rx.ErasureQ16; ErasureP95Q16 = rx.ErasureP95Q16
               THi = (if rx.SeenEnd > 0UL then rx.SeenEnd - 1UL else 0UL)
               RxTimeUs = uint64 (now / 1000L); PathCount = 0
               DecodedBitmap0 = bmp0; DecodedBitmap1 = bmp1; DecodedBitmap2 = bmp2; DecodedBitmap3 = bmp3
-              CtrlAckHi = ctrl.AckHi; CtrlAckBitmap = ctrl.AckBitmap }
+              CtrlAckHi = ctrl.AckHi; CtrlAckBitmap = ctrl.AckBitmap
+              MissingMasks = (if nackDeficit > 0 && windowMode then rx.MissingBitmaps rx.AckStepLo else 0UL) }
         symbol.Clear()
         WinAck.writeHead head symbol
         let meta =
@@ -744,7 +746,9 @@ type Session(role: Role, p: SessionParams, port: IFlowPort, clock: IClock, confi
                     tx.OnPeerSeen h.THi
                     tx.OnPeerErasure(h.ErasureMeanQ16, q95 = h.ErasureP95Q16)
                     tx.OnPeerDecodedBitmap(h.TLo, h.DecodedBitmap0, h.DecodedBitmap1, h.DecodedBitmap2, h.DecodedBitmap3)
-                    if h.NackFlags &&& 1uy <> 0uy then tx.OnNack(h.TLo, int h.Span, int h.Deficit)
+                    if h.NackFlags &&& 1uy <> 0uy then
+                        let masks = if h.NackFlags &&& 2uy <> 0uy then h.MissingMasks else 0UL
+                        tx.OnNack(h.TLo, int h.Span, int h.Deficit, masks)
             | CellType.Heartbeat -> rx.OnHeartbeat m.StepId
             | CellType.Ctrl -> onCtrl (Span<byte>.op_Implicit (frame.Slice(Layout.SymbolOffset, s)))
             | CellType.FlowState when credit.Enabled ->

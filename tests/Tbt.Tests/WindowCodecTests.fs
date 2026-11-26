@@ -130,15 +130,17 @@ let ``every tail length 1..64 recovers a dropped source without waiting for 64``
         let mutable j = 0
         while got.IsNone && j < k do
             let mask = WindowCodec.WindowSessionCodec.parityMask 7UL j k
+            let parity = WindowCodec.WindowSessionCodec.encodeParity 7UL j src
+            // Consistent rows are duplicates, not failures: only rank decides recovery.
+            decoder.Add(mask, parity) |> ignore
             if mask &&& (1UL <<< dropped) <> 0UL then
-                let parity = WindowCodec.WindowSessionCodec.encodeParity 7UL j src
-                decoder.Add(mask, parity) |> ignore
                 got <- decoder.TryGet dropped
             j <- j + 1
         match got with
         | Some actual -> Assert.Equal<byte[]>(src.[dropped], actual)
         | None -> failwithf "tail %d did not recover index %d" k dropped
-        Assert.True(WindowCodec.WindowSessionCodec.degree k >= 1 && WindowCodec.WindowSessionCodec.degree k <= min 8 k)
+        Assert.True(WindowCodec.WindowSessionCodec.degree k >= 1 && WindowCodec.WindowSessionCodec.degree k <= min 15 k)
+        Assert.True(WindowCodec.WindowSessionCodec.degree k % 2 = 1 || k < 4, sprintf "tail %d has even degree %d" k (WindowCodec.WindowSessionCodec.degree k))
 
 [<Fact>]
 let ``160 full windows respect the decoder payload budget and backpressure`` () =

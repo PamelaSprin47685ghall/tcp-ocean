@@ -109,7 +109,7 @@ let ``WIN_ACK carries 78 path stats at S = 1344 and round trips`` () =
     let h =
         { TLo = 1000UL; Deficit = 3us; Span = 2uy; NackFlags = 1uy; ErasureMeanQ16 = 19661us; ErasureP95Q16 = 30000us
           THi = 1200UL; RxTimeUs = 123456789UL; PathCount = 2; DecodedBitmap0 = 5UL; DecodedBitmap1 = 0UL
-          DecodedBitmap2 = 0UL; DecodedBitmap3 = 1UL <<< 63; CtrlAckHi = 9u; CtrlAckBitmap = 6UL }
+          DecodedBitmap2 = 0UL; DecodedBitmap3 = 1UL <<< 63; CtrlAckHi = 9u; CtrlAckBitmap = 6UL; MissingMasks = 0UL }
     WinAck.writeHead h (Span b)
     let p = { PathId = 287us; Flags = 0uy; HighestCellSeqLow32 = 77u; CellsRx10ms = 35us; Late10ms = 1us; OwdDeltaUs = -1500 }
     WinAck.writePathStat 1 p (Span b)

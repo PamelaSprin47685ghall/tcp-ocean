@@ -18,13 +18,17 @@ type WinAckHead =
     { TLo: uint64
       Deficit: uint16
       Span: byte
-      /// bit0 = request BOOSTER.
+      /// bit0 = request repair of the range TLo..TLo+Span-1.
+      /// bit1 = MissingMasks carries per-step 16-bit missing-slot bitmaps (window codec);
+      ///        zero masks mean the step's missing set is unknown and the full step is due.
       NackFlags: byte
       ErasureMeanQ16: uint16
       ErasureP95Q16: uint16
       THi: uint64
       RxTimeUs: uint64
       PathCount: int
+      /// Per-step missing-slot bitmaps for steps TLo..TLo+3, valid when NackFlags bit1 is set.
+      MissingMasks: uint64
       /// Bit j: step t_lo + 1 + j decoded on its own (selective ack, 256 bits).
       DecodedBitmap0: uint64
       DecodedBitmap1: uint64
@@ -59,6 +63,8 @@ module WinAck =
         BinaryPrimitives.WriteUInt64LittleEndian(dst.Slice 60, h.DecodedBitmap3)
         BinaryPrimitives.WriteUInt32LittleEndian(dst.Slice 68, h.CtrlAckHi)
         BinaryPrimitives.WriteUInt64LittleEndian(dst.Slice 72, h.CtrlAckBitmap)
+        // Offset 80..95 was zero-reserved. Masks occupy 80..87; 88..95 stay zero.
+        BinaryPrimitives.WriteUInt64LittleEndian(dst.Slice 80, h.MissingMasks)
 
     let writePathStat (i: int) (p: PathStat) (dst: Span<byte>) =
         let d = dst.Slice(HeadLength + i * PathStatLength, PathStatLength)
@@ -76,7 +82,7 @@ module WinAck =
         let paths = int (BinaryPrimitives.ReadUInt16LittleEndian(src.Slice 32))
         let span = src.[10]
         let deficit = BinaryPrimitives.ReadUInt16LittleEndian(src.Slice 8)
-        if src.[34] <> 0uy || src.[35] <> 0uy || src.Slice(80, 16).IndexOfAnyExcept(0uy) >= 0
+        if src.[34] <> 0uy || src.[35] <> 0uy || src.Slice(88, 8).IndexOfAnyExcept(0uy) >= 0
            || paths > maxPaths src.Length || (deficit <> 0us && (span < 1uy || span > 4uy)) then
             false
         else
@@ -94,7 +100,8 @@ module WinAck =
                    DecodedBitmap2 = BinaryPrimitives.ReadUInt64LittleEndian(src.Slice 52)
                    DecodedBitmap3 = BinaryPrimitives.ReadUInt64LittleEndian(src.Slice 60)
                    CtrlAckHi = BinaryPrimitives.ReadUInt32LittleEndian(src.Slice 68)
-                   CtrlAckBitmap = BinaryPrimitives.ReadUInt64LittleEndian(src.Slice 72) }
+                   CtrlAckBitmap = BinaryPrimitives.ReadUInt64LittleEndian(src.Slice 72)
+                   MissingMasks = BinaryPrimitives.ReadUInt64LittleEndian(src.Slice 80) }
             true
 
     let readPathStat (src: ReadOnlySpan<byte>) (i: int) =

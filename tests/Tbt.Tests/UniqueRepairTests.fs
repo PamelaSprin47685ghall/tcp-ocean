@@ -61,7 +61,7 @@ let private runApi rounds ackBeforeRender repairFirst =
     let initial = if repairFirst then c.Tx.Queued else drain "initial" Int32.MaxValue
     for i in 1..rounds do
         clock.Now <- clock.Now + int64 (ceil c.Tx.RepairWaitNs) + 1L
-        c.Tx.OnNack(0UL,1,1)
+        c.Tx.OnNack(0UL,1,1, 0UL)
         if ackBeforeRender && i=rounds then c.Tx.OnPeerAck(1UL,4096us)
         drain ("round"+string i) (if repairFirst && i<65 then 4 else Int32.MaxValue) |> ignore
     if not ackBeforeRender then c.Tx.OnPeerAck(1UL,4096us)
@@ -231,19 +231,19 @@ let ``partial NACK queue keeps unused repair seeds available`` () =
     // Each step has used 124 seeds. An extra five on step 4 leaves 27 slots.
     for _ in 1..31 do
         f.Expire()
-        tx.OnNack(0UL,4,4)
-        tx.OnNack(4UL,4,4)
+        tx.OnNack(0UL,4,4, 0UL)
+        tx.OnNack(4UL,4,4, 0UL)
     f.Expire()
-    tx.OnNack(4UL,1,2)
+    tx.OnNack(4UL,1,2, 0UL)
     f.Expire()
     // Eight per step: the last step gets only three of the 27 free slots.
-    tx.OnNack(0UL,4,20)
+    tx.OnNack(0UL,4,20, 0UL)
     let partial=f.Drain() |> Array.filter(fun m -> m.Type=CellType.Booster && m.StepId=3UL)
     Assert.Equal(127,partial.Length)
     Assert.Equal(126uy,partial.[126].Slot)
     Assert.Equal(3us,partial.[126].Aux)
     f.Expire()
-    tx.OnNack(3UL,1,1)
+    tx.OnNack(3UL,1,1, 0UL)
     let next=f.Drain() |> Array.filter(fun m -> m.Type=CellType.Booster)
     Assert.Equal<byte>([|127uy;128uy;129uy;130uy|],next |> Array.map(fun m -> m.Slot))
 
@@ -255,7 +255,7 @@ let ``DATA identity ring reuse keeps new absolute steps distinct`` () =
         f.Add()
         if i>=512 then
             // Public API robustness: obsolete absolute range cannot affect the reused slot.
-            f.Client.Tx.OnNack(0UL,1,16)
+            f.Client.Tx.OnNack(0UL,1,16, 0UL)
         let cells=f.Drain()
         Assert.Equal(3,cells.Length)
         Assert.All(cells, fun m -> Assert.Equal(uint64 i,m.StepId))
@@ -277,7 +277,7 @@ let ``opt-in scheduler DATA fallback excludes duplicate first copies`` () =
     let mutable boosters=0
     for _ in 1..65 do
         f.Expire()
-        f.Client.Tx.OnNack(1UL,1,1)
+        f.Client.Tx.OnNack(1UL,1,1, 0UL)
         for m in f.Drain() do
             if m.Type=CellType.Data then fallback <- fallback+1
             elif m.Type=CellType.Booster then boosters <- boosters+1
@@ -341,10 +341,10 @@ let ``paced committed inflight follows first actual DATA not queue origin`` repa
     if not repairFirst then send 3
     for _ in 1..64 do
         f.Expire()
-        f.Client.Tx.OnNack(0UL,1,1)
+        f.Client.Tx.OnNack(0UL,1,1, 0UL)
         send 4
     f.Expire()
-    f.Client.Tx.OnNack(0UL,1,1)
+    f.Client.Tx.OnNack(0UL,1,1, 0UL)
     send 1
     if repairFirst then send 3
     Assert.Equal(260L,carrier.FramesOut)
@@ -369,7 +369,7 @@ let ``all sixteen DATA slot identities survive fallback and fill parity is separ
     let mutable fallback=[||]
     for _ in 1..14 do
         f.Expire()
-        tx.OnNack(0UL,1,16)
+        tx.OnNack(0UL,1,16, 0UL)
         let cells=f.Drain()
         if cells.Length>0 && cells.[0].Type=CellType.Data then fallback <- cells
     Assert.Equal<int>([|0..15|],fallback |> Array.map(fun m -> int m.Slot))

@@ -134,17 +134,25 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: ICodecEn
             // rho at 0.324, gave only 5 parities per 16 sources (54 % first-round decode) and
             // kept the stall that produced the ratio. 2.0x separates them: loss-driven waiting
             // stays under it, real queueing does not.
-            let congested = rttRatio > 2.0
+            // In window mode srtt is inflated by repair round trips, not by queueing: a hole
+            // in a window must wait for parity or a bitmap-NACK retransmission, and that wait
+            // enters the seal-to-ack sample. Reading 2x minRtt as congestion then suppressed
+            // the very parity that would have closed the hole, pinning rho at its floor while
+            // the peer still reported real loss (e2e: rho 0.028 at 5 % loss, 13 Mbit/s against
+            // 176 lossless). Queueing protection stays: the controller still cannot climb past
+            // `target`, and `target` itself is capped by RhoMax.
+            let congested = not windowMode && rttRatio > 2.0
             // A standing queue alone must never hold redundancy at zero while the peer still
             // reports real loss and the path is not queued. Cover that erasure first.
             let neededFloor = min 0.40 target
             // Congestion (srtt well above minRtt) means the queue is ours. Climbing rho, or
             // parking it at 0.30, feeds the queue that produced the report (live: 4 220 boosters,
             // srtt 347 ms on a 115 ms path). Drain toward the floor; do not hold a 30 % tax.
-            if congested && rho > max rhoFloor target + 0.01 then
-                rho <- max (max rhoFloor target) (rho - 0.04)
-            elif rho < neededFloor then
-                rho <- min target (rho + 0.06)
+            let floor' = if windowMode then max 0.10 rhoFloor else rhoFloor
+            if congested && rho > max floor' target + 0.01 then
+                rho <- max (max floor' target) (rho - 0.04)
+            elif rho < max floor' neededFloor then
+                rho <- min (max floor' target) (rho + 0.06)
             elif target > rho + 0.01 then
                 rho <- min target (rho + 0.08)
             elif target < rho - 0.01 then
@@ -325,7 +333,21 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: ICodecEn
         pendingDeficit.[si] <- 0
         nextDeadlineNs.[si] <- 0L
         let m =
-            if small then max (int (ceil (float k * rho))) smallParities.[k]
+            if windowMode then
+                // Proactive parity is per window, sized on source symbols. rho is a ratio of
+                // parity cells to source symbols, so each step contributes its k to one shared
+                // accumulator and every step releases the share accumulated so far. A parity
+                // snapshot is authenticated metadata of the window's sealed tail at render
+                // time, so early parities cover a shorter tail and later ones the longer one;
+                // none is ever invalidated by the window continuing to fill. A small step adds
+                // its legacy minimum, which scales naturally with the window position of the
+                // step: a mid-window flush protects only the tail that exists.
+                acc <- acc + float k * rho
+                let share = min 48 (int (floor acc))
+                acc <- acc - float share
+                if small then max share (max (int (ceil (float k * rho))) smallParities.[k])
+                else share
+            elif small then max (int (ceil (float k * rho))) smallParities.[k]
             else
                 acc <- acc + float k * rho
                 let m = min 48 (int (floor acc))
@@ -828,16 +850,25 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: ICodecEn
     /// after that step's expected arrival has passed, or — for the outstanding tail
     /// with no later evidence — the longer tail timer has passed. When the 256 seeds
     /// of a step are used, its DATA cells go again.
-    member this.OnNack(tLo: uint64, span: int, deficit: int) =
+    member this.OnNack(tLo: uint64, span: int, deficit: int, ?missingMasks: uint64) =
         if windowMode then
             let count = min (max 0 span) CodeGraph.MaxBoosterSpan
+            let lanes = defaultArg missingMasks 0UL
             for j in 0 .. count - 1 do
                 if uint64 j <= UInt64.MaxValue - tLo then
                     let t = tLo + uint64 j
                     let k = if t >= peerAck && t < encoder.Head then encoder.StepUsed t else 0
                     if k > 0 && deficit > 0 then
-                        let mask = uint16 ((1u <<< k) - 1u)
-                        if not (windowRepairs.TryRequest(t, mask)) then
+                        // With lane bitmaps the receiver names exactly the slots it lacks, so
+                        // repair traffic is proportional to real holes instead of whole steps:
+                        // a window that lost three slots used to re-flood all 64. A zero lane
+                        // (no bitmap on the wire, or an unknown step length) keeps the
+                        // conservative full-step mask.
+                        let lane = int ((lanes >>> (16 * j)) &&& 0xFFFFUL)
+                        let mask =
+                            if lane <> 0 then uint16 lane &&& uint16 ((1u <<< k) - 1u)
+                            else uint16 ((1u <<< k) - 1u)
+                        if mask <> 0us && not (windowRepairs.TryRequest(t, mask)) then
                             invalidOp "window repair capacity invariant violated"
         elif newRepair then
             let span = int (min (uint64 (min span CodeGraph.MaxBoosterSpan)) (encoder.Head - min tLo encoder.Head))
@@ -1233,7 +1264,7 @@ type TxHalf(dir: Direction, symbolSize: int, field: CodeField, encoder: ICodecEn
         member this.SpuriousRepairs = this.SpuriousRepairs
         member this.OnPeerSeen(thi) = this.OnPeerSeen(thi)
         member this.OnPeerDecodedBitmap(a, b, c, d, e) = this.OnPeerDecodedBitmap(a, b, c, d, e)
-        member this.OnNack(t, span, deficit) = this.OnNack(t, span, deficit)
+        member this.OnNack(t, span, deficit, masks) = this.OnNack(t, span, deficit, masks)
         member this.HeartbeatDue = this.HeartbeatDue
         member this.NextHeartbeatNs = this.NextHeartbeatNs
         member this.RenderHeartbeat(frame, path, ack, grant, erasure) = this.RenderHeartbeat(frame, path, ack, grant, erasure)

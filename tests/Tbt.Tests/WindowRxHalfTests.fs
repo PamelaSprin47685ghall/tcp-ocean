@@ -76,7 +76,7 @@ let ``encrypted window flow recovers an entirely lost step through nack`` () =
     let mutable span, deficit = 0, 0
     now <- now + 30_000_000L
     Assert.True(rx.TryNack(now, &span, &deficit), "whole-step loss must request repair")
-    tx.OnNack(rx.AckStepLo, span, deficit)
+    tx.OnNack(rx.AckStepLo, span, deficit, 0UL)
     let mutable count = 0
     while tx.HasCandidate && count < 256 do
         deliver false

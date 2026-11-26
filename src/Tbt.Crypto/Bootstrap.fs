@@ -98,7 +98,7 @@ module WindowOffer =
     [<Literal>]
     let DefaultSymbols = 64us
 
-    /// Policy 3: degree(k) = min(k, 8, max(3, k / 8)), not a fixed degree.
+    /// Policy 3: degree(k) = min(k, 15, max(3, (k / 4) | 1)), odd by construction.
     [<Literal>]
     let DefaultDegree = 3uy
 

@@ -210,6 +210,18 @@ type WindowSnapshotDecoder(symbolSize: int, maxWindows: int, maxBytes: int64) =
                 | ValueSome missing -> total <- total + System.Numerics.BitOperations.PopCount(uint32 missing)
                 | ValueNone -> total <- total + 16
         total
+    /// Per-step missing-slot masks for steps tLo..tLo+3, packed as 16-bit lanes into a
+    /// uint64. A step with no authenticated length reports all 16 slots missing.
+    member _.MissingBitmaps(tLo: uint64) =
+        let mutable packed = 0UL
+        for j = 0 to 3 do
+            if uint64 j <= UInt64.MaxValue - tLo then
+                let missing =
+                    match custody.MissingKnown(tLo + uint64 j) with
+                    | ValueSome m -> uint64 m
+                    | ValueNone -> 0xFFFFUL
+                packed <- packed ||| (missing <<< (16 * j))
+        packed
     member _.ObserveEnd(endExclusive: uint64, nowNs: int64) =
         if endExclusive = 0UL then true
         else gap.ObserveSealed(endExclusive - 1UL, custody.PublishedLimit, nowNs)
