@@ -11,6 +11,7 @@
     <Compile Include="Handshake.fs" />
     <Compile Include="WindowBridge.fs" />
     <Compile Include="WindowRxBackend.fs" />
+    <Compile Include="WindowRxGapTracker.fs" />
     <Compile Include="WindowGrant.fs" />
     <Compile Include="WindowCustody.fs" />
     <Compile Include="WindowTxStore.fs" />

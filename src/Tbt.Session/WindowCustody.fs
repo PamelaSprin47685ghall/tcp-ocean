@@ -20,6 +20,7 @@ type WindowCustody(symbolSize: int, maxWindows: int, maxBytes: int64, ?reserveCo
         if int64 maxWindows * perWindow > maxBytes then
             invalidArg (nameof maxBytes) "insufficient decoder capacity for advertised windows"
     let mutable limit = 0UL
+    let mutable deliveringWindow = false
 
     member _.AllocatedBytes = receiver.AllocatedBytes
     /// Reserved matrix payload; excludes object overhead and other session buffers.
@@ -28,6 +29,21 @@ type WindowCustody(symbolSize: int, maxWindows: int, maxBytes: int64, ?reserveCo
     member _.DecodedFrontier = progress.DecodedFrontier
     member _.CustodyFrontier = progress.CustodyFrontier
     member _.PublishedLimit = limit
+
+    /// Authenticated step length, or unknown before DATA/snapshot or after release.
+    member _.TryStepUsed(step: uint64) = receiver.TryStepUsed step
+
+    /// Missing decoded slots, not merely slots awaiting flow-table delivery.
+    /// An entirely unseen step has no authenticated length and returns ValueNone.
+    member _.MissingKnown(step: uint64) =
+        match receiver.TryStepUsed step with
+        | ValueNone -> ValueNone
+        | ValueSome used ->
+            let mutable missing = 0us
+            for slot = 0 to used - 1 do
+                if receiver.Source(step, slot).IsEmpty then
+                    missing <- missing ||| (1us <<< slot)
+            ValueSome missing
 
     /// Publish only after the caller has reserved all resources promised by the grant.
     member _.NextGrant() =
@@ -76,6 +92,28 @@ type WindowCustody(symbolSize: int, maxWindows: int, maxBytes: int64, ?reserveCo
                 progress.StepUndelivered(step, -1)
                 true
 
+    /// Deliver every known, authenticated source in this window at most once.
+    /// Defer reentrant Advance until the batch has registered all references.
+    member this.DeliverAvailable(windowId: uint64, deliver: Action<uint64, int>) =
+        if isNull (box deliver) then nullArg (nameof deliver)
+        if windowId > (UInt64.MaxValue - 3UL) / 4UL then 0
+        elif deliveringWindow then invalidOp "reentrant window delivery"
+        else
+            deliveringWindow <- true
+            try
+                let first = windowId * 4UL
+                let mutable delivered = 0
+                for offset = 0 to 3 do
+                    let step = first + uint64 offset
+                    match receiver.TryStepUsed step with
+                    | ValueNone -> ()
+                    | ValueSome used ->
+                        for slot = 0 to used - 1 do
+                            if this.DeliverKnown(step, slot, deliver) then delivered <- delivered + 1
+                delivered
+            finally
+                deliveringWindow <- false
+
     /// Returns a newly discovered source once. The caller must immediately register
     /// all resulting FlowTable references before Advance or any reentrant release.
     member _.TakeKnown(step: uint64, slot: int) =
@@ -95,15 +133,14 @@ type WindowCustody(symbolSize: int, maxWindows: int, maxBytes: int64, ?reserveCo
     /// Call after all discovered symbols have been delivered to the local flow table.
     /// This is a local custody boundary, not proof the remote application has read.
     member _.Advance() =
-        progress.Advance()
-        let ack = progress.DecodedFrontier
-        // Advance the tracker's acknowledged frontier, but do not grant credit
-        // against the new custody floor until NextGrant is explicitly called.
-        // The old floor is still in force here, so this cannot enlarge limit.
-        grant.NextGrant ack |> ignore
-        let floor = progress.CustodyFrontier - progress.CustodyFrontier % 4UL
-        grant.AdvanceCustody floor
-        receiver.ReleaseThrough floor
+        if not deliveringWindow then
+            progress.Advance()
+            let ack = progress.DecodedFrontier
+            // Keep the old floor in force when acknowledging the new frontier.
+            grant.NextGrant ack |> ignore
+            let floor = progress.CustodyFrontier - progress.CustodyFrontier % 4UL
+            grant.AdvanceCustody floor
+            receiver.ReleaseThrough floor
 
     interface ISourceStore with
         member _.Source(step, slot) = receiver.Source(step, slot)
